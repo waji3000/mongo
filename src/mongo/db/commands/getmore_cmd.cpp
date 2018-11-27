@@ -283,8 +283,11 @@ public:
                         ? _request.nss.getTargetNSForGloballyManagedNamespace()
                         : _request.nss) {
                     const boost::optional<int> dbProfilingLevel = boost::none;
-                    statsTracker.emplace(
-                        opCtx, *nssForCurOp, Top::LockType::NotLocked, dbProfilingLevel);
+                    statsTracker.emplace(opCtx,
+                                         *nssForCurOp,
+                                         Top::LockType::NotLocked,
+                                         AutoStatsTracker::LogMode::kUpdateTopAndCurop,
+                                         dbProfilingLevel);
                 }
             } else {
                 readLock.emplace(opCtx, _request.nss);
@@ -292,6 +295,7 @@ public:
                 statsTracker.emplace(opCtx,
                                      _request.nss,
                                      Top::LockType::ReadLocked,
+                                     AutoStatsTracker::LogMode::kUpdateTopAndCurop,
                                      readLock->getDb() ? readLock->getDb()->getProfilingLevel()
                                                        : doNotChangeProfilingLevel);
 
@@ -402,6 +406,12 @@ public:
             }
 
             PlanExecutor* exec = cursor->getExecutor();
+            const auto* cq = exec->getCanonicalQuery();
+            if (cq && cq->getQueryRequest().isReadOnce()) {
+                // The readOnce option causes any storage-layer cursors created during plan
+                // execution to assume read data will not be needed again and need not be cached.
+                opCtx->recoveryUnit()->setReadOnce(true);
+            }
             exec->reattachToOperationContext(opCtx);
             exec->restoreState();
 

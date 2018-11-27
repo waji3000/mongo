@@ -49,6 +49,7 @@
 #include "mongo/db/pipeline/value.h"
 #include "mongo/db/query/explain_options.h"
 #include "mongo/db/storage/backup_cursor_state.h"
+#include "mongo/s/chunk_version.h"
 
 namespace mongo {
 
@@ -266,7 +267,11 @@ public:
      */
     virtual BackupCursorState openBackupCursor(OperationContext* opCtx) = 0;
 
-    virtual void closeBackupCursor(OperationContext* opCtx, UUID backupId) = 0;
+    virtual void closeBackupCursor(OperationContext* opCtx, const UUID& backupId) = 0;
+
+    virtual BackupCursorExtendState extendBackupCursor(OperationContext* opCtx,
+                                                       const UUID& backupId,
+                                                       const Timestamp& extendTo) = 0;
 
     /**
      * Returns a vector of BSON objects, where each entry in the vector describes a plan cache entry
@@ -295,9 +300,18 @@ public:
      * request to be sent to the config servers. If another thread has already requested a refresh,
      * it will instead wait for that response.
      */
-    virtual boost::optional<OID> refreshAndGetEpoch(
+    virtual boost::optional<ChunkVersion> refreshAndGetCollectionVersion(
         const boost::intrusive_ptr<ExpressionContext>& expCtx,
         const NamespaceString& nss) const = 0;
+
+    /**
+     * Consults the CatalogCache to determine if this node has routing information for the
+     * collection given by 'nss' which reports the same epoch as given by 'targetCollectionVersion'.
+     * Major and minor versions in 'targetCollectionVersion' are ignored.
+     */
+    virtual void checkRoutingInfoEpochOrThrow(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                              const NamespaceString& nss,
+                                              ChunkVersion targetCollectionVersion) const = 0;
 };
 
 }  // namespace mongo

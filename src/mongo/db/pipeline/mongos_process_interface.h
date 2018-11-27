@@ -148,7 +148,13 @@ public:
         MONGO_UNREACHABLE;
     }
 
-    void closeBackupCursor(OperationContext* opCtx, UUID backupId) final {
+    void closeBackupCursor(OperationContext* opCtx, const UUID& backupId) final {
+        MONGO_UNREACHABLE;
+    }
+
+    BackupCursorExtendState extendBackupCursor(OperationContext* opCtx,
+                                               const UUID& backupId,
+                                               const Timestamp& extendTo) final {
         MONGO_UNREACHABLE;
     }
 
@@ -166,6 +172,12 @@ public:
     bool uniqueKeyIsSupportedByIndex(const boost::intrusive_ptr<ExpressionContext>&,
                                      const NamespaceString&,
                                      const std::set<FieldPath>& uniqueKeyPaths) const final;
+
+    void checkRoutingInfoEpochOrThrow(const boost::intrusive_ptr<ExpressionContext>&,
+                                      const NamespaceString&,
+                                      ChunkVersion) const final {
+        MONGO_UNREACHABLE;
+    }
 
 protected:
     BSONObj _reportCurrentOpForClient(OperationContext* opCtx,
