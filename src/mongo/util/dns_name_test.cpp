@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,6 +29,8 @@
 
 
 #include "mongo/util/dns_name.h"
+
+#include <type_traits>
 
 #include "mongo/stdx/utility.h"
 #include "mongo/unittest/unittest.h"
@@ -216,7 +217,7 @@ TEST(DNSNameTest, Resolution) {
             const ::mongo::dns::HostName subdomain(test.subdomain);
             const ::mongo::dns::HostName resolved = [&] {
                 try {
-                    const ::mongo::dns::HostName rv = subdomain.resolvedIn(domain);
+                    ::mongo::dns::HostName rv = subdomain.resolvedIn(domain);
                     return rv;
                 } catch (const ExceptionFor<ErrorCodes::DNSRecordTypeMismatch>&) {
                     ASSERT(test.fails);

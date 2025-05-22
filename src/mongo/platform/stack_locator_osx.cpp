@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,7 +27,6 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
 
 #include "mongo/platform/stack_locator.h"
 
@@ -38,7 +36,8 @@
 
 namespace mongo {
 
-StackLocator::StackLocator() {
+StackLocator::StackLocator(const void* capturedStackPointer)
+    : _capturedStackPointer(capturedStackPointer) {
     const auto self = pthread_self();
     _begin = pthread_get_stackaddr_np(self);
     invariant(_begin);
@@ -47,7 +46,7 @@ StackLocator::StackLocator() {
     invariant(size);
 
     // TODO: Assumes stack grows downward on OS X.
-    _end = static_cast<char*>(_begin) - size;
+    _end = static_cast<const char*>(_begin) - size;
 }
 
 }  // namespace mongo

@@ -1,6 +1,3 @@
-// expression_where_noop.cpp
-
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,30 +27,26 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <memory>
+#include <string>
+#include <utility>
 
 #include "mongo/db/matcher/expression_where_noop.h"
-
-#include "mongo/stdx/memory.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 
 WhereNoOpMatchExpression::WhereNoOpMatchExpression(WhereParams params)
     : WhereMatchExpressionBase(std::move(params)) {}
 
-bool WhereNoOpMatchExpression::matches(const MatchableDocument* doc, MatchDetails* details) const {
-    MONGO_UNREACHABLE;
-}
-
-std::unique_ptr<MatchExpression> WhereNoOpMatchExpression::shallowClone() const {
+std::unique_ptr<MatchExpression> WhereNoOpMatchExpression::clone() const {
     WhereParams params;
     params.code = getCode();
-    params.scope = getScope();
     std::unique_ptr<WhereNoOpMatchExpression> e =
-        stdx::make_unique<WhereNoOpMatchExpression>(std::move(params));
+        std::make_unique<WhereNoOpMatchExpression>(std::move(params));
     if (getTag()) {
         e->setTag(getTag()->clone());
     }
     return std::move(e);
 }
-}
+}  // namespace mongo

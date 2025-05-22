@@ -32,7 +32,7 @@ global:
     cpp_namespace: "mongo::repl"
 
 imports:
-    - "mongo/idl/basic_types.idl"
+    - "mongo/db/basic_types.idl"
     - "mongo/db/repl/replication_types.idl"
 
 structs:
@@ -66,8 +66,18 @@ structs:
         fields:
             oplogTruncateAfterPoint:
                 type: timestamp
-                description: "The timestamp of the first oplog entry in a batch when we are writing oplog entries to the oplog after which the oplog may be inconsistent."
+                description: "The timestamp of an oplog entry after which the oplog may be inconsistent (have holes due to parallel writes)."
             _id:
                 type: string
                 description: "Always set to 'oplogTruncateAfterPoint' to easily retrieve it."
 
+    InitialSyncIdDocument:
+        description: A document in which the server stores data related to the initial sync of the server.
+        fields:
+            _id:
+                type: uuid
+                description: "An arbitrary unique identifier associated with the initial sync of the server."
+            wallTime:
+                type: date
+                optional: true
+                description: "The walltime at which the initial sync document was written."

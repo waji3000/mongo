@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,78 +27,192 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/service_context_d_test_fixture.h"
 
-#include <memory>
+#include <type_traits>
 
-#include "mongo/base/checked_cast.h"
-#include "mongo/db/catalog/catalog_control.h"
+#include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/collection_catalog_helper.h"
+#include "mongo/db/catalog/collection_impl.h"
 #include "mongo/db/catalog/database_holder.h"
-#include "mongo/db/catalog/uuid_catalog.h"
+#include "mongo/db/catalog/database_holder_impl.h"
+#include "mongo/db/client.h"
 #include "mongo/db/concurrency/d_concurrency.h"
-#include "mongo/db/logical_clock.h"
-#include "mongo/db/op_observer_registry.h"
-#include "mongo/db/service_entry_point_mongod.h"
-#include "mongo/db/storage/storage_engine_init.h"
+#include "mongo/db/concurrency/lock_manager_defs.h"
+#include "mongo/db/global_settings.h"
+#include "mongo/db/index_builds/index_builds_coordinator.h"
+#include "mongo/db/index_builds/index_builds_coordinator_mongod.h"
+#include "mongo/db/repl/repl_settings.h"
+#include "mongo/db/repl/replication_coordinator_mock.h"
+#include "mongo/db/s/collection_sharding_state.h"
+#include "mongo/db/s/collection_sharding_state_factory_shard.h"
+#include "mongo/db/s/database_sharding_state_factory_shard.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/service_entry_point_shard_role.h"
+#include "mongo/db/storage/control/storage_control.h"
+#include "mongo/db/storage/storage_engine.h"
 #include "mongo/db/storage/storage_options.h"
-#include "mongo/util/assert_util.h"
-#include "mongo/util/mock_periodic_runner_impl.h"
+#include "mongo/s/sharding_state.h"
+#include "mongo/util/clock_source_mock.h"
+#include "mongo/util/periodic_runner.h"
+#include "mongo/util/periodic_runner_factory.h"
 
 namespace mongo {
 
-ServiceContextMongoDTest::ServiceContextMongoDTest()
-    : ServiceContextMongoDTest("ephemeralForTest") {}
+ServiceContext::UniqueServiceContext MongoDScopedGlobalServiceContextForTest::makeServiceContext(
+    bool useMockClock,
+    Milliseconds autoAdvancingMockClockIncrement,
+    std::unique_ptr<TickSource> tickSource) {
+    {
+        // Reset the global clock source
+        ClockSourceMock clkSource;
+        clkSource.reset();
+    }
 
-ServiceContextMongoDTest::ServiceContextMongoDTest(std::string engine)
-    : ServiceContextMongoDTest(engine, RepairAction::kNoRepair) {}
+    std::unique_ptr<ClockSource> fastClockSource, preciseClockSource;
 
-ServiceContextMongoDTest::ServiceContextMongoDTest(std::string engine, RepairAction repair)
-    : _tempDir("service_context_d_test_fixture") {
+    if (useMockClock) {
+        // Copied from dbtests.cpp. DBTests sets up a controlled mock clock while
+        // ScopedGlobalServiceContextMongoDForTest uses the system clock. Tests moved from dbtests
+        // to unittests may depend on a deterministic clock. Additionally, if a test chooses to set
+        // a non-zero _autoAdvancingMockClockIncrement, the mock clock will automatically advance by
+        // that increment each time it is read.
+        auto fastClock =
+            std::make_unique<AutoAdvancingClockSourceMock>(autoAdvancingMockClockIncrement);
+        // Timestamps are split into two 32-bit integers, seconds and "increments". Currently
+        // (but maybe not for eternity), a Timestamp with a value of `0` seconds is always
+        // considered "null" by `Timestamp::isNull`, regardless of its increment value. Ticking
+        // the `ClockSourceMock` only bumps the "increment" counter, thus by default, generating
+        // "null" timestamps. Bumping by one second here avoids any accidental interpretations.
+        fastClock->advance(Seconds(1));
+        fastClockSource = std::move(fastClock);
 
-    _stashedStorageParams.engine = std::exchange(storageGlobalParams.engine, std::move(engine));
+        auto preciseClock =
+            std::make_unique<AutoAdvancingClockSourceMock>(autoAdvancingMockClockIncrement);
+        // See above.
+        preciseClock->advance(Seconds(1));
+        preciseClockSource = std::move(preciseClock);
+    }
+
+    return ServiceContext::make(
+        std::move(fastClockSource), std::move(preciseClockSource), std::move(tickSource));
+}
+
+MongoDScopedGlobalServiceContextForTest::MongoDScopedGlobalServiceContextForTest(Options options,
+                                                                                 bool shouldSetupTL)
+    : MongoDScopedGlobalServiceContextForTest(nullptr, std::move(options), shouldSetupTL) {}
+
+MongoDScopedGlobalServiceContextForTest::MongoDScopedGlobalServiceContextForTest(
+    ServiceContext::UniqueServiceContext serviceContextHolder, Options options, bool shouldSetupTL)
+    : ScopedGlobalServiceContextForTest(
+          serviceContextHolder ? std::move(serviceContextHolder)
+                               : makeServiceContext(options._useMockClock,
+                                                    options._autoAdvancingMockClockIncrement,
+                                                    std::move(options._mockTickSource)),
+          shouldSetupTL),
+      _journalListener(std::move(options._journalListener)) {
+    auto serviceContext = getServiceContext();
+
+    for (auto& observer : options._clientObservers) {
+        serviceContext->registerClientObserver(std::move(observer));
+    }
+
+    auto setupClient = serviceContext->getService()->makeClient("MongoDSCTestCtor");
+    AlternativeClientRegion acr(setupClient);
+
+    if (options._forceDisableTableLogging) {
+        storageGlobalParams.forceDisableTableLogging = true;
+    }
+
+    if (options._useReplSettings) {
+        repl::ReplSettings replSettings;
+        replSettings.setOplogSizeBytes(10 * 1024 * 1024);
+        replSettings.setReplSetString("rs0");
+        setGlobalReplSettings(replSettings);
+    } else {
+        repl::ReplSettings replSettings;
+        // The empty string "disables" replication.
+        replSettings.setReplSetString("");
+        setGlobalReplSettings(replSettings);
+    }
+
+    // TODO: SERVER-97042 move to service_context_test_fixture.
+    repl::ReplicationCoordinator::set(
+        serviceContext,
+        std::make_unique<repl::ReplicationCoordinatorMock>(serviceContext, repl::ReplSettings()));
+
+    _stashedStorageParams.engine =
+        std::exchange(storageGlobalParams.engine, std::move(options._engine));
     _stashedStorageParams.engineSetByUser =
         std::exchange(storageGlobalParams.engineSetByUser, true);
     _stashedStorageParams.repair =
-        std::exchange(storageGlobalParams.repair, (repair == RepairAction::kRepair));
+        std::exchange(storageGlobalParams.repair, (options._repair == RepairAction::kRepair));
 
-    auto const serviceContext = getServiceContext();
-    serviceContext->setServiceEntryPoint(std::make_unique<ServiceEntryPointMongod>(serviceContext));
-    auto logicalClock = std::make_unique<LogicalClock>(serviceContext);
-    LogicalClock::set(serviceContext, std::move(logicalClock));
+    serviceContext->getService()->setServiceEntryPoint(
+        std::make_unique<ServiceEntryPointShardRole>());
 
-    // Set up a fake no-op PeriodicRunner. No jobs will ever get run, which is
-    // desired behavior for unit tests unrelated to background jobs.
-    auto runner = std::make_unique<MockPeriodicRunnerImpl>();
+    auto observerRegistry = std::make_unique<OpObserverRegistry>();
+    _opObserverRegistry = observerRegistry.get();
+    serviceContext->setOpObserver(std::move(observerRegistry));
+
+    // Set up the periodic runner to allow background job execution for tests that require it.
+    auto runner = makePeriodicRunner(serviceContext);
     serviceContext->setPeriodicRunner(std::move(runner));
 
     storageGlobalParams.dbpath = _tempDir.path();
 
-    initializeStorageEngine(serviceContext, StorageEngineInitFlags::kNone);
+    storageGlobalParams.inMemory = options._inMemory;
 
-    // Set up UUID Catalog observer. This is necessary because the Collection destructor contains an
-    // invariant to ensure the UUID corresponding to that Collection object is no longer associated
-    // with that Collection object in the UUIDCatalog. UUIDs may be registered in the UUIDCatalog
-    // directly in certain code paths, but they can only be removed from the UUIDCatalog via a
-    // UUIDCatalogObserver. It is therefore necessary to install the observer to ensure the
-    // invariant in the Collection destructor is not triggered.
-    auto observerRegistry = checked_cast<OpObserverRegistry*>(serviceContext->getOpObserver());
-    observerRegistry->addObserver(std::make_unique<UUIDCatalogObserver>());
-}
+    // Since unit tests start in their own directories, by default skip lock file and metadata file
+    // for faster startup.
+    catalog::startUpStorageEngineAndCollectionCatalog(serviceContext, &cc(), options._initFlags);
+    StorageControl::startStorageControls(serviceContext, true /*forTestOnly*/);
 
-ServiceContextMongoDTest::~ServiceContextMongoDTest() {
-    {
-        auto opCtx = getClient()->makeOperationContext();
-        Lock::GlobalLock glk(opCtx.get(), MODE_X);
-        DatabaseHolder::getDatabaseHolder().closeAll(opCtx.get(), "all databases dropped");
+    DatabaseHolder::set(serviceContext, std::make_unique<DatabaseHolderImpl>());
+    Collection::Factory::set(serviceContext, std::make_unique<CollectionImpl::FactoryImpl>());
+    if (options._createShardingState) {
+        ShardingState::create(serviceContext);
+    }
+    CollectionShardingStateFactory::set(
+        serviceContext, std::make_unique<CollectionShardingStateFactoryShard>(serviceContext));
+    DatabaseShardingStateFactory::set(serviceContext,
+                                      std::make_unique<DatabaseShardingStateFactoryShard>());
+    serviceContext->getStorageEngine()->notifyStorageStartupRecoveryComplete();
+
+    if (options._indexBuildsCoordinator) {
+        IndexBuildsCoordinator::set(serviceContext, std::move(options._indexBuildsCoordinator));
+    } else {
+        IndexBuildsCoordinator::set(serviceContext,
+                                    std::make_unique<IndexBuildsCoordinatorMongod>());
     }
 
-    shutdownGlobalStorageEngineCleanly(getServiceContext());
+    if (_journalListener) {
+        serviceContext->getStorageEngine()->setJournalListener(_journalListener.get());
+    }
+}
+
+MongoDScopedGlobalServiceContextForTest::~MongoDScopedGlobalServiceContextForTest() {
+    auto teardownClient = getServiceContext()->getService()->makeClient("MongoDSCTestDtor");
+    AlternativeClientRegion acr(teardownClient);
+    auto opCtx = Client::getCurrent()->makeOperationContext();
+
+    IndexBuildsCoordinator::get(opCtx.get())->shutdown(opCtx.get());
+    CollectionShardingStateFactory::clear(getServiceContext());
+    DatabaseShardingStateFactory::clear(getServiceContext());
+
+    {
+        Lock::GlobalLock glk(opCtx.get(), MODE_X);
+        auto databaseHolder = DatabaseHolder::get(opCtx.get());
+        databaseHolder->closeAll(opCtx.get());
+    }
+
+    catalog::shutDownCollectionCatalogAndGlobalStorageEngineCleanly(getServiceContext());
 
     std::swap(storageGlobalParams.engine, _stashedStorageParams.engine);
     std::swap(storageGlobalParams.engineSetByUser, _stashedStorageParams.engineSetByUser);
     std::swap(storageGlobalParams.repair, _stashedStorageParams.repair);
+
+    storageGlobalParams.reset();
 }
 
 }  // namespace mongo

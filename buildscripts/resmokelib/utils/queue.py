@@ -6,19 +6,20 @@ in order for KeyboardInterrupt exceptions to get propagated.
 See https://bugs.python.org/issue1167930 for more details.
 """
 
-from __future__ import absolute_import
-
-import Queue as _Queue
+import queue as _queue
 import time
+from typing import Generic, TypeVar
 
 # Exception that is raised when get_nowait() is called on an empty Queue.
-Empty = _Queue.Empty
+Empty = _queue.Empty
+
+T = TypeVar("T")
 
 
-class Queue(_Queue.Queue):
+class Queue(_queue.Queue, Generic[T]):
     """A multi-producer, multi-consumer queue."""
 
-    def join(self, timeout=None):  # pylint: disable=arguments-differ
+    def join(self, timeout=None):
         """Wait until all items in the queue have been processed or 'timeout' seconds have passed.
 
         The count of unfinished tasks is incremented whenever an item is added

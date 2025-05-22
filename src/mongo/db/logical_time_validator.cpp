@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,58 +27,69 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
 
-#include "mongo/platform/basic.h"
+#include <boost/optional/optional.hpp>
+#include <mutex>
+#include <string>
+#include <utility>
+#include <vector>
 
-#include "mongo/db/logical_time_validator.h"
-
-#include "mongo/base/init.h"
-#include "mongo/db/auth/action_set.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/base/init.h"  // IWYU pragma: keep
+#include "mongo/base/status_with.h"
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/privilege.h"
+#include "mongo/db/auth/resource_pattern.h"
+#include "mongo/db/client.h"
 #include "mongo/db/keys_collection_manager.h"
-#include "mongo/db/logical_clock.h"
+#include "mongo/db/logical_time_validator.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/vector_clock.h"
+#include "mongo/logv2/log.h"
+#include "mongo/platform/compiler.h"
+#include "mongo/transport/session.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/log.h"
+#include "mongo/util/decorable.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/time_support.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
+
 
 namespace mongo {
 
 namespace {
-const auto getLogicalClockValidator =
-    ServiceContext::declareDecoration<std::unique_ptr<LogicalTimeValidator>>();
 
-stdx::mutex validatorMutex;  // protects access to decoration instance of LogicalTimeValidator.
+MONGO_FAIL_POINT_DEFINE(alwaysValidateClientsClusterTime);
+MONGO_FAIL_POINT_DEFINE(externalClientsNeverAuthorizedToAdvanceLogicalClock);
+MONGO_FAIL_POINT_DEFINE(throwClientDisconnectInSignLogicalTimeForExternalClients);
 
-std::vector<Privilege> advanceClusterTimePrivilege;
+const auto getLogicalTimeValidator =
+    ServiceContext::declareDecoration<std::shared_ptr<LogicalTimeValidator>>();
 
-MONGO_INITIALIZER(InitializeAdvanceClusterTimePrivilegeVector)(InitializerContext* const) {
-    ActionSet actions;
-    actions.addAction(ActionType::advanceClusterTime);
-    advanceClusterTimePrivilege.emplace_back(ResourcePattern::forClusterResource(), actions);
-    return Status::OK();
-}
+stdx::mutex validatorMutex;  // protects access to decoration instance of
+                             // LogicalTimeValidator.
 
 Milliseconds kRefreshIntervalIfErrored(200);
 
 }  // unnamed namespace
 
-LogicalTimeValidator* LogicalTimeValidator::get(ServiceContext* service) {
+std::shared_ptr<LogicalTimeValidator> LogicalTimeValidator::get(ServiceContext* service) {
     stdx::lock_guard<stdx::mutex> lk(validatorMutex);
-    return getLogicalClockValidator(service).get();
+    return getLogicalTimeValidator(service);
 }
 
-LogicalTimeValidator* LogicalTimeValidator::get(OperationContext* ctx) {
+std::shared_ptr<LogicalTimeValidator> LogicalTimeValidator::get(OperationContext* ctx) {
     return get(ctx->getClient()->getServiceContext());
 }
 
 void LogicalTimeValidator::set(ServiceContext* service,
                                std::unique_ptr<LogicalTimeValidator> newValidator) {
     stdx::lock_guard<stdx::mutex> lk(validatorMutex);
-    auto& validator = getLogicalClockValidator(service);
+    auto& validator = getLogicalTimeValidator(service);
     validator = std::move(newValidator);
 }
 
@@ -127,7 +137,7 @@ SignedLogicalTime LogicalTimeValidator::signLogicalTime(OperationContext* opCtx,
     auto keyStatusWith = keyManager->getKeyForSigning(nullptr, newTime);
     auto keyStatus = keyStatusWith.getStatus();
 
-    while (keyStatus == ErrorCodes::KeyNotFound && LogicalClock::get(opCtx)->isEnabled()) {
+    while (keyStatus == ErrorCodes::KeyNotFound && VectorClock::get(opCtx)->isEnabled()) {
         keyManager->refreshNow(opCtx);
 
         keyStatusWith = keyManager->getKeyForSigning(nullptr, newTime);
@@ -138,6 +148,14 @@ SignedLogicalTime LogicalTimeValidator::signLogicalTime(OperationContext* opCtx,
         }
     }
 
+    if (MONGO_unlikely(throwClientDisconnectInSignLogicalTimeForExternalClients.shouldFail() &&
+                       opCtx->getClient()->session() && !opCtx->getClient()->isInternalClient())) {
+        // KeysCollectionManager::refreshNow() can throw an exception if the client has
+        // already disconnected. We simulate such behavior using this failpoint.
+        keyStatus = {ErrorCodes::ClientDisconnect,
+                     "throwClientDisconnectInSignLogicalTimeForExternalClients failpoint enabled"};
+    }
+
     uassertStatusOK(keyStatus);
     return _getProof(keyStatusWith.getValue(), newTime);
 }
@@ -145,28 +163,40 @@ SignedLogicalTime LogicalTimeValidator::signLogicalTime(OperationContext* opCtx,
 Status LogicalTimeValidator::validate(OperationContext* opCtx, const SignedLogicalTime& newTime) {
     {
         stdx::lock_guard<stdx::mutex> lk(_mutex);
-        if (newTime.getTime() <= _lastSeenValidTime.getTime()) {
+        if (newTime.getTime() <= _lastSeenValidTime.getTime() &&
+            !MONGO_unlikely(alwaysValidateClientsClusterTime.shouldFail())) {
             return Status::OK();
         }
     }
 
-    auto keyStatus =
-        _getKeyManagerCopy()->getKeyForValidation(opCtx, newTime.getKeyId(), newTime.getTime());
-    uassertStatusOK(keyStatus.getStatus());
+    auto keyStatusWith =
+        _getKeyManagerCopy()->getKeysForValidation(opCtx, newTime.getKeyId(), newTime.getTime());
+    auto status = keyStatusWith.getStatus();
 
-    const auto& key = keyStatus.getValue().getKey();
+    if (!status.isOK()) {
+        return status;
+    }
+
+    auto keys = keyStatusWith.getValue();
+    invariant(!keys.empty());
 
     const auto newProof = newTime.getProof();
     // Cluster time is only sent if a server's clock can verify and sign cluster times, so any
     // received cluster times should have proofs.
     invariant(newProof);
 
-    auto res = _timeProofService.checkProof(newTime.getTime(), newProof.get(), key);
-    if (res != Status::OK()) {
-        return res;
+    auto firstError = Status::OK();
+    for (const auto& key : keys) {
+        auto proofStatus =
+            _timeProofService.checkProof(newTime.getTime(), newProof.value(), key.getKey());
+        if (proofStatus.isOK()) {
+            return Status::OK();
+        } else if (firstError.isOK()) {
+            firstError = proofStatus;
+        }
     }
 
-    return Status::OK();
+    return firstError;
 }
 
 void LogicalTimeValidator::init(ServiceContext* service) {
@@ -174,7 +204,6 @@ void LogicalTimeValidator::init(ServiceContext* service) {
 }
 
 void LogicalTimeValidator::shutDown() {
-    stdx::lock_guard<stdx::mutex> lk(_mutexKeyManager);
     if (_keyManager) {
         _keyManager->stopMonitoring();
     }
@@ -185,33 +214,37 @@ void LogicalTimeValidator::enableKeyGenerator(OperationContext* opCtx, bool doEn
 }
 
 bool LogicalTimeValidator::isAuthorizedToAdvanceClock(OperationContext* opCtx) {
-    auto client = opCtx->getClient();
+    if (MONGO_unlikely(externalClientsNeverAuthorizedToAdvanceLogicalClock.shouldFail())) {
+        return opCtx->getClient()->session() && opCtx->getClient()->isInternalClient();
+    }
+
+    auto as = AuthorizationSession::get(opCtx->getClient());
     // Note: returns true if auth is off, courtesy of
     // AuthzSessionExternalStateServerCommon::shouldIgnoreAuthChecks.
-    return AuthorizationSession::get(client)->isAuthorizedForPrivileges(
-        advanceClusterTimePrivilege);
+    return as->isAuthorizedForClusterAction(ActionType::advanceClusterTime, as->getUserTenantId());
 }
 
 bool LogicalTimeValidator::shouldGossipLogicalTime() {
     return _getKeyManagerCopy()->hasSeenKeys();
 }
 
+void LogicalTimeValidator::cacheExternalKey(ExternalKeysCollectionDocument key) {
+    invariant(_keyManager);
+    _keyManager->cacheExternalKey(std::move(key));
+}
+
 void LogicalTimeValidator::resetKeyManagerCache() {
-    log() << "Resetting key manager cache";
-    {
-        stdx::lock_guard<stdx::mutex> keyManagerLock(_mutexKeyManager);
-        invariant(_keyManager);
-        _keyManager->clearCache();
-    }
+    LOGV2(20716, "Resetting key manager cache");
+    invariant(_keyManager);
+    _keyManager->clearCache();
     stdx::lock_guard<stdx::mutex> lk(_mutex);
     _lastSeenValidTime = SignedLogicalTime();
     _timeProofService.resetCache();
 }
 
 void LogicalTimeValidator::stopKeyManager() {
-    stdx::lock_guard<stdx::mutex> keyManagerLock(_mutexKeyManager);
     if (_keyManager) {
-        log() << "Stopping key manager";
+        LOGV2(20717, "Stopping key manager");
         _keyManager->stopMonitoring();
         _keyManager->clearCache();
 
@@ -219,12 +252,11 @@ void LogicalTimeValidator::stopKeyManager() {
         _lastSeenValidTime = SignedLogicalTime();
         _timeProofService.resetCache();
     } else {
-        log() << "Stopping key manager: no key manager exists.";
+        LOGV2(20718, "Stopping key manager: no key manager exists.");
     }
 }
 
 std::shared_ptr<KeysCollectionManager> LogicalTimeValidator::_getKeyManagerCopy() {
-    stdx::lock_guard<stdx::mutex> lk(_mutexKeyManager);
     invariant(_keyManager);
     return _keyManager;
 }

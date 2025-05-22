@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,36 +27,36 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+
+#include <boost/smart_ptr/intrusive_ptr.hpp>
 
 #include "mongo/db/update/set_node.h"
-
-#include "mongo/db/update/path_support.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 
 Status SetNode::init(BSONElement modExpr, const boost::intrusive_ptr<ExpressionContext>& expCtx) {
     invariant(modExpr.ok());
 
-    _val = modExpr;
+    val = modExpr;
 
     return Status::OK();
 }
 
-ModifierNode::ModifyResult SetNode::updateExistingElement(
-    mutablebson::Element* element, std::shared_ptr<FieldRef> elementPath) const {
+ModifierNode::ModifyResult SetNode::updateExistingElement(mutablebson::Element* element,
+                                                          const FieldRef& elementPath) const {
     // If 'element' is deserialized, then element.getValue() will be EOO, which will never equal
-    // _val.
-    if (element->getValue().binaryEqualValues(_val)) {
+    // val.
+    if (element->getValue().binaryEqualValues(val)) {
         return ModifyResult::kNoOp;
     } else {
-        invariant(element->setValueBSONElement(_val));
+        invariant(element->setValueBSONElement(val));
         return ModifyResult::kNormalUpdate;
     }
 }
 
 void SetNode::setValueForNewElement(mutablebson::Element* element) const {
-    invariant(element->setValueBSONElement(_val));
+    invariant(element->setValueBSONElement(val));
 }
 
 }  // namespace mongo

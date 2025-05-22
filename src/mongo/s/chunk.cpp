@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,32 +27,50 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
-
-#include "mongo/platform/basic.h"
-
 #include "mongo/s/chunk.h"
 
-#include "mongo/platform/random.h"
-#include "mongo/s/chunk_writes_tracker.h"
-#include "mongo/util/mongoutils/str.h"
+// IWYU pragma: no_include "ext/alloc_traits.h"
+#include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+#include <memory>
+#include <utility>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bson_field.h"
+#include "mongo/s/shard_key_pattern.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 namespace mongo {
 
 ChunkInfo::ChunkInfo(const ChunkType& from)
-    : _range(from.getMin(), from.getMax()),
+    : _maxKeyString(ShardKeyPattern::toKeyString(from.getRange().getMax())),
+      _range(from.getRange()),
       _shardId(from.getShard()),
       _lastmod(from.getVersion()),
       _history(from.getHistory()),
-      _jumbo(from.getJumbo()),
-      _writesTracker(std::make_shared<ChunkWritesTracker>()) {
+      _jumbo(from.getJumbo()) {
     uassertStatusOK(from.validate());
 }
+
+ChunkInfo::ChunkInfo(ChunkRange range,
+                     std::string maxKeyString,
+                     ShardId shardId,
+                     ChunkVersion version,
+                     std::vector<ChunkHistory> history,
+                     bool jumbo)
+    : _maxKeyString(std::move(maxKeyString)),
+      _range(std::move(range)),
+      _shardId(shardId),
+      _lastmod(std::move(version)),
+      _history(std::move(history)),
+      _jumbo(jumbo) {}
 
 const ShardId& ChunkInfo::getShardIdAt(const boost::optional<Timestamp>& ts) const {
     // This chunk was refreshed from FCV 3.6 config server so it doesn't have history
     if (_history.empty()) {
-        // TODO: SERVER-34619 - add uassert
         return _shardId;
     }
 
@@ -71,7 +88,7 @@ const ShardId& ChunkInfo::getShardIdAt(const boost::optional<Timestamp>& ts) con
 
     uasserted(ErrorCodes::StaleChunkHistory,
               str::stream() << "Cannot find shardId the chunk belonged to at cluster time "
-                            << ts.get().toString());
+                            << ts.value().toString());
 }
 
 void ChunkInfo::throwIfMovedSince(const Timestamp& ts) const {
@@ -89,21 +106,35 @@ void ChunkInfo::throwIfMovedSince(const Timestamp& ts) const {
 
     uasserted(ErrorCodes::MigrationConflict,
               str::stream() << "Chunk has moved since timestamp: " << ts.toString()
-                            << ", most recently at timestamp: "
-                            << latestValidAfter.toString());
+                            << ", most recently at timestamp: " << latestValidAfter.toString());
 }
 
 bool ChunkInfo::containsKey(const BSONObj& shardKey) const {
-    return getMin().woCompare(shardKey) <= 0 && shardKey.woCompare(getMax()) < 0;
+    return _range.containsKey(shardKey);
 }
 
 std::string ChunkInfo::toString() const {
-    return str::stream() << ChunkType::shard() << ": " << _shardId << ", " << ChunkType::lastmod()
-                         << ": " << _lastmod.toString() << ", " << _range.toString();
+    return toBSON().toString();
+}
+
+BSONObj ChunkInfo::toBSON() const {
+    BSONObjBuilder bob;
+    _range.serialize(&bob);
+    bob.append("maxKeyString", _maxKeyString);
+    bob.append("shardId", _shardId);
+    _lastmod.serialize("lastmod", &bob);
+    bob.append("jumbo", _jumbo.load());
+
+    BSONArrayBuilder historyArr{bob.subarrayStart("history")};
+    for (const auto& historyEntry : _history) {
+        historyArr.append(historyEntry.toBSON());
+    }
+    historyArr.doneFast();
+    return bob.obj();
 }
 
 void ChunkInfo::markAsJumbo() {
-    _jumbo = true;
+    _jumbo.store(true);
 }
 
 void Chunk::throwIfMoved() const {
@@ -113,5 +144,17 @@ void Chunk::throwIfMoved() const {
 
     _chunkInfo.throwIfMovedSince(*_atClusterTime);
 }
+
+std::string Chunk::toString() const {
+    return toBSON().toString();
+}
+
+BSONObj Chunk::toBSON() const {
+    BSONObjBuilder bob;
+    bob.append("chunkInfo", _chunkInfo.toBSON());
+    bob.append("atClusterTime", _atClusterTime ? _atClusterTime->toBSON() : BSONObj());
+    return bob.obj();
+}
+
 
 }  // namespace mongo

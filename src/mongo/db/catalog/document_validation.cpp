@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,11 +27,11 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <utility>
 
 #include "mongo/db/catalog/document_validation.h"
 
 namespace mongo {
-const OperationContext::Decoration<bool> documentValidationDisabled =
-    OperationContext::declareDecoration<bool>();
-}
+const OperationContext::Decoration<DocumentValidationSettings> DocumentValidationSettings::get =
+    OperationContext::declareDecoration<DocumentValidationSettings>();
+}  // namespace mongo

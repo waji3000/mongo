@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,129 +27,34 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
+#include <exception>
+#include <map>
+#include <memory>
+#include <string>
+#include <utility>
 
-#include "mongo/platform/basic.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
 
-#include "mongo/client/mongo_uri.h"
-
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
-#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/base/string_data.h"
+#include "mongo/client/client_api_version_parameters_gen.h"
+#include "mongo/client/connection_string.h"
 #include "mongo/client/dbclient_base.h"
-#include "mongo/db/auth/sasl_command_constants.h"
-#include "mongo/util/mongoutils/str.h"
-#include "mongo/util/password_digest.h"
-
-#include <boost/algorithm/string/case_conv.hpp>
-#include <boost/algorithm/string/classification.hpp>
-#include <boost/algorithm/string/predicate.hpp>
-#include <boost/algorithm/string/split.hpp>
-
-#include <iterator>
+#include "mongo/client/mongo_uri.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
-namespace {
-const char kAuthMechanismPropertiesKey[] = "mechanism_properties";
-
-// CANONICALIZE_HOST_NAME is currently unsupported
-const char kAuthServiceName[] = "SERVICE_NAME";
-const char kAuthServiceRealm[] = "SERVICE_REALM";
-
-const char kAuthMechMongoCR[] = "MONGODB-CR";
-const char kAuthMechScramSha1[] = "SCRAM-SHA-1";
-const char kAuthMechDefault[] = "DEFAULT";
-
-const char* const kSupportedAuthMechanismProperties[] = {kAuthServiceName, kAuthServiceRealm};
-
-BSONObj parseAuthMechanismProperties(const std::string& propStr) {
-    BSONObjBuilder bob;
-    std::vector<std::string> props;
-    boost::algorithm::split(props, propStr, boost::algorithm::is_any_of(",:"));
-    for (std::vector<std::string>::const_iterator it = props.begin(); it != props.end(); ++it) {
-        std::string prop((boost::algorithm::to_upper_copy(*it)));  // normalize case
-        uassert(ErrorCodes::FailedToParse,
-                str::stream() << "authMechanismProperty: " << *it << " is not supported",
-                std::count(kSupportedAuthMechanismProperties,
-                           std::end(kSupportedAuthMechanismProperties),
-                           prop));
-        ++it;
-        uassert(ErrorCodes::FailedToParse,
-                str::stream() << "authMechanismProperty: " << prop << " must have a value",
-                it != props.end());
-        bob.append(prop, *it);
-    }
-    return bob.obj();
-}
-
-}  // namespace
-
-BSONObj MongoURI::_makeAuthObjFromOptions(int maxWireVersion) const {
-    BSONObjBuilder bob;
-
-    // Add the username and optional password
-    invariant(!_user.empty());
-    std::string username(_user);  // may have to tack on service realm before we append
-
-    if (!_password.empty())
-        bob.append(saslCommandPasswordFieldName, _password);
-
-    OptionsMap::const_iterator it;
-
-    it = _options.find("authSource");
-    if (it != _options.end()) {
-        bob.append(saslCommandUserDBFieldName, it->second);
-    } else if (!_database.empty()) {
-        bob.append(saslCommandUserDBFieldName, _database);
-    } else {
-        bob.append(saslCommandUserDBFieldName, "admin");
-    }
-
-    it = _options.find("authMechanism");
-    if (it != _options.end()) {
-        bob.append(saslCommandMechanismFieldName, it->second);
-    } else if (maxWireVersion >= 3) {
-        bob.append(saslCommandMechanismFieldName, kAuthMechScramSha1);
-    } else {
-        bob.append(saslCommandMechanismFieldName, kAuthMechMongoCR);
-    }
-
-    it = _options.find("authMechanismProperties");
-    if (it != _options.end()) {
-        BSONObj parsed(parseAuthMechanismProperties(it->second));
-
-        bool hasNameProp = parsed.hasField(kAuthServiceName);
-        bool hasRealmProp = parsed.hasField(kAuthServiceRealm);
-
-        uassert(ErrorCodes::FailedToParse,
-                "Cannot specify both gssapiServiceName and SERVICE_NAME",
-                !(hasNameProp && _options.count("gssapiServiceName")));
-        // we append the parsed object so that mechanisms that don't accept it can assert.
-        bob.append(kAuthMechanismPropertiesKey, parsed);
-        // we still append using the old way the SASL code expects it
-        if (hasNameProp) {
-            bob.append(saslCommandServiceNameFieldName, parsed[kAuthServiceName].String());
-        }
-        // if we specified a realm, we just append it to the username as the SASL code
-        // expects it that way.
-        if (hasRealmProp) {
-            username.append("@").append(parsed[kAuthServiceRealm].String());
-        }
-    }
-
-    it = _options.find("gssapiServiceName");
-    if (it != _options.end()) {
-        bob.append(saslCommandServiceNameFieldName, it->second);
-    }
-
-    bob.append("user", username);
-
-    return bob.obj();
-}
-
 DBClientBase* MongoURI::connect(StringData applicationName,
                                 std::string& errmsg,
-                                boost::optional<double> socketTimeoutSecs) const {
+                                boost::optional<double> socketTimeoutSecs,
+                                const ClientAPIVersionParameters* apiParameters,
+                                const boost::optional<TransientSSLParams>& transientSSLParams,
+                                ErrorCodes::Error* errcode) const {
     OptionsMap::const_iterator it = _options.find("socketTimeoutMS");
     if (it != _options.end() && !socketTimeoutSecs) {
         try {
@@ -161,16 +65,35 @@ DBClientBase* MongoURI::connect(StringData applicationName,
         }
     }
 
-    auto ret = std::unique_ptr<DBClientBase>(
-        _connectString.connect(applicationName, errmsg, socketTimeoutSecs.value_or(0.0), this));
-    if (!ret) {
+    auto swConn = _connectString.connect(applicationName,
+                                         socketTimeoutSecs.value_or(0.0),
+                                         this,
+                                         apiParameters,
+                                         transientSSLParams ? &*transientSSLParams : nullptr);
+    if (!swConn.isOK()) {
+        errmsg = swConn.getStatus().reason();
+        if (errcode) {
+            *errcode = swConn.getStatus().code();
+        }
         return nullptr;
     }
 
-    if (!_user.empty()) {
-        ret->auth(_makeAuthObjFromOptions(ret->getMaxWireVersion()));
+    if (!getSetName().empty()) {
+        // When performing initial topology discovery, don't bother authenticating
+        // since we will be immediately restarting our connect loop to a single node.
+        return swConn.getValue().release();
     }
-    return ret.release();
+
+    auto connection = std::move(swConn.getValue());
+    if (!connection->authenticatedDuringConnect()) {
+        auto optAuthObj = makeAuthObjFromOptions(connection->getMaxWireVersion(),
+                                                 connection->getIsPrimarySaslMechanisms());
+        if (optAuthObj) {
+            connection->auth(optAuthObj.value());
+        }
+    }
+
+    return connection.release();
 }
 
 }  // namespace mongo

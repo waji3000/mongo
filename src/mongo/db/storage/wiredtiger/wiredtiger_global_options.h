@@ -1,6 +1,3 @@
-// wiredtiger_global_options.h
-
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -32,40 +29,61 @@
 
 #pragma once
 
-#include "mongo/util/options_parser/startup_option_init.h"
-#include "mongo/util/options_parser/startup_options.h"
+#include <cstddef>
+#include <string>
+
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/util/options_parser/environment.h"
 
 namespace mongo {
-
-namespace moe = mongo::optionenvironment;
 
 class WiredTigerGlobalOptions {
 public:
     WiredTigerGlobalOptions()
         : cacheSizeGB(0),
-          checkpointDelaySecs(0),
           statisticsLogDelaySecs(0),
+          zstdCompressorLevel(0),
           directoryForIndexes(false),
-          useCollectionPrefixCompression(false),
-          useIndexPrefixCompression(false){};
+          maxCacheOverflowFileSizeGBDeprecated(0),
+          liveRestoreThreads(0),
+          liveRestoreReadSizeMB(0),
+          useIndexPrefixCompression(false) {};
 
-    Status add(moe::OptionSection* options);
-    Status store(const moe::Environment& params, const std::vector<std::string>& args);
+    Status store(const optionenvironment::Environment& params);
 
     double cacheSizeGB;
-    size_t checkpointDelaySecs;
     size_t statisticsLogDelaySecs;
+    int32_t sessionMax{0};
+    double evictionDirtyTargetGB{0};
+    double evictionDirtyTriggerGB{0};
     std::string journalCompressor;
+    int zstdCompressorLevel;
     bool directoryForIndexes;
+    double maxCacheOverflowFileSizeGBDeprecated;
     std::string engineConfig;
+    std::string liveRestoreSource;
+    int liveRestoreThreads;
+    double liveRestoreReadSizeMB;
 
     std::string collectionBlockCompressor;
-    std::string indexBlockCompressor;
-    bool useCollectionPrefixCompression;
     bool useIndexPrefixCompression;
     std::string collectionConfig;
     std::string indexConfig;
+
+    static Status validateWiredTigerCompressor(const std::string&);
+    static Status validateWiredTigerLiveRestoreReadSizeMB(int);
+
+
+    /**
+     * Returns current history file size limit in MB.
+     * Always returns 0 for unbounded.
+     */
+    std::size_t getMaxHistoryFileSizeMB() const {
+        return 0;
+    }
 };
 
 extern WiredTigerGlobalOptions wiredTigerGlobalOptions;
-}
+
+}  // namespace mongo

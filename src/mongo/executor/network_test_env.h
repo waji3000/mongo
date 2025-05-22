@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,27 +29,29 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
+#include <chrono>
+#include <functional>
+#include <future>
 #include <tuple>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/executor/network_interface_mock.h"
+#include "mongo/executor/remote_command_request.h"
+#include "mongo/executor/remote_command_response.h"
 #include "mongo/executor/task_executor.h"
-#include "mongo/stdx/functional.h"
 #include "mongo/stdx/future.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/unittest/unittest.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/duration.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
-
-class BSONObj;
-class ShardingCatalogClientImpl;
-class DistLockManagerMock;
-class ShardRegistry;
-template <typename T>
-class StatusWith;
-
 namespace executor {
 
 /**
@@ -81,6 +82,9 @@ namespace executor {
  */
 class NetworkTestEnv {
 public:
+    // Common timeout for tests to use for any work scheduled through launchAsync to complete.
+    static constexpr Minutes kDefaultLaunchAsyncFutureTimeout{5};
+
     /**
      * Wraps a std::future but will cancel any pending network operations in its destructor if
      * the future wasn't successfully waited on in the main test thread.
@@ -90,9 +94,9 @@ public:
     template <class T>
     class FutureHandle {
     public:
-        FutureHandle<T>(stdx::future<T> future,
-                        executor::TaskExecutor* executor,
-                        executor::NetworkInterfaceMock* network)
+        FutureHandle(stdx::future<T> future,
+                     executor::TaskExecutor* executor,
+                     executor::NetworkInterfaceMock* network)
             : _future(std::move(future)), _executor(executor), _network(network) {}
 
         FutureHandle(FutureHandle&& other) = default;
@@ -130,6 +134,10 @@ public:
             return timed_get(timeout_duration.toSystemDuration());
         }
 
+        T default_timed_get() {
+            return timed_get(kDefaultLaunchAsyncFutureTimeout);
+        }
+
     private:
         stdx::future<T> _future;
         executor::TaskExecutor* _executor;
@@ -145,22 +153,22 @@ public:
      * Must be defined in the header because of its use of templates.
      */
     template <typename Lambda>
-    FutureHandle<typename std::result_of<Lambda()>::type> launchAsync(Lambda&& func) const {
+    FutureHandle<typename std::invoke_result<Lambda>::type> launchAsync(Lambda&& func) const {
         auto future = async(stdx::launch::async, std::forward<Lambda>(func));
-        return NetworkTestEnv::FutureHandle<typename std::result_of<Lambda()>::type>{
+        return NetworkTestEnv::FutureHandle<typename std::invoke_result<Lambda>::type>{
             std::move(future), _executor, _mockNetwork};
     }
 
-    using OnCommandFunction = stdx::function<StatusWith<BSONObj>(const RemoteCommandRequest&)>;
+    using OnCommandFunction = std::function<StatusWith<BSONObj>(const RemoteCommandRequest&)>;
     using OnCommandWithMetadataFunction =
-        stdx::function<RemoteCommandResponse(const RemoteCommandRequest&)>;
+        std::function<RemoteCommandResponse(const RemoteCommandRequest&)>;
 
     using OnFindCommandFunction =
-        stdx::function<StatusWith<std::vector<BSONObj>>(const RemoteCommandRequest&)>;
+        std::function<StatusWith<std::vector<BSONObj>>(const RemoteCommandRequest&)>;
     // Function that accepts a find request and returns a tuple of resulting documents and response
     // metadata.
     using OnFindCommandWithMetadataFunction =
-        stdx::function<StatusWith<std::tuple<std::vector<BSONObj>, BSONObj>>(
+        std::function<StatusWith<std::tuple<std::vector<BSONObj>, BSONObj>>(
             const RemoteCommandRequest&)>;
 
     /**
@@ -174,6 +182,7 @@ public:
      * single request + response or find tests.
      */
     void onCommand(OnCommandFunction func);
+    void onCommands(std::vector<OnCommandFunction> funcs);
     void onCommandWithMetadata(OnCommandWithMetadataFunction func);
     void onFindCommand(OnFindCommandFunction func);
     void onFindWithMetadataCommand(OnFindCommandWithMetadataFunction func);

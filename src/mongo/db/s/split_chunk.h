@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -31,36 +30,35 @@
 #pragma once
 
 #include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
 #include <string>
 #include <vector>
+
+#include "mongo/base/status_with.h"
+#include "mongo/bson/oid.h"
+#include "mongo/bson/timestamp.h"
 
 namespace mongo {
 
 class BSONObj;
+
 class ChunkRange;
-class KeyPattern;
 class NamespaceString;
-class OID;
 class OperationContext;
-template <typename T>
-class StatusWith;
 
 /**
  * Attempts to split a chunk with the specified parameters. If the split fails, then the StatusWith
  * object returned will contain a Status with an ErrorCode regarding the cause of failure. If the
  * split succeeds, then the StatusWith object returned will contain Status::Ok().
- *
- * Additionally, splitChunk will attempt to perform top-chunk optimization. If top-chunk
- * optimization is performed, then the function will also return a ChunkRange, which contains the
- * range for the top chunk. Note that this ChunkRange is boost::optional, meaning that if top-chunk
- * optimization is not performed, boost::none will be returned inside of the StatusWith instead.
+ * Will update the shard's filtering metadata.
  */
-StatusWith<boost::optional<ChunkRange>> splitChunk(OperationContext* opCtx,
-                                                   const NamespaceString& nss,
-                                                   const BSONObj& keyPatternObj,
-                                                   const ChunkRange& chunkRange,
-                                                   const std::vector<BSONObj>& splitKeys,
-                                                   const std::string& shardName,
-                                                   const OID& expectedCollectionEpoch);
+Status splitChunk(OperationContext* opCtx,
+                  const NamespaceString& nss,
+                  const BSONObj& keyPatternObj,
+                  const ChunkRange& chunkRange,
+                  std::vector<BSONObj>&& splitPoints,
+                  const std::string& shardName,
+                  const OID& expectedCollectionEpoch,
+                  const boost::optional<Timestamp>& expectedCollectionTimestamp);
 
 }  // namespace mongo

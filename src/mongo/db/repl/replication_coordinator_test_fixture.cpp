@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,34 +27,55 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
-
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/repl/replication_coordinator_test_fixture.h"
 
-#include "mongo/db/logical_clock.h"
-#include "mongo/db/operation_context_noop.h"
-#include "mongo/db/repl/is_master_response.h"
+#include <cstdint>
+#include <list>
+#include <mutex>
+#include <utility>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/admission/execution_admission_context.h"
+#include "mongo/db/catalog/collection_options.h"
+#include "mongo/db/client.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/read_write_concern_defaults.h"
+#include "mongo/db/repl/hello/hello_response.h"
+#include "mongo/db/repl/member_state.h"
 #include "mongo/db/repl/repl_set_heartbeat_args_v1.h"
+#include "mongo/db/repl/repl_set_heartbeat_response.h"
 #include "mongo/db/repl/repl_settings.h"
 #include "mongo/db/repl/replication_consistency_markers_mock.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/replication_coordinator_external_state_mock.h"
-#include "mongo/db/repl/replication_coordinator_impl.h"
 #include "mongo/db/repl/replication_process.h"
 #include "mongo/db/repl/replication_recovery_mock.h"
+#include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/repl/storage_interface_mock.h"
 #include "mongo/db/repl/topology_coordinator.h"
-#include "mongo/db/storage/storage_engine_init.h"
-#include "mongo/db/storage/storage_options.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/storage/storage_engine.h"
+#include "mongo/db/transaction_resources.h"
+#include "mongo/executor/network_connection_hook.h"
 #include "mongo/executor/network_interface_mock.h"
 #include "mongo/executor/thread_pool_mock.h"
 #include "mongo/executor/thread_pool_task_executor.h"
-#include "mongo/stdx/functional.h"
-#include "mongo/stdx/memory.h"
+#include "mongo/idl/server_parameter_test_util.h"
+#include "mongo/logv2/log.h"
+#include "mongo/rpc/topology_version_gen.h"
 #include "mongo/unittest/unittest.h"
-#include "mongo/util/fail_point_service.h"
-#include "mongo/util/log.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/concurrency/admission_context.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/scopeguard.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 namespace mongo {
 namespace repl {
@@ -69,8 +89,7 @@ executor::TaskExecutor* ReplCoordTest::getReplExec() {
 }
 
 ReplSetConfig ReplCoordTest::assertMakeRSConfig(const BSONObj& configBson) {
-    ReplSetConfig config;
-    ASSERT_OK(config.initialize(configBson));
+    auto config = ReplSetConfig::parse(configBson);
     ASSERT_OK(config.validate());
     return config;
 }
@@ -82,14 +101,12 @@ BSONObj ReplCoordTest::addProtocolVersion(const BSONObj& configDoc, int protocol
     return builder.obj();
 }
 
-ReplCoordTest::ReplCoordTest() {
+ReplCoordTest::ReplCoordTest(Options options) : ServiceContextMongoDTest(std::move(options)) {
     _settings.setReplSetString("mySet/node1:12345,node2:54321");
 }
 
 ReplCoordTest::~ReplCoordTest() {
-    getGlobalFailPointRegistry()
-        ->getFailPoint("blockHeartbeatReconfigFinish")
-        ->setMode(FailPoint::off);
+    globalFailPointRegistry().find("blockHeartbeatReconfigFinish")->setMode(FailPoint::off);
 
     if (_callShutdown) {
         auto opCtx = makeOperationContext();
@@ -117,49 +134,73 @@ void ReplCoordTest::addSelf(const HostAndPort& selfHost) {
 void ReplCoordTest::init() {
     invariant(!_repl);
     invariant(!_callShutdown);
+    cc().setOperationUnkillable_ForTest();
 
     auto service = getGlobalServiceContext();
     _storageInterface = new StorageInterfaceMock();
     StorageInterface::set(service, std::unique_ptr<StorageInterface>(_storageInterface));
     ASSERT_TRUE(_storageInterface == StorageInterface::get(service));
+    // We define these two function mocks for _storageInterface so we can successfully store the
+    // FCV document in the replica set initiate command code path.
+    _storageInterface->insertDocumentFn = [this](OperationContext* opCtx,
+                                                 const NamespaceStringOrUUID& nsOrUUID,
+                                                 const TimestampedBSONObj& doc,
+                                                 long long term) {
+        return Status::OK();
+    };
 
-    ReplicationProcess::set(service,
-                            stdx::make_unique<ReplicationProcess>(
-                                _storageInterface,
-                                stdx::make_unique<ReplicationConsistencyMarkersMock>(),
-                                stdx::make_unique<ReplicationRecoveryMock>()));
+    _storageInterface->createCollFn = [this](OperationContext* opCtx,
+                                             const NamespaceString& nss,
+                                             const CollectionOptions& options) {
+        return Status::OK();
+    };
+
+    ReplicationProcess::set(
+        service,
+        std::make_unique<ReplicationProcess>(_storageInterface,
+                                             std::make_unique<ReplicationConsistencyMarkersMock>(),
+                                             std::make_unique<ReplicationRecoveryMock>()));
     auto replicationProcess = ReplicationProcess::get(service);
 
     // PRNG seed for tests.
     const int64_t seed = 0;
 
-    auto logicalClock = stdx::make_unique<LogicalClock>(service);
-    LogicalClock::set(service, std::move(logicalClock));
+    // The ReadWriteConcernDefaults decoration on the service context won't always be created,
+    // so we should manually instantiate it to ensure it exists in our tests.
+    ReadWriteConcernDefaults::create(service->getService(), lookupMock.getFetchDefaultsFn());
 
     TopologyCoordinator::Options settings;
-    auto topo = stdx::make_unique<TopologyCoordinator>(settings);
-    _topo = topo.get();
-    auto net = stdx::make_unique<NetworkInterfaceMock>();
-    _net = net.get();
-    auto externalState = stdx::make_unique<ReplicationCoordinatorExternalStateMock>();
-    _externalState = externalState.get();
+    auto topo = std::make_unique<TopologyCoordinator>(settings);
+    auto net = std::make_shared<NetworkInterfaceMock>();
+    auto externalState = std::make_unique<ReplicationCoordinatorExternalStateMock>();
     executor::ThreadPoolMock::Options tpOptions;
-    tpOptions.onCreateThread = []() { Client::initThread("replexec"); };
-    auto pool = stdx::make_unique<executor::ThreadPoolMock>(_net, seed, tpOptions);
-    auto replExec =
-        stdx::make_unique<executor::ThreadPoolTaskExecutor>(std::move(pool), std::move(net));
-    _replExec = replExec.get();
-    _repl = stdx::make_unique<ReplicationCoordinatorImpl>(service,
-                                                          _settings,
-                                                          std::move(externalState),
-                                                          std::move(replExec),
-                                                          std::move(topo),
-                                                          replicationProcess,
-                                                          _storageInterface,
-                                                          seed);
-    service->setFastClockSource(stdx::make_unique<executor::NetworkInterfaceMockClockSource>(_net));
-    service->setPreciseClockSource(
-        stdx::make_unique<executor::NetworkInterfaceMockClockSource>(_net));
+    tpOptions.onCreateThread = []() {
+        Client::initThread("replexec",
+                           getGlobalServiceContext()->getService(),
+                           Client::noSession(),
+                           ClientOperationKillableByStepdown{false});
+    };
+    auto pool = std::make_unique<executor::ThreadPoolMock>(net.get(), seed, tpOptions);
+    auto replExec = executor::ThreadPoolTaskExecutor::create(std::move(pool), net);
+    _repl = std::make_unique<ReplicationCoordinatorImpl>(service,
+                                                         _settings,
+                                                         std::move(externalState),
+                                                         std::move(replExec),
+                                                         std::move(topo),
+                                                         replicationProcess,
+                                                         _storageInterface,
+                                                         seed);
+    // Need to do this after the moves to make the static analyzer happy.
+    // The pointer is stored as a ReplicationCoordinatorExternalState pointer, so we need to
+    // reinterpret cast during retrieval.
+    _externalState =
+        dynamic_cast<ReplicationCoordinatorExternalStateMock*>(_repl->getExternalState_forTest());
+    invariant(_externalState != nullptr);
+    _replExec = _repl->getReplExecutor_forTest();
+    invariant(_replExec != nullptr);
+    _net = dynamic_cast<NetworkInterfaceMock*>(
+        dynamic_cast<executor::ThreadPoolTaskExecutor*>(_replExec)->getNetworkInterface().get());
+    invariant(_net != nullptr);
 }
 
 void ReplCoordTest::init(const ReplSettings& settings) {
@@ -173,6 +214,14 @@ void ReplCoordTest::init(const std::string& replSet) {
 }
 
 void ReplCoordTest::start() {
+    // Skip reconstructing prepared transactions at the end of startup because ReplCoordTest doesn't
+    // construct ServiceEntryPoint and this causes a segmentation fault when
+    // reconstructPreparedTransactions uses DBDirectClient to call into ServiceEntryPoint.
+    FailPointEnableBlock skipReconstructPreparedTransactions("skipReconstructPreparedTransactions");
+    // Skip recovering user writes critical sections for the same reason as the above.
+    FailPointEnableBlock skipRecoverUserWriteCriticalSections(
+        "skipRecoverUserWriteCriticalSections");
+    // Skip recovering of serverless mutual exclusion locks for the same reason as the above.
     invariant(!_callShutdown);
     // if we haven't initialized yet, do that first.
     if (!_repl) {
@@ -180,8 +229,10 @@ void ReplCoordTest::start() {
     }
 
     const auto opCtx = makeOperationContext();
-    _repl->startup(opCtx.get());
+    _repl->startup(opCtx.get(), StorageEngine::LastShutdownState::kClean);
     _repl->waitForStartUpComplete_forTest();
+    // _rsConfig should be written down at this point, so populate _memberData accordingly.
+    _repl->getTopologyCoordinator_forTest()->populateAllMembersConfigVersionAndTerm_forTest();
     _callShutdown = true;
 }
 
@@ -202,6 +253,23 @@ void ReplCoordTest::start(const HostAndPort& selfHost) {
     start();
 }
 
+void ReplCoordTest::assertStartSuccessWithData(const BSONObj& configDoc,
+                                               const HostAndPort& selfHost,
+                                               const LastVote& lastVote,
+                                               const OpTime& topOfOplog) {
+    if (!_repl) {
+        init();
+    }
+
+    _externalState->setLocalLastVoteDocument(lastVote);
+    _externalState->setLastOpTimeAndWallTime(topOfOplog, Date_t() + Seconds(10));
+    _externalState->setLocalConfigDocument(StatusWith<BSONObj>(configDoc));
+    _externalState->addSelf(selfHost);
+    getReplCoord()->setConsistentDataAvailable_forTest();
+    start();
+    ASSERT_NE(MemberState::RS_STARTUP, getReplCoord()->getMemberState().s);
+}
+
 void ReplCoordTest::assertStartSuccess(const BSONObj& configDoc, const HostAndPort& selfHost) {
     // Set default protocol version to 1.
     if (!configDoc.hasField("protocolVersion")) {
@@ -214,8 +282,11 @@ void ReplCoordTest::assertStartSuccess(const BSONObj& configDoc, const HostAndPo
 
 executor::RemoteCommandResponse ReplCoordTest::makeResponseStatus(const BSONObj& doc,
                                                                   Milliseconds millis) {
-    log() << "Responding with " << doc << " (elapsed: " << millis << ")";
-    return RemoteCommandResponse(doc, millis);
+    LOGV2(21515,
+          "Responding with {doc} (elapsed: {millis})",
+          "doc"_attr = doc,
+          "millis"_attr = millis);
+    return RemoteCommandResponse::make_forTest(doc, millis);
 }
 
 void ReplCoordTest::simulateEnoughHeartbeatsForAllNodesUp() {
@@ -226,20 +297,29 @@ void ReplCoordTest::simulateEnoughHeartbeatsForAllNodesUp() {
     for (int i = 0; i < rsConfig.getNumMembers() - 1; ++i) {
         const NetworkInterfaceMock::NetworkOperationIterator noi = net->getNextReadyRequest();
         const RemoteCommandRequest& request = noi->getRequest();
-        log() << request.target.toString() << " processing " << request.cmdObj;
+        LOGV2(21516,
+              "{request_target} processing {request_cmdObj}",
+              "request_target"_attr = request.target.toString(),
+              "request_cmdObj"_attr = request.cmdObj);
         ReplSetHeartbeatArgsV1 hbArgs;
         if (hbArgs.initialize(request.cmdObj).isOK()) {
             ReplSetHeartbeatResponse hbResp;
             hbResp.setSetName(rsConfig.getReplSetName());
             hbResp.setState(MemberState::RS_SECONDARY);
             hbResp.setConfigVersion(rsConfig.getConfigVersion());
-            hbResp.setAppliedOpTime(OpTime(Timestamp(100, 2), 0));
-            hbResp.setDurableOpTime(OpTime(Timestamp(100, 2), 0));
+            hbResp.setAppliedOpTimeAndWallTime(
+                {OpTime(Timestamp(100, 2), 0), Date_t() + Seconds(100)});
+            hbResp.setWrittenOpTimeAndWallTime(
+                {OpTime(Timestamp(100, 2), 0), Date_t() + Seconds(100)});
+            hbResp.setDurableOpTimeAndWallTime(
+                {OpTime(Timestamp(100, 2), 0), Date_t() + Seconds(100)});
             BSONObjBuilder respObj;
             net->scheduleResponse(noi, net->now(), makeResponseStatus(hbResp.toBSON()));
         } else {
-            error() << "Black holing unexpected request to " << request.target << ": "
-                    << request.cmdObj;
+            LOGV2_ERROR(21526,
+                        "Black holing unexpected request to {request_target}: {request_cmdObj}",
+                        "request_target"_attr = request.target,
+                        "request_cmdObj"_attr = request.cmdObj);
             net->blackHole(noi);
         }
         net->runReadyNetworkOperations();
@@ -248,19 +328,22 @@ void ReplCoordTest::simulateEnoughHeartbeatsForAllNodesUp() {
 }
 
 void ReplCoordTest::simulateSuccessfulDryRun(
-    stdx::function<void(const RemoteCommandRequest& request)> onDryRunRequest) {
+    std::function<void(const RemoteCommandRequest& request)> onDryRunRequest) {
     ReplicationCoordinatorImpl* replCoord = getReplCoord();
     ReplSetConfig rsConfig = replCoord->getReplicaSetConfig_forTest();
     NetworkInterfaceMock* net = getNet();
 
     auto electionTimeoutWhen = replCoord->getElectionTimeout_forTest();
     ASSERT_NOT_EQUALS(Date_t(), electionTimeoutWhen);
-    log() << "Election timeout scheduled at " << electionTimeoutWhen << " (simulator time)";
+    LOGV2(21517,
+          "Election timeout scheduled at {electionTimeoutWhen} (simulator time)",
+          "electionTimeoutWhen"_attr = electionTimeoutWhen);
 
     int voteRequests = 0;
     int votesExpected = rsConfig.getNumMembers() / 2;
-    log() << "Simulating dry run responses - expecting " << votesExpected
-          << " replSetRequestVotes requests";
+    LOGV2(21518,
+          "Simulating dry run responses - expecting {votesExpected} replSetRequestVotes requests",
+          "votesExpected"_attr = votesExpected);
     net->enterNetwork();
     while (voteRequests < votesExpected) {
         if (net->now() < electionTimeoutWhen) {
@@ -268,49 +351,60 @@ void ReplCoordTest::simulateSuccessfulDryRun(
         }
         const NetworkInterfaceMock::NetworkOperationIterator noi = net->getNextReadyRequest();
         const RemoteCommandRequest& request = noi->getRequest();
-        log() << request.target.toString() << " processing " << request.cmdObj;
+        LOGV2(21519,
+              "{request_target} processing {request_cmdObj}",
+              "request_target"_attr = request.target.toString(),
+              "request_cmdObj"_attr = request.cmdObj);
         if (request.cmdObj.firstElement().fieldNameStringData() == "replSetRequestVotes") {
             ASSERT_TRUE(request.cmdObj.getBoolField("dryRun"));
             onDryRunRequest(request);
-            net->scheduleResponse(noi,
-                                  net->now(),
-                                  makeResponseStatus(BSON("ok" << 1 << "reason"
-                                                               << ""
-                                                               << "term"
-                                                               << request.cmdObj["term"].Long()
-                                                               << "voteGranted"
-                                                               << true)));
+            net->scheduleResponse(
+                noi,
+                net->now(),
+                makeResponseStatus(BSON("ok" << 1 << "reason"
+                                             << ""
+                                             << "term" << request.cmdObj["term"].Long()
+                                             << "voteGranted" << true)));
             voteRequests++;
         } else if (consumeHeartbeatV1(noi)) {
             // The heartbeat has been consumed.
         } else {
-            error() << "Black holing unexpected request to " << request.target << ": "
-                    << request.cmdObj;
+            LOGV2_ERROR(21527,
+                        "Black holing unexpected request to {request_target}: {request_cmdObj}",
+                        "request_target"_attr = request.target,
+                        "request_cmdObj"_attr = request.cmdObj);
             net->blackHole(noi);
         }
         net->runReadyNetworkOperations();
     }
     net->exitNetwork();
-    log() << "Simulating dry run responses - scheduled " << voteRequests
-          << " replSetRequestVotes responses";
+    LOGV2(21520,
+          "Simulating dry run responses - scheduled {voteRequests} replSetRequestVotes responses",
+          "voteRequests"_attr = voteRequests);
     getReplCoord()->waitForElectionDryRunFinish_forTest();
-    log() << "Simulating dry run responses - dry run completed";
+    LOGV2(21521, "Simulating dry run responses - dry run completed");
 }
 
 void ReplCoordTest::simulateSuccessfulDryRun() {
-    auto onDryRunRequest = [](const RemoteCommandRequest& request) {};
+    auto onDryRunRequest = [](const RemoteCommandRequest& request) {
+    };
     simulateSuccessfulDryRun(onDryRunRequest);
 }
 
 void ReplCoordTest::simulateSuccessfulV1Election() {
     auto electionTimeoutWhen = getReplCoord()->getElectionTimeout_forTest();
     ASSERT_NOT_EQUALS(Date_t(), electionTimeoutWhen);
-    log() << "Election timeout scheduled at " << electionTimeoutWhen << " (simulator time)";
+    LOGV2(21522,
+          "Election timeout scheduled at {electionTimeoutWhen} (simulator time)",
+          "electionTimeoutWhen"_attr = electionTimeoutWhen);
 
-    simulateSuccessfulV1ElectionAt(electionTimeoutWhen);
+    auto opCtx{makeOperationContext()};
+    simulateSuccessfulV1ElectionAt(opCtx.get(), electionTimeoutWhen);
 }
 
-void ReplCoordTest::simulateSuccessfulV1ElectionWithoutExitingDrainMode(Date_t electionTime) {
+void ReplCoordTest::simulateSuccessfulV1ElectionWithoutExitingDrainMode(Date_t electionTime,
+                                                                        OperationContext* opCtx) {
+    RAIIServerParameterControllerForTest controller("featureFlagReduceMajorityWriteLatency", true);
     ReplicationCoordinatorImpl* replCoord = getReplCoord();
     NetworkInterfaceMock* net = getNet();
 
@@ -320,91 +414,130 @@ void ReplCoordTest::simulateSuccessfulV1ElectionWithoutExitingDrainMode(Date_t e
     // Process requests until we're primary and consume the heartbeats for the notification
     // of election win.
     while (!replCoord->getMemberState().primary() || hasReadyRequests) {
-        log() << "Waiting on network in state " << replCoord->getMemberState();
+        LOGV2(21523,
+              "Waiting on network in state {replCoord_getMemberState}",
+              "replCoord_getMemberState"_attr = replCoord->getMemberState());
         getNet()->enterNetwork();
         if (net->now() < electionTime) {
             net->runUntil(electionTime);
         }
         const NetworkInterfaceMock::NetworkOperationIterator noi = net->getNextReadyRequest();
         const RemoteCommandRequest& request = noi->getRequest();
-        log() << request.target.toString() << " processing " << request.cmdObj;
+        LOGV2(21524,
+              "{request_target} processing {request_cmdObj}",
+              "request_target"_attr = request.target.toString(),
+              "request_cmdObj"_attr = request.cmdObj);
         ReplSetHeartbeatArgsV1 hbArgs;
         Status status = hbArgs.initialize(request.cmdObj);
-        if (hbArgs.initialize(request.cmdObj).isOK()) {
+        if (status.isOK()) {
+            if (replCoord->getMemberState().primary()) {
+                ASSERT_EQ(hbArgs.getPrimaryId(), replCoord->getMyId());
+            }
             ReplSetHeartbeatResponse hbResp;
             hbResp.setSetName(rsConfig.getReplSetName());
             hbResp.setState(MemberState::RS_SECONDARY);
             // The smallest valid optime in PV1.
             OpTime opTime(Timestamp(), 0);
-            hbResp.setAppliedOpTime(opTime);
-            hbResp.setDurableOpTime(opTime);
+            hbResp.setAppliedOpTimeAndWallTime({opTime, Date_t() + Seconds(opTime.getSecs())});
+            hbResp.setWrittenOpTimeAndWallTime({opTime, Date_t() + Seconds(opTime.getSecs())});
+            hbResp.setDurableOpTimeAndWallTime({opTime, Date_t() + Seconds(opTime.getSecs())});
             hbResp.setConfigVersion(rsConfig.getConfigVersion());
             net->scheduleResponse(noi, net->now(), makeResponseStatus(hbResp.toBSON()));
         } else if (request.cmdObj.firstElement().fieldNameStringData() == "replSetRequestVotes") {
-            net->scheduleResponse(noi,
-                                  net->now(),
-                                  makeResponseStatus(BSON("ok" << 1 << "reason"
-                                                               << ""
-                                                               << "term"
-                                                               << request.cmdObj["term"].Long()
-                                                               << "voteGranted"
-                                                               << true)));
+            net->scheduleResponse(
+                noi,
+                net->now(),
+                makeResponseStatus(BSON("ok" << 1 << "reason"
+                                             << ""
+                                             << "term" << request.cmdObj["term"].Long()
+                                             << "voteGranted" << true)));
         } else {
-            error() << "Black holing unexpected request to " << request.target << ": "
-                    << request.cmdObj;
+            LOGV2_ERROR(21528,
+                        "Black holing unexpected request to {request_target}: {request_cmdObj}",
+                        "request_target"_attr = request.target,
+                        "request_cmdObj"_attr = request.cmdObj);
             net->blackHole(noi);
         }
         net->runReadyNetworkOperations();
         hasReadyRequests = net->hasReadyRequests();
         getNet()->exitNetwork();
     }
-    ASSERT(replCoord->getApplierState() == ReplicationCoordinator::ApplierState::Draining);
+    ASSERT(replCoord->getOplogSyncState() ==
+           ReplicationCoordinator::OplogSyncState::WriterDraining);
     ASSERT(replCoord->getMemberState().primary()) << replCoord->getMemberState().toString();
 
-    IsMasterResponse imResponse;
-    replCoord->fillIsMasterForReplSet(&imResponse);
-    ASSERT_FALSE(imResponse.isMaster()) << imResponse.toBSON().toString();
-    ASSERT_TRUE(imResponse.isSecondary()) << imResponse.toBSON().toString();
+    auto helloResponse = replCoord->awaitHelloResponse(opCtx, {}, boost::none, boost::none);
+    ASSERT_FALSE(helloResponse->isWritablePrimary()) << helloResponse->toBSON().toString();
+    ASSERT_TRUE(helloResponse->isSecondary()) << helloResponse->toBSON().toString();
 }
-void ReplCoordTest::simulateSuccessfulV1ElectionAt(Date_t electionTime) {
-    simulateSuccessfulV1ElectionWithoutExitingDrainMode(electionTime);
+
+void ReplCoordTest::simulateSuccessfulV1ElectionAt(OperationContext* opCtx, Date_t electionTime) {
+    simulateSuccessfulV1ElectionWithoutExitingDrainMode(electionTime, opCtx);
     ReplicationCoordinatorImpl* replCoord = getReplCoord();
 
-    {
-        auto opCtx = makeOperationContext();
-        signalDrainComplete(opCtx.get());
-    }
-    ASSERT(replCoord->getApplierState() == ReplicationCoordinator::ApplierState::Stopped);
-    IsMasterResponse imResponse;
-    replCoord->fillIsMasterForReplSet(&imResponse);
-    ASSERT_TRUE(imResponse.isMaster()) << imResponse.toBSON().toString();
-    ASSERT_FALSE(imResponse.isSecondary()) << imResponse.toBSON().toString();
+    signalWriterDrainComplete(opCtx);
+    signalApplierDrainComplete(opCtx);
+
+    auto helloResponse = replCoord->awaitHelloResponse(opCtx, {}, boost::none, boost::none);
+    ASSERT_TRUE(helloResponse->isWritablePrimary()) << helloResponse->toBSON().toString();
+    ASSERT_FALSE(helloResponse->isSecondary()) << helloResponse->toBSON().toString();
 
     ASSERT(replCoord->getMemberState().primary()) << replCoord->getMemberState().toString();
 }
 
-void ReplCoordTest::signalDrainComplete(OperationContext* opCtx) {
+void ReplCoordTest::signalWriterDrainComplete(OperationContext* opCtx) noexcept {
+    getReplCoord()->signalWriterDrainComplete(opCtx, getReplCoord()->getTerm());
+    ASSERT(getReplCoord()->getOplogSyncState() ==
+           ReplicationCoordinator::OplogSyncState::ApplierDraining);
+}
+
+void ReplCoordTest::signalApplierDrainComplete(OperationContext* opCtx) noexcept {
+    // Writes that occur in code paths that call signalApplierDrainComplete are expected to have
+    // Immediate priority.
+    ScopedAdmissionPriority<ExecutionAdmissionContext> priority(
+        opCtx, AdmissionContext::Priority::kExempt);
     getExternalState()->setFirstOpTimeOfMyTerm(OpTime(Timestamp(1, 1), getReplCoord()->getTerm()));
-    getReplCoord()->signalDrainComplete(opCtx, getReplCoord()->getTerm());
+    getReplCoord()->signalApplierDrainComplete(opCtx, getReplCoord()->getTerm());
+    ASSERT(getReplCoord()->getOplogSyncState() == ReplicationCoordinator::OplogSyncState::Stopped);
 }
 
 void ReplCoordTest::runSingleNodeElection(OperationContext* opCtx) {
-    getReplCoord()->setMyLastAppliedOpTime(OpTime(Timestamp(1, 1), 0));
-    getReplCoord()->setMyLastDurableOpTime(OpTime(Timestamp(1, 1), 0));
+    RAIIServerParameterControllerForTest controller("featureFlagReduceMajorityWriteLatency", true);
+    replCoordSetMyLastWrittenAndAppliedAndDurableOpTime(OpTime(Timestamp(1, 1), 0),
+                                                        Date_t() + Seconds(1));
     ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
     getReplCoord()->waitForElectionFinish_forTest();
 
-    ASSERT(getReplCoord()->getApplierState() == ReplicationCoordinator::ApplierState::Draining);
+    ASSERT(getReplCoord()->getOplogSyncState() ==
+           ReplicationCoordinator::OplogSyncState::WriterDraining);
     ASSERT(getReplCoord()->getMemberState().primary())
         << getReplCoord()->getMemberState().toString();
 
-    signalDrainComplete(opCtx);
+    signalWriterDrainComplete(opCtx);
+    signalApplierDrainComplete(opCtx);
 }
 
 void ReplCoordTest::shutdown(OperationContext* opCtx) {
     invariant(_callShutdown);
+    _callShutdown = false;
+
+    if (!_repl->getSettings().isReplSet()) {
+        return;
+    }
+
     _net->exitNetwork();
-    _repl->shutdown(opCtx);
+
+    // ReplCoordinator shutdown shuts down the ThreadPoolTaskExecutor and joins it, but we need to
+    // advance the NetworkInterfaceMock "thread" to complete cancellation tasks created during
+    // shutdown. To achieve this, we shut down the coordinator in a separate thread. We use the fail
+    // point as signal for when the main thread can consume networking tasks.
+    boost::optional<FailPointEnableBlock> fp("tpteHangsBeforeDrainingCallbacks");
+    auto shutdownThread =
+        stdx::thread([&] { _repl->shutdown(opCtx, nullptr /* shutdownTimeElapsedBuilder */); });
+    ON_BLOCK_EXIT([&] { shutdownThread.join(); });
+    (*fp)->waitForTimesEntered(fp->initialTimesEntered() + 1);
+    NetworkInterfaceMock::InNetworkGuard(getNet())->runReadyNetworkOperations();
+    fp.reset();
     _callShutdown = false;
 }
 
@@ -430,8 +563,10 @@ bool ReplCoordTest::consumeHeartbeatV1(const NetworkInterfaceMock::NetworkOperat
     hbResp.setSetName(rsConfig.getReplSetName());
     hbResp.setState(MemberState::RS_SECONDARY);
     hbResp.setConfigVersion(rsConfig.getConfigVersion());
-    hbResp.setAppliedOpTime(lastApplied);
-    hbResp.setDurableOpTime(lastApplied);
+    hbResp.setConfigTerm(rsConfig.getConfigTerm());
+    hbResp.setAppliedOpTimeAndWallTime({lastApplied, Date_t() + Seconds(lastApplied.getSecs())});
+    hbResp.setWrittenOpTimeAndWallTime({lastApplied, Date_t() + Seconds(lastApplied.getSecs())});
+    hbResp.setDurableOpTimeAndWallTime({lastApplied, Date_t() + Seconds(lastApplied.getSecs())});
     BSONObjBuilder respObj;
     net->scheduleResponse(noi, net->now(), makeResponseStatus(hbResp.toBSON()));
     return true;
@@ -459,7 +594,10 @@ void ReplCoordTest::simulateCatchUpAbort() {
         auto noi = net->getNextReadyRequest();
         auto request = noi->getRequest();
         // Black hole heartbeat requests caused by time advance.
-        log() << "Black holing request to " << request.target.toString() << " : " << request.cmdObj;
+        LOGV2(21525,
+              "Black holing request to {request_target} : {request_cmdObj}",
+              "request_target"_attr = request.target.toString(),
+              "request_cmdObj"_attr = request.cmdObj);
         net->blackHole(noi);
         if (net->now() < heartbeatTimeoutWhen) {
             net->runUntil(heartbeatTimeoutWhen);

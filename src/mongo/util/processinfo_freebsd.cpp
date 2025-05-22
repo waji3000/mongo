@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,27 +27,35 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kControl
 
 #include <cstdlib>
 #include <string>
 
+#ifndef _WIN32
 #include <kvm.h>
 #include <sys/file.h>
 #include <sys/mman.h>
 #include <sys/param.h>
+#include <sys/socket.h>
 #include <sys/sysctl.h>
 #include <sys/types.h>
 #include <sys/user.h>
 #include <sys/vmmeter.h>
-#include <unistd.h>
 #include <vm/vm_param.h>
+#endif
 
-#include "mongo/util/log.h"
+#include "mongo/config.h"  // IWYU pragma: keep
+#include "mongo/logv2/log.h"
+#include "mongo/util/processinfo.h"
 #include "mongo/util/scopeguard.h"
-#include "processinfo.h"
 
-using namespace std;
+#if defined(MONGO_CONFIG_HAVE_HEADER_UNISTD_H)
+#include <unistd.h>
+#endif
+
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
+
 
 namespace mongo {
 
@@ -82,9 +89,9 @@ int getSysctlByNameWithDefault<uintptr_t>(const char* sysctlName,
 }
 
 template <>
-int getSysctlByNameWithDefault<string>(const char* sysctlName,
-                                       const string& defaultValue,
-                                       string* result) {
+int getSysctlByNameWithDefault<std::string>(const char* sysctlName,
+                                            const std::string& defaultValue,
+                                            std::string* result) {
     char value[256] = {0};
     size_t len = sizeof(value);
     if (sysctlbyname(sysctlName, &value, &len, NULL, 0) == -1) {
@@ -93,10 +100,6 @@ int getSysctlByNameWithDefault<string>(const char* sysctlName,
     }
     *result = value;
     return 0;
-}
-
-bool ProcessInfo::checkNumaEnabled() {
-    return false;
 }
 
 int ProcessInfo::getVirtualMemorySize() {
@@ -123,73 +126,57 @@ int ProcessInfo::getResidentSize() {
     return rss;
 }
 
-double ProcessInfo::getSystemMemoryPressurePercentage() {
-    return 0.0;
-}
-
 void ProcessInfo::SystemInfo::collectSystemInfo() {
     osType = "BSD";
     osName = "FreeBSD";
 
-    int status = getSysctlByNameWithDefault("kern.version", string("unknown"), &osVersion);
+    int status = getSysctlByNameWithDefault("kern.version", std::string("unknown"), &osVersion);
     if (status != 0)
-        log() << "Unable to collect OS Version. (errno: " << status << " msg: " << strerror(status)
-              << ")";
+        LOGV2(23332,
+              "Unable to collect OS Version.",
+              "errno"_attr = status,
+              "msg"_attr = strerror(status));
 
-    status = getSysctlByNameWithDefault("hw.machine_arch", string("unknown"), &cpuArch);
+    status = getSysctlByNameWithDefault("hw.machine_arch", std::string("unknown"), &cpuArch);
     if (status != 0)
-        log() << "Unable to collect Machine Architecture. (errno: " << status
-              << " msg: " << strerror(status) << ")";
+        LOGV2(23333,
+              "Unable to collect Machine Architecture.",
+              "errno"_attr = status,
+              "msg"_attr = strerror(status));
     addrSize = cpuArch.find("64") != std::string::npos ? 64 : 32;
 
     uintptr_t numBuffer;
     uintptr_t defaultNum = 1;
     status = getSysctlByNameWithDefault("hw.physmem", defaultNum, &numBuffer);
     memSize = numBuffer;
+    memLimit = memSize;
     if (status != 0)
-        log() << "Unable to collect Physical Memory. (errno: " << status
-              << " msg: " << strerror(status) << ")";
+        LOGV2(23334,
+              "Unable to collect Physical Memory.",
+              "errno"_attr = status,
+              "msg"_attr = strerror(status));
 
     status = getSysctlByNameWithDefault("hw.ncpu", defaultNum, &numBuffer);
     numCores = numBuffer;
     if (status != 0)
-        log() << "Unable to collect Number of CPUs. (errno: " << status
-              << " msg: " << strerror(status) << ")";
+        LOGV2(23335,
+              "Unable to collect Number of CPUs.",
+              "errno"_attr = status,
+              "msg"_attr = strerror(status));
 
     pageSize = static_cast<unsigned long long>(sysconf(_SC_PAGESIZE));
 
-    hasNuma = checkNumaEnabled();
+    hasNuma = false;
+
+    // The appropriate system parameter is "kern.ipc.soacceptqueue" (or
+    // "kern.ipc.somaxconn" before FreeBSD 10.0), but to simplify testing we
+    // hardcode to `SOMAXCONN`.
+    defaultListenBacklog = SOMAXCONN;
 }
 
 void ProcessInfo::getExtraInfo(BSONObjBuilder& info) {}
 
 bool ProcessInfo::supported() {
-    return true;
-}
-
-bool ProcessInfo::blockCheckSupported() {
-    return true;
-}
-
-bool ProcessInfo::blockInMemory(const void* start) {
-    char x = 0;
-    if (mincore(alignToStartOfPage(start), getPageSize(), &x)) {
-        log() << "mincore failed: " << errnoWithDescription();
-        return 1;
-    }
-    return x & 0x1;
-}
-
-bool ProcessInfo::pagesInMemory(const void* start, size_t numPages, vector<char>* out) {
-    out->resize(numPages);
-    // int mincore(const void *addr, size_t len, char *vec);
-    if (mincore(alignToStartOfPage(start), numPages * getPageSize(), &(out->front()))) {
-        log() << "mincore failed: " << errnoWithDescription();
-        return false;
-    }
-    for (size_t i = 0; i < numPages; ++i) {
-        (*out)[i] = 0x1;
-    }
     return true;
 }
 

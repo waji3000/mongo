@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,9 +27,17 @@
  *    it in the license file.
  */
 
+#pragma once
+
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <functional>
+#include <string>
+
 #include "mongo/bson/bsonobj.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/util/fail_point_service.h"
+#include "mongo/util/fail_point.h"
 
 namespace mongo {
 
@@ -40,21 +47,29 @@ public:
      * Helper function which sets the 'msg' field of the opCtx's CurOp to the specified string, and
      * returns the original value of the field.
      */
-    static std::string updateCurOpMsg(OperationContext* opCtx, const std::string& newMsg);
+    static std::string updateCurOpFailPointMsg(OperationContext* opCtx,
+                                               const std::string& failpointMsg);
 
     /**
-     * This helper function works much like MONGO_FAIL_POINT_PAUSE_WHILE_SET, but additionally
+     * This helper function works much like FailPoint::pauseWhileSet(opCtx), but additionally
      * calls whileWaiting() at regular intervals. Finally, it also sets the 'msg' field of the
      * opCtx's CurOp to the given string while the failpoint is active.
      *
      * whileWaiting() may be used to do anything the caller needs done while hanging in the
      * failpoint. For example, the caller may use whileWaiting() to release and reacquire locks in
      * order to avoid deadlocks.
+     *
+     * The field "shouldCheckForInterrupt" may be set to 'true' at runtime to cause this method to
+     * uassert on interrupt.
+     *
+     * The field "shouldContinueOnInterrupt" may be set to 'true' to cause this method to continue
+     * on interrupt without asserting, regardless of whether the field "shouldCheckForInterrupt" is
+     * set.
      */
     static void waitWhileFailPointEnabled(FailPoint* failPoint,
                                           OperationContext* opCtx,
-                                          const std::string& curOpMsg,
-                                          const std::function<void(void)>& whileWaiting = nullptr,
-                                          bool checkForInterrupt = false);
+                                          const std::string& failpointMsg,
+                                          const std::function<void()>& whileWaiting = nullptr,
+                                          const NamespaceString& nss = {});
 };
-}
+}  // namespace mongo

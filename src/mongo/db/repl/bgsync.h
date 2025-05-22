@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,23 +29,29 @@
 
 #pragma once
 
+#include <functional>
 #include <memory>
 
-#include "mongo/base/disallow_copying.h"
-#include "mongo/base/status_with.h"
-#include "mongo/db/jsobj.h"
-#include "mongo/db/repl/data_replicator_external_state.h"
+#include "mongo/base/status.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/repl/oplog_applier.h"
 #include "mongo/db/repl/oplog_buffer.h"
 #include "mongo/db/repl/oplog_fetcher.h"
+#include "mongo/db/repl/oplog_interface.h"
 #include "mongo/db/repl/oplog_interface_remote.h"
+#include "mongo/db/repl/oplog_writer.h"
 #include "mongo/db/repl/optime.h"
+#include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/repl/replication_process.h"
 #include "mongo/db/repl/rollback_impl.h"
+#include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/repl/sync_source_resolver.h"
+#include "mongo/platform/atomic_word.h"
 #include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/functional.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/stdx/thread.h"
+#include "mongo/util/concurrency/with_lock.h"
 #include "mongo/util/net/hostandport.h"
 
 namespace mongo {
@@ -58,12 +63,14 @@ namespace repl {
 
 class OplogInterface;
 class ReplicationCoordinator;
+
 class ReplicationCoordinatorExternalState;
 class ReplicationProcess;
 class StorageInterface;
 
 class BackgroundSync {
-    MONGO_DISALLOW_COPYING(BackgroundSync);
+    BackgroundSync(const BackgroundSync&) = delete;
+    BackgroundSync& operator=(const BackgroundSync&) = delete;
 
 public:
     /**
@@ -88,6 +95,7 @@ public:
     BackgroundSync(ReplicationCoordinator* replicationCoordinator,
                    ReplicationCoordinatorExternalState* replicationCoordinatorExternalState,
                    ReplicationProcess* replicationProcess,
+                   OplogWriter* oplogWriter,
                    OplogApplier* oplogApplier);
 
     // stop syncing (when this node becomes a primary, e.g.)
@@ -117,8 +125,15 @@ public:
      */
     bool inShutdown() const;
 
-    // starts the sync target notifying thread
-    void notifierThread();
+    /**
+     * Returns true if we have discovered that no sync source's oplog overlaps with ours.
+     */
+    bool tooStale() const;
+
+    /**
+     * Informs us that data relevant to sync source selection has changed.
+     */
+    void notifySyncSourceSelectionDataChanged();
 
     HostAndPort getSyncTarget() const;
 
@@ -153,15 +168,14 @@ private:
     // Production thread inner loop.
     void _runProducer();
     void _produce();
+    void _stop(WithLock, bool resetLastFetchedOptime);
 
     /**
      * Checks current background sync state before pushing operations into blocking queue and
      * updating metrics. If the queue is full, might block.
-     *
-     * requiredRBID is reset to empty after the first call.
      */
-    Status _enqueueDocuments(Fetcher::Documents::const_iterator begin,
-                             Fetcher::Documents::const_iterator end,
+    Status _enqueueDocuments(OplogFetcher::Documents::const_iterator begin,
+                             OplogFetcher::Documents::const_iterator end,
                              const OplogFetcher::DocumentsInfo& info);
 
     /**
@@ -170,7 +184,6 @@ private:
     void _runRollback(OperationContext* opCtx,
                       const Status& fetcherReturnStatus,
                       const HostAndPort& source,
-                      int requiredRBID,
                       StorageInterface* storageInterface);
 
     /**
@@ -183,25 +196,28 @@ private:
                                             StorageInterface* storageInterface,
                                             OplogInterfaceRemote::GetConnectionFn getConnection);
 
-    /**
-     * Executes a rollback via refetch in rs_rollback.cpp.
-     *
-     * We fall back on the rollback via refetch algorithm when the storage engine does not support
-     * "rollback to a checkpoint," or when the forceRollbackViaRefetch parameter is set to true.
-     *
-     * Must be called from _runRollback() which ensures that all the conditions for entering
-     * rollback have been met.
-     */
-    void _fallBackOnRollbackViaRefetch(OperationContext* opCtx,
-                                       const HostAndPort& source,
-                                       int requiredRBID,
-                                       OplogInterface* localOplog,
-                                       OplogInterfaceRemote::GetConnectionFn getConnection);
-
     // restart syncing
     void start(OperationContext* opCtx);
 
-    OpTimeWithHash _readLastAppliedOpTimeWithHash(OperationContext* opCtx);
+    // Set the state and notify the condition variable.
+    void setState(WithLock, ProducerState newState);
+
+    OpTime _readLastAppliedOpTime(OperationContext* opCtx);
+
+    long long _getRetrySleepMS();
+
+    // Waits for the given time, or until we are notified that relevant sync source selection data
+    // has changed.  Takes _mutex, so don't call with _mutex held.
+    void _waitForNewSyncSourceSelectionData(long long waitTimeMillis);
+
+    // Internal version of notifySyncSourceSelectionDataChanged(), to be used by callers
+    // which already hold _mutex.
+    void _notifySyncSourceSelectionDataChanged(WithLock);
+
+    // This OplogWriter writes oplog entries fetched from the sync source and
+    // feeds them to the OplogApplier.
+    // Note: Could be null if featureFlagReduceMajorityWriteLatency is not enabled.
+    OplogWriter* const _oplogWriter;
 
     // This OplogApplier applies oplog entries fetched from the sync source.
     OplogApplier* const _oplogApplier;
@@ -216,17 +232,17 @@ private:
     ReplicationProcess* _replicationProcess;
 
     /**
-      * All member variables are labeled with one of the following codes indicating the
-      * synchronization rules for accessing them:
-      *
-      * (PR) Completely private to BackgroundSync. Can be read or written to from within the main
-      *      BackgroundSync thread without synchronization. Shouldn't be accessed outside of this
-      *      thread.
-      *
-      * (S)  Self-synchronizing; access in any way from any context.
-      *
-      * (M)  Reads and writes guarded by _mutex
-      *
+     * All member variables are labeled with one of the following codes indicating the
+     * synchronization rules for accessing them:
+     *
+     * (PR) Completely private to BackgroundSync. Can be read or written to from within the main
+     *      BackgroundSync thread without synchronization. Shouldn't be accessed outside of this
+     *      thread.
+     *
+     * (S)  Self-synchronizing; access in any way from any context.
+     *
+     * (M)  Reads and writes guarded by _mutex
+     *
      */
 
     // Protects member data of BackgroundSync.
@@ -235,18 +251,18 @@ private:
 
     OpTime _lastOpTimeFetched;  // (M)
 
-    // lastFetchedHash is used to match ops to determine if we need to rollback, when a secondary.
-    long long _lastFetchedHash = 0LL;  // (M)
-
     // Thread running producerThread().
     std::unique_ptr<stdx::thread> _producerThread;  // (M)
+
+    // Condition variable to notify of _state and _inShutdown changes.
+    stdx::condition_variable _stateCv;  // (S)
 
     // Set to true if shutdown() has been called.
     bool _inShutdown = false;  // (M)
 
     // Flag that marks whether a node's oplog has no common point with any
     // potential sync sources.
-    bool _tooStale = false;  // (PR)
+    AtomicWord<bool> _tooStale{false};  // (S)
 
     ProducerState _state = ProducerState::Starting;  // (M)
 
@@ -264,6 +280,13 @@ private:
     // operations in the local oplog in order to bring this server to a consistent state relative
     // to the sync source.
     std::unique_ptr<RollbackImpl> _rollback;  // (PR)
+
+    // A condition variable used to wake us when sync source selection data changes.
+    stdx::condition_variable _syncSourceSelectionDataCv;  // (S)
+
+    // A latch which tells us if sync source selection data has changed since we called
+    // the syncSourcSelector
+    bool _syncSourceSelectionDataChanged = true;  // (M)
 };
 
 

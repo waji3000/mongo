@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,13 +27,18 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <iterator>
+#include <mutex>
+#include <utility>
 
+#include <boost/move/utility_core.hpp>
+
+#include "mongo/base/error_codes.h"
 #include "mongo/db/keys_collection_cache.h"
-
 #include "mongo/db/keys_collection_client.h"
-#include "mongo/db/keys_collection_document.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/db/repl/member_state.h"
+#include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -42,21 +46,48 @@ KeysCollectionCache::KeysCollectionCache(std::string purpose, KeysCollectionClie
     : _purpose(std::move(purpose)), _client(client) {}
 
 StatusWith<KeysCollectionDocument> KeysCollectionCache::refresh(OperationContext* opCtx) {
-    LogicalTime newerThanThis;
+    // Don't allow this to read during initial sync because it will read at the initialDataTimestamp
+    // and that could conflict with reconstructing prepared transactions using the
+    // initialDataTimestamp as the prepareTimestamp.
+    if (repl::ReplicationCoordinator::get(opCtx) &&
+        repl::ReplicationCoordinator::get(opCtx)->getMemberState().startup2()) {
+        return {ErrorCodes::InitialSyncActive,
+                "Cannot refresh keys collection cache during initial sync"};
+    }
 
-    decltype(_cache)::size_type originalSize = 0;
+    // Don't allow this to read during rollback as the storage engine requires exclusive access.
+    if (repl::ReplicationCoordinator::get(opCtx) &&
+        repl::ReplicationCoordinator::get(opCtx)->getMemberState().rollback()) {
+        return {ErrorCodes::InterruptedDueToReplStateChange,
+                "Cannot refresh keys collection cache during rollback"};
+    }
+
+    auto refreshStatus = _refreshExternalKeys(opCtx);
+
+    if (!refreshStatus.isOK()) {
+        return refreshStatus;
+    }
+
+    return _refreshInternalKeys(opCtx);
+}
+
+StatusWith<KeysCollectionDocument> KeysCollectionCache::_refreshInternalKeys(
+    OperationContext* opCtx) {
+    LogicalTime newerThanThis;
+    decltype(_internalKeysCache)::size_type originalSize = 0;
 
     {
         stdx::lock_guard<stdx::mutex> lk(_cacheMutex);
-        auto iter = _cache.crbegin();
-        if (iter != _cache.crend()) {
+        auto iter = _internalKeysCache.crbegin();
+        if (iter != _internalKeysCache.crend()) {
             newerThanThis = iter->second.getExpiresAt();
         }
 
-        originalSize = _cache.size();
+        originalSize = _internalKeysCache.size();
     }
 
-    auto refreshStatus = _client->getNewKeys(opCtx, _purpose, newerThanThis);
+    auto refreshStatus =
+        _client->getNewInternalKeys(opCtx, _purpose, newerThanThis, true /* tryUseMajority */);
 
     if (!refreshStatus.isOK()) {
         return refreshStatus.getStatus();
@@ -65,9 +96,9 @@ StatusWith<KeysCollectionDocument> KeysCollectionCache::refresh(OperationContext
     auto& newKeys = refreshStatus.getValue();
 
     stdx::lock_guard<stdx::mutex> lk(_cacheMutex);
-    if (originalSize > _cache.size()) {
-        // _cache cleared while we getting the new keys, just return the newest key without
-        // touching the _cache so the next refresh will populate it properly.
+    if (originalSize > _internalKeysCache.size()) {
+        // _internalKeysCache cleared while we were getting the new keys, just return the newest key
+        // without touching the _internalKeysCache so the next refresh will populate it properly.
         // Note: newKeys are sorted.
         if (!newKeys.empty()) {
             return std::move(newKeys.back());
@@ -75,40 +106,104 @@ StatusWith<KeysCollectionDocument> KeysCollectionCache::refresh(OperationContext
     }
 
     for (auto&& key : newKeys) {
-        _cache.emplace(std::make_pair(key.getExpiresAt(), std::move(key)));
+        _internalKeysCache.emplace(std::make_pair(key.getExpiresAt(), std::move(key)));
     }
 
-    if (_cache.empty()) {
+    if (_internalKeysCache.empty()) {
         return {ErrorCodes::KeyNotFound, "No keys found after refresh"};
     }
 
-    return _cache.crbegin()->second;
+    return _internalKeysCache.crbegin()->second;
 }
 
-StatusWith<KeysCollectionDocument> KeysCollectionCache::getKeyById(long long keyId,
-                                                                   const LogicalTime& forThisTime) {
+Status KeysCollectionCache::_refreshExternalKeys(OperationContext* opCtx) {
+    decltype(_externalKeysCache)::size_type originalSize = 0;
+
+    {
+        stdx::lock_guard<stdx::mutex> lk(_cacheMutex);
+        originalSize = _externalKeysCache.size();
+    }
+
+    auto refreshStatus = _client->getAllExternalKeys(opCtx, _purpose);
+
+    if (!refreshStatus.isOK()) {
+        return refreshStatus.getStatus();
+    }
+
+    auto& newKeys = refreshStatus.getValue();
+
+    std::multimap<long long, ExternalKeysCollectionDocument> newExternalKeysCache;
+    for (auto&& key : newKeys) {
+        newExternalKeysCache.emplace(key.getKeyId(), std::move(key));
+    }
+
+    stdx::lock_guard<stdx::mutex> lk(_cacheMutex);
+    if (originalSize > _externalKeysCache.size()) {
+        // _externalKeysCache cleared while we were getting the new keys, just return so the next
+        // refresh will populate it properly.
+        return Status::OK();
+    }
+
+    // Replace the cached keys with the newly loaded ones. Note because all external keys are loaded
+    // when refreshing them, this will remove keys that have been deleted from the collection.
+    std::swap(_externalKeysCache, newExternalKeysCache);
+
+    return Status::OK();
+}
+
+StatusWith<KeysCollectionDocument> KeysCollectionCache::getInternalKeyById(
+    long long keyId, const LogicalTime& forThisTime) {
     stdx::lock_guard<stdx::mutex> lk(_cacheMutex);
 
-    for (auto iter = _cache.lower_bound(forThisTime); iter != _cache.cend(); ++iter) {
+    for (auto iter = _internalKeysCache.lower_bound(forThisTime); iter != _internalKeysCache.cend();
+         ++iter) {
         if (iter->second.getKeyId() == keyId) {
             return iter->second;
         }
     }
 
     return {ErrorCodes::KeyNotFound,
-            str::stream() << "Cache Reader No keys found for " << _purpose
-                          << " that is valid for time: "
-                          << forThisTime.toString()
-                          << " with id: "
-                          << keyId};
+            str::stream() << "Cache Reader No internal keys found for " << _purpose
+                          << " that is valid for time: " << forThisTime.toString()
+                          << " with id: " << keyId};
 }
 
-StatusWith<KeysCollectionDocument> KeysCollectionCache::getKey(const LogicalTime& forThisTime) {
+StatusWith<std::vector<ExternalKeysCollectionDocument>> KeysCollectionCache::getExternalKeysById(
+    long long keyId, const LogicalTime& forThisTime) {
+    stdx::lock_guard<stdx::mutex> lk(_cacheMutex);
+    std::vector<ExternalKeysCollectionDocument> keys;
+
+    if (_externalKeysCache.empty()) {
+        return {ErrorCodes::KeyNotFound,
+                str::stream() << "Cache Reader No external keys found for " << _purpose
+                              << " with id: " << keyId};
+    }
+
+    auto keysRange = _externalKeysCache.equal_range(keyId);
+    for (auto keyIter = keysRange.first; keyIter != keysRange.second; keyIter++) {
+        auto key = keyIter->second;
+        if (key.getExpiresAt() > forThisTime) {
+            keys.push_back(key);
+        }
+    }
+
+    if (keys.empty()) {
+        return {ErrorCodes::KeyNotFound,
+                str::stream() << "Cache Reader No external keys found for " << _purpose
+                              << " that is valid for time: " << forThisTime.toString()
+                              << " with id: " << keyId};
+    }
+
+    return std::move(keys);
+}
+
+StatusWith<KeysCollectionDocument> KeysCollectionCache::getInternalKey(
+    const LogicalTime& forThisTime) {
     stdx::lock_guard<stdx::mutex> lk(_cacheMutex);
 
-    auto iter = _cache.upper_bound(forThisTime);
+    auto iter = _internalKeysCache.upper_bound(forThisTime);
 
-    if (iter == _cache.cend()) {
+    if (iter == _internalKeysCache.cend()) {
         return {ErrorCodes::KeyNotFound,
                 str::stream() << "No key found that is valid for " << forThisTime.toString()};
     }
@@ -117,11 +212,18 @@ StatusWith<KeysCollectionDocument> KeysCollectionCache::getKey(const LogicalTime
 }
 
 void KeysCollectionCache::resetCache() {
-    // keys that read with non majority readConcern level can be rolled back.
-    if (!_client->supportsMajorityReads()) {
+    // Refreshes try to use majority read concern, but if the client can't support that then any
+    // cached keys may have been rolled back and should be cleared.
+    if (_client->mustUseLocalReads()) {
         stdx::lock_guard<stdx::mutex> lk(_cacheMutex);
-        _cache.clear();
+        _internalKeysCache.clear();
+        _externalKeysCache.clear();
     }
+}
+
+void KeysCollectionCache::cacheExternalKey(ExternalKeysCollectionDocument key) {
+    stdx::lock_guard<stdx::mutex> lk(_cacheMutex);
+    _externalKeysCache.emplace(key.getKeyId(), std::move(key));
 }
 
 }  // namespace mongo

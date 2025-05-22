@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,52 +27,59 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
+#include <absl/container/node_hash_map.h>
+#include <absl/meta/type_traits.h>
+#include <boost/move/utility_core.hpp>
 #include <string>
 
-#include "mongo/db/pipeline/accumulation_statement.h"
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
 
+#include "mongo/db/feature_flag.h"
+#include "mongo/db/pipeline/accumulation_statement.h"
 #include "mongo/db/pipeline/accumulator.h"
-#include "mongo/db/pipeline/value.h"
+#include "mongo/db/query/allowed_contexts.h"
+#include "mongo/db/stats/counters.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 #include "mongo/util/string_map.h"
 
 namespace mongo {
 
-using boost::intrusive_ptr;
 using std::string;
 
 namespace {
-// Used to keep track of which Accumulators are registered under which name.
-static StringMap<Accumulator::Factory> factoryMap;
+// Used to keep track of which Accumulators are registered under which name and in which contexts
+// they can be used in.
+static StringMap<AccumulationStatement::ParserRegistration> parserMap;
 }  // namespace
 
-void AccumulationStatement::registerAccumulator(std::string name, Accumulator::Factory factory) {
-    auto it = factoryMap.find(name);
+void AccumulationStatement::registerAccumulator(std::string name,
+                                                AccumulationStatement::Parser parser,
+                                                AllowedWithApiStrict allowedWithApiStrict,
+                                                AllowedWithClientType allowedWithClientType,
+                                                FeatureFlag* featureFlag) {
+    auto it = parserMap.find(name);
     massert(28722,
             str::stream() << "Duplicate accumulator (" << name << ") registered.",
-            it == factoryMap.end());
-    factoryMap[name] = factory;
+            it == parserMap.end());
+    parserMap[name] = {parser, allowedWithApiStrict, allowedWithClientType, featureFlag};
+    operatorCountersGroupAccumulatorExpressions.addCounter(name);
 }
 
-Accumulator::Factory AccumulationStatement::getFactory(StringData name) {
-    auto it = factoryMap.find(name);
+AccumulationStatement::ParserRegistration& AccumulationStatement::getParser(StringData name) {
+    auto it = parserMap.find(name);
     uassert(
-        15952, str::stream() << "unknown group operator '" << name << "'", it != factoryMap.end());
+        15952, str::stream() << "unknown group operator '" << name << "'", it != parserMap.end());
     return it->second;
 }
 
-boost::intrusive_ptr<Accumulator> AccumulationStatement::makeAccumulator(
-    const boost::intrusive_ptr<ExpressionContext>& expCtx) const {
-    return _factory(expCtx);
+boost::intrusive_ptr<AccumulatorState> AccumulationStatement::makeAccumulator() const {
+    return expr.factory();
 }
 
 AccumulationStatement AccumulationStatement::parseAccumulationStatement(
-    const boost::intrusive_ptr<ExpressionContext>& expCtx,
-    const BSONElement& elem,
-    const VariablesParseState& vps) {
+    ExpressionContext* const expCtx, const BSONElement& elem, const VariablesParseState& vps) {
     auto fieldName = elem.fieldNameStringData();
     uassert(40234,
             str::stream() << "The field '" << fieldName << "' must be an accumulator object",
@@ -89,7 +95,8 @@ AccumulationStatement AccumulationStatement::parseAccumulationStatement(
             fieldName[0] != '$');
 
     uassert(40238,
-            str::stream() << "The field '" << fieldName << "' must specify one accumulator",
+            str::stream() << "The field '" << fieldName
+                          << "' must specify one accumulator: " << elem,
             elem.Obj().nFields() == 1);
 
     auto specElem = elem.Obj().firstElement();
@@ -98,9 +105,27 @@ AccumulationStatement AccumulationStatement::parseAccumulationStatement(
             str::stream() << "The " << accName << " accumulator is a unary operator",
             specElem.type() != BSONType::Array);
 
-    return {fieldName.toString(),
-            Expression::parseOperand(expCtx, specElem, vps),
-            AccumulationStatement::getFactory(accName)};
+    auto&& [parser, allowedWithApiStrict, allowedWithClientType, featureFlag] =
+        AccumulationStatement::getParser(accName);
+
+    if (featureFlag) {
+        expCtx->ignoreFeatureInParserOrRejectAndThrow(accName, *featureFlag);
+    }
+
+    tassert(5837900,
+            "Accumulators should only appear in a user operation",
+            expCtx->getOperationContext());
+    assertLanguageFeatureIsAllowed(expCtx->getOperationContext(),
+                                   accName.toString(),
+                                   allowedWithApiStrict,
+                                   allowedWithClientType);
+
+    expCtx->incrementGroupAccumulatorExprCounter(accName);
+    auto accExpr = parser(expCtx, specElem, vps);
+
+    return AccumulationStatement(fieldName.toString(), std::move(accExpr));
 }
 
+MONGO_INITIALIZER_GROUP(BeginAccumulatorRegistration, ("default"), ("EndAccumulatorRegistration"))
+MONGO_INITIALIZER_GROUP(EndAccumulatorRegistration, ("BeginAccumulatorRegistration"), ())
 }  // namespace mongo

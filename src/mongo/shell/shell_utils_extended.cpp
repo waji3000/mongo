@@ -1,5 +1,3 @@
-// mongo/shell/shell_utils_extended.cpp
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -29,29 +27,58 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
-
-#include "mongo/platform/basic.h"
+#include <boost/filesystem/directory.hpp>
+#include <boost/filesystem/exception.hpp>
+#include <boost/filesystem/file_status.hpp>
+#include <boost/filesystem/fstream.hpp>
+#include <boost/filesystem/operations.hpp>
+#include <boost/filesystem/path.hpp>
+#include <boost/iterator/iterator_facade.hpp>
+#include <boost/move/utility_core.hpp>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <fmt/format.h>
+#include <fstream>  // IWYU pragma: keep
+#include <string>
+#include <system_error>
+#include <vector>
+// IWYU pragma: no_include "boost/system/detail/error_code.hpp"
 
 #ifndef _WIN32
 #include <sys/stat.h>
-#include <sys/types.h>
 #endif
 
-#include <boost/filesystem.hpp>
-#include <fstream>
-
+#include "mongo/base/data_range_cursor.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bson_bin_util.h"
+#include "mongo/bson/bson_validate.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/bson/column/bsoncolumn.h"
+#include "mongo/config.h"  // IWYU pragma: keep
 #include "mongo/scripting/engine.h"
 #include "mongo/shell/shell_utils.h"
-#include "mongo/shell/shell_utils_launcher.h"
-#include "mongo/util/file.h"
-#include "mongo/util/log.h"
-#include "mongo/util/md5.hpp"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/errno_util.h"
+#include "mongo/util/icu.h"
+#include "mongo/util/md5.h"
 #include "mongo/util/net/socket_utils.h"
 #include "mongo/util/password.h"
 #include "mongo/util/scopeguard.h"
-#include "mongo/util/text.h"
+#include "mongo/util/str.h"
+#include "mongo/util/text.h"  // IWYU pragma: keep
+
+#if defined(MONGO_CONFIG_HAVE_HEADER_UNISTD_H)
+#include <unistd.h>
+#endif
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
+
 
 namespace mongo {
 
@@ -65,64 +92,46 @@ using std::stringstream;
  * threads.
  */
 namespace shell_utils {
+namespace {
 
 BSONObj listFiles(const BSONObj& _args, void* data) {
-    BSONObj cd = BSON("0"
-                      << ".");
+    BSONObj cd = BSON("0" << ".");
     BSONObj args = _args.isEmpty() ? cd : _args;
 
     uassert(10257, "need to specify 1 argument to listFiles", args.nFields() == 1);
 
     BSONArrayBuilder lst;
 
-    string rootname = args.firstElement().valuestrsafe();
+    string rootname = args.firstElement().str();
     boost::filesystem::path root(rootname);
     stringstream ss;
     ss << "listFiles: no such directory: " << rootname;
     string msg = ss.str();
-    uassert(12581, msg.c_str(), boost::filesystem::exists(root));
+    uassert(12581,
+            msg.c_str(),
+            boost::filesystem::exists(root) && boost::filesystem::is_directory(root));
 
-    boost::filesystem::directory_iterator end;
-    boost::filesystem::directory_iterator i(root);
 
-    while (i != end) {
-        boost::filesystem::path p = *i;
-        BSONObjBuilder b;
-        b << "name" << p.generic_string();
-        b << "baseName" << p.filename().generic_string();
-        b.appendBool("isDirectory", is_directory(p));
-        if (!boost::filesystem::is_directory(p)) {
-            try {
+    for (boost::filesystem::directory_iterator i(root), end; i != end; ++i)
+        try {
+            const boost::filesystem::path& p = *i;
+            BSONObjBuilder b;
+            b << "name" << p.generic_string();
+            b << "baseName" << p.filename().generic_string();
+            const bool isDirectory = is_directory(p);
+            b.appendBool("isDirectory", isDirectory);
+            if (boost::filesystem::exists(p) && boost::filesystem::is_regular_file(p)) {
                 b.append("size", (double)boost::filesystem::file_size(p));
-            } catch (...) {
-                i++;
-                continue;
             }
-        }
 
-        lst.append(b.obj());
-        i++;
-    }
+            lst.append(b.obj());
+        } catch (const boost::filesystem::filesystem_error&) {
+            continue;  // Filesystem errors cause us to just skip that entry, entirely.
+        }
 
     BSONObjBuilder ret;
     ret.appendArray("", lst.done());
     return ret.obj();
-}
-
-BSONObj ls(const BSONObj& args, void* data) {
-    BSONArrayBuilder ret;
-    BSONObj o = listFiles(args, data);
-    if (!o.isEmpty()) {
-        for (auto&& elem : o.firstElement().Obj()) {
-            BSONObj f = elem.Obj();
-            string name = f["name"].String();
-            if (f["isDirectory"].trueValue()) {
-                name += '/';
-            }
-            ret << name;
-        }
-    }
-    return BSON("" << ret.arr());
 }
 
 /** Set process wide current working directory. */
@@ -142,7 +151,8 @@ BSONObj cd(const BSONObj& args, void* data) {
         return BSONObj();
     }
 #endif
-    uasserted(16832, mongoutils::str::stream() << "cd command failed: " << errnoWithDescription());
+    auto ec = lastSystemError();
+    uasserted(16832, str::stream() << "cd command failed: " << errorMessage(ec));
     return BSONObj();
 }
 
@@ -178,33 +188,96 @@ BSONObj cat(const BSONObj& args, void* data) {
             mode |= std::ios::binary;
     }
 
-    stringstream ss;
-    ifstream f(filePath.valuestrsafe(), mode);
-    uassert(CANT_OPEN_FILE, "couldn't open file", f.is_open());
+    ifstream f(filePath.valueStringDataSafe().data(), mode);
+    uassert(CANT_OPEN_FILE, fmt::format("couldn't open file {}", filePath.str()), f.is_open());
+    std::streamsize fileSize = 0;
+    // will throw on filesystem error
+    fileSize = boost::filesystem::file_size(filePath.str());
+    static constexpr auto kFileSizeLimit = 1024 * 1024 * 16;
+    uassert(
+        13301,
+        fmt::format(
+            "cat() : file {} too big to load as a variable (file is {} bytes, limit is {} bytes.)",
+            filePath.str(),
+            fileSize,
+            kFileSizeLimit),
+        fileSize < kFileSizeLimit);
 
-    std::streamsize sz = 0;
-    while (1) {
-        char ch = 0;
-        f.get(ch);
-        if (ch == 0)
-            break;
-        ss << ch;
-        sz += 1;
-        uassert(13301, "cat() : file to big to load as a variable", sz < 1024 * 1024 * 16);
-    }
+    std::ostringstream ss;
+    ss << f.rdbuf();
+
     return BSON("" << ss.str());
+}
+
+BSONObj copyFileRange(const BSONObj& args, void* data) {
+    uassert(4793600,
+            "copyFileRange() requires 4 arguments: copyFileRange(src, dest, offset, length)",
+            args.nFields() == 4);
+
+    BSONObjIterator it(args);
+
+    const std::string src = it.next().str();
+    const std::string dest = it.next().str();
+    int64_t offset = it.next().Long();
+    int64_t length = it.next().Long();
+
+    std::ifstream in(src, std::ios::binary | std::ios::in);
+    uassert(CANT_OPEN_FILE, fmt::format("Couldn't open file {} for reading", src), in.is_open());
+
+    in.exceptions(std::ifstream::badbit);
+
+    // Set the position using the given offset.
+    in.seekg(offset, std::ios::beg);
+    if (in.rdstate() & std::ifstream::eofbit) {
+        // Offset is past EOF.
+        in.close();
+        return BSON("n" << 0 << "earlyEOF" << true);
+    }
+
+    bool earlyEOF = false;
+    std::vector<char> buffer(length);
+    if (!in.read(buffer.data(), length)) {
+        invariant(in.rdstate() & std::ifstream::eofbit);
+        earlyEOF = true;
+    }
+
+    int64_t bytesRead = in.gcount();
+    invariant(bytesRead <= length);
+    in.close();
+
+    // Before opening 'dest', check if we need to resize the file to fit in the contents.
+    if (static_cast<uint64_t>(offset + bytesRead) > boost::filesystem::file_size(dest)) {
+        boost::filesystem::resize_file(dest, offset + bytesRead);
+    }
+
+    std::ofstream out(dest, std::ios::binary | std::ios::out | std::ios::in);
+    uassert(CANT_OPEN_FILE, fmt::format("Couldn't open file {} for writing", dest), out.is_open());
+
+    out.exceptions(std::ofstream::eofbit | std::ofstream::failbit | std::ofstream::badbit);
+
+    out.seekp(offset, std::ios::beg);
+    out.write(buffer.data(), bytesRead);
+    out.close();
+
+    uassert(
+        9663000,
+        fmt::format(
+            "Couldn't write {} bytes starting at {} from file {} to {}", length, offset, src, dest),
+        out);
+
+    return BSON("n" << bytesRead << "earlyEOF" << earlyEOF);
 }
 
 BSONObj md5sumFile(const BSONObj& args, void* data) {
     BSONElement e = singleArg(args);
     stringstream ss;
-    FILE* f = fopen(e.valuestrsafe(), "rb");
-    uassert(CANT_OPEN_FILE, "couldn't open file", f);
-    ON_BLOCK_EXIT(fclose, f);
+    FILE* f = fopen(e.valueStringDataSafe().data(), "rb");
+    uassert(CANT_OPEN_FILE, str::stream() << "couldn't open file " << e.str(), f);
+    ON_BLOCK_EXIT([&] { fclose(f); });
 
     md5digest d;
     md5_state_t st;
-    md5_init(&st);
+    md5_init_state(&st);
 
     enum { BUFLEN = 4 * 1024 };
     char buffer[BUFLEN];
@@ -241,19 +314,20 @@ BSONObj mkdir(const BSONObj& args, void* data) {
     return wrapper.obj();
 }
 
-BSONObj removeFile(const BSONObj& args, void* data) {
-    BSONElement e = singleArg(args);
-    bool found = false;
+/**
+ * @param args - [ source, destination ]
+ * copies directory 'source' to 'destination'. Errors if the 'destination' file already exists.
+ */
+BSONObj copyDir(const BSONObj& args, void* data) {
+    uassert(8423308, "copyDir takes 2 arguments", args.nFields() == 2);
 
-    boost::filesystem::path root(e.valuestrsafe());
-    if (boost::filesystem::exists(root)) {
-        found = true;
-        boost::filesystem::remove_all(root);
-    }
+    BSONObjIterator it(args);
+    const std::string source = it.next().str();
+    const std::string destination = it.next().str();
 
-    BSONObjBuilder b;
-    b.appendBool("removed", found);
-    return b.obj();
+    boost::filesystem::copy(source, destination, boost::filesystem::copy_options::recursive);
+
+    return undefinedReturn;
 }
 
 /**
@@ -267,7 +341,9 @@ BSONObj copyFile(const BSONObj& args, void* data) {
     const std::string source = it.next().str();
     const std::string destination = it.next().str();
 
-    boost::filesystem::copy_file(source, destination);
+    bool success = boost::filesystem::copy_file(source, destination);
+    uassert(
+        9663001, str::stream() << "failed to copy " << source << " to " << destination, success);
 
     return undefinedReturn;
 }
@@ -275,10 +351,10 @@ BSONObj copyFile(const BSONObj& args, void* data) {
 BSONObj writeFile(const BSONObj& args, void* data) {
     // Parse the arguments.
 
-    uassert(
-        40340,
-        "writeFile requires at least 2 arguments: writeFile(filePath, content, [useBinaryMode])",
-        args.nFields() >= 2);
+    uassert(40340,
+            "writeFile requires at least 2 arguments: writeFile(filePath, content, "
+            "[useBinaryMode])",
+            args.nFields() >= 2);
 
     BSONObjIterator it(args);
 
@@ -296,16 +372,17 @@ BSONObj writeFile(const BSONObj& args, void* data) {
 
     const boost::filesystem::path originalFilePath{filePathElem.String()};
     const boost::filesystem::path normalizedFilePath{originalFilePath.lexically_normal()};
+    const boost::filesystem::path absoluteFilePath{boost::filesystem::absolute(normalizedFilePath)};
 
     uassert(40343,
             "writeFile() can only write a file in a directory which already exists",
-            boost::filesystem::exists(normalizedFilePath.parent_path()));
+            boost::filesystem::exists(absoluteFilePath.parent_path()));
     uassert(40344,
             "writeFile() can only write to a file which does not yet exist",
-            !boost::filesystem::exists(normalizedFilePath));
+            !boost::filesystem::exists(absoluteFilePath));
     uassert(40345,
             "the file name must be compatible with POSIX and Windows",
-            boost::filesystem::portable_name(normalizedFilePath.filename().string()));
+            boost::filesystem::portable_name(absoluteFilePath.filename().string()));
 
     std::ios::openmode mode = std::ios::out;
 
@@ -320,14 +397,75 @@ BSONObj writeFile(const BSONObj& args, void* data) {
             mode |= std::ios::binary;
     }
 
-    boost::filesystem::ofstream ofs{normalizedFilePath, mode};
+    boost::filesystem::ofstream ofs{absoluteFilePath, mode};
     uassert(40346,
-            str::stream() << "failed to open file " << normalizedFilePath.string()
-                          << " for writing",
+            str::stream() << "failed to open file " << absoluteFilePath.string() << " for writing",
             ofs);
 
     ofs << fileContentElem.String();
-    uassert(40347, str::stream() << "failed to write to file " << normalizedFilePath.string(), ofs);
+    uassert(40347, str::stream() << "failed to write to file " << absoluteFilePath.string(), ofs);
+
+    return undefinedReturn;
+}
+
+BSONObj appendFile(const BSONObj& args, void* data) {
+    // Parse the arguments.
+
+    uassert(9380001,
+            "appendFile requires at least 2 arguments: appendFile(filePath, content, "
+            "[useBinaryMode])",
+            args.nFields() >= 2);
+
+    BSONObjIterator it(args);
+
+    auto filePathElem = it.next();
+    uassert(9380002,
+            "the first argument to appendFile() must be a string containing the path to the file",
+            filePathElem.type() == mongo::String);
+
+    auto fileContentElem = it.next();
+    uassert(9380003,
+            "the second argument to appendFile() must be a string to append to the file",
+            fileContentElem.type() == mongo::String);
+
+    // Limit the capability to appending to only existing files.
+
+    const boost::filesystem::path originalFilePath{filePathElem.String()};
+    const boost::filesystem::path normalizedFilePath{originalFilePath.lexically_normal()};
+    const boost::filesystem::path absoluteFilePath{boost::filesystem::absolute(normalizedFilePath)};
+
+    uassert(9380004,
+            "appendFile() can onlyappend to a file in a directory that already exists",
+            boost::filesystem::exists(absoluteFilePath.parent_path()));
+    uassert(9380005,
+            "appendFile() can only append to a file that does not yet exist",
+            boost::filesystem::exists(absoluteFilePath));
+    uassert(9380006,
+            "the file name must be compatible with POSIX and Windows",
+            boost::filesystem::portable_name(absoluteFilePath.filename().string()));
+
+    std::ios::openmode mode = std::ios::out;
+
+    auto useBinary = it.next();
+    if (!useBinary.eoo()) {
+        uassert(9380007,
+                "the third argument to appendFile(), must be a boolean indicating whether "
+                "or not to read the file in binary mode. If omitted, the default is 'false'.",
+                useBinary.type() == mongo::Bool);
+
+        if (useBinary.Bool())
+            mode |= std::ios::binary;
+    }
+
+    boost::filesystem::ofstream ofs{absoluteFilePath, mode | std::ios::app};
+    uassert(9380008,
+            str::stream() << "failed to open file " << absoluteFilePath.string()
+                          << " for appending",
+            ofs);
+
+    ofs << fileContentElem.String();
+    uassert(
+        9380009, str::stream() << "failed to append to file " << absoluteFilePath.string(), ofs);
 
     return undefinedReturn;
 }
@@ -335,7 +473,7 @@ BSONObj writeFile(const BSONObj& args, void* data) {
 BSONObj getHostName(const BSONObj& a, void* data) {
     uassert(13411, "getHostName accepts no arguments", a.nFields() == 0);
     char buf[260];  // HOST_NAME_MAX is usually 255
-    verify(gethostname(buf, 260) == 0);
+    MONGO_verify(gethostname(buf, 260) == 0);
     buf[259] = '\0';
     return BSON("" << buf);
 }
@@ -352,8 +490,8 @@ BSONObj changeUmask(const BSONObj& a, void* data) {
     uassert(50976,
             "umask takes 1 argument, the octal mode of the umask",
             a.nFields() == 1 && isNumericBSONType(a.firstElementType()));
-    auto val = a.firstElement().Number();
-    return BSON("" << umask(static_cast<mode_t>(val)));
+    auto val = a.firstElement().safeNumberInt();
+    return BSON("" << static_cast<int>(umask(static_cast<mode_t>(val))));
 #endif
 }
 
@@ -362,22 +500,390 @@ BSONObj getFileMode(const BSONObj& a, void* data) {
             "getFileMode() takes one argument, the absolute path to a file",
             a.nFields() == 1 && a.firstElementType() == String);
     auto pathStr = a.firstElement().checkAndGetStringData();
-    boost::filesystem::path path(pathStr.rawData());
+    boost::filesystem::path path(pathStr.data());
     boost::system::error_code ec;
     auto fileStatus = boost::filesystem::status(path, ec);
     if (ec) {
         uasserted(50974,
-                  str::stream() << "Unable to get status for file \"" << pathStr << "\": "
-                                << ec.message());
+                  str::stream() << "Unable to get status for file \"" << pathStr
+                                << "\": " << ec.message());
     }
 
     return BSON("" << fileStatus.permissions());
+}
+
+BSONObj decompressBSONColumn(const BSONObj& a, void* data) {
+    uassert(ErrorCodes::InvalidOptions,
+            "decompressBSONColumn() takes one argument, the BSONColumn BinData element",
+            a.nFields() == 1 && a.firstElementType() == BinData &&
+                a.firstElement().binDataType() == BinDataType::Column);
+
+    BSONColumn column(a.firstElement());
+
+    BSONObjBuilder wrapper;
+    BSONObjBuilder res(wrapper.subobjStart(""));
+
+    size_t index = 0;
+    for (const BSONElement& e : column) {
+        if (e.eoo()) {
+            index++;
+        } else {
+            res.appendAs(e, std::to_string(index++));
+        }
+    }
+    res.done();
+
+    return wrapper.obj();
+}
+
+/**
+ * Dumps BSON data as a Hex-formatted string
+ */
+BSONObj dumpBSONAsHex(const BSONObj& a, void* data) {
+    uassert(9174601,
+            "dumpBSONAsHex() takes one argument: a BSON obj",
+            a.nFields() == 1 && a.firstElementType() == Object);
+    auto obj = a.firstElement().Obj();
+
+    return BSON("" << hexblob::encodeLower(obj.objdata(), obj.objsize()));
+}
+
+/**
+ * Convert a hex string encoded BSON into its BSONObj form.
+ */
+BSONObj hexToBSON(const BSONObj& a, void*) {
+    uassert(9174600,
+            "hexToBSON takes one argument: a hex string",
+            a.nFields() == 1 && a.firstElementType() == String);
+
+    BufBuilder bb;
+    hexblob::decode(a.firstElement().String(), &bb);
+    return BSON("" << BSONObj(bb.release()));
+}
+
+BSONObj generateStorageBSON(const BSONObj& args, void* data) {
+    uassert(9492300,
+            "generateStorageBSON() requires 4 arguments: generateStorageBSON(dbpath, "
+            "storageEngine, directoryPerDB, directoryForIndexes)",
+            args.nFields() == 4);
+
+    // Writes out a storage.bson file in the given dbpath.
+    BSONObjIterator it(args);
+
+    const std::string dbpath = it.next().str();
+    const std::string storageEngine = it.next().str();
+    const bool directoryPerDB = it.next().booleanSafe();
+    const bool directoryForIndexes = it.next().booleanSafe();
+
+    // Generates a document with the following structure.
+    // {
+    //     storage: {
+    //         engine: <string>,
+    //         options: {
+    //             directoryPerDB: <bool>,
+    //             directoryForIndexes: <bool>
+    //         }
+    //     }
+    // }
+    BSONObj storage =
+        BSON("storage" << BSON("engine"
+                               << storageEngine << "options"
+                               << BSON("directoryPerDB" << directoryPerDB << "directoryForIndexes"
+                                                        << directoryForIndexes)));
+
+    boost::filesystem::path storageBSONPath = boost::filesystem::path(dbpath) / "storage.bson";
+
+    std::ofstream out(storageBSONPath.string(), std::ios::binary | std::ios::out | std::ios::trunc);
+    uassert(CANT_OPEN_FILE,
+            fmt::format("Couldn't open file {} for writing", storageBSONPath.string()),
+            out.is_open());
+
+    out.exceptions(std::ofstream::eofbit | std::ofstream::failbit | std::ofstream::badbit);
+
+    out.write(storage.objdata(), storage.objsize());
+    out.close();
+
+    return BSON("ok" << 1);
+}
+
+BSONObj shellGetEnv(const BSONObj& a, void*) {
+    uassert(4671206,
+            "_getEnv() takes one argument: the name of the environment variable",
+            a.nFields() == 1 && a.firstElementType() == String);
+    const auto envName = a.firstElement().String();
+    std::string result{};
+#ifndef _WIN32
+    auto envPtr = getenv(envName.c_str());
+    if (envPtr) {
+        result = std::string(envPtr);
+    }
+#else
+    auto envPtr = _wgetenv(toNativeString(envName.c_str()).c_str());
+    if (envPtr) {
+        result = toUtf8String(envPtr);
+    }
+#endif
+
+    return BSON("" << result.c_str());
+}
+
+BSONObj getStringWidth(const BSONObj& a, void* data) {
+    uassert(8730901,
+            "getStringWidth takes a single string argument",
+            a.nFields() == 1 && a.firstElementType() == String);
+    const auto str = a.firstElement().valueStringData();
+    int width = icuGetStringWidth(str, false, true);
+    return BSON("" << width);
+}
+
+}  // namespace
+
+/**
+ * Writes an array of bson objects one after another. The format is readable by the `bsondump` tool.
+ */
+BSONObj writeBsonArrayToFile(const BSONObj& args, void* data) {
+    uassert(7196709, "writeBsonArrayToFile needs 2 arguments", args.nFields() == 2);
+
+    BSONObjIterator it(args);
+    auto filePathElem = it.next();
+    uassert(7196708, "first argument must be a string", filePathElem.type() == BSONType::String);
+
+    auto fileContentElem = it.next();
+    uassert(
+        7196707, "second argument must be a BSON array", fileContentElem.type() == BSONType::Array);
+
+    const boost::filesystem::path originalFilePath{filePathElem.String()};
+    const boost::filesystem::path normalizedFilePath{originalFilePath.lexically_normal()};
+    const boost::filesystem::path absoluteFilePath{boost::filesystem::absolute(normalizedFilePath)};
+
+    uassert(7196706,
+            "bsonArrayToFile() can only write a file in a directory which already exists",
+            boost::filesystem::exists(absoluteFilePath.parent_path()));
+    uassert(7196705,
+            "bsonArrayToFile() can only write to a file which does not yet exist",
+            !boost::filesystem::exists(absoluteFilePath));
+    uassert(7196704,
+            "the file name must be compatible with POSIX and Windows",
+            boost::filesystem::portable_name(absoluteFilePath.filename().string()));
+
+    std::ios::openmode mode = std::ios::out | std::ios::binary;
+    boost::filesystem::ofstream ofs{absoluteFilePath, mode};
+    uassert(7196703,
+            str::stream() << "failed to open file " << normalizedFilePath.string()
+                          << " for writing",
+            ofs);
+
+    for (const auto& obj : fileContentElem.Obj()) {
+        ofs.write(obj.Obj().objdata(), obj.objsize());
+        uassert(7196702, "Error writing to file", !ofs.bad());
+    }
+    ofs.flush();
+    uassert(7196701, str::stream() << "failed to write to file " << absoluteFilePath.string(), ofs);
+
+    return undefinedReturn;
+}
+
+// The name of the file to dump is provided as a string in the first
+// field of the 'a' object. Other arguments in the BSONObj are
+// ignored. The void* argument is unused.
+BSONObj readDumpFile(const BSONObj& a, void*) {
+    uassert(31404,
+            "readDumpFile() takes one argument: the path to a file",
+            a.nFields() == 1 && a.firstElementType() == String);
+
+    // Open the file for reading in binary mode.
+    const auto pathStr = a.firstElement().String();
+    boost::filesystem::ifstream stream(pathStr, std::ios::in | std::ios::binary);
+    uassert(31405,
+            str::stream() << "readDumpFile(): Unable to open file \"" << pathStr
+                          << "\" for reading",
+            stream);
+
+    // Consume the contents of the file into a std::string, or bail out
+    // if there is more data in the file or stream than we can handle.
+    std::string contents;
+    while (stream) {
+        char buffer[4096];
+        stream.read(buffer, sizeof(buffer));
+        contents.append(buffer, stream.gcount());
+
+        // Check that the size of the data can fit into the BSON shape
+        // { "" : [ ... ] }, which has 12 bytes of overhead.
+        uassert(31406,
+                str::stream() << "readDumpFile(): file \"" << pathStr
+                              << "\" too big to load as a variable",
+                contents.size() <= (BSONObj::DefaultSizeTrait::MaxSize - 12));
+    }
+
+    // Construct our return shape
+    BSONObjBuilder builder;
+    BSONArrayBuilder array(builder.subarrayStart(""));
+
+    // Walk the data we read out of the file and interpret it as a series
+    // of contiguous BSON objects. Validate the BSON objects we find and insert
+    // them into the results array.
+    ConstDataRangeCursor cursor(contents.data(), contents.size());
+    while (!cursor.empty()) {
+
+        // Record the amount of valid data ahead of us before
+        // advancing the cursor so we can use it as an argument to
+        // validate below. It would be nice and proper to use
+        // Validated<BSONObj> for all of this instead, but
+        // unfortunately the BSONObj specialization of Validated
+        // depends on a server parameter, so we do it manually.
+        const auto expectedValidBytes = cursor.length();
+
+        const auto swObj = cursor.readAndAdvanceNoThrow<BSONObj>();
+        uassertStatusOK(swObj);
+
+        const auto obj = swObj.getValue();
+        uassertStatusOKWithContext(validateBSON(obj.objdata(), expectedValidBytes),
+                                   str::stream() << " at offset " << cursor.debug_offset());
+
+        array.append(obj);
+    }
+
+    array.doneFast();
+    return builder.obj();
+}
+
+// Returns the number of BSON objects present in a dump file.
+// The name of the file to scan is provided as a string in the first
+// field of the 'a' object. Other arguments in the BSONObj are
+// ignored. The void* argument is unused.
+BSONObj numObjsInDumpFile(const BSONObj& a, void*) {
+    uassert(9806101,
+            "numObjsInDumpFile() takes one argument: the path to a file",
+            a.nFields() == 1 && a.firstElementType() == String);
+
+    // Open the file for reading in binary mode.
+    const auto pathStr = a.firstElement().String();
+    boost::filesystem::ifstream stream(pathStr, std::ios::in | std::ios::binary);
+    uassert(9806102,
+            str::stream() << "numObjsInDumpFile(): Unable to open file \"" << pathStr
+                          << "\" for reading",
+            stream);
+
+    // Consume the contents of the file into a std::string, or bail out
+    // if there is more data in the file or stream than we can handle.
+    std::string contents;
+    while (stream) {
+        char buffer[4096];
+        stream.read(buffer, sizeof(buffer));
+        contents.append(buffer, stream.gcount());
+    }
+
+    // Walk the data we read out of the file and interpret it as a series
+    // of contiguous BSON objects. Count the objects without doing validation.
+    ConstDataRangeCursor cursor(contents.data(), contents.size());
+    int numObjs = 0;
+    while (!cursor.empty()) {
+        const auto swObj = cursor.readAndAdvanceNoThrow<BSONObj>();
+        uassertStatusOK(swObj);
+        numObjs++;
+    }
+
+    return BSON("" << numObjs);
+}
+
+// Returns the nth (0-indexed) object in a dump file.
+// The name of the file to scan is provided as a string in the first
+// field of the 'a' object. The only other argument should be an integer
+// specifying which object to fetch.
+BSONObj getObjInDumpFile(const BSONObj& a, void*) {
+    uassert(9806103,
+            "getObjInDumpFile() takes two arguments: the path to a file and the index of the "
+            "object to be fetched",
+            a.nFields() == 2 && a.firstElementType() == String);
+
+    // Open the file for reading in binary mode.
+    BSONObjIterator it(a);
+
+    const std::string pathStr = it.next().str();
+    const int objIndex = it.next().safeNumberInt();
+
+    boost::filesystem::ifstream stream(pathStr, std::ios::in | std::ios::binary);
+    uassert(9806104,
+            str::stream() << "getObjInDumpFile(): Unable to open file \"" << pathStr
+                          << "\" for reading",
+            stream);
+
+    // Consume the contents of the file into a std::string, or bail out
+    // if there is more data in the file or stream than we can handle.
+    std::string contents;
+    while (stream) {
+        char buffer[4096];
+        stream.read(buffer, sizeof(buffer));
+        contents.append(buffer, stream.gcount());
+    }
+
+    // Walk the data we read out of the file and interpret it as a series
+    // of contiguous BSON objects. Skip over objIndex objects and return
+    // the next one.
+    ConstDataRangeCursor cursor(contents.data(), contents.size());
+    for (int i = 0; i < objIndex && !cursor.empty(); ++i) {
+        // We do not perform validation on BSONObj
+        const auto swObj = cursor.readAndAdvanceNoThrow<BSONObj>();
+        uassertStatusOK(swObj);
+    }
+    uassert(9806105,
+            str::stream() << "getObjInDumpFile(): File does not contain an object at "
+                          << "index " << objIndex,
+            !cursor.empty());
+
+    // Record the amount of valid data ahead of us before
+    // advancing the cursor so we can use it as an argument to
+    // validate below. It would be nice and proper to use
+    // Validated<BSONObj> for all of this instead, but
+    // unfortunately the BSONObj specialization of Validated
+    // depends on a server parameter, so we do it manually.
+    const auto expectedValidBytes = cursor.length();
+    BSONObj obj;
+    cursor.readAndAdvance<BSONObj>(&obj);
+    uassertStatusOKWithContext(validateBSON(obj.objdata(), expectedValidBytes),
+                               str::stream() << " at offset " << cursor.debug_offset());
+
+    BSONObjBuilder builder;
+    builder.append("", obj);
+    return builder.obj<BSONObj::LargeSizeTrait>();
+}
+
+BSONObj ls(const BSONObj& args, void* data) {
+    BSONArrayBuilder ret;
+    BSONObj o = listFiles(args, data);
+    if (!o.isEmpty()) {
+        for (auto&& elem : o.firstElement().Obj()) {
+            BSONObj f = elem.Obj();
+            string name = f["name"].String();
+            if (f["isDirectory"].trueValue()) {
+                name += '/';
+            }
+            ret << name;
+        }
+    }
+    return BSON("" << ret.arr());
+}
+
+BSONObj removeFile(const BSONObj& args, void* data) {
+    BSONElement e = singleArg(args);
+    bool found = false;
+
+    boost::filesystem::path root(e.str());
+    if (boost::filesystem::exists(root)) {
+        found = true;
+        boost::filesystem::remove_all(root);
+    }
+
+    BSONObjBuilder b;
+    b.appendBool("removed", found);
+    return b.obj();
 }
 
 void installShellUtilsExtended(Scope& scope) {
     scope.injectNative("getHostName", getHostName);
     scope.injectNative("removeFile", removeFile);
     scope.injectNative("copyFile", copyFile);
+    scope.injectNative("appendFile", appendFile);
     scope.injectNative("writeFile", writeFile);
     scope.injectNative("listFiles", listFiles);
     scope.injectNative("ls", ls);
@@ -387,9 +893,22 @@ void installShellUtilsExtended(Scope& scope) {
     scope.injectNative("hostname", hostname);
     scope.injectNative("md5sumFile", md5sumFile);
     scope.injectNative("mkdir", mkdir);
+    scope.injectNative("copyDir", copyDir);
     scope.injectNative("passwordPrompt", passwordPrompt);
     scope.injectNative("umask", changeUmask);
     scope.injectNative("getFileMode", getFileMode);
+    scope.injectNative("decompressBSONColumn", decompressBSONColumn);
+    scope.injectNative("dumpBSONAsHex", dumpBSONAsHex);
+    scope.injectNative("hexToBSON", hexToBSON);
+    scope.injectNative("_copyFileRange", copyFileRange);
+    scope.injectNative("_readDumpFile", readDumpFile);
+    scope.injectNative("_numObjsInDumpFile", numObjsInDumpFile);
+    scope.injectNative("_getObjInDumpFile", getObjInDumpFile);
+    scope.injectNative("_getEnv", shellGetEnv);
+    scope.injectNative("writeBsonArrayToFile", writeBsonArrayToFile);
+    scope.injectNative("getStringWidth", getStringWidth);
+    scope.injectNative("_generateStorageBSON", generateStorageBSON);
 }
-}
-}
+
+}  // namespace shell_utils
+}  // namespace mongo

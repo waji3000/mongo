@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,80 +29,85 @@
 
 #pragma once
 
-#include <vector>
+#include <memory>
 
 #include "mongo/base/status.h"
-#include "mongo/stdx/mutex.h"
-#include "mongo/transport/session.h"
-#include "mongo/transport/transport_layer.h"
-#include "mongo/util/time_support.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/config.h"  // IWYU pragma: keep
+#include "mongo/db/client.h"
 
-namespace mongo {
-struct ServerGlobalParams;
-class ServiceContext;
+#ifdef MONGO_CONFIG_SSL
+#include "mongo/util/net/ssl_manager.h"
+#endif
 
-namespace transport {
+namespace mongo::transport {
+
+class TransportLayer;
+enum class TransportProtocol;
 
 /**
- * This TransportLayerManager is a TransportLayer implementation that holds other
- * TransportLayers. Mongod and Mongos can treat this like the "only" TransportLayer
- * and not be concerned with which other TransportLayer implementations it holds
- * underneath.
+ * This TransportLayerManager holds other TransportLayers, and manages all TransportLayer
+ * operations that should touch every TransportLayer. For egress-only functionality, callers should
+ * access the egress layer through getDefaultEgressLayer(). Mongod and Mongos can treat this like
+ * the "only" TransportLayer and not be concerned with which other TransportLayer implementations it
+ * holds underneath.
+ *
+ * The manager must be provided with an immutable list of TransportLayers that it will manage at
+ * construction (preferably through factory functions) to obviate the need for synchronization.
  */
-class TransportLayerManager final : public TransportLayer {
-    MONGO_DISALLOW_COPYING(TransportLayerManager);
+class TransportLayerManager {
+    TransportLayerManager(const TransportLayerManager&) = delete;
+    TransportLayerManager& operator=(const TransportLayerManager&) = delete;
 
 public:
-    TransportLayerManager(std::vector<std::unique_ptr<TransportLayer>> tls)
-        : _tls(std::move(tls)) {}
-    TransportLayerManager();
+    TransportLayerManager() = default;
+    virtual ~TransportLayerManager() = default;
 
-    StatusWith<SessionHandle> connect(HostAndPort peer,
-                                      ConnectSSLMode sslMode,
-                                      Milliseconds timeout) override;
-    Future<SessionHandle> asyncConnect(HostAndPort peer,
-                                       ConnectSSLMode sslMode,
-                                       const ReactorHandle& reactor,
-                                       Milliseconds timeout) override;
+    virtual Status start() = 0;
+    virtual void shutdown() = 0;
+    virtual Status setup() = 0;
+    virtual void appendStatsForServerStatus(BSONObjBuilder* bob) const = 0;
+    virtual void appendStatsForFTDC(BSONObjBuilder& bob) const = 0;
 
-    Status start() override;
-    void shutdown() override;
-    Status setup() override;
+    virtual TransportLayer* getDefaultEgressLayer() = 0;
+    virtual const std::vector<std::unique_ptr<TransportLayer>>& getTransportLayers() const = 0;
 
-    ReactorHandle getReactor(WhichReactor which) override;
-
-    // TODO This method is not called anymore, but may be useful to add new TransportLayers
-    // to the manager after it's been created.
-    Status addAndStartTransportLayer(std::unique_ptr<TransportLayer> tl);
-
-    /*
-     * This initializes a TransportLayerManager with the global configuration of the server.
-     *
-     * To setup networking in mongod/mongos, create a TransportLayerManager with this function,
-     * then call
-     * tl->setup();
-     * serviceContext->setTransportLayer(std::move(tl));
-     * serviceContext->getTransportLayer->start();
+    /**
+     * Returns the transport layer that matches the TransportProtocol. If none exist this function
+     * returns a nullptr.
      */
-    static std::unique_ptr<TransportLayer> createWithConfig(const ServerGlobalParams* config,
-                                                            ServiceContext* ctx);
+    virtual TransportLayer* getTransportLayer(TransportProtocol protocol) const = 0;
 
-    static std::unique_ptr<TransportLayer> makeAndStartDefaultEgressTransportLayer();
+#ifdef MONGO_CONFIG_SSL
+    virtual Status rotateCertificates(std::shared_ptr<SSLManagerInterface> manager,
+                                      bool asyncOCSPStaple) = 0;
+#endif
 
-    BatonHandle makeBaton(OperationContext* opCtx) override {
-        stdx::lock_guard<stdx::mutex> lk(_tlsMutex);
-        // TODO: figure out what to do about managers with more than one transport layer.
-        invariant(_tls.size() == 1);
-        return _tls[0]->makeBaton(opCtx);
-    }
+    /**
+     * Execute a callback on every TransportLayer owned by the TransportLayerManager.
+     */
+    virtual void forEach(std::function<void(TransportLayer*)> fn) = 0;
 
-private:
-    template <typename Callable>
-    void _foreach(Callable&& cb) const;
+    /**
+     * True if any of the TransportLayers has any active sessions.
+     */
+    virtual bool hasActiveSessions() const = 0;
 
-    mutable stdx::mutex _tlsMutex;
-    std::vector<std::unique_ptr<TransportLayer>> _tls;
+    /**
+     * Check that the total number of max open sessions across TransportLayers
+     * does not exceed system limits, and log a startup warning if not.
+     */
+    virtual void checkMaxOpenSessionsAtStartup() const = 0;
+
+    /**
+     * End all sessions that do not match the mask in tags.
+     */
+    virtual void endAllSessions(Client::TagMask tags) = 0;
+
+    /**
+     * Instruct transport layers to discontinue accepting new sessions.
+     */
+    virtual void stopAcceptingSessions() = 0;
 };
 
-}  // namespace transport
-}  // namespace mongo
+}  // namespace mongo::transport

@@ -1,6 +1,3 @@
-// path_internal.h
-
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -32,14 +29,15 @@
 
 #include "mongo/db/matcher/path_internal.h"
 
+#include <algorithm>
+
+#include "mongo/bson/bsontypes.h"
+#include "mongo/util/ctype.h"
+
 namespace mongo {
 
 bool isAllDigits(StringData str) {
-    for (unsigned i = 0; i < str.size(); i++) {
-        if (!isdigit(str[i]))
-            return false;
-    }
-    return true;
+    return std::all_of(str.begin(), str.end(), [](char c) { return ctype::isDigit(c); });
 }
 
 BSONElement getFieldDottedOrArray(const BSONObj& doc,

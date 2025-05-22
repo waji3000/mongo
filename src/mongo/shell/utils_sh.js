@@ -1,11 +1,19 @@
-sh = function() {
+/* global ShardingTest */
+
+var sh = function() {
     return "try sh.help();";
 };
 
 sh._checkMongos = function() {
-    var x = db.runCommand("ismaster");
-    if (x.msg != "isdbgrid")
+    if (TestData !== undefined && TestData.testingReplicaSetEndpoint) {
+        // When testing the replica set endpoint, the test connects directly to a mongod on the
+        // config shard which returns mongod hello responses (i.e. do not have "isdbgrid").
+        return;
+    }
+    var x = globalThis.db._helloOrLegacyHello();
+    if (x.msg != "isdbgrid") {
         throw Error("not connected to a mongos");
+    }
 };
 
 sh._checkFullName = function(fullName) {
@@ -16,12 +24,12 @@ sh._checkFullName = function(fullName) {
 sh._adminCommand = function(cmd, skipCheck) {
     if (!skipCheck)
         sh._checkMongos();
-    return db.getSisterDB("admin").runCommand(cmd);
+    return globalThis.db.getSiblingDB("admin").runCommand(cmd);
 };
 
 sh._getConfigDB = function() {
     sh._checkMongos();
-    return db.getSiblingDB("config");
+    return globalThis.db.getSiblingDB("config");
 };
 
 sh._getBalancerStatus = function() {
@@ -29,6 +37,10 @@ sh._getBalancerStatus = function() {
 };
 
 sh._dataFormat = function(bytes) {
+    if (bytes == null) {
+        return "0B";
+    }
+
     if (bytes < 1024)
         return Math.floor(bytes) + "B";
     if (bytes < 1024 * 1024)
@@ -51,10 +63,54 @@ sh._pchunk = function(chunk) {
  * directly, instead go through the start/stopBalancer calls and the balancerStart/Stop commands.
  */
 sh._writeBalancerStateDeprecated = function(onOrNot) {
-    return assert.writeOK(
+    return assert.commandWorked(
         sh._getConfigDB().settings.update({_id: 'balancer'},
                                           {$set: {stopped: onOrNot ? false : true}},
                                           {upsert: true, writeConcern: {w: 'majority'}}));
+};
+
+/**
+ * Asserts the specified command is executed successfully. However, if a retryable error occurs, the
+ * command is retried.
+ */
+sh.assertRetryableCommandWorkedOrFailedWithCodes = function(cmd, msg, expectedErrorCodes = []) {
+    let res = undefined;
+    assert.soon(function() {
+        try {
+            res = assert.commandWorked((() => {
+                try {
+                    return cmd();
+                } catch (err) {
+                    return err;
+                }
+            })());
+            return true;
+        } catch (err) {
+            const errorCode = (() => {
+                if (err.hasOwnProperty("code")) {
+                    return err.code;
+                }
+                if (err.hasOwnProperty("writeErrors")) {
+                    return err.writeErrors[err.writeErrors.length - 1].code;
+                }
+                if (err.hasOwnProperty("writeConcernError")) {
+                    return err.writeConcernError.code;
+                }
+                return undefined;
+            })();
+
+            if (expectedErrorCodes.includes(errorCode)) {
+                return true;
+            }
+
+            if (ErrorCodes.isRetriableError(errorCode)) {
+                return false;
+            }
+            throw err;
+        }
+    }, msg);
+
+    return res;
 };
 
 sh.help = function() {
@@ -64,7 +120,8 @@ sh.help = function() {
           "assigns the specified range of the given collection to a zone");
     print("\tsh.disableBalancing(coll)                 disable balancing on one collection");
     print("\tsh.enableBalancing(coll)                  re-enable balancing on one collection");
-    print("\tsh.enableSharding(dbname)                 enables sharding on the database dbname");
+    print(
+        "\tsh.enableSharding(dbname, shardName)      enables sharding on the database dbname, optionally use shardName as primary");
     print("\tsh.getBalancerState()                     returns whether the balancer is enabled");
     print(
         "\tsh.isBalancerRunning()                    return true if the balancer has work in progress on any mongos");
@@ -83,9 +140,20 @@ sh.help = function() {
     print("\tsh.status()                               prints a general overview of the cluster");
     print(
         "\tsh.stopBalancer()                         stops the balancer so chunks are not balanced automatically");
-    print("\tsh.disableAutoSplit()                   disable autoSplit on one collection");
-    print("\tsh.enableAutoSplit()                    re-enable autoSplit on one collection");
-    print("\tsh.getShouldAutoSplit()                 returns whether autosplit is enabled");
+    print(
+        "\tsh.startAutoMerger()                      globally enable auto-merger (active only if balancer is up)");
+    print("\tsh.stopAutoMerger()                     globally disable auto-merger");
+    print("\tsh.shouldAutoMerge()                    returns whether the auto-merger is enabled");
+    print("\tsh.disableAutoMerger(coll)              disable auto-merging on one collection");
+    print("\tsh.enableAutoMerger(coll)               re-enable auto-merge on one collection");
+    print(
+        "\tsh.balancerCollectionStatus(fullName)       " +
+        "returns wheter the specified collection is balanced or the balancer needs to take more actions on it");
+    print("\tsh.configureCollectionBalancing(fullName, params)       " +
+          "configure balancing settings for a specific collection");
+    print("\tsh.awaitCollectionBalance(coll)         waits for a collection to be balanced");
+    print(
+        "\tsh.verifyCollectionIsBalanced(coll)       verifies that a collection is well balanced by checking the actual data size on each shard");
 };
 
 sh.status = function(verbose, configDB) {
@@ -97,21 +165,25 @@ sh.addShard = function(url) {
     return sh._adminCommand({addShard: url}, true);
 };
 
-sh.enableSharding = function(dbname) {
+sh.enableSharding = function(dbname, shardName) {
     assert(dbname, "need a valid dbname");
-    return sh._adminCommand({enableSharding: dbname});
+    var command = {enableSharding: dbname};
+    if (shardName) {
+        command.primaryShard = shardName;
+    }
+    return sh._adminCommand(command);
 };
 
 sh.shardCollection = function(fullName, key, unique, options) {
     sh._checkFullName(fullName);
     assert(key, "need a key");
-    assert(typeof(key) == "object", "key needs to be an object");
+    assert(typeof (key) == "object", "key needs to be an object");
 
     var cmd = {shardCollection: fullName, key: key};
     if (unique)
         cmd.unique = true;
     if (options) {
-        if (typeof(options) !== "object") {
+        if (typeof (options) !== "object") {
             throw new Error("options must be an object");
         }
         Object.extend(cmd, options);
@@ -136,7 +208,7 @@ sh.moveChunk = function(fullName, find, to) {
 };
 
 sh.setBalancerState = function(isOn) {
-    assert(typeof(isOn) == "boolean", "Must pass boolean to setBalancerState");
+    assert(typeof (isOn) == "boolean", "Must pass boolean to setBalancerState");
     if (isOn) {
         return sh.startBalancer();
     } else {
@@ -144,13 +216,16 @@ sh.setBalancerState = function(isOn) {
     }
 };
 
-sh.getBalancerState = function(configDB) {
-    if (configDB === undefined)
+sh.getBalancerState = function(configDB, balancerStatus) {
+    if (configDB === undefined) {
         configDB = sh._getConfigDB();
-    var x = configDB.settings.findOne({_id: "balancer"});
-    if (x == null)
-        return true;
-    return !x.stopped;
+    }
+
+    if (balancerStatus === undefined) {
+        balancerStatus = assert.commandWorked(configDB.adminCommand({balancerStatus: 1}));
+    }
+
+    return balancerStatus.mode !== "off";
 };
 
 sh.isBalancerRunning = function(configDB) {
@@ -164,43 +239,79 @@ sh.isBalancerRunning = function(configDB) {
 sh.stopBalancer = function(timeoutMs, interval) {
     timeoutMs = timeoutMs || 60000;
 
-    var result = db.adminCommand({balancerStop: 1, maxTimeMS: timeoutMs});
+    var result = globalThis.db.adminCommand({balancerStop: 1, maxTimeMS: timeoutMs});
     return assert.commandWorked(result);
 };
 
 sh.startBalancer = function(timeoutMs, interval) {
     timeoutMs = timeoutMs || 60000;
 
-    var result = db.adminCommand({balancerStart: 1, maxTimeMS: timeoutMs});
+    var result = globalThis.db.adminCommand({balancerStart: 1, maxTimeMS: timeoutMs});
     return assert.commandWorked(result);
 };
 
-sh.enableAutoSplit = function(configDB) {
+sh.startAutoMerger = function(configDB) {
     if (configDB === undefined)
         configDB = sh._getConfigDB();
-    return assert.writeOK(
-        configDB.settings.update({_id: 'autosplit'},
-                                 {$set: {enabled: true}},
-                                 {upsert: true, writeConcern: {w: 'majority', wtimeout: 30000}}));
+
+    // Set retryable write since mongos doesn't do it automatically.
+    const mongosSession = configDB.getMongo().startSession({retryWrites: true});
+    const sessionConfigDB = mongosSession.getDatabase('config');
+    return assert.commandWorked(sessionConfigDB.settings.update(
+        {_id: 'automerge'},
+        {$set: {enabled: true}},
+        {upsert: true, writeConcern: {w: 'majority', wtimeout: 30000}}));
 };
 
-sh.disableAutoSplit = function(configDB) {
+sh.stopAutoMerger = function(configDB) {
     if (configDB === undefined)
         configDB = sh._getConfigDB();
-    return assert.writeOK(
-        configDB.settings.update({_id: 'autosplit'},
-                                 {$set: {enabled: false}},
-                                 {upsert: true, writeConcern: {w: 'majority', wtimeout: 30000}}));
+
+    // Set retryable write since mongos doesn't do it automatically.
+    const mongosSession = configDB.getMongo().startSession({retryWrites: true});
+    const sessionConfigDB = mongosSession.getDatabase('config');
+    return assert.commandWorked(sessionConfigDB.settings.update(
+        {_id: 'automerge'},
+        {$set: {enabled: false}},
+        {upsert: true, writeConcern: {w: 'majority', wtimeout: 30000}}));
 };
 
-sh.getShouldAutoSplit = function(configDB) {
+sh.shouldAutoMerge = function(configDB) {
     if (configDB === undefined)
         configDB = sh._getConfigDB();
-    var autosplit = configDB.settings.findOne({_id: 'autosplit'});
-    if (autosplit == null) {
+    var automerge = configDB.settings.findOne({_id: 'automerge'});
+    if (automerge == null) {
         return true;
     }
-    return autosplit.enabled;
+    return automerge.enabled;
+};
+
+sh.disableAutoMerger = function(coll) {
+    if (coll === undefined) {
+        throw Error("Must specify collection");
+    }
+    var dbase = globalThis.db;
+    if (coll instanceof DBCollection) {
+        dbase = coll.getDB();
+    } else {
+        sh._checkMongos();
+    }
+
+    return dbase.adminCommand({configureCollectionBalancing: coll + "", enableAutoMerger: false});
+};
+
+sh.enableAutoMerger = function(coll) {
+    if (coll === undefined) {
+        throw Error("Must specify collection");
+    }
+    var dbase = globalThis.db;
+    if (coll instanceof DBCollection) {
+        dbase = coll.getDB();
+    } else {
+        sh._checkMongos();
+    }
+
+    return dbase.adminCommand({configureCollectionBalancing: coll + "", enableAutoMerger: true});
 };
 
 sh.waitForPingChange = function(activePings, timeout, interval) {
@@ -238,18 +349,28 @@ sh.waitForPingChange = function(activePings, timeout, interval) {
     return remainingPings;
 };
 
-sh.waitForBalancer = function(wait, timeout, interval) {
-    if (typeof(wait) === 'undefined') {
-        wait = false;
-    }
+/**
+ * Waits up to the specified timeout (with a default of 60s) for the balancer to execute one
+ * round. If no round has been executed, throws an error.
+ */
+sh.awaitBalancerRound = function(timeout, interval) {
+    timeout = timeout || 60000;
+
     var initialStatus = sh._getBalancerStatus();
-    if (!initialStatus.inBalancerRound && !wait) {
-        return;
-    }
     var currentStatus;
     assert.soon(function() {
         currentStatus = sh._getBalancerStatus();
-        return (currentStatus.numBalancerRounds - initialStatus.numBalancerRounds) != 0;
+        assert.eq(currentStatus.mode, 'full', "Balancer is disabled");
+        if (!friendlyEqual(currentStatus.term, initialStatus.term)) {
+            // A new primary of the csrs has been elected
+            initialStatus = currentStatus;
+            return false;
+        }
+        assert.gte(currentStatus.numBalancerRounds,
+                   initialStatus.numBalancerRounds,
+                   'Number of balancer rounds moved back in time unexpectedly. Current status: ' +
+                       tojson(currentStatus) + ', initial status: ' + tojson(initialStatus));
+        return currentStatus.numBalancerRounds > initialStatus.numBalancerRounds;
     }, 'Latest balancer status: ' + tojson(currentStatus), timeout, interval);
 };
 
@@ -257,34 +378,128 @@ sh.disableBalancing = function(coll) {
     if (coll === undefined) {
         throw Error("Must specify collection");
     }
-    var dbase = db;
-    if (coll instanceof DBCollection) {
-        dbase = coll.getDB();
-    } else {
-        sh._checkMongos();
+    if (!(coll instanceof DBCollection)) {
+        throw Error("Collection must be a DBCollection");
     }
-
-    return assert.writeOK(dbase.getSisterDB("config").collections.update(
-        {_id: coll + ""},
-        {$set: {"noBalance": true}},
-        {writeConcern: {w: 'majority', wtimeout: 60000}}));
+    return coll.disableBalancing();
 };
 
 sh.enableBalancing = function(coll) {
     if (coll === undefined) {
         throw Error("Must specify collection");
     }
-    var dbase = db;
-    if (coll instanceof DBCollection) {
-        dbase = coll.getDB();
-    } else {
-        sh._checkMongos();
+    if (!(coll instanceof DBCollection)) {
+        throw Error("Collection must be a DBCollection");
+    }
+    return coll.enableBalancing();
+};
+
+sh.awaitCollectionBalance = function(coll, timeout, interval) {
+    if (coll === undefined) {
+        throw Error("Must specify collection");
+    }
+    timeout = timeout || 60000;
+    interval = interval || 200;
+
+    const ns = coll.getFullName();
+    const orphanDocsPipeline = [
+        {'$collStats': {'storageStats': {}}},
+        {'$project': {'shard': true, 'storageStats': {'numOrphanDocs': true}}},
+        {'$group': {'_id': null, 'totalNumOrphanDocs': {'$sum': '$storageStats.numOrphanDocs'}}}
+    ];
+
+    var oldDb = (typeof (globalThis.db) === 'undefined' ? undefined : globalThis.db);
+    try {
+        globalThis.db = coll.getDB();
+
+        assert.soon(
+            function() {
+                assert.soon(function() {
+                    return assert
+                        .commandWorked(sh._adminCommand({balancerCollectionStatus: ns}, true))
+                        .balancerCompliant;
+                }, 'Timed out waiting for the collection to be balanced', timeout, interval);
+
+                // (SERVER-67301) Wait for orphans counter to be 0 to account for potential stale
+                // orphans count
+                sh.disableBalancing(coll);
+                assert.soon(function() {
+                    return coll.aggregate(orphanDocsPipeline).toArray()[0].totalNumOrphanDocs === 0;
+                }, 'Timed out waiting for orphans counter to be 0', timeout, interval);
+                sh.enableBalancing(coll);
+
+                // (SERVER-70602) Wait for some balancing rounds to avoid balancerCollectionStatus
+                // reporting balancerCompliant too early
+                for (let i = 0; i < 3; ++i) {
+                    sh.awaitBalancerRound(timeout, interval);
+                }
+
+                return assert.commandWorked(sh._adminCommand({balancerCollectionStatus: ns}, true))
+                    .balancerCompliant;
+            },
+            'Timed out waiting for collection to be balanced and orphans counter to be 0',
+            timeout,
+            interval);
+    } finally {
+        globalThis.db = oldDb;
+    }
+};
+
+/**
+ * Verifies if given collection is properly balanced according to the data size aware balancing
+ * policy
+ */
+sh.verifyCollectionIsBalanced = function(coll) {
+    if (coll === undefined) {
+        throw Error("Must specify collection");
     }
 
-    return assert.writeOK(dbase.getSisterDB("config").collections.update(
-        {_id: coll + ""},
-        {$set: {"noBalance": false}},
-        {writeConcern: {w: 'majority', wtimeout: 60000}}));
+    var oldDb = globalThis.db;
+    try {
+        globalThis.db = coll.getDB();
+
+        const configDB = sh._getConfigDB();
+        const ns = coll.getFullName();
+        const collection = configDB.collections.findOne({_id: ns});
+
+        let collSizeOnShards = [];
+        let shards = [];
+        const collStatsPipeline = [
+            {'$collStats': {'storageStats': {}}},
+            {
+                '$project': {
+                    'shard': true,
+                    'storageStats':
+                        {'count': true, 'size': true, 'avgObjSize': true, 'numOrphanDocs': true}
+                }
+            },
+            {'$sort': {'shard': 1}}
+        ];
+
+        let kChunkSize = 1024 * 1024 *
+            assert.commandWorked(sh._adminCommand({balancerCollectionStatus: ns})).chunkSize;
+
+        // Get coll size per shard
+        const storageStats = coll.aggregate(collStatsPipeline).toArray();
+        coll.aggregate(collStatsPipeline).forEach((shardStats) => {
+            shards.push(shardStats['shard']);
+            const collSize = (shardStats['storageStats']['count'] -
+                              shardStats['storageStats']['numOrphanDocs']) *
+                shardStats['storageStats']['avgObjSize'];
+            collSizeOnShards.push(collSize);
+        });
+
+        let errorMsg = "Collection not balanced. collection= " + tojson(collection) +
+            ", shards= " + tojson(shards) + ", collSizeOnShards=" + tojson(collSizeOnShards) +
+            ", storageStats=" + tojson(storageStats) + ", kChunkSize=" + tojson(kChunkSize);
+
+        assert.lte((Math.max(...collSizeOnShards) - Math.min(...collSizeOnShards)),
+                   3 * kChunkSize,
+                   errorMsg);
+
+    } finally {
+        globalThis.db = oldDb;
+    }
 };
 
 /*
@@ -292,19 +507,18 @@ sh.enableBalancing = function(coll) {
  * mongos )
  */
 sh._lastMigration = function(ns) {
-
     var coll = null;
     var dbase = null;
     var config = null;
 
     if (!ns) {
-        config = db.getSisterDB("config");
+        config = globalThis.db.getSiblingDB("config");
     } else if (ns instanceof DBCollection) {
         coll = ns;
-        config = coll.getDB().getSisterDB("config");
+        config = coll.getDB().getSiblingDB("config");
     } else if (ns instanceof DB) {
         dbase = ns;
-        config = dbase.getSisterDB("config");
+        config = dbase.getSiblingDB("config");
     } else if (ns instanceof ShardingTest) {
         config = ns.s.getDB("config");
     } else if (ns instanceof Mongo) {
@@ -313,11 +527,11 @@ sh._lastMigration = function(ns) {
         // String namespace
         ns = ns + "";
         if (ns.indexOf(".") > 0) {
-            config = db.getSisterDB("config");
-            coll = db.getMongo().getCollection(ns);
+            config = globalThis.db.getSiblingDB("config");
+            coll = globalThis.db.getMongo().getCollection(ns);
         } else {
-            config = db.getSisterDB("config");
-            dbase = db.getSisterDB(ns);
+            config = globalThis.db.getSiblingDB("config");
+            dbase = globalThis.db.getSiblingDB(ns);
         }
     }
 
@@ -344,7 +558,7 @@ sh.addShardTag = function(shard, tag) {
     if (config.shards.findOne({_id: shard}) == null) {
         throw Error("can't find a shard with name: " + shard);
     }
-    return assert.writeOK(config.shards.update(
+    return assert.commandWorked(config.shards.update(
         {_id: shard}, {$addToSet: {tags: tag}}, {writeConcern: {w: 'majority', wtimeout: 60000}}));
 };
 
@@ -358,7 +572,7 @@ sh.removeShardTag = function(shard, tag) {
     if (config.shards.findOne({_id: shard}) == null) {
         throw Error("can't find a shard with name: " + shard);
     }
-    return assert.writeOK(config.shards.update(
+    return assert.commandWorked(config.shards.update(
         {_id: shard}, {$pull: {tags: tag}}, {writeConcern: {w: 'majority', wtimeout: 60000}}));
 };
 
@@ -373,31 +587,14 @@ sh.addTagRange = function(ns, min, max, tag) {
     }
 
     var config = sh._getConfigDB();
-    return assert.writeOK(
+    return assert.commandWorked(
         config.tags.update({_id: {ns: ns, min: min}},
                            {_id: {ns: ns, min: min}, ns: ns, min: min, max: max, tag: tag},
                            {upsert: true, writeConcern: {w: 'majority', wtimeout: 60000}}));
 };
 
-sh.removeTagRange = function(ns, min, max, tag) {
-    var result = sh.removeRangeFromZone(ns, min, max);
-    if (result.code != ErrorCodes.CommandNotFound) {
-        return result;
-    }
-
-    var config = sh._getConfigDB();
-    // warn if the namespace does not exist, even dropped
-    if (config.collections.findOne({_id: ns}) == null) {
-        print("Warning: can't find the namespace: " + ns + " - collection likely never sharded");
-    }
-    // warn if the tag being removed is still in use
-    if (config.shards.findOne({tags: tag})) {
-        print("Warning: tag still in use by at least one shard");
-    }
-    // max and tag criteria not really needed, but including them avoids potentially unexpected
-    // behavior.
-    return assert.writeOK(config.tags.remove({_id: {ns: ns, min: min}, max: max, tag: tag},
-                                             {writeConcern: {w: 'majority', wtimeout: 60000}}));
+sh.removeTagRange = function(ns, min, max) {
+    return sh._getConfigDB().adminCommand({updateZoneKeyRange: ns, min: min, max: max, zone: null});
 };
 
 sh.addShardToZone = function(shardName, zoneName) {
@@ -419,7 +616,7 @@ sh.removeRangeFromZone = function(ns, min, max) {
 
 sh.getBalancerWindow = function(configDB) {
     if (configDB === undefined)
-        configDB = db.getSiblingDB('config');
+        configDB = globalThis.db.getSiblingDB('config');
     var settings = configDB.settings.findOne({_id: 'balancer'});
     if (settings == null) {
         return null;
@@ -432,7 +629,7 @@ sh.getBalancerWindow = function(configDB) {
 
 sh.getActiveMigrations = function(configDB) {
     if (configDB === undefined)
-        configDB = db.getSiblingDB('config');
+        configDB = globalThis.db.getSiblingDB('config');
     var activeLocks = configDB.locks.find({state: {$eq: 2}});
     var result = [];
     if (activeLocks != null) {
@@ -445,15 +642,17 @@ sh.getActiveMigrations = function(configDB) {
 
 sh.getRecentFailedRounds = function(configDB) {
     if (configDB === undefined)
-        configDB = db.getSiblingDB('config');
+        configDB = globalThis.db.getSiblingDB('config');
     var balErrs = configDB.actionlog.find({what: "balancer.round"}).sort({time: -1}).limit(5);
     var result = {count: 0, lastErr: "", lastTime: " "};
     if (balErrs != null) {
         balErrs.forEach(function(r) {
-            if (r.details.errorOccured) {
+            if (r.details.errorOccurred) {
                 result.count += 1;
-                result.lastErr = r.details.errmsg;
-                result.lastTime = r.time;
+                if (result.count == 1) {
+                    result.lastErr = r.details.errmsg;
+                    result.lastTime = r.time;
+                }
             }
         });
     }
@@ -474,12 +673,12 @@ sh.getRecentMigrations = function(configDB) {
     var result = configDB.changelog
                      .aggregate([
                          {
-                           $match: {
-                               time: {$gt: yesterday},
-                               what: "moveChunk.from",
-                               'details.errmsg': {$exists: false},
-                               'details.note': 'success'
-                           }
+                             $match: {
+                                 time: {$gt: yesterday},
+                                 what: "moveChunk.from",
+                                 'details.errmsg': {$exists: false},
+                                 'details.note': 'success'
+                             }
                          },
                          {$group: {_id: {msg: "$details.errmsg"}, count: {$sum: 1}}},
                          {$project: {_id: {$ifNull: ["$_id.msg", "Success"]}, count: "$count"}}
@@ -491,28 +690,28 @@ sh.getRecentMigrations = function(configDB) {
         configDB.changelog
             .aggregate([
                 {
-                  $match: {
-                      time: {$gt: yesterday},
-                      what: "moveChunk.from",
-                      $or: [
-                          {'details.errmsg': {$exists: true}},
-                          {'details.note': {$ne: 'success'}}
-                      ]
-                  }
+                    $match: {
+                        time: {$gt: yesterday},
+                        what: "moveChunk.from",
+                        $or: [
+                            {'details.errmsg': {$exists: true}},
+                            {'details.note': {$ne: 'success'}}
+                        ]
+                    }
                 },
                 {
-                  $group: {
-                      _id: {msg: "$details.errmsg", from: "$details.from", to: "$details.to"},
-                      count: {$sum: 1}
-                  }
+                    $group: {
+                        _id: {msg: "$details.errmsg", from: "$details.from", to: "$details.to"},
+                        count: {$sum: 1}
+                    }
                 },
                 {
-                  $project: {
-                      _id: {$ifNull: ['$_id.msg', 'aborted']},
-                      from: "$_id.from",
-                      to: "$_id.to",
-                      count: "$count"
-                  }
+                    $project: {
+                        _id: {$ifNull: ['$_id.msg', 'aborted']},
+                        from: "$_id.from",
+                        to: "$_id.to",
+                        count: "$count"
+                    }
                 }
             ])
             .toArray());
@@ -532,11 +731,24 @@ sh._shardingStatusStr = function(indent, s) {
     return indentStr(indent, s) + "\n";
 };
 
+sh.balancerCollectionStatus = function(coll) {
+    return sh._adminCommand({balancerCollectionStatus: coll}, true);
+};
+
+sh.configureCollectionBalancing = function(coll, opts) {
+    let cmd = {configureCollectionBalancing: coll};
+    if (opts) {
+        cmd = Object.assign(cmd, opts);
+    }
+    return sh._adminCommand(cmd, true);
+};
+
 function printShardingStatus(configDB, verbose) {
     // configDB is a DB object that contains the sharding metadata of interest.
     // Defaults to the db named "config" on the current connection.
-    if (configDB === undefined)
-        configDB = db.getSisterDB('config');
+    if (configDB === undefined) {
+        configDB = globalThis.db.getSiblingDB('config');
+    }
 
     var version = configDB.getCollection("version").findOne();
     if (version == null) {
@@ -603,23 +815,34 @@ function printShardingStatus(configDB, verbose) {
         }
     }
 
-    output(1, "autosplit:");
+    output(1, "automerge:");
 
-    // Is autosplit currently enabled
-    output(2, "Currently enabled: " + (sh.getShouldAutoSplit(configDB) ? "yes" : "no"));
+    output(2, "Currently enabled: " + (sh.shouldAutoMerge(configDB) ? "yes" : "no"));
 
     output(1, "balancer:");
 
+    let balancerEnabledString;
+    let balancerRunning;
+
+    const balancerStatus = configDB.adminCommand({balancerStatus: 1});
+    if (!balancerStatus.ok) {
+        // If the call to balancerStatus returns CommandNotFound, we indicate that the balancer
+        // being enabled is currently unknown, since CommandNotFound implies we're running this
+        // command on a standalone mongod. All other error statuses return "no" for historical
+        // reasons.
+        balancerEnabledString =
+            (balancerStatus.code == ErrorCodes.CommandNotFound) ? "unknown" : "no";
+        balancerRunning = false;
+    } else {
+        balancerEnabledString = sh.getBalancerState(configDB, balancerStatus) ? "yes" : "no";
+        balancerRunning = balancerStatus.inBalancerRound;
+    }
+
     // Is the balancer currently enabled
-    output(2, "Currently enabled:  " + (sh.getBalancerState(configDB) ? "yes" : "no"));
+    output(2, "Currently enabled: " + balancerEnabledString);
 
     // Is the balancer currently active
-    var balancerRunning = "unknown";
-    var balancerStatus = configDB.adminCommand({balancerStatus: 1});
-    if (balancerStatus.code != ErrorCodes.CommandNotFound) {
-        balancerRunning = balancerStatus.inBalancerRound ? "yes" : "no";
-    }
-    output(2, "Currently running:  " + balancerRunning);
+    output(2, "Currently running: " + (balancerRunning ? "yes" : "no"));
 
     // Output the balancer window
     var balSettings = sh.getBalancerWindow(configDB);
@@ -645,7 +868,7 @@ function printShardingStatus(configDB, verbose) {
         versionHasActionlog = true;
     }
     if (metaDataVersion == 5) {
-        var verArray = db.serverBuildInfo().versionArray;
+        var verArray = globalThis.db.getServerBuildInfo().rawData().versionArray;
         if (verArray[0] == 2 && verArray[1] > 6) {
             versionHasActionlog = true;
         }
@@ -655,15 +878,15 @@ function printShardingStatus(configDB, verbose) {
         // Review config.actionlog for errors
         var actionReport = sh.getRecentFailedRounds(configDB);
         // Always print the number of failed rounds
-        output(2, "Failed balancer rounds in last 5 attempts:  " + actionReport.count);
+        output(2, "Failed balancer rounds in last 5 attempts: " + actionReport.count);
 
         // Only print the errors if there are any
         if (actionReport.count > 0) {
-            output(2, "Last reported error:  " + actionReport.lastErr);
-            output(2, "Time of Reported error:  " + actionReport.lastTime);
+            output(2, "Last reported error: " + actionReport.lastErr);
+            output(2, "Time of reported error: " + actionReport.lastTime);
         }
 
-        output(2, "Migration Results for the last 24 hours: ");
+        output(2, "Migration results for the last 24 hours: ");
         var migrations = sh.getRecentMigrations(configDB);
         if (migrations.length > 0) {
             migrations.forEach(function(x) {
@@ -697,7 +920,7 @@ function printShardingStatus(configDB, verbose) {
         var nonBooleanNote = function(name, value) {
             // If the given value is not a boolean, return a string of the
             // form " (<name>: <value>)", where <value> is converted to JSON.
-            var t = typeof(value);
+            var t = typeof (value);
             var s = "";
             if (t != "boolean" && t != "undefined") {
                 s = " (" + name + ": " + tojson(value) + ")";
@@ -707,57 +930,59 @@ function printShardingStatus(configDB, verbose) {
 
         output(2, tojsononeline(db, "", true));
 
-        if (db.partitioned) {
-            configDB.collections.find({_id: new RegExp("^" + RegExp.escape(db._id) + "\\.")})
-                .sort({_id: 1})
-                .forEach(function(coll) {
-                    if (!coll.dropped) {
-                        output(3, coll._id);
-                        output(4, "shard key: " + tojson(coll.key));
+        configDB.collections.find({_id: new RegExp("^" + RegExp.escape(db._id) + "\\.")})
+            .sort({_id: 1})
+            .forEach(function(coll) {
+                // Checking for '!dropped' to ensure mongo shell compatibility with earlier
+                // versions of the server
+                if (!coll.dropped) {
+                    output(3, coll._id);
+                    output(4, "shard key: " + tojson(coll.key));
+                    output(
+                        4,
+                        "unique: " + truthy(coll.unique) + nonBooleanNote("unique", coll.unique));
+                    output(4,
+                           "balancing: " + !truthy(coll.noBalance) +
+                               nonBooleanNote("noBalance", coll.noBalance));
+                    output(4, "chunks:");
+
+                    const chunksMatchPredicate =
+                        coll.hasOwnProperty("timestamp") ? {uuid: coll.uuid} : {ns: coll._id};
+
+                    const res = configDB.chunks
+                                    .aggregate({$match: chunksMatchPredicate},
+                                               {$group: {_id: "$shard", cnt: {$sum: 1}}},
+                                               {$project: {_id: 0, shard: "$_id", nChunks: "$cnt"}},
+                                               {$sort: {shard: 1}})
+                                    .toArray();
+
+                    var totalChunks = 0;
+                    res.forEach(function(z) {
+                        totalChunks += z.nChunks;
+                        output(5, z.shard + "\t" + z.nChunks);
+                    });
+
+                    if (totalChunks < 20 || verbose) {
+                        configDB.chunks.find(chunksMatchPredicate)
+                            .sort({min: 1})
+                            .forEach(function(chunk) {
+                                output(4,
+                                       tojson(chunk.min) + " -->> " + tojson(chunk.max) +
+                                           " on : " + chunk.shard + " " + tojson(chunk.lastmod) +
+                                           " " + (chunk.jumbo ? "jumbo " : ""));
+                            });
+                    } else {
                         output(4,
-                               "unique: " + truthy(coll.unique) +
-                                   nonBooleanNote("unique", coll.unique));
-                        output(4,
-                               "balancing: " + !truthy(coll.noBalance) +
-                                   nonBooleanNote("noBalance", coll.noBalance));
-                        output(4, "chunks:");
-
-                        res = configDB.chunks
-                                  .aggregate({$match: {ns: coll._id}},
-                                             {$group: {_id: "$shard", cnt: {$sum: 1}}},
-                                             {$project: {_id: 0, shard: "$_id", nChunks: "$cnt"}},
-                                             {$sort: {shard: 1}})
-                                  .toArray();
-                        var totalChunks = 0;
-                        res.forEach(function(z) {
-                            totalChunks += z.nChunks;
-                            output(5, z.shard + "\t" + z.nChunks);
-                        });
-
-                        if (totalChunks < 20 || verbose) {
-                            configDB.chunks.find({"ns": coll._id})
-                                .sort({min: 1})
-                                .forEach(function(chunk) {
-                                    output(4,
-                                           tojson(chunk.min) + " -->> " + tojson(chunk.max) +
-                                               " on : " + chunk.shard + " " +
-                                               tojson(chunk.lastmod) + " " +
-                                               (chunk.jumbo ? "jumbo " : ""));
-                                });
-                        } else {
-                            output(
-                                4,
-                                "too many chunks to print, use verbose if you want to force print");
-                        }
-
-                        configDB.tags.find({ns: coll._id}).sort({min: 1}).forEach(function(tag) {
-                            output(4,
-                                   " tag: " + tag.tag + "  " + tojson(tag.min) + " -->> " +
-                                       tojson(tag.max));
-                        });
+                               "too many chunks to print, use verbose if you want to force print");
                     }
-                });
-        }
+
+                    configDB.tags.find({ns: coll._id}).sort({min: 1}).forEach(function(tag) {
+                        output(4,
+                               " tag: " + tag.tag + "  " + tojson(tag.min) + " -->> " +
+                                   tojson(tag.max));
+                    });
+                }
+            });
     });
 
     print(raw);
@@ -766,8 +991,9 @@ function printShardingStatus(configDB, verbose) {
 function printShardingSizes(configDB) {
     // configDB is a DB object that contains the sharding metadata of interest.
     // Defaults to the db named "config" on the current connection.
-    if (configDB === undefined)
-        configDB = db.getSisterDB('config');
+    if (configDB === undefined) {
+        configDB = globalThis.db.getSiblingDB('config');
+    }
 
     var version = configDB.getCollection("version").findOne();
     if (version == null) {
@@ -787,33 +1013,26 @@ function printShardingSizes(configDB) {
         output(2, tojson(z));
     });
 
-    var saveDB = db;
+    var saveDB = globalThis.db;
     output(1, "databases:");
     configDB.databases.find().sort({name: 1}).forEach(function(db) {
         output(2, tojson(db, "", true));
 
-        if (db.partitioned) {
-            configDB.collections.find({_id: new RegExp("^" + RegExp.escape(db._id) + "\.")})
-                .sort({_id: 1})
-                .forEach(function(coll) {
-                    output(3, coll._id + " chunks:");
-                    configDB.chunks.find({"ns": coll._id}).sort({min: 1}).forEach(function(chunk) {
-                        var out = saveDB.adminCommand({
-                            dataSize: coll._id,
-                            keyPattern: coll.key,
-                            min: chunk.min,
-                            max: chunk.max
-                        });
-                        delete out.millis;
-                        delete out.ok;
+        configDB.collections.find({_id: new RegExp("^" + RegExp.escape(db._id) + "\.")})
+            .sort({_id: 1})
+            .forEach(function(coll) {
+                output(3, coll._id + " chunks:");
+                configDB.chunks.find({"ns": coll._id}).sort({min: 1}).forEach(function(chunk) {
+                    var out = saveDB.adminCommand(
+                        {dataSize: coll._id, keyPattern: coll.key, min: chunk.min, max: chunk.max});
+                    delete out.millis;
+                    delete out.ok;
 
-                        output(4,
-                               tojson(chunk.min) + " -->> " + tojson(chunk.max) + " on : " +
-                                   chunk.shard + " " + tojson(out));
-
-                    });
+                    output(4,
+                           tojson(chunk.min) + " -->> " + tojson(chunk.max) +
+                               " on : " + chunk.shard + " " + tojson(out));
                 });
-        }
+            });
     });
 
     print(raw);

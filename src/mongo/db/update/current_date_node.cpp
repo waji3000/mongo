@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,13 +27,21 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
 
-#include "mongo/db/update/current_date_node.h"
+#include <boost/smart_ptr/intrusive_ptr.hpp>
 
-#include "mongo/db/logical_clock.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
 #include "mongo/db/logical_time.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/update/current_date_node.h"
+#include "mongo/db/vector_clock_mutable.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo {
 
@@ -43,12 +50,12 @@ constexpr StringData kType = "$type"_sd;
 constexpr StringData kDate = "date"_sd;
 constexpr StringData kTimestamp = "timestamp"_sd;
 
-void setValue(mutablebson::Element* element, bool typeIsDate) {
+void setValue(ServiceContext* service, mutablebson::Element* element, bool typeIsDate) {
     if (typeIsDate) {
-        invariant(element->setValueDate(mongo::jsTime()));
+        invariant(element->setValueDate(mongo::Date_t::now()));
     } else {
         invariant(element->setValueTimestamp(
-            LogicalClock::get(getGlobalServiceContext())->reserveTicks(1).asTimestamp()));
+            VectorClockMutable::get(service)->tickClusterTime(1).asTimestamp()));
     }
 }
 }  // namespace
@@ -93,17 +100,33 @@ Status CurrentDateNode::init(BSONElement modExpr,
                                        " or a $type expression ({$type: 'timestamp/date'}).");
     }
 
+    _service = expCtx->getOperationContext()->getServiceContext();
+
     return Status::OK();
 }
 
 ModifierNode::ModifyResult CurrentDateNode::updateExistingElement(
-    mutablebson::Element* element, std::shared_ptr<FieldRef> elementPath) const {
-    setValue(element, _typeIsDate);
+    mutablebson::Element* element, const FieldRef& elementPath) const {
+    setValue(_service, element, _typeIsDate);
     return ModifyResult::kNormalUpdate;
 }
 
 void CurrentDateNode::setValueForNewElement(mutablebson::Element* element) const {
-    setValue(element, _typeIsDate);
+    setValue(_service, element, _typeIsDate);
+}
+
+BSONObj CurrentDateNode::operatorValue() const {
+    BSONObjBuilder bob;
+    {
+        BSONObjBuilder subBuilder(bob.subobjStart(""));
+        {
+            if (_typeIsDate)
+                subBuilder << kType << kDate;
+            else
+                subBuilder << kType << kTimestamp;
+        }
+    }
+    return bob.obj();
 }
 
 }  // namespace mongo

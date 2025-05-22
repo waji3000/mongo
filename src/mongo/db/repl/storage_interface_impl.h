@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -31,23 +30,40 @@
 
 #pragma once
 
-#include "mongo/base/disallow_copying.h"
+#include <cstddef>
+#include <memory>
+#include <string>
+#include <vector>
+
+#include <boost/optional/optional.hpp>
+
 #include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
 #include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/timestamp.h"
+#include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/collection_options.h"
+#include "mongo/db/index/multikey_paths.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/query/index_bounds.h"
+#include "mongo/db/repl/collection_bulk_loader.h"
+#include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/storage_interface.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/storage/key_string/key_string.h"
+#include "mongo/util/uuid.h"
 
 namespace mongo {
 namespace repl {
 
 class StorageInterfaceImpl : public StorageInterface {
-    MONGO_DISALLOW_COPYING(StorageInterfaceImpl);
+    StorageInterfaceImpl(const StorageInterfaceImpl&) = delete;
+    StorageInterfaceImpl& operator=(const StorageInterfaceImpl&) = delete;
 
 public:
-    static const char kDefaultRollbackIdNamespace[];
     static const char kRollbackIdFieldName[];
     static const char kRollbackIdDocumentId[];
 
@@ -63,7 +79,7 @@ public:
     StatusWith<std::unique_ptr<CollectionBulkLoader>> createCollectionForBulkLoading(
         const NamespaceString& nss,
         const CollectionOptions& options,
-        const BSONObj idIndexSpec,
+        BSONObj idIndexSpec,
         const std::vector<BSONObj>& secondaryIndexSpecs) override;
 
     Status insertDocument(OperationContext* opCtx,
@@ -78,14 +94,23 @@ public:
     Status dropReplicatedDatabases(OperationContext* opCtx) override;
 
     Status createOplog(OperationContext* opCtx, const NamespaceString& nss) override;
-    StatusWith<size_t> getOplogMaxSize(OperationContext* opCtx,
-                                       const NamespaceString& nss) override;
+    StatusWith<size_t> getOplogMaxSize(OperationContext* opCtx) override;
 
     Status createCollection(OperationContext* opCtx,
                             const NamespaceString& nss,
-                            const CollectionOptions& options) override;
+                            const CollectionOptions& options,
+                            bool createIdIndex = true,
+                            const BSONObj& idIndexSpec = BSONObj()) override;
+
+    Status createIndexesOnEmptyCollection(OperationContext* opCtx,
+                                          const NamespaceString& nss,
+                                          const std::vector<BSONObj>& secondaryIndexSpecs) override;
 
     Status dropCollection(OperationContext* opCtx, const NamespaceString& nss) override;
+
+    Status dropCollectionsWithPrefix(OperationContext* opCtx,
+                                     const DatabaseName& dbName,
+                                     const std::string& collectionNamePrefix) override;
 
     Status truncateCollection(OperationContext* opCtx, const NamespaceString& nss) override;
 
@@ -96,7 +121,9 @@ public:
 
     Status setIndexIsMultikey(OperationContext* opCtx,
                               const NamespaceString& nss,
+                              const UUID& collectionUUID,
                               const std::string& indexName,
+                              const KeyStringSet& multikeyMetadataKeys,
                               const MultikeyPaths& paths,
                               Timestamp ts) override;
 
@@ -122,10 +149,22 @@ public:
                         const NamespaceString& nss,
                         const TimestampedBSONObj& update) override;
 
+    Status putSingleton(OperationContext* opCtx,
+                        const NamespaceString& nss,
+                        const BSONObj& query,
+                        const TimestampedBSONObj& update) override;
+
     Status updateSingleton(OperationContext* opCtx,
                            const NamespaceString& nss,
                            const BSONObj& query,
                            const TimestampedBSONObj& update) override;
+
+    Status updateDocuments(
+        OperationContext* opCtx,
+        const NamespaceString& nss,
+        const BSONObj& query,
+        const TimestampedBSONObj& update,
+        const boost::optional<std::vector<BSONObj>>& arrayFilters = boost::none) override;
 
     StatusWith<BSONObj> findById(OperationContext* opCtx,
                                  const NamespaceStringOrUUID& nsOrUUID,
@@ -144,6 +183,15 @@ public:
                           const NamespaceString& nss,
                           const BSONObj& filter) override;
 
+    boost::optional<OpTimeAndWallTime> findOplogOpTimeLessThanOrEqualToTimestamp(
+        OperationContext* opCtx, const CollectionPtr& oplog, const Timestamp& timestamp) override;
+
+    boost::optional<OpTimeAndWallTime> findOplogOpTimeLessThanOrEqualToTimestampRetryOnWCE(
+        OperationContext* opCtx, const CollectionPtr& oplog, const Timestamp& timestamp) override;
+
+    Timestamp getEarliestOplogTimestamp(OperationContext* opCtx) override;
+    Timestamp getLatestOplogTimestamp(OperationContext* opCtx) override;
+
     StatusWith<StorageInterface::CollectionSize> getCollectionSize(
         OperationContext* opCtx, const NamespaceString& nss) override;
 
@@ -154,33 +202,31 @@ public:
                               const NamespaceStringOrUUID& nsOrUUID,
                               long long newCount) override;
 
-    StatusWith<OptionalCollectionUUID> getCollectionUUID(OperationContext* opCtx,
-                                                         const NamespaceString& nss) override;
+    StatusWith<UUID> getCollectionUUID(OperationContext* opCtx,
+                                       const NamespaceString& nss) override;
 
-    Status upgradeNonReplicatedUniqueIndexes(OperationContext* opCtx) override;
-
-    void setStableTimestamp(ServiceContext* serviceCtx, Timestamp snapshotName) override;
+    void setStableTimestamp(ServiceContext* serviceCtx,
+                            Timestamp snapshotName,
+                            bool force = false) override;
 
     void setInitialDataTimestamp(ServiceContext* serviceCtx, Timestamp snapshotName) override;
 
-    StatusWith<Timestamp> recoverToStableTimestamp(OperationContext* opCtx) override;
+    Timestamp getInitialDataTimestamp(ServiceContext* serviceCtx) const override;
+
+    Timestamp recoverToStableTimestamp(OperationContext* opCtx) override;
 
     bool supportsRecoverToStableTimestamp(ServiceContext* serviceCtx) const override;
 
     bool supportsRecoveryTimestamp(ServiceContext* serviceCtx) const override;
 
+    void initializeStorageControlsForReplication(ServiceContext* serviceCtx) const override;
+
     boost::optional<Timestamp> getRecoveryTimestamp(ServiceContext* serviceCtx) const override;
 
-    bool supportsDocLocking(ServiceContext* serviceCtx) const override;
+    Timestamp getAllDurableTimestamp(ServiceContext* serviceCtx) const override;
 
-    Timestamp getAllCommittedTimestamp(ServiceContext* serviceCtx) const override;
-
-    /**
-     * Checks that the "admin" database contains a supported version of the auth data schema.
-     */
-    Status isAdminDbValid(OperationContext* opCtx) override;
-
-    void waitForAllEarlierOplogWritesToBeVisible(OperationContext* opCtx) override;
+    void waitForAllEarlierOplogWritesToBeVisible(OperationContext* opCtx,
+                                                 bool primaryOnly) override;
     void oplogDiskLocRegister(OperationContext* opCtx,
                               const Timestamp& ts,
                               bool orderedCommit) override;
@@ -188,10 +234,10 @@ public:
     boost::optional<Timestamp> getLastStableRecoveryTimestamp(
         ServiceContext* serviceCtx) const override;
 
-    boost::optional<Timestamp> getLastStableCheckpointTimestampDeprecated(
-        ServiceContext* serviceCtx) const override;
-
     Timestamp getPointInTimeReadTimestamp(OperationContext* opCtx) const override;
+
+    void setPinnedOplogTimestamp(OperationContext* opCtx,
+                                 const Timestamp& pinnedTimestamp) const override;
 
 private:
     const NamespaceString _rollbackIdNss;

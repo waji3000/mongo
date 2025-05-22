@@ -1,140 +1,98 @@
-Building MongoDB
-================
+# Building MongoDB
+
+Please note that prebuilt binaries are available on
+[mongodb.org](http://www.mongodb.org/downloads) and may be the easiest
+way to get started, rather than building from source.
 
 To build MongoDB, you will need:
 
-* A modern C++ compiler. One of the following is required.
-    * GCC 5.4.0 or newer
-    * Clang 3.8 (or Apple XCode 8.3.2 Clang) or newer
-    * Visual Studio 2015 Update 3 or newer (See Windows section below for details)
-* On Linux and macOS, the libcurl library and header is required. MacOS includes libcurl.
-    * Fedora/RHEL - dnf install libcurl-devel
-    * Ubuntu/Debian - apt-get install libcurl-dev
-* Python 2.7.x and Pip modules:
-  * pyyaml
-  * typing
-  * cheetah
+- A modern C++ compiler capable of compiling C++20. One of the following is required:
+  - GCC 14.2 or newer
+  - Clang 19.1 or newer
+  - Apple XCode 14 or newer
+  - Visual Studio 2022 version 17.0 or newer (See Windows section below for details)
+- On Linux and macOS, the libcurl library and header is required. MacOS includes libcurl.
+  - Fedora/RHEL - `dnf install libcurl-devel`
+  - Ubuntu/Debian - `libcurl-dev` is provided by three packages. Install one of them:
+    - `libcurl4-openssl-dev`
+    - `libcurl4-nss-dev`
+    - `libcurl4-gnutls-dev`
+  - On Ubuntu, the lzma library is required. Install `liblzma-dev`
+  - On Amazon Linux, the xz-devel library is required. `yum install xz-devel`
+- Python 3.10
+- About 13 GB of free disk space for the core binaries (`mongod`,
+  `mongos`, and `mongo`) and about 600 GB for the install-all target.
 
-MongoDB supports the following architectures: arm64, ppc64le, s390x, and x86-64.
-More detailed platform instructions can be found below.
+MongoDB supports the following architectures: arm64, ppc64le, s390x,
+and x86-64. More detailed platform instructions can be found below.
 
+## Quick (re)Start
 
-MongoDB Tools
---------------
+### Linux
 
-The MongoDB command line tools (mongodump, mongorestore, mongoimport, mongoexport, etc)
-have been rewritten in [Go](http://golang.org/) and are no longer included in this repository.
+```bash
+python buildscripts/install_bazel.py
+export PATH=~/.local/bin:$PATH
+bazel build install-dist-test
+bazel-bin/install/bin/mongod --version
+```
 
-The source for the tools is now available at [mongodb/mongo-tools](https://github.com/mongodb/mongo-tools).
+## Bazel
 
-Python Prerequisites
----------------
+If you only want to build the database server `mongod`:
 
-In order to build MongoDB, Python 2.7.x is required, and several Python modules. To install
-the required Python modules, run:
+    $ bazel build install-mongod
 
-    $ pip2 install -r etc/pip/compile-requirements.txt
+**_Note_**: For C++ compilers that are newer than the supported
+version, the compiler may issue new warnings that cause MongoDB to
+fail to build since the build system treats compiler warnings as
+errors. To ignore the warnings, pass the switch
+`--disable_warnings_as_errors=True` to the bazel command.
 
-Note: If the `pip2` command is not available, `pip` without a suffix may be the pip command
-associated with Python 2.7.x.
+    $ bazel build install-mongod --disable_warnings_as_errors=True
 
-SCons
----------------
+If you want to build absolutely everything (`mongod`, `mongo`, unit
+tests, etc):
 
-For detail information about building, please see [the build manual](https://github.com/mongodb/mongo/wiki/Build-Mongodb-From-Source)
+    $ bazel build --build_tag_filters=mongo_binary //src/mongo/...
 
-If you want to build everything (mongod, mongo, tests, etc):
+## Bazel Targets
 
-    $ python2 buildscripts/scons.py all
+The following targets can be named on the bazel command line to build and
+install a subset of components:
 
-If you only want to build the database:
+- `install-mongod`
+- `install-mongos`
+- `install-core` (includes _only_ `mongod` and `mongos`)
+- `install-dist` (includes all server components)
+- `install-devcore` (includes `mongod`, `mongos`, and `jstestshell` (formerly `mongo` shell))
 
-    $ python2 buildscripts/scons.py mongod
+**_NOTE_**: The `install-core` and `install-dist` targets are _not_
+guaranteed to be identical. The `install-core` target will only ever include a
+minimal set of "core" server components, while `install-dist` is intended
+for a functional end-user installation. If you are testing, you should use the
+`install-devcore` or `install-dist` targets instead.
 
-***Note***: For C++ compilers that are newer than the supported version, the compiler may issue new warnings that cause MongoDB to fail to build since the build system treats compiler warnings as errors. To ignore the warnings, pass the switch --disable-warnings-as-errors to scons.
+## Where to find Binaries
 
-    $ python2 buildscripts/scons.py mongod --disable-warnings-as-errors
+The build system will produce an installation tree into `bazel-bin/install`, as well
+individual install target trees like `bazel-bin/<install-target>`.
 
-To install
-
-    $ python2 buildscripts/scons.py --prefix=/opt/mongo install
-
-Please note that prebuilt binaries are available on [mongodb.org](http://www.mongodb.org/downloads) and may be the easiest way to get started.
-
-SCons Targets
---------------
-
-* mongod
-* mongos
-* mongo
-* core (includes mongod, mongos, mongo)
-* all
-
-Windows
---------------
-
-See [the windows build manual](https://github.com/mongodb/mongo/wiki/Build-Mongodb-From-Source#windows-specific-instructions)
+## Windows
 
 Build requirements:
-* Visual Studio 2015 Update 2 or newer
-* Python 2.7, ActiveState ActivePython 2.7.x Community Edition for Windows is recommended
 
-If using VS 2015 Update 3, two hotfixes are required to build. For details, see:
-* https://support.microsoft.com/en-us/help/3207317/visual-c-optimizer-fixes-for-visual-studio-2015-update-3
-* https://support.microsoft.com/en-za/help/4020481/fix-link-exe-crashes-with-a-fatal-lnk1000-error-when-you-use-wholearch
+- Visual Studio 2022 version 17.0 or newer
+- Python 3.10
 
 Or download a prebuilt binary for Windows at www.mongodb.org.
 
-Debian/Ubuntu
---------------
+## Debian/Ubuntu
 
 To install dependencies on Debian or Ubuntu systems:
 
-    # aptitude install build-essential
-    # aptitude install libboost-filesystem-dev libboost-program-options-dev libboost-system-dev libboost-thread-dev
+    # apt-get install build-essential
 
-To run tests as well, you will need PyMongo:
+## OS X
 
-    # aptitude install python-pymongo
-
-OS X
---------------
-
-Using [Homebrew](http://brew.sh):
-
-    $ brew install mongodb
-
-Using [MacPorts](http://www.macports.org):
-
-    $ sudo port install mongodb
-
-FreeBSD
---------------
-
-Install the following ports:
-
-  * devel/libexecinfo
-  * lang/clang38
-  * lang/python
-
-Optional Components if you want to use system libraries instead of the libraries included with MongoDB
-
-  * archivers/snappy
-  * lang/v8
-  * devel/boost
-  * devel/pcre
-
-Add `CC=clang38 CXX=clang++38` to the `scons` options, when building.
-
-OpenBSD
---------------
-Install the following ports:
-
-  * devel/libexecinfo
-  * lang/gcc
-  * lang/python
-
-Special Build Notes
---------------
-  * [open solaris on ec2](building.opensolaris.ec2.md)
-
+Install Xcode 14.0 or newer.

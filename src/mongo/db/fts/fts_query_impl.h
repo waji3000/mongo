@@ -1,6 +1,3 @@
-// fts_query_impl.h
-
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -32,11 +29,16 @@
 
 #pragma once
 
+#include <cstddef>
+#include <memory>
 #include <set>
 #include <string>
 #include <vector>
 
+#include "mongo/base/status.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/db/fts/fts_query.h"
+#include "mongo/db/fts/fts_util.h"
 
 namespace mongo {
 
@@ -78,6 +80,8 @@ public:
      */
     BSONObj toBSON() const;
 
+    size_t getApproximateSize() const final;
+
 private:
     void _addTerms(FTSTokenizer* tokenizer, const std::string& tokens, bool negated);
 
@@ -87,5 +91,5 @@ private:
     std::vector<std::string> _negatedPhrases;
     std::set<std::string> _termsForBounds;
 };
-}
-}
+}  // namespace fts
+}  // namespace mongo

@@ -7,10 +7,9 @@
  * - in its storage catalog, with the same UUID as the collection has in the sharding catalog
  * - in its catalog cache, with the same UUID as the collection has in the sharding catalog
  *
- * TODO (SERVER-33252): extend the hook to add consistency checks for databases
  * TODO (SERVER-33253): extend the hook to add consistency checks for collection indexes and options
  */
-"use strict";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 ShardingTest.prototype.checkUUIDsConsistentAcrossCluster = function() {
     if (jsTest.options().skipCheckingUUIDsConsistentAcrossCluster) {
@@ -20,7 +19,7 @@ ShardingTest.prototype.checkUUIDsConsistentAcrossCluster = function() {
         //     config primary should skip the checks.
         // 2) The sharding catalog is read from the config server via mongos, so tests that cause
         //    the config primary to be unreachable from mongos should skip the checks.
-        print(
+        jsTest.log.info(
             "Skipping checking consistency of the sharding catalog with shards' storage catalogs and catalog caches");
         return;
     }
@@ -31,10 +30,10 @@ ShardingTest.prototype.checkUUIDsConsistentAcrossCluster = function() {
         // But since sharding catalog changes are not transactional, it's possible the shard's
         // catalog cache will be stale. A test or suite that induces stepdowns or otherwise makes it
         // likely that this "best-effort" will fail should skip checks for only the catalog caches.
-        print(
+        jsTest.log.info(
             "Checking consistency of the sharding catalog with shards' storage catalogs, but not with shards' catalog caches");
     } else {
-        print(
+        jsTest.log.info(
             "Checking consistency of the sharding catalog with shards' storage catalogs and catalog caches");
     }
 
@@ -47,7 +46,8 @@ ShardingTest.prototype.checkUUIDsConsistentAcrossCluster = function() {
                 continue;
             }
             var rs = this._rs[i].test;
-            var keyFile = this._otherParams.keyFile;
+
+            var keyFile = this.keyFile;
             if (keyFile) {
                 authutil.asCluster(rs.nodes, keyFile, function() {
                     rs.awaitLastOpCommitted(timeout);
@@ -71,8 +71,10 @@ ShardingTest.prototype.checkUUIDsConsistentAcrossCluster = function() {
         // Read from config.collections, config.shards, and config.chunks to construct a picture
         // of which shards own data for which collections, and what the UUIDs for those collections
         // are.
+        // Create a new connection in case the router was restarted during the test.
+        let mongos = new Mongo(this.s.host);
         let authoritativeCollMetadataArr =
-            this.s.getDB("config")
+            mongos.getDB("config")
                 .chunks
                 .aggregate([
                     {
@@ -97,8 +99,9 @@ ShardingTest.prototype.checkUUIDsConsistentAcrossCluster = function() {
                 ])
                 .toArray();
 
-        print("Aggregated authoritative metadata on config server for all sharded collections: " +
-              tojson(authoritativeCollMetadataArr));
+        jsTest.log.info(
+            "Aggregated authoritative metadata on config server for all sharded collections",
+            {authoritativeCollMetadataArr});
 
         // The ShardingTest object maintains a connection to each shard in its _connections array,
         // where each connection is tagged with the shard's connection string in a 'host' field.
@@ -116,20 +119,22 @@ ShardingTest.prototype.checkUUIDsConsistentAcrossCluster = function() {
 
         for (let authoritativeCollMetadata of authoritativeCollMetadataArr) {
             const ns = authoritativeCollMetadata._id;
-            const[dbName, collName] = parseNs(ns);
+            const [dbName, collName] = parseNs(ns);
 
             for (let shardConnString of authoritativeCollMetadata.shardConnStrings) {
                 // A connection the shard may not be cached in ShardingTest if the shard was added
                 // manually to the cluster by the test.
                 if (!(shardConnStringToConn.hasOwnProperty(shardConnString))) {
-                    print("Creating connection to manually added shard: " + shardConnString);
+                    jsTest.log.info("Creating connection to manually added shard: " +
+                                    shardConnString);
                     shardConnStringToConn[shardConnString] = new Mongo(shardConnString);
                 }
                 let shardConn = shardConnStringToConn[shardConnString];
 
-                print("Checking that the UUID for " + ns + " returned by listCollections on " +
-                      shardConn +
-                      " is consistent with the UUID in config.collections on the config server");
+                jsTest.log.info(
+                    "Checking that the UUID for " + ns + " returned by listCollections on " +
+                    shardConn +
+                    " is consistent with the UUID in config.collections on the config server");
 
                 const actualCollMetadata =
                     shardConn.getDB(dbName).getCollectionInfos({name: collName})[0];
@@ -141,7 +146,7 @@ ShardingTest.prototype.checkUUIDsConsistentAcrossCluster = function() {
                               tojson(actualCollMetadata));
 
                 if (!jsTest.options().skipCheckingCatalogCacheConsistencyWithShardingCatalog) {
-                    print(
+                    jsTest.log.info(
                         "Checking that the UUID for " + ns + " in config.cache.collections on " +
                         shardConn +
                         " is consistent with the UUID in config.collections on the config server");
@@ -150,10 +155,17 @@ ShardingTest.prototype.checkUUIDsConsistentAcrossCluster = function() {
                     assert.commandWorked(shardConn.adminCommand(
                         {_flushRoutingTableCacheUpdates: ns, syncFromConfig: false}));
 
-                    const actualConfigMetadata =
-                        shardConn.getDB("config").getCollection("cache.collections").find({
-                            "_id": ns
-                        })[0];
+                    let actualConfigMetadata = shardConn.getDB("config")
+                                                   .getCollection("cache.collections")
+                                                   .find({"_id": ns})
+                                                   .toArray();
+                    assert.eq(
+                        actualConfigMetadata.length,
+                        1,
+                        "Incorrect number of entries in 'cache.collections' have been found for collection '" +
+                            ns + "' on node " + shardConn);
+                    actualConfigMetadata = actualConfigMetadata[0];
+
                     assert.eq(authoritativeCollMetadata.collInfo.uuid,
                               actualConfigMetadata.uuid,
                               "authoritative collection info on config server: " +
@@ -164,10 +176,10 @@ ShardingTest.prototype.checkUUIDsConsistentAcrossCluster = function() {
             }
         }
     } catch (e) {
-        if (e.message.indexOf("Unauthorized") < 0) {
+        if (formatErrorMsg(e.message, e.extraAttr).indexOf("Unauthorized") < 0) {
             throw e;
         }
-        print("ignoring exception " + tojson(e) +
-              " while checking UUID consistency across cluster");
+        jsTest.log.info("ignoring exception while checking UUID consistency across cluster",
+                        {error: e});
     }
 };

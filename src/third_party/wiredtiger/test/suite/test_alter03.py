@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Public Domain 2014-2018 MongoDB, Inc.
+# Public Domain 2014-present MongoDB, Inc.
 # Public Domain 2008-2014 WiredTiger, Inc.
 #
 # This is free and unencumbered software released into the public domain.
@@ -27,20 +27,23 @@
 # OTHER DEALINGS IN THE SOFTWARE.
 
 import wiredtiger, wttest
+from helper_tiered import TieredConfigMixin, gen_tiered_storage_sources
 from wtscenario import make_scenarios
 
 # test_alter03.py
 #    Check if app_metadata can be altered.
-class test_alter03(wttest.WiredTigerTestCase):
+class test_alter03(TieredConfigMixin, wttest.WiredTigerTestCase):
     name = "alter03"
 
+    # Build all scenarios
+    tiered_storage_sources = gen_tiered_storage_sources()
+    scenarios = make_scenarios(tiered_storage_sources)
+
     def verify_metadata(self, table_metastr, file_metastr):
-        if table_metastr == '' and file_metastr == '':
-            return
         c = self.session.open_cursor('metadata:', None, None)
 
         if table_metastr != '':
-            # We must find a table type entry for this object and it's value
+            # We must find a table type entry for this object and its value
             # should contain the provided table meta string.
             c.set_key('table:' + self.name)
             self.assertNotEqual(c.search(), wiredtiger.WT_NOTFOUND)
@@ -48,9 +51,13 @@ class test_alter03(wttest.WiredTigerTestCase):
             self.assertTrue(value.find(table_metastr) != -1)
 
         if file_metastr != '':
-            # We must find a file type entry for the object and it's value
+            # We must find a file type entry for the object and its value
             # should contain the provided file meta string.
-            c.set_key('file:' + self.name + '.wt')
+            if self.is_tiered_scenario():
+                c.set_key('file:' + self.name + '-0000000001.wtobj')
+            else:
+                c.set_key('file:' + self.name + '.wt')
+
             self.assertNotEqual(c.search(), wiredtiger.WT_NOTFOUND)
             value = c.get_value()
             self.assertTrue(value.find(file_metastr) != -1)
@@ -112,21 +119,3 @@ class test_alter03(wttest.WiredTigerTestCase):
         # Confirm we retain the app_metadata as expected after reopen
         self.reopen_conn()
         self.verify_metadata('app_metadata="meta_data_5",', 'app_metadata="meta_data_3",')
-
-    # Alter LSM: A non exclusive alter should not be allowed
-    def test_alter03_lsm_app_metadata(self):
-        uri = "lsm:" + self.name
-        create_params = 'key_format=i,value_format=i,'
-        app_meta_orig = 'app_metadata="meta_data_1",'
-
-        self.session.create(uri, create_params + app_meta_orig)
-
-        self.assertRaisesWithMessage(wiredtiger.WiredTigerError,
-            lambda: self.session.alter(uri,
-                'exclusive_refreshed=false,app_metadata="meta_data_2",'),
-                '/is applicable only on simple tables/')
-
-        self.session.alter(uri, 'exclusive_refreshed=true,app_metadata="meta_data_2",')
-
-if __name__ == '__main__':
-    wttest.run()

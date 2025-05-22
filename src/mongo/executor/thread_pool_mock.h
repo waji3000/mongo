@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -31,13 +30,15 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
+#include <mutex>
 #include <vector>
 
 #include "mongo/platform/random.h"
-#include "mongo/stdx/functional.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/util/concurrency/thread_pool_interface.h"
+#include "mongo/util/out_of_line_executor.h"
 
 namespace mongo {
 namespace executor {
@@ -57,8 +58,9 @@ public:
      */
     struct Options {
         // This function is run before the worker thread begins consuming tasks.
-        using OnCreateThreadFn = stdx::function<void()>;
-        OnCreateThreadFn onCreateThread = []() {};
+        using OnCreateThreadFn = std::function<void()>;
+        OnCreateThreadFn onCreateThread = []() {
+        };
     };
 
     /**
@@ -66,15 +68,17 @@ public:
      * generator that is used to determine which schedulable task runs next.
      */
     ThreadPoolMock(NetworkInterfaceMock* net, int32_t prngSeed, Options options);
-    ~ThreadPoolMock();
+    ~ThreadPoolMock() override;
 
     void startup() override;
     void shutdown() override;
     void join() override;
-    Status schedule(Task task) override;
+    void schedule(Task task) override;
 
 private:
-    void consumeTasks(stdx::unique_lock<stdx::mutex>* lk);
+    void _consumeOneTask(stdx::unique_lock<stdx::mutex>& lk);
+    void _shutdown(stdx::unique_lock<stdx::mutex>& lk);
+    void _join(stdx::unique_lock<stdx::mutex>& lk);
 
     // These are the options with which the pool was configured at construction time.
     const Options _options;

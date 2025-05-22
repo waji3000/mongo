@@ -1,6 +1,3 @@
-// debug_util.h
-
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -38,13 +35,10 @@
 namespace mongo {
 
 #if defined(MONGO_CONFIG_DEBUG_BUILD)
-const bool kDebugBuild = true;
+inline constexpr bool kDebugBuild = true;
 #else
-const bool kDebugBuild = false;
+inline constexpr bool kDebugBuild = false;
 #endif
-
-#define MONGO_DEV if (kDebugBuild)
-#define DEV MONGO_DEV
 
 template <unsigned period>
 class SampleEveryNth {
@@ -55,7 +49,7 @@ public:
     }
 
 private:
-    AtomicInt64 _count{0};
+    AtomicWord<long long> _count{0};
 };
 
 struct Occasionally : SampleEveryNth<16> {};

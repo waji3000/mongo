@@ -1,6 +1,3 @@
-// bits_test.cpp
-
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -32,6 +29,7 @@
 
 #include "mongo/platform/bits.h"
 
+#include "mongo/base/string_data.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
@@ -57,4 +55,4 @@ TEST(BitsTest_CountZeros, EachBit) {
         ASSERT_EQUALS(countTrailingZeros64(x), i);
     }
 }
-}
+}  // namespace mongo

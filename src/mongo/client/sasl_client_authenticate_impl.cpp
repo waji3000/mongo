@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -35,46 +34,64 @@
  * The primary entry point at runtime is saslClientAuthenticateImpl().
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
 
-#include "mongo/platform/basic.h"
-
-#include <cstdint>
+#include <boost/smart_ptr.hpp>
+#include <functional>
+#include <memory>
+#include <ostream>
 #include <string>
+#include <utility>
 
-#include "mongo/base/init.h"
+#include <boost/move/utility_core.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/init.h"  // IWYU pragma: keep
+#include "mongo/base/initializer.h"
 #include "mongo/base/status.h"
 #include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
 #include "mongo/bson/util/bson_extract.h"
+#include "mongo/client/authenticate.h"
 #include "mongo/client/sasl_client_authenticate.h"
 #include "mongo/client/sasl_client_session.h"
 #include "mongo/db/auth/sasl_command_constants.h"
+#include "mongo/db/database_name.h"
+#include "mongo/executor/remote_command_request.h"
+#include "mongo/executor/remote_command_response.h"
+#include "mongo/logv2/log.h"
 #include "mongo/rpc/get_status_from_command_result.h"
+#include "mongo/rpc/op_msg.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/base64.h"
-#include "mongo/util/log.h"
+#include "mongo/util/future.h"
+#include "mongo/util/future_impl.h"
 #include "mongo/util/net/hostandport.h"
 #include "mongo/util/password_digest.h"
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
+
+
 namespace mongo {
-
-using std::endl;
-using executor::RemoteCommandRequest;
-using executor::RemoteCommandResponse;
-
 namespace {
 
-// Default log level on the client for SASL log messages.
-const int defaultSaslClientLogLevel = 4;
-
-const char* const saslClientLogFieldName = "clientLogLevel";
+constexpr auto saslClientLogFieldName = "clientLogLevel"_sd;
 
 int getSaslClientLogLevel(const BSONObj& saslParameters) {
-    int saslLogLevel = defaultSaslClientLogLevel;
+    int saslLogLevel = kSaslClientLogLevelDefault;
     BSONElement saslLogElement = saslParameters[saslClientLogFieldName];
-    if (saslLogElement.trueValue())
+
+    if (saslLogElement.trueValue()) {
         saslLogLevel = 1;
-    if (saslLogElement.isNumber())
+    }
+
+    if (saslLogElement.isNumber()) {
         saslLogLevel = saslLogElement.numberInt();
+    }
+
     return saslLogLevel;
 }
 
@@ -110,19 +127,16 @@ Status extractPassword(const BSONObj& saslParameters,
     }
     return Status::OK();
 }
+}  // namespace
 
-/**
- * Configures "session" to perform the client side of a SASL conversation over connection
- * "client".
- *
- * "saslParameters" is a BSON document providing the necessary configuration information.
- *
- * Returns Status::OK() on success.
- */
-Status configureSession(SaslClientSession* session,
-                        const HostAndPort& hostname,
-                        StringData targetDatabase,
-                        const BSONObj& saslParameters) {
+Status saslConfigureSession(SaslClientSession* session,
+                            const HostAndPort& hostname,
+                            StringData targetDatabase,
+                            const BSONObj& saslParameters) {
+    // SERVER-59876 Ensure hostname is never empty. If it is empty, the client-side SCRAM cache will
+    // not be used which creates performance problems.
+    dassert(!hostname.empty());
+
     std::string mechanism;
     Status status =
         bsonExtractStringField(saslParameters, saslCommandMechanismFieldName, &mechanism);
@@ -145,11 +159,15 @@ Status configureSession(SaslClientSession* session,
     session->setParameter(SaslClientSession::parameterServiceHostAndPort, hostname.toString());
 
     status = bsonExtractStringField(saslParameters, saslCommandUserFieldName, &value);
-    if (!status.isOK())
+    if (status.isOK()) {
+        session->setParameter(SaslClientSession::parameterUser, value);
+    } else if ((targetDatabase != DatabaseName::kExternal.db(omitTenant)) ||
+               ((mechanism != auth::kMechanismMongoAWS) &&
+                (mechanism != auth::kMechanismMongoOIDC))) {
         return status;
-    session->setParameter(SaslClientSession::parameterUser, value);
+    }
 
-    const bool digestPasswordDefault = (mechanism == "SCRAM-SHA-1");
+    const bool digestPasswordDefault = (mechanism == auth::kMechanismScramSha1);
     bool digestPassword;
     status = bsonExtractBooleanFieldWithDefault(
         saslParameters, saslCommandDigestPasswordFieldName, digestPasswordDefault, &digestPassword);
@@ -159,9 +177,20 @@ Status configureSession(SaslClientSession* session,
     status = extractPassword(saslParameters, digestPassword, &value);
     if (status.isOK()) {
         session->setParameter(SaslClientSession::parameterPassword, value);
-    } else if (!(status == ErrorCodes::NoSuchKey && targetDatabase == "$external")) {
+    } else if (!(status == ErrorCodes::NoSuchKey &&
+                 targetDatabase == DatabaseName::kExternal.db(omitTenant))) {
         // $external users do not have passwords, hence NoSuchKey is expected
         return status;
+    }
+
+    status = bsonExtractStringField(saslParameters, saslCommandIamSessionToken, &value);
+    if (status.isOK()) {
+        session->setParameter(SaslClientSession::parameterAWSSessionToken, value);
+    }
+
+    status = bsonExtractStringField(saslParameters, saslCommandOIDCAccessToken, &value);
+    if (status.isOK()) {
+        session->setParameter(SaslClientSession::parameterOIDCAccessToken, value);
     }
 
     return session->initialize();
@@ -180,7 +209,7 @@ Future<void> asyncSaslConversation(auth::RunCommandHook runCommand,
     if (!status.isOK())
         return status;
 
-    LOG(saslLogLevel) << "sasl client input: " << base64::encode(payload) << endl;
+    LOGV2_DEBUG(20197, saslLogLevel, "sasl client input", "payload"_attr = base64::encode(payload));
 
     // Create new payload for our response
     std::string responsePayload;
@@ -188,7 +217,16 @@ Future<void> asyncSaslConversation(auth::RunCommandHook runCommand,
     if (!status.isOK())
         return status;
 
-    LOG(saslLogLevel) << "sasl client output: " << base64::encode(responsePayload) << endl;
+    LOGV2_DEBUG(20198,
+                saslLogLevel,
+                "sasl client output",
+                "payload"_attr = base64::encode(responsePayload));
+
+    // Handle a done from the server which comes before the client is complete.
+    const bool serverDone = inputObj[saslCommandDoneFieldName].trueValue();
+    if (serverDone && responsePayload.empty() && session->isSuccess()) {
+        return Status::OK();
+    }
 
     // Build command using our new payload and conversationId
     BSONObjBuilder commandBuilder;
@@ -202,7 +240,13 @@ Future<void> asyncSaslConversation(auth::RunCommandHook runCommand,
         commandBuilder.append(conversationId);
 
     // Asynchronously continue the conversation
-    return runCommand(OpMsgRequest::fromDBAndBody(targetDatabase, commandBuilder.obj()))
+    const auto dbName = DatabaseNameUtil::deserialize(
+        boost::none, targetDatabase, SerializationContext::stateDefault());
+    return runCommand(
+               OpMsgRequestBuilder::create(
+                   auth::ValidatedTenancyScope::kNotRequired /* TODO SERVER-86582 investigate */,
+                   dbName,
+                   commandBuilder.obj()))
         .then([runCommand, session, targetDatabase, saslLogLevel](
                   BSONObj serverResponse) -> Future<void> {
             auto status = getStatusFromCommandResult(serverResponse);
@@ -211,7 +255,7 @@ Future<void> asyncSaslConversation(auth::RunCommandHook runCommand,
             }
 
             // Exit if we have finished
-            if (session->isDone()) {
+            if (session->isSuccess()) {
                 bool isServerDone = serverResponse[saslCommandDoneFieldName].trueValue();
                 if (!isServerDone) {
                     return Status(ErrorCodes::ProtocolError, "Client finished before server.");
@@ -222,13 +266,14 @@ Future<void> asyncSaslConversation(auth::RunCommandHook runCommand,
             static const BSONObj saslFollowupCommandPrefix = BSON(saslContinueCommandName << 1);
             return asyncSaslConversation(runCommand,
                                          session,
-                                         std::move(saslFollowupCommandPrefix),
-                                         std::move(serverResponse),
-                                         std::move(targetDatabase),
+                                         saslFollowupCommandPrefix,
+                                         serverResponse,
+                                         targetDatabase,
                                          saslLogLevel);
         });
 }
 
+namespace {
 /**
  * Driver for the client side of a sasl authentication session, conducted synchronously over
  * "client".
@@ -258,25 +303,22 @@ Future<void> saslClientAuthenticateImpl(auth::RunCommandHook runCommand,
     // Come C++14, we should be able to do this in a nicer way.
     std::shared_ptr<SaslClientSession> session(SaslClientSession::create(mechanism));
 
-    status = configureSession(session.get(), hostname, targetDatabase, saslParameters);
+    status = saslConfigureSession(session.get(), hostname, targetDatabase, saslParameters);
     if (!status.isOK())
         return status;
 
+    auto mechanismName = session->getParameter(SaslClientSession::parameterMechanism);
     BSONObj saslFirstCommandPrefix =
-        BSON(saslStartCommandName << 1 << saslCommandMechanismFieldName
-                                  << session->getParameter(SaslClientSession::parameterMechanism));
+        BSON(saslStartCommandName << 1 << saslCommandMechanismFieldName << mechanismName
+                                  << "options" << BSON(saslCommandOptionSkipEmptyExchange << true));
+
     BSONObj inputObj = BSON(saslCommandPayloadFieldName << "");
-    return asyncSaslConversation(runCommand,
-                                 session,
-                                 std::move(saslFirstCommandPrefix),
-                                 std::move(inputObj),
-                                 targetDatabase,
-                                 saslLogLevel);
+    return asyncSaslConversation(
+        runCommand, session, saslFirstCommandPrefix, inputObj, targetDatabase, saslLogLevel);
 }
 
 MONGO_INITIALIZER(SaslClientAuthenticateFunction)(InitializerContext* context) {
     saslClientAuthenticate = saslClientAuthenticateImpl;
-    return Status::OK();
 }
 
 }  // namespace

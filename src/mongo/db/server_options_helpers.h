@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,9 +29,17 @@
 
 #pragma once
 
+#include <map>
+#include <string>
+#include <vector>
+
 #include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/server_parameter.h"
 #include "mongo/util/options_parser/environment.h"
 #include "mongo/util/options_parser/option_section.h"
+#include "mongo/util/options_parser/value.h"
 
 namespace mongo {
 
@@ -43,26 +50,24 @@ class Environment;
 
 namespace moe = mongo::optionenvironment;
 
-/**
- * Base server options that are available in all applications, standalone and embedded.
- *
- * Included by addGeneralServerOptions, don't call both.
- */
-Status addBaseServerOptions(moe::OptionSection* options);
+namespace server_options_detail {
+StatusWith<BSONObj> applySetParameterOptions(const std::map<std::string, std::string>& toApply,
+                                             ServerParameterSet& parameterSet);
+}  // namespace server_options_detail
 
 /**
-* Handle custom validation of base options that can not currently be done by using
-* Constraints in the Environment.  See the "validate" function in the Environment class for
-* more details.
-*/
+ * Handle custom validation of base options that can not currently be done by using
+ * Constraints in the Environment.  See the "validate" function in the Environment class for
+ * more details.
+ */
 Status validateBaseOptions(const moe::Environment& params);
 
 /**
-* Canonicalize base options for the given environment.
-*
-* For example, the options "objcheck", "noobjcheck", and "net.wireObjectCheck" should all be
-* merged into "net.wireObjectCheck".
-*/
+ * Canonicalize base options for the given environment.
+ *
+ * For example, the options "objcheck", "noobjcheck", and "net.wireObjectCheck" should all be
+ * merged into "net.wireObjectCheck".
+ */
 Status canonicalizeBaseOptions(moe::Environment* params);
 
 /**
@@ -75,11 +80,11 @@ Status canonicalizeBaseOptions(moe::Environment* params);
 Status setupBaseOptions(const std::vector<std::string>& args);
 
 /**
-* Store the given parsed params in global server state.
-*
-* For example, sets the serverGlobalParams.quiet variable based on the systemLog.quiet config
-* parameter.
-*/
+ * Store the given parsed params in global server state.
+ *
+ * For example, sets the serverGlobalParams.quiet variable based on the systemLog.quiet config
+ * parameter.
+ */
 Status storeBaseOptions(const moe::Environment& params);
 
 }  // namespace mongo

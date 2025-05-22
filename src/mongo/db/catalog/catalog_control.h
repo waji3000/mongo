@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,15 +27,24 @@
  *    it in the license file.
  */
 
+#pragma once
+
 #include <map>
 
+#include "mongo/bson/timestamp.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/util/uuid.h"
 
 namespace mongo {
 namespace catalog {
 
 using MinVisibleTimestamp = Timestamp;
 using MinVisibleTimestampMap = std::map<UUID, MinVisibleTimestamp>;
+using RequiresTimestampExtendedRangeSupportMap = std::map<UUID, bool>;
+struct PreviousCatalogState {
+    MinVisibleTimestampMap minValidTimestampMap;
+    RequiresTimestampExtendedRangeSupportMap requiresTimestampExtendedRangeSupportMap;
+};
 
 /**
  * Closes the catalog, destroying all associated in-memory data structures for all databases. After
@@ -44,13 +52,23 @@ using MinVisibleTimestampMap = std::map<UUID, MinVisibleTimestamp>;
  *
  * Must be called with the global lock acquired in exclusive mode.
  */
-MinVisibleTimestampMap closeCatalog(OperationContext* opCtx);
+PreviousCatalogState closeCatalog(OperationContext* opCtx);
 
 /**
- * Restores the catalog and all in-memory state after a call to closeCatalog().
+ * Restores the catalog and all in-memory state after a call to closeCatalog(). Used by replication
+ * after it recovers to the stable timestamp, whereas initial sync goes through a different sequence
+ * that reinitializes storage engine and restores the catalog, and so does not use this function.
+ */
+void openCatalog(OperationContext* opCtx,
+                 const PreviousCatalogState& catalogState,
+                 Timestamp stableTimestamp);
+
+/**
+ * Restores the catalog and all in-memory state after a call to
+ * closeCatalog -> reinitializeStorageEngine -> startupRecovery.
  *
  * Must be called with the global lock acquired in exclusive mode.
  */
-void openCatalog(OperationContext* opCtx, const MinVisibleTimestampMap& catalogState);
+void openCatalogAfterStorageChange(OperationContext* opCtx);
 }  // namespace catalog
 }  // namespace mongo

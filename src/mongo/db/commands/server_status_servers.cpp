@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,92 +27,128 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#include <memory>
 
-#include "mongo/platform/basic.h"
 
-#include "mongo/config.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/config.h"  // IWYU pragma: keep
 #include "mongo/db/commands/server_status.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/stats/counters.h"
+#include "mongo/platform/atomic_word.h"
 #include "mongo/transport/message_compressor_registry.h"
-#include "mongo/transport/service_entry_point.h"
+#include "mongo/transport/service_executor.h"
+#include "mongo/transport/session_manager.h"
+#include "mongo/transport/transport_layer_manager.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/net/hostname_canonicalization.h"
 #include "mongo/util/net/socket_utils.h"
 #include "mongo/util/net/ssl_manager.h"
+#include "mongo/util/net/ssl_types.h"
 
 namespace mongo {
-
-using std::endl;
-using std::map;
-using std::string;
-using std::stringstream;
-
 namespace {
 
 // some universal sections
 
-class Connections : public ServerStatusSection {
-public:
-    Connections() : ServerStatusSection("connections") {}
-    virtual bool includeByDefault() const {
-        return true;
-    }
-
-    BSONObj generateSection(OperationContext* opCtx, const BSONElement& configElement) const {
-        BSONObjBuilder bb;
-
-        auto serviceEntryPoint = opCtx->getServiceContext()->getServiceEntryPoint();
-        invariant(serviceEntryPoint);
-
-        serviceEntryPoint->appendStats(&bb);
-        return bb.obj();
-    }
-
-} connections;
-
 class Network : public ServerStatusSection {
 public:
-    Network() : ServerStatusSection("network") {}
-    virtual bool includeByDefault() const {
+    using ServerStatusSection::ServerStatusSection;
+
+    bool includeByDefault() const override {
         return true;
     }
 
-    BSONObj generateSection(OperationContext* opCtx, const BSONElement& configElement) const {
+    BSONObj generateSection(OperationContext* opCtx,
+                            const BSONElement& configElement) const override {
         BSONObjBuilder b;
         networkCounter.append(b);
         appendMessageCompressionStats(&b);
-        auto executor = opCtx->getServiceContext()->getServiceExecutor();
-        if (executor) {
-            BSONObjBuilder section(b.subobjStart("serviceExecutorTaskStats"));
-            executor->appendStats(&section);
+
+        auto svcCtx = opCtx->getServiceContext();
+
+        {
+            BSONObjBuilder section = b.subobjStart("serviceExecutors");
+            transport::ServiceExecutor::appendAllServerStats(&section, svcCtx);
         }
+
+        if (auto tl = svcCtx->getTransportLayerManager())
+            tl->appendStatsForServerStatus(&b);
 
         return b.obj();
     }
+};
+auto& network = *ServerStatusSectionBuilder<Network>("network");
 
-} network;
-
-#ifdef MONGO_CONFIG_SSL
 class Security : public ServerStatusSection {
 public:
-    Security() : ServerStatusSection("security") {}
-    virtual bool includeByDefault() const {
+    using ServerStatusSection::ServerStatusSection;
+
+    bool includeByDefault() const override {
         return true;
     }
 
-    BSONObj generateSection(OperationContext* opCtx, const BSONElement& configElement) const {
-        BSONObj result;
-        if (getSSLManager()) {
-            result = getSSLManager()->getSSLConfiguration().getServerStatusBSON();
-        }
+    BSONObj generateSection(OperationContext* opCtx,
+                            const BSONElement& configElement) const override {
+        BSONObjBuilder result;
 
-        return result;
+        BSONObjBuilder auth;
+        authCounter.append(&auth);
+        result.append("authentication", auth.obj());
+
+#ifdef MONGO_CONFIG_SSL
+        if (SSLManagerCoordinator::get()) {
+            SSLManagerCoordinator::get()
+                ->getSSLManager()
+                ->getSSLConfiguration()
+                .getServerStatusBSON(&result);
+        }
+#endif
+
+        return result.obj();
     }
-} security;
+};
+auto& security = *ServerStatusSectionBuilder<Security>("security").forShard().forRouter();
+
+#ifdef MONGO_CONFIG_SSL
+/**
+ * Status section of which tls versions connected to MongoDB and completed an SSL handshake.
+ * Note: Clients are only not counted if they try to connect to the server with a unsupported TLS
+ * version. They are still counted if the server rejects them for certificate issues in
+ * parseAndValidatePeerCertificate.
+ */
+class TLSVersionStatus : public ServerStatusSection {
+public:
+    using ServerStatusSection::ServerStatusSection;
+
+    bool includeByDefault() const override {
+        return true;
+    }
+
+    BSONObj generateSection(OperationContext* opCtx,
+                            const BSONElement& configElement) const override {
+        auto& counts = TLSVersionCounts::get(opCtx->getServiceContext());
+
+        BSONObjBuilder builder;
+        builder.append("1.0", counts.tls10.load());
+        builder.append("1.1", counts.tls11.load());
+        builder.append("1.2", counts.tls12.load());
+        builder.append("1.3", counts.tls13.load());
+        builder.append("unknown", counts.tlsUnknown.load());
+        return builder.obj();
+    }
+};
+auto& tlsVersionStatus =
+    *ServerStatusSectionBuilder<TLSVersionStatus>("transportSecurity").forShard().forRouter();
 #endif
 
 class AdvisoryHostFQDNs final : public ServerStatusSection {
 public:
-    AdvisoryHostFQDNs() : ServerStatusSection("advisoryHostFQDNs") {}
+    using ServerStatusSection::ServerStatusSection;
 
     bool includeByDefault() const override {
         return false;
@@ -122,11 +157,16 @@ public:
     void appendSection(OperationContext* opCtx,
                        const BSONElement& configElement,
                        BSONObjBuilder* out) const override {
-        out->append(
-            "advisoryHostFQDNs",
-            getHostFQDNs(getHostNameCached(), HostnameCanonicalizationMode::kForwardAndReverse));
+        auto statusWith =
+            getHostFQDNs(getHostNameCached(), HostnameCanonicalizationMode::kForwardAndReverse);
+        if (statusWith.isOK()) {
+            out->append("advisoryHostFQDNs", statusWith.getValue());
+        }
     }
-} advisoryHostFQDNs;
-}  // namespace
+};
+// Register one instance of the section shared by both roles; the system has one set of FQDNs.
+auto& advisoryHostFQDNs =
+    *ServerStatusSectionBuilder<AdvisoryHostFQDNs>("advisoryHostFQDNs").forShard().forRouter();
 
+}  // namespace
 }  // namespace mongo

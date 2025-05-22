@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,12 +29,16 @@
 
 #pragma once
 
+#include <boost/optional/optional.hpp>
+#include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
 
-#include "mongo/base/disallow_copying.h"
-#include "mongo/db/jsobj.h"
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/db/database_name.h"
 
 namespace boost {
 namespace filesystem {
@@ -86,16 +89,31 @@ public:
     virtual boost::filesystem::path getProtectedPathSuffix();
 
     /**
-     * Transform temp data to non-readable form before writing it to disk.
+     * Transform temporary data that has been spilled to disk into non-readable form. If dbName
+     * is specified, the database key corresponding to dbName will be used to encrypt the data.
+     * This key is persistent across process restarts. Otherwise, an ephemeral key that is only
+     * consistent for the duration of the process will be generated and used for encryption.
      */
-    virtual Status protectTmpData(
-        const uint8_t* in, size_t inLen, uint8_t* out, size_t outLen, size_t* resultLen);
+    virtual Status protectTmpData(const uint8_t* in,
+                                  size_t inLen,
+                                  uint8_t* out,
+                                  size_t outLen,
+                                  size_t* resultLen,
+                                  boost::optional<DatabaseName> dbName);
 
     /**
-     * Tranforms temp data back to readable form, after reading from disk.
+     * Transform temporary data that has been spilled to disk back into readable form. If dbName
+     * is specified, the database key corresponding to dbName will be used to decrypt the data.
+     * This key is persistent across process restarts, so decryption will be successful even if a
+     * restart had occurred after encryption. Otherwise, an ephemeral key that can only decrypt data
+     * encrypted earlier in the current process's lifetime will be used.
      */
-    virtual Status unprotectTmpData(
-        const uint8_t* in, size_t inLen, uint8_t* out, size_t outLen, size_t* resultLen);
+    virtual Status unprotectTmpData(const uint8_t* in,
+                                    size_t inLen,
+                                    uint8_t* out,
+                                    size_t outLen,
+                                    size_t* resultLen,
+                                    boost::optional<DatabaseName> dbName);
 
     /**
      * Inform the encryption storage system to prepare its data such that its files can be copied

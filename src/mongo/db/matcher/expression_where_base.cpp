@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,30 +27,30 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <utility>
 
+#include "mongo/bson/bsontypes_util.h"
+#include "mongo/bson/util/builder.h"
 #include "mongo/db/matcher/expression_where_base.h"
-
-#include "mongo/bson/simple_bsonobj_comparator.h"
 
 namespace mongo {
 
 WhereMatchExpressionBase::WhereMatchExpressionBase(WhereParams params)
-    : MatchExpression(WHERE), _code(std::move(params.code)), _scope(std::move(params.scope)) {}
+    : MatchExpression(WHERE), _code(std::move(params.code)) {}
 
-void WhereMatchExpressionBase::debugString(StringBuilder& debug, int level) const {
-    _debugAddSpace(debug, level);
-    debug << "$where\n";
+void WhereMatchExpressionBase::debugString(StringBuilder& debug, int indentationLevel) const {
+    _debugAddSpace(debug, indentationLevel);
+    debug << "$where";
+    _debugStringAttachTagInfo(&debug);
 
-    _debugAddSpace(debug, level + 1);
+    _debugAddSpace(debug, indentationLevel + 1);
     debug << "code: " << getCode() << "\n";
-
-    _debugAddSpace(debug, level + 1);
-    debug << "scope: " << getScope() << "\n";
 }
 
-void WhereMatchExpressionBase::serialize(BSONObjBuilder* out) const {
-    out->appendCodeWScope("$where", getCode(), getScope());
+void WhereMatchExpressionBase::serialize(BSONObjBuilder* out,
+                                         const SerializationOptions& opts,
+                                         bool includePath) const {
+    opts.appendLiteral(out, "$where", BSONCode(getCode()));
 }
 
 bool WhereMatchExpressionBase::equivalent(const MatchExpression* other) const {
@@ -59,8 +58,7 @@ bool WhereMatchExpressionBase::equivalent(const MatchExpression* other) const {
         return false;
     }
     const WhereMatchExpressionBase* realOther = static_cast<const WhereMatchExpressionBase*>(other);
-    return getCode() == realOther->getCode() &&
-        SimpleBSONObjComparator::kInstance.evaluate(getScope() == realOther->getScope());
+    return getCode() == realOther->getCode();
 }
 
 }  // namespace mongo

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -27,96 +26,96 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
+#include <limits>
+#include <memory>
 
-#include "mongo/platform/basic.h"
+#include <boost/optional/optional.hpp>
 
-#include "mongo/db/commands/kill_op_cmd_base.h"
-
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/util/bson_extract.h"
-#include "mongo/db/audit.h"
+#include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/auth/user_name.h"
 #include "mongo/db/client.h"
-#include "mongo/db/operation_context.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/db/commands/kill_op_cmd_base.h"
+#include "mongo/db/operation_killer.h"
+#include "mongo/logv2/attribute_storage.h"
+#include "mongo/logv2/log.h"
+#include "mongo/rpc/metadata/client_metadata.h"
+#include "mongo/transport/session.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
+
 
 namespace mongo {
 
-Status KillOpCmdBase::checkAuthForCommand(Client* client,
-                                          const std::string& dbname,
-                                          const BSONObj& cmdObj) const {
-    AuthorizationSession* authzSession = AuthorizationSession::get(client);
+void KillOpCmdBase::reportSuccessfulCompletion(OperationContext* opCtx,
+                                               const DatabaseName& dbName,
+                                               const BSONObj& cmdObj) {
 
-    if (authzSession->isAuthorizedForActionsOnResource(ResourcePattern::forClusterResource(),
-                                                       ActionType::killop)) {
-        // If we have administrative permission to run killop, we don't need to traverse the
-        // Client list to figure out if we own the operation which will be terminated.
+    logv2::DynamicAttributes attr;
+
+    auto client = opCtx->getClient();
+    if (client) {
+        if (AuthorizationManager::get(client->getService())->isAuthEnabled()) {
+            if (auto user = AuthorizationSession::get(client)->getAuthenticatedUserName()) {
+                attr.add("user", BSON_ARRAY(user->toBSON()));
+            } else {
+                attr.add("user", BSONArray());
+            }
+        }
+
+        if (client->session()) {
+            attr.add("remote", client->session()->remote());
+        }
+
+        if (auto metadata = ClientMetadata::get(client)) {
+            attr.add("metadata", metadata->getDocument());
+        }
+    }
+
+    attr.add("db", dbName);
+    attr.add("command", cmdObj);
+
+    LOGV2(558700, "Successful killOp", attr);
+}
+
+
+Status KillOpCmdBase::checkAuthForOperation(OperationContext* workerOpCtx,
+                                            const DatabaseName&,
+                                            const BSONObj& cmdObj) const {
+    auto* worker = workerOpCtx->getClient();
+    auto opKiller = OperationKiller(worker);
+
+    if (opKiller.isGenerallyAuthorizedToKill()) {
         return Status::OK();
     }
 
-    if (authzSession->isAuthenticated() && isKillingLocalOp(cmdObj.getField("op"))) {
+    if (isKillingLocalOp(cmdObj.getField("op"))) {
         // Look up the OperationContext and see if we have permission to kill it. This is done once
-        // here and again in the command body. The check here in the checkAuthForCommand() function
+        // here and again in the command body. The check here in the checkAuthForOperation function
         // is necessary because if the check fails, it will be picked up by the auditing system.
         long long opId = parseOpId(cmdObj);
-        auto lkAndOp = KillOpCmdBase::findOpForKilling(client, opId);
-        if (lkAndOp) {
-            // We were able to find the Operation, and we were authorized to interact with it.
+        auto target = worker->getServiceContext()->getLockedClient(opId);
+
+        if (OperationKiller(worker).isAuthorizedToKill(target)) {
+            // We were authorized to interact with the target Client
             return Status::OK();
         }
     }
+
     return Status(ErrorCodes::Unauthorized, "Unauthorized");
 }
 
+void KillOpCmdBase::killLocalOperation(OperationContext* opCtx, OperationId opToKill) {
+    OperationKiller(opCtx->getClient()).killOperation(opToKill);
+}
 
 bool KillOpCmdBase::isKillingLocalOp(const BSONElement& opElem) {
     return opElem.isNumber();
-}
-
-boost::optional<std::tuple<stdx::unique_lock<Client>, OperationContext*>>
-KillOpCmdBase::findOperationContext(ServiceContext* serviceContext, unsigned int opId) {
-    for (ServiceContext::LockedClientsCursor cursor(serviceContext);
-         Client* opClient = cursor.next();) {
-        stdx::unique_lock<Client> lk(*opClient);
-
-        OperationContext* opCtx = opClient->getOperationContext();
-        if (opCtx && opCtx->getOpID() == opId) {
-            return {std::make_tuple(std::move(lk), opCtx)};
-        }
-    }
-
-    return boost::none;
-}
-
-boost::optional<std::tuple<stdx::unique_lock<Client>, OperationContext*>>
-KillOpCmdBase::findOpForKilling(Client* client, unsigned int opId) {
-    AuthorizationSession* authzSession = AuthorizationSession::get(client);
-
-    auto lockAndOpCtx = findOperationContext(client->getServiceContext(), opId);
-    if (lockAndOpCtx) {
-        OperationContext* opToKill = std::get<1>(*lockAndOpCtx);
-        if (authzSession->isAuthorizedForActionsOnResource(ResourcePattern::forClusterResource(),
-                                                           ActionType::killop) ||
-            authzSession->isCoauthorizedWithClient(opToKill->getClient())) {
-            return lockAndOpCtx;
-        }
-    }
-
-    return boost::none;
-}
-
-void KillOpCmdBase::killLocalOperation(OperationContext* opCtx, unsigned int opToKill) {
-    stdx::unique_lock<Client> lk;
-    OperationContext* opCtxToKill;
-    auto lockAndOpCtx = findOpForKilling(opCtx->getClient(), opToKill);
-    if (!lockAndOpCtx) {
-        // killOp always reports success past the auth check.
-        return;
-    }
-
-    std::tie(lk, opCtxToKill) = std::move(*lockAndOpCtx);
-
-    invariant(lk);
-    opCtx->getServiceContext()->killOperation(opCtxToKill);
 }
 
 unsigned int KillOpCmdBase::parseOpId(const BSONObj& cmdObj) {

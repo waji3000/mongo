@@ -1,25 +1,26 @@
 
 // Test replication of collection renaming
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
-baseName = "jstests_replsets_replset6";
+let baseName = "jstests_replsets_replset6";
 
 var rt = new ReplSetTest({name: "replset6tests", nodes: 2});
 var nodes = rt.startSet();
 rt.initiate();
-var m = rt.getPrimary();
+var p = rt.getPrimary();
 rt.awaitSecondaryNodes();
-var slaves = rt._slaves;
-s = slaves[0];
-s.setSlaveOk();
-admin = m.getDB("admin");
+var secondaries = rt.getSecondaries();
+let s = secondaries[0];
+s.setSecondaryOk();
+let admin = p.getDB("admin");
 
-debug = function(foo) {};  // print( foo ); }
+let debug = function(foo) {};  // print( foo ); }
 
 // rename within db
 
-m.getDB(baseName).one.save({a: 1});
+p.getDB(baseName).one.save({a: 1});
 assert.soon(function() {
-    v = s.getDB(baseName).one.findOne();
+    let v = s.getDB(baseName).one.findOne();
     return v && 1 == v.a;
 });
 
@@ -41,10 +42,10 @@ assert.eq(-1, s.getDB(baseName).getCollectionNames().indexOf("one"));
 
 // rename to new db
 
-first = baseName + "_first";
-second = baseName + "_second";
+let first = baseName + "_first";
+let second = baseName + "_second";
 
-m.getDB(first).one.save({a: 1});
+p.getDB(first).one.save({a: 1});
 assert.soon(function() {
     return s.getDB(first).one.findOne() && 1 == s.getDB(first).one.findOne().a;
 });

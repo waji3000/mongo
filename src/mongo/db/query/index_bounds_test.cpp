@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -32,15 +31,15 @@
  * This file contains tests for mongo/db/query/index_bounds.cpp
  */
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/jsobj.h"
-#include "mongo/db/json.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/json.h"
 #include "mongo/db/query/index_bounds.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/mongoutils/str.h"
-#include "mongo/util/text.h"
+#include "mongo/util/str.h"
+#include "mongo/util/text.h"  // IWYU pragma: keep
 
 using namespace mongo;
 
@@ -174,6 +173,14 @@ TEST(IndexBoundsTest, OILReverseClone) {
                              Interval(BSON("" << 20 << "" << 7), false, true)};
     ASSERT(reverseList == listClone);
     ASSERT(listClone.computeDirection() == Interval::Direction::kDirectionDescending);
+
+    OrderedIntervalList descendingPoints("foo");
+    descendingPoints.intervals.push_back(Interval(BSON("" << 7 << "" << 7), true, true));
+    descendingPoints.intervals.push_back(Interval(BSON("" << 5 << "" << 5), true, true));
+    ASSERT(descendingPoints.computeDirection() == Interval::Direction::kDirectionDescending);
+
+    OrderedIntervalList ascendingPoints = descendingPoints.reverseClone();
+    ASSERT(ascendingPoints.computeDirection() == Interval::Direction::kDirectionAscending);
 }
 
 //
@@ -210,6 +217,16 @@ BSONObj allValues() {
     BSONObjBuilder bob;
     bob.appendMinKey("");
     bob.appendMaxKey("");
+    return bob.obj();
+}
+
+/**
+ * Returns an object representing the interval [MaxKey, MinKey].
+ */
+BSONObj allValuesReverse() {
+    BSONObjBuilder bob;
+    bob.appendMaxKey("");
+    bob.appendMinKey("");
     return bob.obj();
 }
 
@@ -614,6 +631,62 @@ TEST(IndexBoundsTest, ForwardizeOnNonSimpleRangeShouldOnlyReverseDescendingRange
     ASSERT(expectedBounds == forwardizedBounds);
 }
 
+TEST(IndexBoundsTest, BoundsDebugStringFormatTest) {
+    // The bounds consist of a string and a non-string interval:
+    // {a: [["string", "string"]], b: [[1,1]]}.
+    OrderedIntervalList stringInterval;
+    stringInterval.name = "a";
+    stringInterval.intervals.push_back(Interval(BSON("" << "string"
+                                                        << ""
+                                                        << "string"),
+                                                true,
+                                                true));
+
+    OrderedIntervalList nonStringInterval;
+    nonStringInterval.name = "b";
+    nonStringInterval.intervals.push_back(Interval(BSON("" << 1 << "" << 1), true, true));
+
+    IndexBounds bounds;
+    bounds.fields.push_back(stringInterval);
+    bounds.fields.push_back(nonStringInterval);
+
+    // First test the debug format pretending there is no non-simple collation preset.
+    bool hasNonSimpleCollation = false;
+    ASSERT_EQ(stringInterval.toString(hasNonSimpleCollation), "['a']: [\"string\", \"string\"]");
+    ASSERT_EQ(nonStringInterval.toString(hasNonSimpleCollation), "['b']: [1, 1]");
+
+    // Now test pretending there is a non-simple collation.
+    hasNonSimpleCollation = true;
+    ASSERT_EQ(stringInterval.toString(true),
+              "['a']: [CollationKey(0x737472696e67), CollationKey(0x737472696e67)]");
+    ASSERT_EQ(nonStringInterval.toString(true), "['b']: [1, 1]");
+}
+
+TEST(IndexBoundsTest, Unbounded) {
+    IndexBounds bounds;
+
+    bounds.fields.push_back([] {
+        OrderedIntervalList oil;
+        oil.intervals.emplace_back(allValues(), true, true);
+        return oil;
+    }());
+    ASSERT_TRUE(bounds.isUnbounded());
+
+    bounds.fields.push_back([] {
+        OrderedIntervalList oil;
+        oil.intervals.emplace_back(allValuesReverse(), true, true);
+        return oil;
+    }());
+    ASSERT_TRUE(bounds.isUnbounded());
+
+    bounds.fields.push_back([] {
+        OrderedIntervalList oil;
+        oil.intervals.emplace_back(minKeyIntObj(1), true, true);
+        return oil;
+    }());
+    ASSERT_FALSE(bounds.isUnbounded());
+}
+
 //
 // Iteration over
 //
@@ -633,10 +706,9 @@ TEST(IndexBoundsCheckerTest, StartKey) {
     IndexSeekPoint seekPoint;
     it.getStartSeekPoint(&seekPoint);
 
-    ASSERT_EQUALS(seekPoint.keySuffix[0]->numberInt(), 7);
-    ASSERT_EQUALS(seekPoint.suffixInclusive[0], true);
-    ASSERT_EQUALS(seekPoint.keySuffix[1]->numberInt(), 0);
-    ASSERT_EQUALS(seekPoint.suffixInclusive[1], false);
+    ASSERT_EQUALS(seekPoint.keySuffix[0].numberInt(), 7);
+    ASSERT_EQUALS(seekPoint.keySuffix[1].numberInt(), 0);
+    ASSERT_EQUALS(seekPoint.firstExclusive, 1);
 }
 
 TEST(IndexBoundsCheckerTest, CheckEnd) {
@@ -664,7 +736,7 @@ TEST(IndexBoundsCheckerTest, CheckEnd) {
     state = it.checkKey(BSON("" << 20 << "" << 5), &seekPoint);
     ASSERT_EQUALS(state, IndexBoundsChecker::MUST_ADVANCE);
     ASSERT_EQUALS(seekPoint.prefixLen, 1);
-    ASSERT(seekPoint.prefixExclusive);
+    ASSERT_EQUALS(seekPoint.firstExclusive, 0);
 
     // The next index key is in the second interval for 'foo' and there is a valid interval for
     // 'bar'.
@@ -677,7 +749,7 @@ TEST(IndexBoundsCheckerTest, CheckEnd) {
     state = it.checkKey(BSON("" << 29.9 << "" << 5), &seekPoint);
     ASSERT_EQUALS(state, IndexBoundsChecker::MUST_ADVANCE);
     ASSERT_EQUALS(seekPoint.prefixLen, 1);
-    ASSERT(seekPoint.prefixExclusive);
+    ASSERT_EQUALS(seekPoint.firstExclusive, 0);
 }
 
 TEST(IndexBoundsCheckerTest, MoveIntervalForwardToNextInterval) {
@@ -705,11 +777,9 @@ TEST(IndexBoundsCheckerTest, MoveIntervalForwardToNextInterval) {
     ASSERT_EQUALS(state, IndexBoundsChecker::MUST_ADVANCE);
     ASSERT_EQUALS(seekPoint.prefixLen, 0);
     // Should be told to move exactly to the next interval's beginning.
-    ASSERT_EQUALS(seekPoint.prefixExclusive, false);
-    ASSERT_EQUALS(seekPoint.keySuffix[0]->numberInt(), 21);
-    ASSERT_EQUALS(seekPoint.suffixInclusive[0], true);
-    ASSERT_EQUALS(seekPoint.keySuffix[1]->numberInt(), 0);
-    ASSERT_EQUALS(seekPoint.suffixInclusive[1], false);
+    ASSERT_EQUALS(seekPoint.keySuffix[0].numberInt(), 21);
+    ASSERT_EQUALS(seekPoint.keySuffix[1].numberInt(), 0);
+    ASSERT_EQUALS(seekPoint.firstExclusive, 1);
 }
 
 TEST(IndexBoundsCheckerTest, MoveIntervalForwardManyIntervals) {
@@ -759,15 +829,14 @@ TEST(IndexBoundsCheckerTest, SimpleCheckKey) {
     state = it.checkKey(BSON("" << 7 << "" << 5.00001), &seekPoint);
     ASSERT_EQUALS(state, IndexBoundsChecker::MUST_ADVANCE);
     ASSERT_EQUALS(seekPoint.prefixLen, 1);
-    ASSERT_EQUALS(seekPoint.prefixExclusive, true);
+    ASSERT_EQUALS(seekPoint.firstExclusive, 0);
 
     // Move a little forward, but note that the rightmost key isn't in the interval yet.
     state = it.checkKey(BSON("" << 7.2 << "" << 0), &seekPoint);
     ASSERT_EQUALS(state, IndexBoundsChecker::MUST_ADVANCE);
     ASSERT_EQUALS(seekPoint.prefixLen, 1);
-    ASSERT_EQUALS(seekPoint.prefixExclusive, false);
-    ASSERT_EQUALS(seekPoint.keySuffix[1]->numberInt(), 0);
-    ASSERT_EQUALS(seekPoint.suffixInclusive[1], false);
+    ASSERT_EQUALS(seekPoint.keySuffix[1].numberInt(), 0);
+    ASSERT_EQUALS(seekPoint.firstExclusive, 1);
 
     // Move to the edge of both intervals, 20,5
     state = it.checkKey(BSON("" << 20 << "" << 5), &seekPoint);
@@ -802,9 +871,8 @@ TEST(IndexBoundsCheckerTest, FirstKeyMovedIsOKSecondKeyMustMove) {
     state = it.checkKey(BSON("" << 10 << "" << -1), &seekPoint);
     ASSERT_EQUALS(state, IndexBoundsChecker::MUST_ADVANCE);
     ASSERT_EQUALS(seekPoint.prefixLen, 1);
-    ASSERT_EQUALS(seekPoint.prefixExclusive, false);
-    ASSERT_EQUALS(seekPoint.keySuffix[1]->numberInt(), 0);
-    ASSERT_EQUALS(seekPoint.suffixInclusive[1], false);
+    ASSERT_EQUALS(seekPoint.keySuffix[1].numberInt(), 0);
+    ASSERT_EQUALS(seekPoint.firstExclusive, 1);
 }
 
 TEST(IndexBoundsCheckerTest, SecondIntervalMustRewind) {
@@ -832,9 +900,8 @@ TEST(IndexBoundsCheckerTest, SecondIntervalMustRewind) {
     state = it.checkKey(BSON("" << 25 << "" << 1), &seekPoint);
     ASSERT_EQUALS(state, IndexBoundsChecker::MUST_ADVANCE);
     ASSERT_EQUALS(seekPoint.prefixLen, 1);
-    ASSERT_EQUALS(seekPoint.prefixExclusive, false);
-    ASSERT_EQUALS(seekPoint.keySuffix[1]->numberInt(), 9);
-    ASSERT_EQUALS(seekPoint.suffixInclusive[1], true);
+    ASSERT_EQUALS(seekPoint.keySuffix[1].numberInt(), 9);
+    ASSERT_EQUALS(seekPoint.firstExclusive, -1);
 
     state = it.checkKey(BSON("" << 25 << "" << 9), &seekPoint);
     ASSERT_EQUALS(state, IndexBoundsChecker::VALID);
@@ -872,15 +939,14 @@ TEST(IndexBoundsCheckerTest, SimpleCheckKeyBackwards) {
     state = it.checkKey(BSON("" << 20 << "" << 0), &seekPoint);
     ASSERT_EQUALS(state, IndexBoundsChecker::MUST_ADVANCE);
     ASSERT_EQUALS(seekPoint.prefixLen, 1);
-    ASSERT_EQUALS(seekPoint.prefixExclusive, true);
+    ASSERT_EQUALS(seekPoint.firstExclusive, 0);
 
     // Move a little forward, but note that the rightmost key isn't in the interval yet.
     state = it.checkKey(BSON("" << 19 << "" << 6), &seekPoint);
     ASSERT_EQUALS(state, IndexBoundsChecker::MUST_ADVANCE);
     ASSERT_EQUALS(seekPoint.prefixLen, 1);
-    ASSERT_EQUALS(seekPoint.prefixExclusive, false);
-    ASSERT_EQUALS(seekPoint.keySuffix[1]->numberInt(), 5);
-    ASSERT_EQUALS(seekPoint.suffixInclusive[1], true);
+    ASSERT_EQUALS(seekPoint.keySuffix[1].numberInt(), 5);
+    ASSERT_EQUALS(seekPoint.firstExclusive, -1);
 
     // Move to the edge of both intervals
     state = it.checkKey(BSON("" << 7 << "" << 0.01), &seekPoint);
@@ -919,7 +985,7 @@ TEST(IndexBoundsCheckerTest, CheckEndBackwards) {
     state = it.checkKey(BSON("" << 30 << "" << 5), &seekPoint);
     ASSERT_EQUALS(state, IndexBoundsChecker::MUST_ADVANCE);
     ASSERT_EQUALS(seekPoint.prefixLen, 1);
-    ASSERT(seekPoint.prefixExclusive);
+    ASSERT_EQUALS(seekPoint.firstExclusive, 0);
 
     // The next index key is in the second interval for 'foo' and there is a valid interval for
     // 'bar'.
@@ -932,7 +998,7 @@ TEST(IndexBoundsCheckerTest, CheckEndBackwards) {
     state = it.checkKey(BSON("" << 7.001 << "" << 5), &seekPoint);
     ASSERT_EQUALS(state, IndexBoundsChecker::MUST_ADVANCE);
     ASSERT_EQUALS(seekPoint.prefixLen, 1);
-    ASSERT(seekPoint.prefixExclusive);
+    ASSERT_EQUALS(seekPoint.firstExclusive, 0);
 }
 
 //
@@ -982,9 +1048,9 @@ void testFindIntervalForField(int key,
     IndexBoundsChecker::Location location =
         IndexBoundsChecker::findIntervalForField(keyElt, oil, expectedDirection, &intervalIndex);
     if (expectedLocation != location) {
-        mongoutils::str::stream ss;
+        str::stream ss;
         ss << "Unexpected location from findIntervalForField: key=" << keyElt
-           << "; intervals=" << oil.toString() << "; direction=" << expectedDirection
+           << "; intervals=" << oil.toString(false) << "; direction=" << expectedDirection
            << ". Expected: " << toString(expectedLocation) << ". Actual: " << toString(location);
         FAIL(ss);
     }
@@ -992,9 +1058,9 @@ void testFindIntervalForField(int key,
     if ((IndexBoundsChecker::BEHIND == expectedLocation ||
          IndexBoundsChecker::WITHIN == expectedLocation) &&
         expectedIntervalIndex != intervalIndex) {
-        mongoutils::str::stream ss;
+        str::stream ss;
         ss << "Unexpected interval index from findIntervalForField: key=" << keyElt
-           << "; intervals=" << oil.toString() << "; direction=" << expectedDirection
+           << "; intervals=" << oil.toString(false) << "; direction=" << expectedDirection
            << "; location= " << toString(location) << ". Expected: " << expectedIntervalIndex
            << ". Actual: " << intervalIndex;
         FAIL(ss);

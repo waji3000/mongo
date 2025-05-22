@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,7 +29,13 @@
 
 #pragma once
 
+#include <memory>
+#include <utility>
+
 #include "mongo/base/error_codes.h"
+#include "mongo/base/error_extra_info.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/namespace_string.h"
 
 namespace mongo {
@@ -51,8 +56,5 @@ public:
 private:
     NamespaceString _nss;
 };
-
-using ImplicitCreateCollectionException =
-    ExceptionFor<ErrorCodes::CannotImplicitlyCreateCollection>;
 
 }  // namespace mongo

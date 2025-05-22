@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,7 +29,8 @@
 
 #pragma once
 
-#include "mongo/base/disallow_copying.h"
+#include <string>
+
 #include "mongo/db/fts/fts_phrase_matcher.h"
 #include "mongo/db/fts/unicode/codepoints.h"
 
@@ -49,7 +49,8 @@ class FTSLanguage;
  * case fold mapping), the phrase matcher will take that into account.
  */
 class UnicodeFTSPhraseMatcher final : public FTSPhraseMatcher {
-    MONGO_DISALLOW_COPYING(UnicodeFTSPhraseMatcher);
+    UnicodeFTSPhraseMatcher(const UnicodeFTSPhraseMatcher&) = delete;
+    UnicodeFTSPhraseMatcher& operator=(const UnicodeFTSPhraseMatcher&) = delete;
 
 public:
     UnicodeFTSPhraseMatcher(const std::string& language);

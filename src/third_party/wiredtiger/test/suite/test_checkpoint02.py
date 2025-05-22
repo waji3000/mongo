@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Public Domain 2014-2018 MongoDB, Inc.
+# Public Domain 2014-present MongoDB, Inc.
 # Public Domain 2008-2014 WiredTiger, Inc.
 #
 # This is free and unencumbered software released into the public domain.
@@ -25,9 +25,13 @@
 # OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
 # ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
 # OTHER DEALINGS IN THE SOFTWARE.
+#
+# [TEST_TAGS]
+# checkpoint
+# [END_TAGS]
+#
 
-import Queue
-import threading, time, wiredtiger, wttest
+import queue, threading, wttest
 from wtthread import checkpoint_thread, op_thread
 from wtscenario import make_scenarios
 
@@ -35,42 +39,63 @@ from wtscenario import make_scenarios
 #   Run background checkpoints repeatedly while doing inserts and other
 #   operations in another thread
 class test_checkpoint02(wttest.WiredTigerTestCase):
-    scenarios = make_scenarios([
-        ('table-100', dict(uri='table:test',fmt='L',dsize=100,nops=50000,nthreads=10)),
-        ('table-10', dict(uri='table:test',fmt='L',dsize=10,nops=50000,nthreads=30))
-    ])
+    format_values = [
+        ('column_fix', dict(key_format='r', value_format='8t')),
+        ('column', dict(key_format='r', value_format='S')),
+        ('u32_row', dict(key_format='L', value_format='S')),
+    ]
+
+    size_values = [
+        ('table-100', dict(uri='table:test',dsize=100,nops=50000,nthreads=10)),
+        ('table-10', dict(uri='table:test',dsize=10,nops=50000,nthreads=30))
+    ]
+
+    scenarios = make_scenarios(format_values, size_values)
 
     def test_checkpoint02(self):
         done = threading.Event()
         self.session.create(self.uri,
-            "key_format=" + self.fmt + ",value_format=S")
+            "key_format={},value_format={}".format(self.key_format, self.value_format))
+
+        if self.value_format == '8t':
+            self.nops *= 2
+            my_data = 97
+        else:
+            my_data = 'a' * self.dsize
+
         ckpt = checkpoint_thread(self.conn, done)
-        ckpt.start()
-
-        uris = list()
-        uris.append(self.uri)
-        queue = Queue.Queue()
-        my_data = 'a' * self.dsize
-        for i in xrange(self.nops):
-            if i % 191 == 0 and i != 0:
-                queue.put_nowait(('b', i, my_data))
-            queue.put_nowait(('i', i, my_data))
-
+        work_queue = queue.Queue()
         opthreads = []
-        for i in xrange(self.nthreads):
-            t = op_thread(self.conn, uris, self.fmt, queue, done)
-            opthreads.append(t)
-            t.start()
+        try:
+            ckpt.start()
 
-        queue.join()
-        done.set()
-        for t in opthreads:
-            t.join()
-        ckpt.join()
+            uris = list()
+            uris.append(self.uri)
+            for i in range(self.nops):
+                if i % 191 == 0 and i != 0:
+                    work_queue.put_nowait(('b', i + 1, my_data))
+                work_queue.put_nowait(('i', i + 1, my_data))
+
+            for i in range(self.nthreads):
+                t = op_thread(self.conn, uris, self.key_format, work_queue, done)
+                opthreads.append(t)
+                t.start()
+        except:
+            # Deplete the work queue if there's an error.
+            while not work_queue.empty():
+                work_queue.get()
+                work_queue.task_done()
+            raise
+        finally:
+            work_queue.join()
+            done.set()
+            for t in opthreads:
+                t.join()
+            ckpt.join()
 
         # Create a cursor - ensure all items have been put.
         cursor = self.session.open_cursor(self.uri, None, None)
-        i = 0
+        i = 1
         while True:
             nextret = cursor.next()
             if nextret != 0:
@@ -81,7 +106,4 @@ class test_checkpoint02(wttest.WiredTigerTestCase):
             self.assertEqual(value, my_data)
             i += 1
 
-        self.assertEqual(i, self.nops)
-
-if __name__ == '__main__':
-    wttest.run()
+        self.assertEqual(i, self.nops + 1)

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,15 +27,28 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <absl/container/node_hash_map.h>
+#include <absl/meta/type_traits.h>
+#include <js/CallArgs.h>
+#include <js/PropertySpec.h>
+#include <js/RootingAPI.h>
+#include <js/TypeDecls.h>
+#include <jsapi.h>
+// IWYU pragma: no_include "cxxabi.h"
+#include <climits>
+#include <cmath>
+#include <cstdint>
+#include <memory>
+#include <mutex>
+#include <utility>
 
+#include "mongo/base/error_codes.h"
 #include "mongo/scripting/mozjs/countdownlatch.h"
-
-#include "mongo/scripting/mozjs/implscope.h"
 #include "mongo/scripting/mozjs/objectwrapper.h"
 #include "mongo/stdx/condition_variable.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/stdx/unordered_map.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 namespace mozjs {
@@ -65,13 +77,13 @@ public:
         stdx::lock_guard<stdx::mutex> lock(_mutex);
 
         int32_t desc = ++_counter;
-        _latches.insert(std::make_pair(desc, std::make_shared<Latch>(count)));
+        _latches.insert(std::make_pair(desc, std::make_shared<CountDownLatch>(count)));
 
         return desc;
     }
 
     void await(int32_t desc) {
-        std::shared_ptr<Latch> latch = get(desc);
+        auto latch = get(desc);
         stdx::unique_lock<stdx::mutex> lock(latch->mutex);
 
         while (latch->count != 0) {
@@ -80,7 +92,7 @@ public:
     }
 
     void countDown(int32_t desc) {
-        std::shared_ptr<Latch> latch = get(desc);
+        auto latch = get(desc);
         stdx::unique_lock<stdx::mutex> lock(latch->mutex);
 
         if (latch->count > 0)
@@ -91,7 +103,7 @@ public:
     }
 
     int32_t getCount(int32_t desc) {
-        std::shared_ptr<Latch> latch = get(desc);
+        auto latch = get(desc);
         stdx::unique_lock<stdx::mutex> lock(latch->mutex);
 
         return latch->count;
@@ -101,15 +113,15 @@ private:
     /**
      * Latches for communication between threads
      */
-    struct Latch {
-        Latch(int32_t count) : count(count) {}
+    struct CountDownLatch {
+        CountDownLatch(int32_t count) : count(count) {}
 
         stdx::mutex mutex;
         stdx::condition_variable cv;
         int32_t count;
     };
 
-    std::shared_ptr<Latch> get(int32_t desc) {
+    std::shared_ptr<CountDownLatch> get(int32_t desc) {
         stdx::lock_guard<stdx::mutex> lock(_mutex);
 
         auto iter = _latches.find(desc);
@@ -120,7 +132,7 @@ private:
         return iter->second;
     }
 
-    using Map = stdx::unordered_map<int32_t, std::shared_ptr<Latch>>;
+    using Map = stdx::unordered_map<int32_t, std::shared_ptr<CountDownLatch>>;
 
     stdx::mutex _mutex;
     Map _latches;
@@ -131,40 +143,52 @@ namespace {
 CountDownLatchHolder globalCountDownLatchHolder;
 }  // namespace
 
-void CountDownLatchInfo::Functions::_new::call(JSContext* cx, JS::CallArgs args) {
+/**
+ * The argument for _new is a count value. We restrict it to be a 32 bit integer.
+ *
+ * The argument for _await/_countDown/_getCount is an id for CountDownLatch instance returned from
+ * _new call. It must be a 32 bit integer.
+ */
+auto uassertGet(JS::CallArgs args, unsigned int i) {
     uassert(ErrorCodes::JSInterpreterFailure, "need exactly one argument", args.length() == 1);
-    uassert(
-        ErrorCodes::JSInterpreterFailure, "argument must be an integer", args.get(0).isNumber());
 
-    args.rval().setInt32(globalCountDownLatchHolder.make(args.get(0).toNumber()));
+    auto int32Arg = args.get(i);
+    if (int32Arg.isDouble()) {
+        uassert(ErrorCodes::JSInterpreterFailure,
+                "argument must not be an NaN",
+                !int32Arg.isDouble() || !std::isnan(int32Arg.toDouble()));
+        auto val = int32Arg.toDouble();
+        uassert(ErrorCodes::JSInterpreterFailure,
+                "argument must be a 32 bit integer",
+                INT_MIN <= val && val <= INT_MAX);
+
+        return static_cast<int32_t>(val);
+    }
+
+    uassert(
+        ErrorCodes::JSInterpreterFailure, "argument must be a 32 bit integer", int32Arg.isInt32());
+
+    return int32Arg.toInt32();
+}
+
+void CountDownLatchInfo::Functions::_new::call(JSContext* cx, JS::CallArgs args) {
+    args.rval().setInt32(globalCountDownLatchHolder.make(uassertGet(args, 0)));
 }
 
 void CountDownLatchInfo::Functions::_await::call(JSContext* cx, JS::CallArgs args) {
-    uassert(ErrorCodes::JSInterpreterFailure, "need exactly one argument", args.length() == 1);
-    uassert(
-        ErrorCodes::JSInterpreterFailure, "argument must be an integer", args.get(0).isNumber());
-
-    globalCountDownLatchHolder.await(args.get(0).toNumber());
+    globalCountDownLatchHolder.await(uassertGet(args, 0));
 
     args.rval().setUndefined();
 }
 
 void CountDownLatchInfo::Functions::_countDown::call(JSContext* cx, JS::CallArgs args) {
-    uassert(ErrorCodes::JSInterpreterFailure, "need exactly one argument", args.length() == 1);
-    uassert(
-        ErrorCodes::JSInterpreterFailure, "argument must be an integer", args.get(0).isNumber());
-
-    globalCountDownLatchHolder.countDown(args.get(0).toNumber());
+    globalCountDownLatchHolder.countDown(uassertGet(args, 0));
 
     args.rval().setUndefined();
 }
 
 void CountDownLatchInfo::Functions::_getCount::call(JSContext* cx, JS::CallArgs args) {
-    uassert(ErrorCodes::JSInterpreterFailure, "need exactly one argument", args.length() == 1);
-    uassert(
-        ErrorCodes::JSInterpreterFailure, "argument must be an integer", args.get(0).isNumber());
-
-    args.rval().setInt32(globalCountDownLatchHolder.getCount(args.get(0).toNumber()));
+    args.rval().setInt32(globalCountDownLatchHolder.getCount(uassertGet(args, 0)));
 }
 
 /**
@@ -187,12 +211,14 @@ void CountDownLatchInfo::postInstall(JSContext* cx,
 
     JS::RootedValue val(cx);
     for (auto iter = methods; iter->name; ++iter) {
-        protoWrapper.getValue(iter->name, &val);
-        objWrapper.setValue(iter->name, val);
+        invariant(!iter->name.isSymbol());
+        ObjectWrapper::Key key(iter->name.string());
+        protoWrapper.getValue(key, &val);
+        objWrapper.setValue(key, val);
     }
 
     val.setObjectOrNull(obj);
-    ObjectWrapper(cx, global).setValue("CountDownLatch", val);
+    ObjectWrapper(cx, global).setValue(CountDownLatchInfo::className, val);
 }
 
 }  // namespace mozjs

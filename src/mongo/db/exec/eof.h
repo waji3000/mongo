@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,8 +29,14 @@
 
 #pragma once
 
+#include <memory>
+
 #include "mongo/db/exec/plan_stage.h"
-#include "mongo/db/record_id.h"
+#include "mongo/db/exec/plan_stats.h"
+#include "mongo/db/exec/working_set.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/query/eof_node_type.h"
+#include "mongo/db/query/stage_types.h"
 
 namespace mongo {
 
@@ -40,11 +45,11 @@ namespace mongo {
  */
 class EOFStage final : public PlanStage {
 public:
-    EOFStage(OperationContext* opCtx);
+    EOFStage(ExpressionContext* expCtx, eof_node::EOFType type);
 
-    ~EOFStage();
+    ~EOFStage() override;
 
-    bool isEOF() final;
+    bool isEOF() const final;
     StageState doWork(WorkingSetID* out) final;
 
 
@@ -52,11 +57,14 @@ public:
         return STAGE_EOF;
     }
 
-    std::unique_ptr<PlanStageStats> getStats();
+    std::unique_ptr<PlanStageStats> getStats() override;
 
     const SpecificStats* getSpecificStats() const final;
 
     static const char* kStageType;
+
+private:
+    EofStats _specificStats;
 };
 
 }  // namespace mongo

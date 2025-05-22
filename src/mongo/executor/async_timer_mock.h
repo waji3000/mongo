@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,11 +29,16 @@
 
 #pragma once
 
+#include <memory>
+#include <mutex>
+#include <system_error>
 #include <vector>
 
 #include "mongo/executor/async_timer_interface.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/stdx/unordered_set.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo {
 namespace executor {

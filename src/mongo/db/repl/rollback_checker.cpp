@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,14 +27,18 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
 
-#include "mongo/platform/basic.h"
+#include <memory>
+#include <mutex>
 
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsonmisc.h"
 #include "mongo/db/repl/rollback_checker.h"
+#include "mongo/executor/remote_command_request.h"
+#include "mongo/util/assert_util.h"
 
-#include "mongo/stdx/mutex.h"
-#include "mongo/util/log.h"
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
+
 
 namespace mongo {
 namespace repl {
@@ -61,7 +64,7 @@ StatusWith<RollbackChecker::CallbackHandle> RollbackChecker::checkForRollback(
             int remoteRBID = rbidElement.numberInt();
 
             UniqueLock lk(_mutex);
-            bool hadRollback = _checkForRollback_inlock(remoteRBID);
+            bool hadRollback = _checkForRollback(lk, remoteRBID);
             lk.unlock();
             nextAction(hadRollback);
         } else {
@@ -94,7 +97,7 @@ StatusWith<RollbackChecker::CallbackHandle> RollbackChecker::reset(const Callbac
             int newRBID = rbidElement.numberInt();
 
             UniqueLock lk(_mutex);
-            _setRBID_inlock(newRBID);
+            _setRBID(lk, newRBID);
             lk.unlock();
 
             // Actual bool value does not matter because reset_sync()
@@ -114,7 +117,7 @@ Status RollbackChecker::reset_sync() {
 
     if (!cbh.isOK()) {
         return Status(ErrorCodes::CallbackCanceled,
-                      "RollbackChecker reset failed due to callback cancelation");
+                      "RollbackChecker reset failed due to callback cancellation");
     }
 
     _executor->wait(cbh.getValue());
@@ -131,7 +134,7 @@ int RollbackChecker::getLastRBID_forTest() {
     return _lastRBID;
 }
 
-bool RollbackChecker::_checkForRollback_inlock(int remoteRBID) {
+bool RollbackChecker::_checkForRollback(WithLock lk, int remoteRBID) {
     _lastRBID = remoteRBID;
     return remoteRBID != _baseRBID;
 }
@@ -139,11 +142,11 @@ bool RollbackChecker::_checkForRollback_inlock(int remoteRBID) {
 StatusWith<RollbackChecker::CallbackHandle> RollbackChecker::_scheduleGetRollbackId(
     const RemoteCommandCallbackFn& nextAction) {
     executor::RemoteCommandRequest getRollbackIDReq(
-        _syncSource, "admin", BSON("replSetGetRBID" << 1), nullptr);
+        _syncSource, DatabaseName::kAdmin, BSON("replSetGetRBID" << 1), nullptr);
     return _executor->scheduleRemoteCommand(getRollbackIDReq, nextAction);
 }
 
-void RollbackChecker::_setRBID_inlock(int rbid) {
+void RollbackChecker::_setRBID(WithLock lk, int rbid) {
     _baseRBID = rbid;
     _lastRBID = rbid;
 }

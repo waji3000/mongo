@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,19 +27,41 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <initializer_list>
+#include <limits>
+#include <list>
+#include <ostream>
+#include <set>
+#include <string>
+#include <type_traits>
+#include <utility>
+#include <vector>
 
-#include "mongo/db/jsobj.h"
-#include "mongo/db/json.h"
+#include <boost/container/small_vector.hpp>
+#include <boost/container/vector.hpp>
+// IWYU pragma: no_include "boost/intrusive/detail/iterator.hpp"
+#include <boost/move/utility_core.hpp>
+
+#include "mongo/base/data_range.h"
+#include "mongo/base/data_type_endian.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/base/static_assert.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/bson/util/builder.h"
 #include "mongo/unittest/unittest.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/shared_buffer.h"
 
 namespace mongo {
 namespace {
 
 using std::string;
-
-const long long maxEncodableInt = (1 << 30) - 1;
-const long long minEncodableInt = -maxEncodableInt;
 
 const long long maxInt = (std::numeric_limits<int>::max)();
 const long long minInt = (std::numeric_limits<int>::min)();
@@ -74,122 +95,27 @@ TEST(BSONObjBuilderTest, AppendInt64T) {
     ASSERT_EQ(obj["b"].Long(), 1ll << 40);
 }
 
-/**
- * current conversion ranges in append(unsigned n)
- * dbl/int max/min in comments refer to max/min encodable constants
- *                  0 <= n <= uint_max          -----> int
- */
+template <typename T, typename = void>
+struct isUnsignedAppendable : std::false_type {};
 
-TEST(BSONObjBuilderTest, AppendUnsignedInt) {
-    struct {
-        unsigned int v;
-        BSONType t;
-    } data[] = {{0, mongo::NumberInt},
-                {100, mongo::NumberInt},
-                {maxEncodableInt, mongo::NumberInt},
-                {maxEncodableInt + 1, mongo::NumberInt},
-                {static_cast<unsigned int>(maxInt), mongo::NumberInt},
-                {static_cast<unsigned int>(maxInt) + 1U, mongo::NumberInt},
-                {(std::numeric_limits<unsigned int>::max)(), mongo::NumberInt},
-                {0, mongo::Undefined}};
-    for (int i = 0; data[i].t != mongo::Undefined; i++) {
-        unsigned int v = data[i].v;
-        BSONObjBuilder b;
-        b.append("a", v);
-        BSONObj o = b.obj();
-        ASSERT_EQUALS(o.nFields(), 1);
-        BSONElement e = o.getField("a");
-        unsigned int n = e.numberLong();
-        ASSERT_EQUALS(n, v);
-        assertBSONTypeEquals(e.type(), data[i].t, v, i);
-    }
-}
+template <typename T>
+struct isUnsignedAppendable<T, std::void_t<decltype(BSONObjAppendFormat<T>::value)>>
+    : std::true_type {};
 
-/**
- * current conversion ranges in appendIntOrLL(long long n)
- * dbl/int max/min in comments refer to max/min encodable constants
- *                       n <  dbl_min            -----> long long
- *            dbl_min <= n <  int_min            -----> double
- *            int_min <= n <= int_max            -----> int
- *            int_max <  n <= dbl_max            -----> double
- *            dbl_max <  n                       -----> long long
- */
-
-TEST(BSONObjBuilderTest, AppendIntOrLL) {
-    struct {
-        long long v;
-        BSONType t;
-    } data[] = {{0, mongo::NumberInt},
-                {-100, mongo::NumberInt},
-                {100, mongo::NumberInt},
-                {-(maxInt / 2 - 1), mongo::NumberInt},
-                {maxInt / 2 - 1, mongo::NumberInt},
-                {-(maxInt / 2), mongo::NumberLong},
-                {maxInt / 2, mongo::NumberLong},
-                {minEncodableInt, mongo::NumberLong},
-                {maxEncodableInt, mongo::NumberLong},
-                {minEncodableInt - 1, mongo::NumberLong},
-                {maxEncodableInt + 1, mongo::NumberLong},
-                {minInt, mongo::NumberLong},
-                {maxInt, mongo::NumberLong},
-                {minInt - 1, mongo::NumberLong},
-                {maxInt + 1, mongo::NumberLong},
-                {minLongLong, mongo::NumberLong},
-                {maxLongLong, mongo::NumberLong},
-                {0, mongo::Undefined}};
-    for (int i = 0; data[i].t != mongo::Undefined; i++) {
-        long long v = data[i].v;
-        BSONObjBuilder b;
-        b.appendIntOrLL("a", v);
-        BSONObj o = b.obj();
-        ASSERT_EQUALS(o.nFields(), 1);
-        BSONElement e = o.getField("a");
-        long long n = e.numberLong();
-        ASSERT_EQUALS(n, v);
-        assertBSONTypeEquals(e.type(), data[i].t, v, i);
-    }
-}
-
-/**
- * current conversion ranges in appendNumber(size_t n)
- * dbl/int max/min in comments refer to max/min encodable constants
- *                  0 <= n <= int_max            -----> int
- *            int_max <  n                       -----> long long
- */
-
-TEST(BSONObjBuilderTest, AppendNumberSizeT) {
-    struct {
-        size_t v;
-        BSONType t;
-    } data[] = {{0, mongo::NumberInt},
-                {100, mongo::NumberInt},
-                {maxEncodableInt, mongo::NumberInt},
-                {maxEncodableInt + 1, mongo::NumberLong},
-                {size_t(maxInt), mongo::NumberLong},
-                {size_t(maxInt) + 1U, mongo::NumberLong},
-                {(std::numeric_limits<size_t>::max)(), mongo::NumberLong},
-                {0, mongo::Undefined}};
-    for (int i = 0; data[i].t != mongo::Undefined; i++) {
-        size_t v = data[i].v;
-        BSONObjBuilder b;
-        b.appendNumber("a", v);
-        BSONObj o = b.obj();
-        ASSERT_EQUALS(o.nFields(), 1);
-        BSONElement e = o.getField("a");
-        size_t n = e.numberLong();
-        ASSERT_EQUALS(n, v);
-        assertBSONTypeEquals(e.type(), data[i].t, v, i);
-    }
+TEST(BSONObjBuilderTest, AppendUnsignedIsForbidden) {
+    MONGO_STATIC_ASSERT(!isUnsignedAppendable<unsigned>::value);
+    MONGO_STATIC_ASSERT(!isUnsignedAppendable<unsigned long>::value);
+    MONGO_STATIC_ASSERT(!isUnsignedAppendable<unsigned long long>::value);
+    MONGO_STATIC_ASSERT(!isUnsignedAppendable<uint64_t>::value);
+    MONGO_STATIC_ASSERT(!isUnsignedAppendable<size_t>::value);
 }
 
 /**
  * current conversion ranges in appendNumber(long long n)
- * dbl/int max/min in comments refer to max/min encodable constants
- *                       n <  dbl_min            -----> long long
- *            dbl_min <= n <  int_min            -----> double
+ * int max/min in comments refer to max/min encodable constants
+ *                       n <  int_min            -----> long long
  *            int_min <= n <= int_max            -----> int
- *            int_max <  n <= dbl_max            -----> double
- *            dbl_max <  n                       -----> long long
+ *            int_max <  n                       -----> long long
  */
 
 TEST(BSONObjBuilderTest, AppendNumberLongLong) {
@@ -199,16 +125,12 @@ TEST(BSONObjBuilderTest, AppendNumberLongLong) {
     } data[] = {{0, mongo::NumberInt},
                 {-100, mongo::NumberInt},
                 {100, mongo::NumberInt},
-                {minEncodableInt, mongo::NumberInt},
-                {maxEncodableInt, mongo::NumberInt},
-                {minEncodableInt - 1, mongo::NumberDouble},
-                {maxEncodableInt + 1, mongo::NumberDouble},
-                {minInt, mongo::NumberDouble},
-                {maxInt, mongo::NumberDouble},
-                {minInt - 1, mongo::NumberDouble},
-                {maxInt + 1, mongo::NumberDouble},
-                {minEncodableDouble, mongo::NumberDouble},
-                {maxEncodableDouble, mongo::NumberDouble},
+                {minInt, mongo::NumberInt},
+                {maxInt, mongo::NumberInt},
+                {minInt - 1, mongo::NumberLong},
+                {maxInt + 1, mongo::NumberLong},
+                {minEncodableDouble, mongo::NumberLong},
+                {maxEncodableDouble, mongo::NumberLong},
                 {minEncodableDouble - 1, mongo::NumberLong},
                 {maxEncodableDouble + 1, mongo::NumberLong},
                 {minDouble, mongo::NumberLong},
@@ -278,10 +200,9 @@ TEST(BSONObjBuilderTest, ResumeBuilding) {
     }
     auto obj = BSONObj(b.buf());
     ASSERT_BSONOBJ_EQ(obj,
-                      BSON("a"
-                           << "b"
-                           << "c"
-                           << "d"));
+                      BSON("a" << "b"
+                               << "c"
+                               << "d"));
 }
 
 TEST(BSONObjBuilderTest, ResumeBuildingWithNesting) {
@@ -289,9 +210,7 @@ TEST(BSONObjBuilderTest, ResumeBuildingWithNesting) {
     // build a trivial object.
     {
         BSONObjBuilder firstBuilder(b);
-        firstBuilder.append("ll",
-                            BSON("f" << BSON("cc"
-                                             << "dd")));
+        firstBuilder.append("ll", BSON("f" << BSON("cc" << "dd")));
     }
     // add a complex field
     {
@@ -299,11 +218,7 @@ TEST(BSONObjBuilderTest, ResumeBuildingWithNesting) {
         secondBuilder.append("a", BSON("c" << 3));
     }
     auto obj = BSONObj(b.buf());
-    ASSERT_BSONOBJ_EQ(obj,
-                      BSON("ll" << BSON("f" << BSON("cc"
-                                                    << "dd"))
-                                << "a"
-                                << BSON("c" << 3)));
+    ASSERT_BSONOBJ_EQ(obj, BSON("ll" << BSON("f" << BSON("cc" << "dd")) << "a" << BSON("c" << 3)));
 }
 
 TEST(BSONObjBuilderTest, ResetToEmptyResultsInEmptyObj) {
@@ -332,6 +247,56 @@ TEST(BSONObjBuilderTest, MovingAnOwningBSONObjBuilderWorks) {
     bob.append("b", 2);
     bob << "c" << 3;
     ASSERT_BSONOBJ_EQ(bob.obj(), BSON("a" << 1 << "b" << 2 << "c" << 3));
+}
+
+TEST(BSONObjBuilderTest, BSONObjBuilderAppendSet) {
+    BSONObjBuilder initial;
+    std::set<int> testSet = {10, 20, 30};
+
+    initial.append("a", testSet);
+    ASSERT_BSONOBJ_EQ(initial.obj(), BSON("a" << BSON_ARRAY(10 << 20 << 30)));
+}
+
+TEST(BSONObjBuilderTest, BSONObjBuilderAppendList) {
+    BSONObjBuilder initial;
+    std::list<int> testList = {10, 20, 30};
+
+    initial.append("a", testList);
+    ASSERT_BSONOBJ_EQ(initial.obj(), BSON("a" << BSON_ARRAY(10 << 20 << 30)));
+}
+
+TEST(BSONObjBuilderTest, BSONObjBuilderAppendVector) {
+    BSONObjBuilder initial;
+    std::vector<int> vect = {10, 20, 30};
+
+    initial.append("a", vect);
+    ASSERT_BSONOBJ_EQ(initial.obj(), BSON("a" << BSON_ARRAY(10 << 20 << 30)));
+}
+
+TEST(BSONObjBuilderTest, BSONObjBuilderAppendVectorIterator) {
+    BSONObjBuilder initial;
+    std::vector<int> vect = {10, 20, 30};
+
+    initial.append("a", vect.begin(), vect.end());
+    ASSERT_BSONOBJ_EQ(initial.obj(), BSON("a" << BSON_ARRAY(10 << 20 << 30)));
+}
+
+TEST(BSONObjBuilderTest, BSONObjBuilderAppendSetIterator) {
+    BSONObjBuilder initial;
+
+    std::set<int> testSet = {30, 20, 10};
+
+    initial.append("a", testSet.begin(), testSet.end());
+    ASSERT_BSONOBJ_EQ(initial.obj(), BSON("a" << BSON_ARRAY(10 << 20 << 30)));
+}
+
+TEST(BSONObjBuilderTest, BSONObjBuilderAppendBoostVectorIterator) {
+    BSONObjBuilder initial;
+
+    auto vect = boost::container::small_vector<int, 3>{10, 20, 30};
+
+    initial.append("a", vect.begin(), vect.end());
+    ASSERT_BSONOBJ_EQ(initial.obj(), BSON("a" << BSON_ARRAY(10 << 20 << 30)));
 }
 
 TEST(BSONObjBuilderTest, MovingANonOwningBSONObjBuilderWorks) {
@@ -368,6 +333,66 @@ TEST(BSONArrayBuilderTest, MovingABSONArrayBuilderWorks) {
     ASSERT_BSONOBJ_EQ(bob.obj(), BSON("a" << 1 << "array" << BSON_ARRAY(1 << "2" << 3 << "4")));
 }
 
+TEST(BSONArrayBuilderTest, BSONArrayBuilderAppendSet) {
+    BSONObjBuilder initial;
+
+    {
+        BSONArrayBuilder arr(initial.subarrayStart("a"));
+        std::set<int> testSet = {10, 20, 30};
+        arr.append(testSet);
+    }
+
+    ASSERT_BSONOBJ_EQ(initial.obj(), BSON("a" << BSON_ARRAY(10 << 20 << 30)));
+}
+
+TEST(BSONArrayBuilderTest, BSONArrayBuilderAppendList) {
+    BSONObjBuilder initial;
+
+    {
+        BSONArrayBuilder arr(initial.subarrayStart("a"));
+        std::list<int> testList = {10, 20, 30};
+        arr.append(testList);
+    }
+
+    ASSERT_BSONOBJ_EQ(initial.obj(), BSON("a" << BSON_ARRAY(10 << 20 << 30)));
+}
+
+TEST(BSONArrayBuilderTest, BSONArrayBuilderAppendVectorIterator) {
+    BSONObjBuilder initial;
+
+    {
+        BSONArrayBuilder arr(initial.subarrayStart("a"));
+        std::vector<int> vect = {10, 20, 30};
+        arr.append(vect.begin(), vect.end());
+    }
+
+    ASSERT_BSONOBJ_EQ(initial.obj(), BSON("a" << BSON_ARRAY(10 << 20 << 30)));
+}
+
+TEST(BSONArrayBuilderTest, BSONArrayBuilderAppendSetIterator) {
+    BSONObjBuilder initial;
+
+    {
+        BSONArrayBuilder arr(initial.subarrayStart("a"));
+        std::set<int> testSet = {10, 20, 30};
+        arr.append(testSet.begin(), testSet.end());
+    }
+
+    ASSERT_BSONOBJ_EQ(initial.obj(), BSON("a" << BSON_ARRAY(10 << 20 << 30)));
+}
+
+TEST(BSONObjBuilderTest, BSONArrayBuilderAppendBoostVectorIterator) {
+    BSONObjBuilder initial;
+
+    {
+        BSONArrayBuilder arr(initial.subarrayStart("a"));
+        auto vect = boost::container::small_vector<int, 3>{10, 20, 30};
+        arr.append(vect.begin(), vect.end());
+    }
+
+    ASSERT_BSONOBJ_EQ(initial.obj(), BSON("a" << BSON_ARRAY(10 << 20 << 30)));
+}
+
 TEST(BSONObjBuilderTest, SeedingBSONObjBuilderWithRootedUnsharedOwnedBsonWorks) {
     auto origObj = BSON("a" << 1);
     auto origObjPtr = origObj.objdata();
@@ -375,7 +400,7 @@ TEST(BSONObjBuilderTest, SeedingBSONObjBuilderWithRootedUnsharedOwnedBsonWorks) 
     BSONObjBuilder bob(std::move(origObj));  // moving.
     bob.append("b", 1);
     const auto obj = bob.obj();
-    ASSERT_BSONOBJ_EQ(origObj, BSONObj());
+    ASSERT_BSONOBJ_EQ(origObj, BSONObj());  // NOLINT(bugprone-use-after-move)
     ASSERT_BSONOBJ_EQ(obj, BSON("a" << 1 << "b" << 1));
     ASSERT_EQ(static_cast<const void*>(obj.objdata()), static_cast<const void*>(origObjPtr));
 }
@@ -415,7 +440,7 @@ TEST(BSONObjBuilderTest, SeedingBSONObjBuilderWithNonrootedUnsharedOwnedBsonWork
     BSONObjBuilder bob(std::move(origObj));  // moving.
     bob.append("b", 1);
     const auto obj = bob.obj();
-    ASSERT_BSONOBJ_EQ(origObj, BSONObj());
+    ASSERT_BSONOBJ_EQ(origObj, BSONObj());  // NOLINT(bugprone-use-after-move)
     ASSERT_BSONOBJ_EQ(obj, BSON("a" << 1 << "b" << 1));
     ASSERT_EQ(static_cast<const void*>(obj.objdata()), static_cast<const void*>(origObjPtr));
 }
@@ -452,7 +477,7 @@ TEST(BSONObjBuilderTest, SizeChecks) {
     auto generateBuffer = [](std::int32_t size) {
         std::vector<char> buffer(size);
         DataRange bufferRange(&buffer.front(), &buffer.back());
-        ASSERT_OK(bufferRange.write(LittleEndian<int32_t>(size)));
+        ASSERT_OK(bufferRange.writeNoThrow(LittleEndian<int32_t>(size)));
 
         return buffer;
     };
@@ -494,22 +519,107 @@ TEST(BSONObjBuilderTest, SizeChecks) {
 
     // But a size is in fact being enforced.
     {
-        auto largeBuffer = generateBuffer(40 * 1024 * 1024);
+        auto largeBuffer = generateBuffer(50 * 1024 * 1024);
         BSONObj obj(largeBuffer.data(), BSONObj::LargeSizeTrait{});
         BSONObjBuilder builder;
         ASSERT_THROWS(
             [&]() {
-
                 for (StringData character : {"a", "b", "c"}) {
                     builder.append(character, obj);
                 }
                 BSONObj finalObj = builder.obj<BSONObj::LargeSizeTrait>();
-
             }(),
             DBException);
     }
 }
 
+TEST(BSONObjBuilderTest, UniqueBuilderNoop) {
+    UniqueBSONObjBuilder bob;
 
+    // No invariants should trip in destroying a default constructed UniqueBSONObjBuilder.
+}
+
+TEST(BSONObjBuilderTest, UniqueBuilderFromPrefix) {
+    UniqueBSONObjBuilder bob(BSON("a" << 1 << "b" << 2));
+
+    bob.append("c", 3);
+    ASSERT_BSONOBJ_EQ(bob.obj(), BSON("a" << 1 << "b" << 2 << "c" << 3));
+}
+
+TEST(BSONObjBuilderTest, UniqueBuilderReleaseToObj) {
+    UniqueBSONObjBuilder bob;
+    {
+        UniqueBSONObjBuilder inner(bob.subobjStart("nested"));
+        inner.append("a", 1);
+
+        UniqueBSONObjBuilder inner2(std::move(inner));
+        ASSERT(!inner2.owned());
+        ASSERT_EQ(&inner2.bb(), &bob.bb());
+    }
+
+    bob.append("b", 2);
+
+    ASSERT_BSONOBJ_EQ(bob.obj(), BSON("nested" << BSON("a" << 1) << "b" << 2));
+}
+
+TEST(BSONObjBuilderTest, UniqueBuilderReleaseToBuffer) {
+    UniqueBSONObjBuilder bob;
+    {
+        UniqueBSONObjBuilder inner(bob.subobjStart("nested"));
+        inner.append("a", 1);
+
+        UniqueBSONObjBuilder inner2(std::move(inner));
+        ASSERT(!inner2.owned());
+        ASSERT_EQ(&inner2.bb(), &bob.bb());
+    }
+
+    bob.append("b", 2);
+
+    bob.doneFast();
+    char* rawData = bob.bb().release().release();
+    ASSERT_BSONOBJ_EQ(BSONObj(rawData), BSON("nested" << BSON("a" << 1) << "b" << 2));
+
+    {
+        // The memory will be freed when this goes out of scope.
+        auto tmp = UniqueBuffer::reclaim(rawData);
+    }
+}
+
+TEST(BSONObjBuilderTest, UniqueBuilderResetToEmpty) {
+    UniqueBSONObjBuilder bob;
+    bob.append("a", 1);
+    bob.append("b", 2);
+    bob.resetToEmpty();
+
+    bob.append("x", 1);
+    bob.append("y", 2);
+
+    ASSERT_BSONOBJ_EQ(bob.obj(), BSON("x" << 1 << "y" << 2));
+}
+
+TEST(BSONObjBuilderTest, UniqueArrayBuilderReleaseToObj) {
+    UniqueBSONArrayBuilder bab;
+    bab.append(1);
+    bab.append("hello");
+
+    BSONArray arr = bab.arr();
+    ASSERT_BSONOBJ_EQ(arr, BSON_ARRAY(1 << "hello"));
+}
+
+TEST(BSONObjBuilderTest, UniqueArrayBuilderReleaseToBuffer) {
+    UniqueBSONArrayBuilder bab;
+    bab.append(1);
+    bab.append("hello");
+
+    bab.doneFast();
+
+    char* rawData = bab.bb().release().release();
+    ASSERT_BSONOBJ_EQ(BSONObj(rawData), BSON_ARRAY(1 << "hello"));
+
+    {
+        // The memory will be freed when this goes out of scope.
+        auto tmp = UniqueBuffer::reclaim(rawData);
+    }
+}
 }  // namespace
 }  // namespace mongo

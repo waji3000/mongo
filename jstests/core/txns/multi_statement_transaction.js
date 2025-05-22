@@ -1,33 +1,43 @@
 // Test basic multi-statement transaction.
-// @tags: [uses_transactions]
-(function() {
-    "use strict";
+//
+// @tags: [
+//   # The test runs commands that are not allowed with security token: endSession.
+//   not_allowed_with_signed_security_token,
+//   uses_transactions
+// ]
 
-    const dbName = "test";
-    const collName = "multi_statement_transaction";
-    const testDB = db.getSiblingDB(dbName);
-    const testColl = testDB[collName];
+// TODO(SERVER-39704): Remove the following load after SERVER-39704 is completed
+import {withTxnAndAutoRetryOnMongos} from "jstests/libs/auto_retry_transaction_in_sharding.js";
 
-    testDB.runCommand({drop: collName, writeConcern: {w: "majority"}});
+const dbName = "test";
+const collName = "multi_statement_transaction";
+const testDB = db.getSiblingDB(dbName);
+const testColl = testDB[collName];
 
-    assert.commandWorked(
-        testDB.createCollection(testColl.getName(), {writeConcern: {w: "majority"}}));
+testDB.runCommand({drop: collName, writeConcern: {w: "majority"}});
 
-    const sessionOptions = {causalConsistency: false};
-    const session = db.getMongo().startSession(sessionOptions);
-    const sessionDb = session.getDatabase(dbName);
-    const sessionColl = sessionDb[collName];
+assert.commandWorked(testDB.createCollection(testColl.getName(), {writeConcern: {w: "majority"}}));
 
-    /***********************************************************************************************
-     * Insert two documents in a transaction.
-     **********************************************************************************************/
+const sessionOptions = {
+    causalConsistency: false
+};
+const session = db.getMongo().startSession(sessionOptions);
+const sessionDb = session.getDatabase(dbName);
+const sessionColl = sessionDb[collName];
 
-    assert.commandWorked(testColl.remove({}, {writeConcern: {w: "majority"}}));
+/***********************************************************************************************
+ * Insert two documents in a transaction.
+ **********************************************************************************************/
 
-    jsTest.log("Insert two documents in a transaction");
+assert.commandWorked(testColl.remove({}, {writeConcern: {w: "majority"}}));
 
-    session.startTransaction();
+jsTest.log("Insert two documents in a transaction");
 
+// TODO(SERVER-39704): We use the withTxnAndAutoRetryOnMongos
+// function to handle how MongoS will propagate a StaleShardVersion error as a
+// TransientTransactionError. After SERVER-39704 is completed the
+// withTxnAndAutoRetryOnMongos function can be removed
+withTxnAndAutoRetryOnMongos(session, () => {
     // Insert a doc within the transaction.
     assert.commandWorked(sessionColl.insert({_id: "insert-1"}));
 
@@ -47,29 +57,31 @@
     assert.eq(null, testColl.findOne({_id: "insert-1"}));
     // Cannot read with default read concern.
     assert.eq(null, testColl.findOne({_id: "insert-2"}));
+});
 
-    // Commit the transaction.
-    session.commitTransaction();
+// Read with default read concern sees the committed transaction.
+assert.eq({_id: "insert-1"}, testColl.findOne({_id: "insert-1"}));
+assert.eq({_id: "insert-2"}, testColl.findOne({_id: "insert-2"}));
 
-    // Read with default read concern sees the committed transaction.
-    assert.eq({_id: "insert-1"}, testColl.findOne({_id: "insert-1"}));
-    assert.eq({_id: "insert-2"}, testColl.findOne({_id: "insert-2"}));
+/***********************************************************************************************
+ * Update documents in a transaction.
+ **********************************************************************************************/
 
-    /***********************************************************************************************
-     * Update documents in a transaction.
-     **********************************************************************************************/
+assert.commandWorked(testColl.remove({}, {writeConcern: {w: "majority"}}));
 
-    assert.commandWorked(testColl.remove({}, {writeConcern: {w: "majority"}}));
+jsTest.log("Update documents in a transaction");
 
-    jsTest.log("Update documents in a transaction");
+// Insert the docs to be updated.
+assert.commandWorked(sessionColl.insert([{_id: "update-1", a: 0}, {_id: "update-2", a: 0}],
+                                        {writeConcern: {w: "majority"}}));
 
-    // Insert the docs to be updated.
-    assert.commandWorked(sessionColl.insert([{_id: "update-1", a: 0}, {_id: "update-2", a: 0}],
-                                            {writeConcern: {w: "majority"}}));
+// Update the docs in a new transaction.
 
-    // Update the docs in a new transaction.
-    session.startTransaction();
-
+// TODO(SERVER-39704): We use the withTxnAndAutoRetryOnMongos
+// function to handle how MongoS will propagate a StaleShardVersion error as a
+// TransientTransactionError. After SERVER-39704 is completed the
+// withTxnAndAutoRetryOnMongos function can be removed
+withTxnAndAutoRetryOnMongos(session, () => {
     assert.commandWorked(sessionColl.update({_id: "update-1"}, {$inc: {a: 1}}));
 
     // Batch update in transaction.
@@ -81,23 +93,25 @@
     // Cannot read with default read concern.
     assert.eq({_id: "update-1", a: 0}, testColl.findOne({_id: "update-1"}));
     assert.eq({_id: "update-2", a: 0}, testColl.findOne({_id: "update-2"}));
+});
 
-    // Commit the transaction.
-    session.commitTransaction();
+// Read with default read concern sees the committed transaction.
+assert.eq({_id: "update-1", a: 2}, testColl.findOne({_id: "update-1"}));
+assert.eq({_id: "update-2", a: 1}, testColl.findOne({_id: "update-2"}));
 
-    // Read with default read concern sees the committed transaction.
-    assert.eq({_id: "update-1", a: 2}, testColl.findOne({_id: "update-1"}));
-    assert.eq({_id: "update-2", a: 1}, testColl.findOne({_id: "update-2"}));
+/***********************************************************************************************
+ * Insert, update and read documents in a transaction.
+ **********************************************************************************************/
 
-    /***********************************************************************************************
-     * Insert, update and read documents in a transaction.
-     **********************************************************************************************/
+assert.commandWorked(testColl.remove({}, {writeConcern: {w: "majority"}}));
 
-    assert.commandWorked(testColl.remove({}, {writeConcern: {w: "majority"}}));
+jsTest.log("Insert, update and read documents in a transaction");
 
-    jsTest.log("Insert, update and read documents in a transaction");
-
-    session.startTransaction();
+// TODO(SERVER-39704): We use the withTxnAndAutoRetryOnMongos
+// function to handle how MongoS will propagate a StaleShardVersion error as a
+// TransientTransactionError. After SERVER-39704 is completed the
+// withTxnAndAutoRetryOnMongos function can be removed
+withTxnAndAutoRetryOnMongos(session, () => {
     assert.commandWorked(sessionColl.insert([{_id: "doc-1"}, {_id: "doc-2"}]));
 
     // Update the two docs in transaction.
@@ -109,31 +123,33 @@
     assert.eq(null, testColl.findOne({_id: "doc-2"}));
 
     // But read in the same transaction returns the docs.
-    docs = sessionColl.find({$or: [{_id: "doc-1"}, {_id: "doc-2"}]}).toArray();
+    let docs = sessionColl.find({$or: [{_id: "doc-1"}, {_id: "doc-2"}]}).toArray();
     assert.sameMembers([{_id: "doc-1", a: 1}, {_id: "doc-2", a: 1}], docs);
+});
 
-    // Commit the transaction.
-    session.commitTransaction();
+// Read with default read concern sees the committed transaction.
+assert.eq({_id: "doc-1", a: 1}, testColl.findOne({_id: "doc-1"}));
+assert.eq({_id: "doc-2", a: 1}, testColl.findOne({_id: "doc-2"}));
 
-    // Read with default read concern sees the committed transaction.
-    assert.eq({_id: "doc-1", a: 1}, testColl.findOne({_id: "doc-1"}));
-    assert.eq({_id: "doc-2", a: 1}, testColl.findOne({_id: "doc-2"}));
+jsTest.log("Insert and delete documents in a transaction");
 
-    jsTest.log("Insert and delete documents in a transaction");
+assert.commandWorked(testColl.remove({}, {writeConcern: {w: "majority"}}));
 
-    assert.commandWorked(testColl.remove({}, {writeConcern: {w: "majority"}}));
+assert.commandWorked(
+    testColl.insert([{_id: "doc-1"}, {_id: "doc-2"}], {writeConcern: {w: "majority"}}));
 
-    assert.commandWorked(
-        testColl.insert([{_id: "doc-1"}, {_id: "doc-2"}], {writeConcern: {w: "majority"}}));
-
-    session.startTransaction();
+// TODO(SERVER-39704): We use the withTxnAndAutoRetryOnMongos
+// function to handle how MongoS will propagate a StaleShardVersion error as a
+// TransientTransactionError. After SERVER-39704 is completed the
+// withTxnAndAutoRetryOnMongos function can be removed
+withTxnAndAutoRetryOnMongos(session, () => {
     assert.commandWorked(sessionColl.insert({_id: "doc-3"}));
 
     // Remove three docs in transaction.
     assert.commandWorked(sessionColl.remove({_id: "doc-1"}));
 
     // Batch delete.
-    bulk = sessionColl.initializeUnorderedBulkOp();
+    let bulk = sessionColl.initializeUnorderedBulkOp();
     bulk.find({_id: "doc-2"}).removeOne();
     bulk.find({_id: "doc-3"}).removeOne();
     assert.commandWorked(bulk.execute());
@@ -144,16 +160,34 @@
     assert.eq(null, testColl.findOne({_id: "doc-3"}));
 
     // But read in the same transaction sees the docs get deleted.
-    docs = sessionColl.find({$or: [{_id: "doc-1"}, {_id: "doc-2"}, {_id: "doc-3"}]}).toArray();
+    let docs = sessionColl.find({$or: [{_id: "doc-1"}, {_id: "doc-2"}, {_id: "doc-3"}]}).toArray();
     assert.sameMembers([], docs);
+});
 
-    // Commit the transaction.
-    session.commitTransaction();
+// Read with default read concern sees the commmitted transaction.
+assert.eq(null, testColl.findOne({_id: "doc-1"}));
+assert.eq(null, testColl.findOne({_id: "doc-2"}));
+assert.eq(null, testColl.findOne({_id: "doc-3"}));
 
-    // Read with default read concern sees the commmitted transaction.
-    assert.eq(null, testColl.findOne({_id: "doc-1"}));
-    assert.eq(null, testColl.findOne({_id: "doc-2"}));
-    assert.eq(null, testColl.findOne({_id: "doc-3"}));
+// Transaction involving several collections
+{
+    assert.commandWorked(testColl.remove({}, {writeConcern: {w: "majority"}}));
 
-    session.endSession();
-}());
+    const collName2 = "multi_statement_transaction_2";
+    const testColl2 = testDB[collName2];
+    testColl2.drop();
+    assert.commandWorked(testDB.createCollection(collName2));
+
+    const sessionColl2 = sessionDb[collName2];
+    withTxnAndAutoRetryOnMongos(session, () => {
+        assert.commandWorked(sessionColl.insert({_id: "doc-1"}));
+        assert.commandWorked(sessionColl2.insert({_id: "doc-2"}));
+    });
+
+    assert.eq(1, testColl.find().itcount());
+    assert.eq(1, testColl2.find().itcount());
+    assert.eq({_id: "doc-1"}, testColl.findOne({_id: "doc-1"}));
+    assert.eq({_id: "doc-2"}, testColl2.findOne({_id: "doc-2"}));
+}
+
+session.endSession();

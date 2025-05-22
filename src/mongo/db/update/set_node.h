@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,8 +29,22 @@
 
 #pragma once
 
+#include <memory>
+
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/exec/mutable_bson/element.h"
+#include "mongo/db/field_ref.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/query/collation/collator_interface.h"
 #include "mongo/db/update/modifier_node.h"
-#include "mongo/stdx/memory.h"
+#include "mongo/db/update/update_node.h"
+#include "mongo/db/update/update_node_visitor.h"
 
 namespace mongo {
 
@@ -45,14 +58,20 @@ public:
     Status init(BSONElement modExpr, const boost::intrusive_ptr<ExpressionContext>& expCtx) final;
 
     std::unique_ptr<UpdateNode> clone() const final {
-        return stdx::make_unique<SetNode>(*this);
+        return std::make_unique<SetNode>(*this);
     }
 
     void setCollator(const CollatorInterface* collator) final {}
 
+    void acceptVisitor(UpdateNodeVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    BSONElement val;
+
 protected:
     ModifyResult updateExistingElement(mutablebson::Element* element,
-                                       std::shared_ptr<FieldRef> elementPath) const final;
+                                       const FieldRef& elementPath) const final;
     void setValueForNewElement(mutablebson::Element* element) const final;
 
     bool allowCreation() const final {
@@ -64,7 +83,13 @@ protected:
     }
 
 private:
-    BSONElement _val;
+    StringData operatorName() const final {
+        return context == Context::kAll ? "$set" : "$setOnInsert";
+    }
+
+    BSONObj operatorValue() const final {
+        return BSON("" << val);
+    }
 };
 
 }  // namespace mongo

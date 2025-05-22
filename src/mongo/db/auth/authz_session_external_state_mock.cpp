@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,9 +29,9 @@
 
 #include "mongo/db/auth/authz_session_external_state_mock.h"
 
-namespace mongo {
-MONGO_REGISTER_SHIM(AuthzSessionExternalState::create)
-(AuthorizationManager* const authzManager)->std::unique_ptr<AuthzSessionExternalState> {
-    return std::make_unique<AuthzSessionExternalStateMock>(authzManager);
-}
-}  // namespace mongo
+#include <memory>
+#include <string>
+
+#include "mongo/base/shim.h"
+
+namespace mongo {}  // namespace mongo

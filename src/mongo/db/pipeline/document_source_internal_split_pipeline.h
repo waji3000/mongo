@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,7 +29,24 @@
 
 #pragma once
 
+#include <set>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/pipeline/document_source.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/pipeline.h"
+#include "mongo/db/pipeline/stage_constraints.h"
+#include "mongo/db/pipeline/variables.h"
+#include "mongo/db/query/query_shape/serialization_options.h"
+#include "mongo/util/intrusive_counter.h"
 
 namespace mongo {
 
@@ -38,13 +54,12 @@ namespace mongo {
  * An internal stage available for testing. Acts as a simple passthrough of intermediate results
  * from the source stage, but forces the pipeline to split at the point where this stage appears
  * (assuming that no earlier splitpoints exist). Takes a single parameter, 'mergeType', which can be
- * one of 'primaryShard', 'anyShard' or 'mongos' to control where the merge may occur. Omitting this
- * parameter or specifying 'mongos' produces the default merging behaviour; the merge half of the
- * pipeline will be executed on mongoS if all other stages are eligible, and will be sent to a
- * random participating shard otherwise.
+ * one of 'anyShard' or 'router' to control where the merge may occur. Omitting this parameter or
+ * specifying 'router' produces the default merging behaviour; the merge half of the  pipeline will
+ * be executed on router if all other stages are eligible, and will be sent to a random
+ * participating shard otherwise.
  */
-class DocumentSourceInternalSplitPipeline final : public DocumentSource,
-                                                  public NeedsMergerDocumentSource {
+class DocumentSourceInternalSplitPipeline final : public DocumentSource {
 public:
     static constexpr StringData kStageName = "$_internalSplitPipeline"_sd;
 
@@ -52,40 +67,62 @@ public:
         BSONElement, const boost::intrusive_ptr<ExpressionContext>&);
 
     static boost::intrusive_ptr<DocumentSource> create(
-        const boost::intrusive_ptr<ExpressionContext>& expCtx, HostTypeRequirement mergeType) {
-        return new DocumentSourceInternalSplitPipeline(expCtx, mergeType);
+        const boost::intrusive_ptr<ExpressionContext>& expCtx,
+        HostTypeRequirement mergeType,
+        boost::optional<ShardId> mergeShardId = boost::none) {
+        return new DocumentSourceInternalSplitPipeline(expCtx, mergeType, mergeShardId);
     }
 
     const char* getSourceName() const final {
-        return kStageName.rawData();
+        return kStageName.data();
     }
 
-    boost::intrusive_ptr<DocumentSource> getShardSource() final {
-        return nullptr;
+    static const Id& id;
+
+    Id getId() const override {
+        return id;
     }
 
-    MergingLogic mergingLogic() final {
-        return {this};
+    boost::optional<DistributedPlanLogic> distributedPlanLogic() final {
+        // {shardsStage, mergingStage, sortPattern}
+        return DistributedPlanLogic{nullptr, this, boost::none};
     }
 
     StageConstraints constraints(Pipeline::SplitState pipeState) const final {
-        return {StreamType::kStreaming,
-                PositionRequirement::kNone,
-                _mergeType,
-                DiskUseRequirement::kNoDiskUse,
-                FacetRequirement::kAllowed,
-                TransactionRequirement::kAllowed};
+        StageConstraints constraints{StreamType::kStreaming,
+                                     PositionRequirement::kNone,
+                                     _mergeType,
+                                     DiskUseRequirement::kNoDiskUse,
+                                     FacetRequirement::kAllowed,
+                                     TransactionRequirement::kAllowed,
+                                     _mergeType == HostTypeRequirement::kRouter
+                                         ? LookupRequirement::kNotAllowed
+                                         : LookupRequirement::kAllowed,
+                                     UnionRequirement::kAllowed};
+        if (_mergeShardId) {
+            constraints.mergeShardId = _mergeShardId;
+        }
+        return constraints;
     }
 
-    GetNextResult getNext() final;
+    void addVariableRefs(std::set<Variables::Id>* refs) const final {}
+
+    DepsTracker::State getDependencies(DepsTracker* deps) const override {
+        return DepsTracker::State::SEE_NEXT;
+    }
 
 private:
     DocumentSourceInternalSplitPipeline(const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                                        HostTypeRequirement mergeType)
-        : DocumentSource(expCtx), _mergeType(mergeType) {}
+                                        HostTypeRequirement mergeType,
+                                        boost::optional<ShardId> mergeShardId)
+        : DocumentSource(kStageName, expCtx), _mergeType(mergeType), _mergeShardId(mergeShardId) {}
 
-    Value serialize(boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final;
+    GetNextResult doGetNext() final;
+    Value serialize(const SerializationOptions& opts = SerializationOptions{}) const final;
     HostTypeRequirement _mergeType = HostTypeRequirement::kNone;
+
+    // Populated with a valid ShardId if this stage was constructed with
+    boost::optional<ShardId> _mergeShardId = boost::none;
 };
 
-}  // namesace mongo
+}  // namespace mongo

@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Public Domain 2014-2018 MongoDB, Inc.
+# Public Domain 2014-present MongoDB, Inc.
 # Public Domain 2008-2014 WiredTiger, Inc.
 #
 # This is free and unencumbered software released into the public domain.
@@ -37,12 +37,12 @@ from workgen import *
 
 context = Context()
 # Connection configuration.
-conn_config = "cache_size=100MB,log=(enabled=false),statistics=[fast],statistics_log=(wait=1,json=false)"
-conn = wiredtiger_open("WT_TEST", "create," + conn_config)
+conn_config = "cache_size=100MB,log=(enabled=false),statistics=[fast],statistics_log=(wait=1,json=true)"
+conn = context.wiredtiger_open("create," + conn_config)
 s = conn.open_session("")
 
 # Table configuration.
-table_config = "leaf_page_max=8k,internal_page_max=8k,leaf_item_max=1433,internal_item_max=3100,type=file,memory_page_max=1MB,split_deepen_min_child=100"
+table_config = "leaf_page_max=8k,internal_page_max=8k,leaf_key_max=1433,leaf_value_max=1433,type=file,memory_page_max=1MB,split_deepen_min_child=100"
 tables = []
 table_count = 3
 for i in range(0, table_count):
@@ -61,11 +61,12 @@ icount = 50000
 # the icount is split between them all.
 pop_ops = Operation(Operation.OP_INSERT, tables[0])
 pop_ops = op_multi_table(pop_ops, tables)
-nops_per_thread = icount / (populate_threads * table_count)
+nops_per_thread = icount // (populate_threads * table_count)
 pop_thread = Thread(pop_ops * nops_per_thread)
 pop_workload = Workload(context, populate_threads * pop_thread)
 print('populate:')
-pop_workload.run(conn)
+ret = pop_workload.run(conn)
+assert ret == 0, ret
 
 # Run phase.
 ops = Operation(Operation.OP_INSERT, tables[0])
@@ -76,8 +77,9 @@ workload = Workload(context, 20 * thread0)
 workload.options.report_interval=5
 workload.options.run_time=300
 print('Split stress workload running...')
-workload.run(conn)
+ret = workload.run(conn)
+assert ret == 0, ret
 
-latency_filename = "WT_TEST/latency.out"
+latency_filename = context.args.home + "/latency.out"
 latency.workload_latency(workload, latency_filename)
 conn.close()

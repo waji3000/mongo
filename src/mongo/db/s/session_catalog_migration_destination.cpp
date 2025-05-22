@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,43 +27,73 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
 
-#include "mongo/platform/basic.h"
+#include <boost/optional.hpp>
+#include <cstdint>
+#include <memory>
+#include <mutex>
+#include <utility>
+#include <vector>
 
-#include "mongo/db/s/session_catalog_migration_destination.h"
+#include <boost/cstdint.hpp>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
 
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonelement.h"
 #include "mongo/bson/bsonobjbuilder.h"
-#include "mongo/client/connection_string.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/client/read_preference.h"
+#include "mongo/db/cancelable_operation_context.h"
+#include "mongo/db/client.h"
 #include "mongo/db/concurrency/d_concurrency.h"
-#include "mongo/db/concurrency/write_conflict_exception.h"
-#include "mongo/db/logical_session_id.h"
+#include "mongo/db/concurrency/exception_util.h"
+#include "mongo/db/concurrency/lock_manager_defs.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/query/write_ops/write_ops_retryability.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/oplog_entry.h"
+#include "mongo/db/repl/oplog_entry_gen.h"
+#include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/s/migration_session_id.h"
-#include "mongo/db/session_catalog.h"
-#include "mongo/db/transaction_participant.h"
+#include "mongo/db/s/session_catalog_migration.h"
+#include "mongo/db/s/session_catalog_migration_destination.h"
+#include "mongo/db/s/session_catalog_migration_util.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/session/logical_session_id.h"
+#include "mongo/db/session/logical_session_id_helpers.h"
+#include "mongo/db/session/session_catalog_mongod.h"
+#include "mongo/db/session/session_txn_record_gen.h"
+#include "mongo/db/shard_id.h"
+#include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/db/transaction/transaction_participant.h"
 #include "mongo/db/write_concern.h"
+#include "mongo/db/write_concern_options.h"
+#include "mongo/executor/task_executor_pool.h"
+#include "mongo/logv2/log.h"
+#include "mongo/s/client/shard.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
-#include "mongo/s/shard_id.h"
-#include "mongo/stdx/functional.h"
-#include "mongo/util/log.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/out_of_line_executor.h"
+#include "mongo/util/str.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 namespace mongo {
 namespace {
+
+MONGO_FAIL_POINT_DEFINE(interruptBeforeProcessingPrePostImageOriginatingOp);
 
 const auto kOplogField = "oplog";
 const WriteConcernOptions kMajorityWC(WriteConcernOptions::kMajority,
                                       WriteConcernOptions::SyncMode::UNSET,
                                       Milliseconds(0));
-
-struct ProcessOplogResult {
-    bool isPrePostImage = false;
-    repl::OpTime oplogTime;
-    LogicalSessionId sessionId;
-    TxnNumber txnNum;
-};
 
 /**
  * Returns the command request to extract session information from the source shard.
@@ -77,94 +106,87 @@ BSONObj buildMigrateSessionCmd(const MigrationSessionId& migrationSessionId) {
 }
 
 /**
- * Determines whether the oplog entry has a link to either preImage/postImage and return a new
- * oplogLink that contains the same link, but pointing to lastResult.oplogTime. For example, if
- * entry has link to preImageTs, this returns an oplogLink with preImageTs pointing to
+ * Determines whether the oplog entry has a link to either preImage/postImage and sets a new link
+ * to lastResult.oplogTime. For example, if entry has link to preImageTs, this sets preImageTs to
  * lastResult.oplogTime.
  *
  * It is an error to have both preImage and postImage as well as not having them at all.
  */
-repl::OplogLink extractPrePostImageTs(const ProcessOplogResult& lastResult,
-                                      const repl::OplogEntry& entry) {
-    repl::OplogLink oplogLink;
-
+void setPrePostImageTs(const SessionCatalogMigrationDestination::ProcessOplogResult& lastResult,
+                       repl::MutableOplogEntry* entry) {
     if (!lastResult.isPrePostImage) {
         uassert(40628,
-                str::stream() << "expected oplog with ts: " << entry.getTimestamp().toString()
-                              << " to not have "
-                              << repl::OplogEntryBase::kPreImageOpTimeFieldName
-                              << " or "
-                              << repl::OplogEntryBase::kPostImageOpTimeFieldName,
-                !entry.getPreImageOpTime() && !entry.getPostImageOpTime());
-
-        return oplogLink;
+                str::stream() << "expected oplog with ts: " << entry->getTimestamp().toString()
+                              << " to not have " << repl::OplogEntryBase::kPreImageOpTimeFieldName
+                              << " or " << repl::OplogEntryBase::kPostImageOpTimeFieldName,
+                !entry->getPreImageOpTime() && !entry->getPostImageOpTime());
+        return;
     }
 
     invariant(!lastResult.oplogTime.isNull());
 
-    const auto& sessionInfo = entry.getOperationSessionInfo();
-    const auto sessionId = *sessionInfo.getSessionId();
-    const auto txnNum = *sessionInfo.getTxnNumber();
-
     uassert(40629,
-            str::stream() << "expected oplog with ts: " << entry.getTimestamp().toString() << ": "
-                          << redact(entry.toBSON())
-                          << " to have session: "
-                          << lastResult.sessionId,
-            lastResult.sessionId == sessionId);
+            str::stream() << "expected oplog with ts: " << entry->getTimestamp().toString() << ": "
+                          << redact(entry->toBSON())
+                          << " to have session: " << lastResult.sessionId,
+            lastResult.sessionId == entry->getSessionId());
     uassert(40630,
-            str::stream() << "expected oplog with ts: " << entry.getTimestamp().toString() << ": "
-                          << redact(entry.toBSON())
-                          << " to have txnNumber: "
-                          << lastResult.txnNum,
-            lastResult.txnNum == txnNum);
+            str::stream() << "expected oplog with ts: " << entry->getTimestamp().toString() << ": "
+                          << redact(entry->toBSON()) << " to have txnNumber: " << lastResult.txnNum,
+            lastResult.txnNum == entry->getTxnNumber());
 
-    if (entry.getPreImageOpTime()) {
-        oplogLink.preImageOpTime = lastResult.oplogTime;
-    } else if (entry.getPostImageOpTime()) {
-        oplogLink.postImageOpTime = lastResult.oplogTime;
-    } else {
-        uasserted(40631,
-                  str::stream() << "expected oplog with opTime: " << entry.getOpTime().toString()
-                                << ": "
-                                << redact(entry.toBSON())
-                                << " to have either "
-                                << repl::OplogEntryBase::kPreImageOpTimeFieldName
-                                << " or "
-                                << repl::OplogEntryBase::kPostImageOpTimeFieldName);
+    // PM-2213 introduces oplog entries that link to pre/post images in the
+    // `config.image_collection` table. For chunk migration, we downconvert to the classic format
+    // where the image is stored as a no-op in the oplog. A chunk migration source will always send
+    // the appropriate no-op. This code on the destination patches up the CRUD operation oplog entry
+    // to look like the classic format.
+    if (entry->getNeedsRetryImage()) {
+        switch (entry->getNeedsRetryImage().value()) {
+            case repl::RetryImageEnum::kPreImage:
+                entry->setPreImageOpTime({repl::OpTime()});
+                break;
+            case repl::RetryImageEnum::kPostImage:
+                entry->setPostImageOpTime({repl::OpTime()});
+                break;
+        }
+        entry->setNeedsRetryImage(boost::none);
     }
 
-    return oplogLink;
+    if (entry->getPreImageOpTime()) {
+        entry->setPreImageOpTime(lastResult.oplogTime);
+    } else if (entry->getPostImageOpTime()) {
+        entry->setPostImageOpTime(lastResult.oplogTime);
+    } else {
+        uasserted(40631,
+                  str::stream() << "expected oplog with opTime: " << entry->getOpTime().toString()
+                                << ": " << redact(entry->toBSON()) << " to have either "
+                                << repl::OplogEntryBase::kPreImageOpTimeFieldName << " or "
+                                << repl::OplogEntryBase::kPostImageOpTimeFieldName);
+    }
 }
 
 /**
  * Parses the oplog into an oplog entry and makes sure that it contains the expected fields.
  */
-repl::OplogEntry parseOplog(const BSONObj& oplogBSON) {
-    auto oplogStatus = repl::OplogEntry::parse(oplogBSON);
-    uassertStatusOK(oplogStatus.getStatus());
+repl::MutableOplogEntry parseOplog(const BSONObj& oplogBSON) {
+    auto oplogEntry = uassertStatusOK(repl::MutableOplogEntry::parse(oplogBSON));
 
-    auto oplogEntry = oplogStatus.getValue();
-
-    auto sessionInfo = oplogEntry.getOperationSessionInfo();
+    const auto& sessionInfo = oplogEntry.getOperationSessionInfo();
 
     uassert(ErrorCodes::UnsupportedFormat,
             str::stream() << "oplog with opTime " << oplogEntry.getTimestamp().toString()
-                          << " does not have sessionId: "
-                          << redact(oplogBSON),
+                          << " does not have sessionId: " << redact(oplogBSON),
             sessionInfo.getSessionId());
 
     uassert(ErrorCodes::UnsupportedFormat,
             str::stream() << "oplog with opTime " << oplogEntry.getTimestamp().toString()
-                          << " does not have txnNumber: "
-                          << redact(oplogBSON),
+                          << " does not have txnNumber: " << redact(oplogBSON),
             sessionInfo.getTxnNumber());
 
     uassert(ErrorCodes::UnsupportedFormat,
             str::stream() << "oplog with opTime " << oplogEntry.getTimestamp().toString()
-                          << " does not have stmtId: "
-                          << redact(oplogBSON),
-            oplogEntry.getStatementId());
+                          << " does not have stmtId: " << redact(oplogBSON),
+            !oplogEntry.getStatementIds().empty());
 
     return oplogEntry;
 }
@@ -181,7 +203,7 @@ BSONObj getNextSessionOplogBatch(OperationContext* opCtx,
     auto shard = shardStatus.getValue();
     auto responseStatus = shard->runCommand(opCtx,
                                             ReadPreferenceSetting(ReadPreference::PrimaryOnly),
-                                            "admin",
+                                            DatabaseName::kAdmin,
                                             buildMigrateSessionCmd(migrationSessionId),
                                             Shard::RetryPolicy::kNoRetry);
 
@@ -197,129 +219,17 @@ BSONObj getNextSessionOplogBatch(OperationContext* opCtx,
 
     return result;
 }
-
-/**
- * Insert a new oplog entry by converting the oplogBSON into type 'n' oplog with the session
- * information. The new oplogEntry will also link to prePostImageTs if not null.
- */
-ProcessOplogResult processSessionOplog(OperationContext* opCtx,
-                                       const BSONObj& oplogBSON,
-                                       const ProcessOplogResult& lastResult) {
-    ProcessOplogResult result;
-    auto oplogEntry = parseOplog(oplogBSON);
-
-    BSONObj object2;
-    if (oplogEntry.getOpType() == repl::OpTypeEnum::kNoop) {
-        // Note: Oplog is already no-op type, no need to nest.
-        // There are two types of type 'n' oplog format expected here:
-        // (1) Oplog entries that has been transformed by a previous migration into a
-        //     nested oplog. In this case, o field contains {$sessionMigrateInfo: 1}
-        //     and o2 field contains the details of the original oplog.
-        // (2) Oplog entries that contains the pre/post-image information of a
-        //     findAndModify operation. In this case, o field contains the relevant info
-        //     and o2 will be empty.
-
-        if (oplogEntry.getObject2()) {
-            object2 = *oplogEntry.getObject2();
-        }
-
-        if (object2.isEmpty()) {
-            result.isPrePostImage = true;
-
-            uassert(40632,
-                    str::stream() << "Can't handle 2 pre/post image oplog in a row. Prevoius oplog "
-                                  << lastResult.oplogTime.getTimestamp().toString()
-                                  << ", oplog ts: "
-                                  << oplogEntry.getTimestamp().toString()
-                                  << ": "
-                                  << redact(oplogBSON),
-                    !lastResult.isPrePostImage);
-        }
-    } else {
-        object2 = oplogBSON;  // TODO: strip redundant info?
-    }
-
-    const auto& sessionInfo = oplogEntry.getOperationSessionInfo();
-    result.sessionId = sessionInfo.getSessionId().value();
-    result.txnNum = sessionInfo.getTxnNumber().value();
-    const auto stmtId = *oplogEntry.getStatementId();
-
-    // Session oplog entries must always contain wall clock time, because we will not be
-    // transferring anything from a previous version of the server
-    invariant(oplogEntry.getWallClockTime());
-
-    auto scopedSession = SessionCatalog::get(opCtx)->getOrCreateSession(opCtx, result.sessionId);
-    auto const txnParticipant =
-        TransactionParticipant::getFromNonCheckedOutSession(scopedSession.get());
-    txnParticipant->refreshFromStorageIfNeeded(opCtx);
-
-    if (!txnParticipant->onMigrateBeginOnPrimary(opCtx, result.txnNum, stmtId)) {
-        // Don't continue migrating the transaction history
-        return lastResult;
-    }
-
-    BSONObj object(result.isPrePostImage
-                       ? oplogEntry.getObject()
-                       : BSON(SessionCatalogMigrationDestination::kSessionMigrateOplogTag << 1));
-    auto oplogLink = extractPrePostImageTs(lastResult, oplogEntry);
-    oplogLink.prevOpTime = txnParticipant->getLastWriteOpTime(result.txnNum);
-
-    writeConflictRetry(
-        opCtx,
-        "SessionOplogMigration",
-        NamespaceString::kSessionTransactionsTableNamespace.ns(),
-        [&] {
-            // Need to take global lock here so repl::logOp will not unlock it and trigger the
-            // invariant that disallows unlocking global lock while inside a WUOW. Grab a DBLock
-            // here instead of plain GlobalLock to make sure the MMAPV1 flush lock will be
-            // lock/unlocked correctly. Take the transaction table db lock to ensure the same lock
-            // ordering with normal replicated updates to the table.
-            Lock::DBLock lk(
-                opCtx, NamespaceString::kSessionTransactionsTableNamespace.db(), MODE_IX);
-            WriteUnitOfWork wunit(opCtx);
-
-            result.oplogTime = repl::logOp(opCtx,
-                                           "n",
-                                           oplogEntry.getNss(),
-                                           oplogEntry.getUuid(),
-                                           object,
-                                           &object2,
-                                           true,
-                                           *oplogEntry.getWallClockTime(),
-                                           sessionInfo,
-                                           stmtId,
-                                           oplogLink,
-                                           false /* prepare */,
-                                           OplogSlot());
-
-            auto oplogOpTime = result.oplogTime;
-            uassert(40633,
-                    str::stream() << "Failed to create new oplog entry for oplog with opTime: "
-                                  << oplogEntry.getOpTime().toString()
-                                  << ": "
-                                  << redact(oplogBSON),
-                    !oplogOpTime.isNull());
-
-            // Do not call onWriteOpCompletedOnPrimary if we inserted a pre/post image, because the
-            // next oplog will contain the real operation
-            if (!result.isPrePostImage) {
-                txnParticipant->onMigrateCompletedOnPrimary(
-                    opCtx, result.txnNum, {stmtId}, oplogOpTime, *oplogEntry.getWallClockTime());
-            }
-
-            wunit.commit();
-        });
-
-    return result;
-}
-
 }  // namespace
 
-const char SessionCatalogMigrationDestination::kSessionMigrateOplogTag[] = "$sessionMigrateInfo";
-
 SessionCatalogMigrationDestination::SessionCatalogMigrationDestination(
-    ShardId fromShard, MigrationSessionId migrationSessionId)
-    : _fromShard(std::move(fromShard)), _migrationSessionId(std::move(migrationSessionId)) {}
+    NamespaceString nss,
+    ShardId fromShard,
+    MigrationSessionId migrationSessionId,
+    CancellationToken cancellationToken)
+    : _nss(std::move(nss)),
+      _fromShard(std::move(fromShard)),
+      _migrationSessionId(std::move(migrationSessionId)),
+      _cancellationToken(std::move(cancellationToken)) {}
 
 SessionCatalogMigrationDestination::~SessionCatalogMigrationDestination() {
     if (_thread.joinable()) {
@@ -333,18 +243,34 @@ void SessionCatalogMigrationDestination::start(ServiceContext* service) {
         stdx::lock_guard<stdx::mutex> lk(_mutex);
         invariant(_state == State::NotStarted);
         _state = State::Migrating;
-        _isStateChanged.notify_all();
     }
 
-    _thread = stdx::thread([=] { _retrieveSessionStateFromSource(service); });
+    _thread = stdx::thread([=, this] {
+        try {
+            _retrieveSessionStateFromSource(service);
+        } catch (const DBException& ex) {
+            if (ex.code() == ErrorCodes::CommandNotFound) {
+                // TODO: remove this after v3.7
+                //
+                // This means that the donor shard is running at an older version so it is safe to
+                // just end this because there is no session information to transfer.
+                return;
+            }
+
+            _errorOccurred(ex.toString());
+        }
+    });
 }
 
 void SessionCatalogMigrationDestination::finish() {
     stdx::lock_guard<stdx::mutex> lk(_mutex);
     if (_state != State::ErrorOccurred) {
         _state = State::Committing;
-        _isStateChanged.notify_all();
     }
+}
+
+bool SessionCatalogMigrationDestination::joinable() const {
+    return _thread.joinable();
 }
 
 void SessionCatalogMigrationDestination::join() {
@@ -366,12 +292,9 @@ void SessionCatalogMigrationDestination::join() {
  * 6. Wait for writes to be committed to majority of the replica set.
  */
 void SessionCatalogMigrationDestination::_retrieveSessionStateFromSource(ServiceContext* service) {
-    Client::initThread(
-        "sessionCatalogMigration-" + _migrationSessionId.toString(), service, nullptr);
-
-    auto uniqueCtx = cc().makeOperationContext();
-    auto opCtx = uniqueCtx.get();
-
+    Client::initThread("sessionCatalogMigrationProducer-" + _migrationSessionId.toString(),
+                       service->getService(ClusterRole::ShardServer),
+                       Client::noSession());
     bool oplogDrainedAfterCommiting = false;
     ProcessOplogResult lastResult;
     repl::OpTime lastOpTimeWaited;
@@ -384,12 +307,19 @@ void SessionCatalogMigrationDestination::_retrieveSessionStateFromSource(Service
             }
         }
 
-        try {
-            auto nextBatch = getNextSessionOplogBatch(opCtx, _fromShard, _migrationSessionId);
-            BSONArray oplogArray(nextBatch[kOplogField].Obj());
-            BSONArrayIteratorSorted oplogIter(oplogArray);
+        BSONObj nextBatch;
+        BSONArray oplogArray;
+        {
+            auto executor = Grid::get(service)->getExecutorPool()->getFixedExecutor();
+            auto uniqueCtx = CancelableOperationContext(
+                cc().makeOperationContext(), _cancellationToken, executor);
+            auto opCtx = uniqueCtx.get();
+            opCtx->setAlwaysInterruptAtStepDownOrUp_UNSAFE();
 
-            if (!oplogIter.more()) {
+            nextBatch = getNextSessionOplogBatch(opCtx, _fromShard, _migrationSessionId);
+            oplogArray = BSONArray{nextBatch[kOplogField].Obj()};
+
+            if (oplogArray.isEmpty()) {
                 {
                     stdx::lock_guard<stdx::mutex> lk(_mutex);
                     if (_state == State::Committing) {
@@ -399,6 +329,13 @@ void SessionCatalogMigrationDestination::_retrieveSessionStateFromSource(Service
                         // this depleted the buffer from the source shard and receiving the commit
                         // command.
                         if (oplogDrainedAfterCommiting) {
+                            LOGV2(5087100,
+                                  "Recipient finished draining oplog entries for retryable writes "
+                                  "and transactions from donor again after receiving "
+                                  "_recvChunkCommit",
+                                  logAttrs(_nss),
+                                  "migrationSessionId"_attr = _migrationSessionId,
+                                  "fromShard"_attr = _fromShard);
                             break;
                         }
 
@@ -406,69 +343,215 @@ void SessionCatalogMigrationDestination::_retrieveSessionStateFromSource(Service
                     }
                 }
 
-                WriteConcernResult wcResult;
-                auto wcStatus =
-                    waitForWriteConcern(opCtx, lastResult.oplogTime, kMajorityWC, &wcResult);
-                if (!wcStatus.isOK()) {
-                    _errorOccurred(wcStatus.toString());
-                    return;
-                }
+                WriteConcernResult unusedWCResult;
+                uassertStatusOK(
+                    waitForWriteConcern(opCtx, lastResult.oplogTime, kMajorityWC, &unusedWCResult));
 
-                // We depleted the buffer at least once, transition to ready for commit.
                 {
                     stdx::lock_guard<stdx::mutex> lk(_mutex);
                     // Note: only transition to "ready to commit" if state is not error/force stop.
                     if (_state == State::Migrating) {
+                        // We depleted the buffer at least once, transition to ready for commit.
+                        LOGV2(5087101,
+                              "Recipient finished draining oplog entries for retryable writes and "
+                              "transactions from donor for the first time, before receiving "
+                              "_recvChunkCommit",
+                              logAttrs(_nss),
+                              "migrationSessionId"_attr = _migrationSessionId,
+                              "fromShard"_attr = _fromShard);
                         _state = State::ReadyToCommit;
-                        _isStateChanged.notify_all();
                     }
-                }
-
-                if (lastOpTimeWaited == lastResult.oplogTime) {
-                    // We got an empty result at least twice in a row from the source shard so
-                    // space it out a little bit so we don't hammer the shard.
-                    opCtx->sleepFor(Milliseconds(200));
                 }
 
                 lastOpTimeWaited = lastResult.oplogTime;
             }
+        }
 
-            while (oplogIter.more()) {
-                lastResult = processSessionOplog(opCtx, oplogIter.next().Obj(), lastResult);
-            }
-        } catch (const DBException& excep) {
-            if (excep.code() == ErrorCodes::ConflictingOperationInProgress ||
-                excep.code() == ErrorCodes::TransactionTooOld) {
-                // This means that the server has a newer txnNumber than the oplog being migrated,
-                // so just skip it.
-                continue;
-            }
-
-            if (excep.code() == ErrorCodes::CommandNotFound) {
-                // TODO: remove this after v3.7
-                //
-                // This means that the donor shard is running at an older version so it is safe to
-                // just end this because there is no session information to transfer.
-                break;
-            }
-
-            _errorOccurred(excep.toString());
-            return;
+        for (BSONArrayIteratorSorted oplogIter(oplogArray); oplogIter.more();) {
+            auto oplogEntry = oplogIter.next().Obj();
+            interruptBeforeProcessingPrePostImageOriginatingOp.executeIf(
+                [&](const auto&) {
+                    uasserted(6749200,
+                              "Intentionally failing session migration before processing post/pre "
+                              "image originating update oplog entry");
+                },
+                [&](const auto&) {
+                    return !oplogEntry["needsRetryImage"].eoo() ||
+                        !oplogEntry["preImageOpTime"].eoo() || !oplogEntry["postImageOpTime"].eoo();
+                });
+            lastResult = _processSessionOplog(oplogEntry, lastResult, service, _cancellationToken);
         }
     }
 
-    WriteConcernResult wcResult;
-    auto wcStatus = waitForWriteConcern(opCtx, lastResult.oplogTime, kMajorityWC, &wcResult);
-    if (!wcStatus.isOK()) {
-        _errorOccurred(wcStatus.toString());
-        return;
-    }
+    WriteConcernResult unusedWCResult;
+
+    auto executor = Grid::get(service)->getExecutorPool()->getFixedExecutor();
+    auto uniqueOpCtx =
+        CancelableOperationContext(cc().makeOperationContext(), _cancellationToken, executor);
+    uniqueOpCtx->setAlwaysInterruptAtStepDownOrUp_UNSAFE();
+
+    uassertStatusOK(
+        waitForWriteConcern(uniqueOpCtx.get(), lastResult.oplogTime, kMajorityWC, &unusedWCResult));
 
     {
         stdx::lock_guard<stdx::mutex> lk(_mutex);
         _state = State::Done;
-        _isStateChanged.notify_all();
     }
+}
+
+/**
+ * Insert a new oplog entry by converting the oplogBSON into type 'n' oplog with the session
+ * information. The new oplogEntry will also link to prePostImageTs if not null.
+ */
+SessionCatalogMigrationDestination::ProcessOplogResult
+SessionCatalogMigrationDestination::_processSessionOplog(const BSONObj& oplogBSON,
+                                                         const ProcessOplogResult& lastResult,
+                                                         ServiceContext* serviceContext,
+                                                         CancellationToken cancellationToken) {
+
+    auto oplogEntry = parseOplog(oplogBSON);
+
+    ProcessOplogResult result;
+    result.sessionId = *oplogEntry.getSessionId();
+    result.txnNum = *oplogEntry.getTxnNumber();
+
+    if (oplogEntry.getOpType() == repl::OpTypeEnum::kNoop) {
+        // Note: Oplog is already no-op type, no need to nest.
+        // There are three types of type 'n' oplog format expected here:
+        // (1) Oplog entries that has been transformed by a previous migration into a
+        //     nested oplog. In this case, o field contains {$sessionMigrateInfo: 1}
+        //     and o2 field contains the details of the original oplog.
+        // (2) Oplog entries that contains the pre/post-image information of a
+        //     findAndModify operation. In this case, o field contains the relevant info
+        //     and o2 will be empty.
+        // (3) Oplog entries that are a dead sentinel, which the donor sent over as the replacement
+        //     for a prepare oplog entry or unprepared transaction commit oplog entry.
+        // (4) Oplog entries that are a WouldChangeOwningShard sentinel entry, used for making
+        //     retries of a WouldChangeOwningShard update or findAndModify fail with
+        //     IncompleteTransactionHistory. In this case, the o field is non-empty and the o2
+        //     field is an empty BSONObj.
+
+        BSONObj object2;
+        if (oplogEntry.getObject2()) {
+            object2 = *oplogEntry.getObject2();
+        } else {
+            oplogEntry.setObject2(object2);
+        }
+
+        if (object2.isEmpty() && !isWouldChangeOwningShardSentinelOplogEntry(oplogEntry)) {
+            result.isPrePostImage = true;
+
+            uassert(40632,
+                    str::stream() << "Can't handle 2 pre/post image oplog in a row. Prevoius oplog "
+                                  << lastResult.oplogTime.getTimestamp().toString()
+                                  << ", oplog ts: " << oplogEntry.getTimestamp().toString() << ": "
+                                  << oplogBSON,
+                    !lastResult.isPrePostImage);
+        }
+    } else {
+        oplogEntry.setObject2(oplogBSON);  // TODO: strip redundant info?
+    }
+
+    const auto stmtIds = oplogEntry.getStatementIds();
+
+    auto executor = Grid::get(serviceContext)->getExecutorPool()->getFixedExecutor();
+    auto uniqueOpCtx =
+        CancelableOperationContext(cc().makeOperationContext(), cancellationToken, executor);
+    auto opCtx = uniqueOpCtx.get();
+    opCtx->setAlwaysInterruptAtStepDownOrUp_UNSAFE();
+
+    // Irrespective of whether or not the oplog gets logged, we want to update the
+    // entriesMigrated counter to signal that we have succesfully recieved the oplog
+    // from the source and have processed it.
+    _sessionOplogEntriesMigrated.addAndFetch(1);
+
+    bool beganOrContinuedTxn = false;
+    bool appendedOplogEntry = false;
+    while (!beganOrContinuedTxn) {
+        auto conflictingTxnCompletionFuture =
+            session_catalog_migration_util::runWithSessionCheckedOutIfStatementNotExecuted(
+                opCtx, result.sessionId, result.txnNum, stmtIds.front(), [&] {
+                    auto txnParticipant = TransactionParticipant::get(opCtx);
+
+                    if (!result.isPrePostImage &&
+                        !isWouldChangeOwningShardSentinelOplogEntry(oplogEntry)) {
+                        // Do not overwrite the "o" field if this is a pre/post image oplog entry.
+                        // Also do not overwrite it if this is a WouldChangeOwningShard sentinel
+                        // oplog entry since it contains a special BSONObj used for making retries
+                        // fail with an IncompleteTransactionHistory error.
+                        oplogEntry.setObject(SessionCatalogMigration::kSessionOplogTag);
+                    }
+                    setPrePostImageTs(lastResult, &oplogEntry);
+                    oplogEntry.setPrevWriteOpTimeInTransaction(txnParticipant.getLastWriteOpTime());
+
+                    oplogEntry.setOpType(repl::OpTypeEnum::kNoop);
+                    oplogEntry.setFromMigrate(true);
+                    // Reset OpTime so logOp() can assign a new one.
+                    oplogEntry.setOpTime(OplogSlot());
+
+                    writeConflictRetry(
+                        opCtx,
+                        "SessionOplogMigration",
+                        NamespaceString::kSessionTransactionsTableNamespace,
+                        [&] {
+                            // Need to take global lock here so repl::logOp will not unlock it and
+                            // trigger the invariant that disallows unlocking global lock while
+                            // inside a WUOW. Take the transaction table db lock to ensure the same
+                            // lock ordering with normal replicated updates to the table.
+                            Lock::DBLock lk(
+                                opCtx,
+                                NamespaceString::kSessionTransactionsTableNamespace.dbName(),
+                                MODE_IX);
+                            WriteUnitOfWork wunit(opCtx);
+
+                            result.oplogTime = repl::logOp(opCtx, &oplogEntry);
+
+                            const auto& oplogOpTime = result.oplogTime;
+                            uassert(
+                                40633,
+                                str::stream()
+                                    << "Failed to create new oplog entry for oplog with opTime: "
+                                    << oplogEntry.getOpTime().toString() << ": "
+                                    << redact(oplogBSON),
+                                !oplogOpTime.isNull());
+
+                            // Do not call onWriteOpCompletedO nPrimary if we inserted a pre/post
+                            // image, because the next oplog will contain the real operation
+                            if (!result.isPrePostImage) {
+                                SessionTxnRecord sessionTxnRecord;
+                                sessionTxnRecord.setSessionId(result.sessionId);
+                                sessionTxnRecord.setTxnNum(result.txnNum);
+                                sessionTxnRecord.setLastWriteOpTime(oplogOpTime);
+
+                                // Use the same wallTime as oplog since SessionUpdateTracker looks
+                                // at the oplog entry wallTime when replicating.
+                                sessionTxnRecord.setLastWriteDate(oplogEntry.getWallClockTime());
+
+                                if (isInternalSessionForRetryableWrite(result.sessionId)) {
+                                    sessionTxnRecord.setParentSessionId(
+                                        *getParentSessionId(result.sessionId));
+                                }
+
+                                // We do not migrate transaction oplog entries so don't set the txn
+                                // state.
+                                txnParticipant.onRetryableWriteCloningCompleted(
+                                    opCtx, stmtIds, sessionTxnRecord);
+                            }
+
+                            wunit.commit();
+                        });
+
+                    appendedOplogEntry = true;
+                });
+
+        if (conflictingTxnCompletionFuture) {
+            conflictingTxnCompletionFuture->wait(opCtx);
+        } else {
+            beganOrContinuedTxn = true;
+        }
+    }
+
+    return appendedOplogEntry ? result : lastResult;
 }
 
 std::string SessionCatalogMigrationDestination::getErrMsg() {
@@ -477,11 +560,20 @@ std::string SessionCatalogMigrationDestination::getErrMsg() {
 }
 
 void SessionCatalogMigrationDestination::_errorOccurred(StringData errMsg) {
+    LOGV2(5087102,
+          "Recipient failed to copy oplog entries for retryable writes and transactions from donor",
+          logAttrs(_nss),
+          "migrationSessionId"_attr = _migrationSessionId,
+          "fromShard"_attr = _fromShard,
+          "error"_attr = errMsg);
+
     stdx::lock_guard<stdx::mutex> lk(_mutex);
     _state = State::ErrorOccurred;
     _errMsg = errMsg.toString();
+}
 
-    _isStateChanged.notify_all();
+MigrationSessionId SessionCatalogMigrationDestination::getMigrationSessionId() const {
+    return _migrationSessionId;
 }
 
 SessionCatalogMigrationDestination::State SessionCatalogMigrationDestination::getState() {
@@ -493,4 +585,7 @@ void SessionCatalogMigrationDestination::forceFail(StringData errMsg) {
     _errorOccurred(errMsg);
 }
 
+long long SessionCatalogMigrationDestination::getSessionOplogEntriesMigrated() {
+    return _sessionOplogEntriesMigrated.load();
+}
 }  // namespace mongo

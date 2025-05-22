@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,76 +27,159 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#include <string>
 
-#include "mongo/platform/basic.h"
+#include <boost/move/utility_core.hpp>
 
-#include <set>
-
+#include "mongo/base/error_codes.h"
 #include "mongo/db/audit.h"
-#include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
-#include "mongo/db/client.h"
+#include "mongo/db/auth/resource_pattern.h"
+#include "mongo/db/cluster_role.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/commands/feature_compatibility_version.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/read_concern_args.h"
+#include "mongo/db/repl/read_concern_level.h"
 #include "mongo/db/s/config/sharding_catalog_manager.h"
-#include "mongo/s/catalog/type_database.h"
-#include "mongo/s/catalog_cache.h"
-#include "mongo/s/grid.h"
-#include "mongo/s/request_types/create_database_gen.h"
-#include "mongo/util/log.h"
-#include "mongo/util/scopeguard.h"
+#include "mongo/db/s/create_database_coordinator.h"
+#include "mongo/db/s/create_database_coordinator_document_gen.h"
+#include "mongo/db/s/create_database_util.h"
+#include "mongo/db/s/ddl_lock_manager.h"
+#include "mongo/db/s/sharding_ddl_util.h"
+#include "mongo/db/server_options.h"
+#include "mongo/db/service_context.h"
+#include "mongo/s/catalog/type_database_gen.h"
+#include "mongo/s/request_types/sharded_ddl_commands_gen.h"
+#include "mongo/s/sharding_feature_flags_gen.h"
+#include "mongo/util/assert_util.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
+
 
 namespace mongo {
-namespace {
 
-/**
- * Internal sharding command run on config servers to create a database.
- * Call with { _configsvrCreateDatabase: <string dbName> }
- */
 class ConfigSvrCreateDatabaseCommand final : public TypedCommand<ConfigSvrCreateDatabaseCommand> {
 public:
+    /**
+     * We accept any apiVersion, apiStrict, and/or apiDeprecationErrors forwarded with this internal
+     * command.
+     */
+    bool skipApiVersionCheck() const override {
+        // Internal command (server to server).
+        return true;
+    }
+
     using Request = ConfigsvrCreateDatabase;
+    using Response = ConfigsvrCreateDatabaseResponse;
 
     class Invocation final : public InvocationBase {
     public:
         using InvocationBase::InvocationBase;
 
-        void typedRun(OperationContext* opCtx) {
+        Response typedRun(OperationContext* opCtx) {
             uassert(ErrorCodes::IllegalOperation,
                     "_configsvrCreateDatabase can only be run on config servers",
-                    serverGlobalParams.clusterRole == ClusterRole::ConfigServer);
+                    serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer));
+            CommandHelpers::uassertCommandRunWithMajority(Request::kCommandName,
+                                                          opCtx->getWriteConcern());
+            opCtx->setAlwaysInterruptAtStepDownOrUp_UNSAFE();
 
             // Set the operation context read concern level to local for reads into the config
             // database.
             repl::ReadConcernArgs::get(opCtx) =
                 repl::ReadConcernArgs(repl::ReadConcernLevel::kLocalReadConcern);
 
-            auto dbname = request().getCommandParameter();
+            const auto dbNameStr = request().getCommandParameter();
+            const auto dbName = DatabaseNameUtil::deserialize(
+                boost::none, dbNameStr, request().getSerializationContext());
 
-            uassert(ErrorCodes::InvalidNamespace,
-                    str::stream() << "invalid db name specified: " << dbname,
-                    NamespaceString::validDBName(dbname,
-                                                 NamespaceString::DollarInDbNameBehavior::Allow));
+            audit::logEnableSharding(opCtx->getClient(), dbNameStr);
 
-            uassert(ErrorCodes::InvalidOptions,
-                    str::stream() << "createDatabase must be called with majority writeConcern",
-                    opCtx->getWriteConcern().wMode == WriteConcernOptions::kMajority);
+            // Checks for restricted and invalid namespaces.
+            if (const auto configDatabaseOpt =
+                    create_database_util::checkDbNameConstraints(dbName)) {
+                return configDatabaseOpt->getVersion();
+            }
+            const auto optResolvedPrimaryShard =
+                create_database_util::resolvePrimaryShard(opCtx, request().getPrimaryShardId());
 
-            // Make sure to force update of any stale metadata
-            ON_BLOCK_EXIT(
-                [opCtx, dbname] { Grid::get(opCtx)->catalogCache()->purgeDatabase(dbname); });
+            {
+                // The use isEnabledAndIgnoreFCVUnsafe is intentional, we want to check whether the
+                // feature flag is enabled on any version. This is a hack, but SERVER-102647 will
+                // get rid of this code before it hits production. The reason we take the DDL lock
+                // here is to respect the acquisition order DDL Lock -> FCV Lock, and avoid
+                // deadlocks. This is a pessimization, and thus we only do this if
+                // ShardAuthoritativeDbMetadataDDL is active in this binary.
+                // (Ignore FCV check): We need to know if the feature flag is active in any version.
+                // TODO (SERVER-102647): Remove this code.
+                boost::optional<DDLLockManager::ScopedBaseDDLLock> ddlLock;
+                if (feature_flags::gShardAuthoritativeDbMetadataDDL.isEnabledAndIgnoreFCVUnsafe()) {
+                    ddlLock.emplace(
+                        opCtx,
+                        shard_role_details::getLocker(opCtx),
+                        DatabaseNameUtil::deserialize(boost::none,
+                                                      str::toLower(dbNameStr),
+                                                      request().getSerializationContext()),
+                        "createDatabase" /* reason */,
+                        MODE_X,
+                        true /*waitForRecovery*/);
+                }
 
-            auto scopedLock =
-                ShardingCatalogManager::get(opCtx)->serializeCreateOrDropDatabase(opCtx, dbname);
+                boost::optional<FixedFCVRegion> fixedFcvRegion{opCtx};
 
-            auto dbDistLock =
-                uassertStatusOK(Grid::get(opCtx)->catalogClient()->getDistLockManager()->lock(
-                    opCtx, dbname, "createDatabase", DistLockManager::kDefaultLockTimeout));
+                const auto fcvSnapshot = (*fixedFcvRegion)->acquireFCVSnapshot();
+                // The Operation FCV is currently propagated only for DDL operations,
+                // which cannot be nested. Therefore, the VersionContext shouldn't have
+                // been initialized yet.
+                invariant(!VersionContext::getDecoration(opCtx).isInitialized());
+                const auto createDatabaseDDLCoordinatorFeatureFlagEnabled =
+                    feature_flags::gCreateDatabaseDDLCoordinator.isEnabled(
+                        VersionContext::getDecoration(opCtx), fcvSnapshot);
+                const auto authoritativeMetadataAccessLevel =
+                    sharding_ddl_util::getGrantedAuthoritativeMetadataAccessLevel(
+                        VersionContext::getDecoration(opCtx), fcvSnapshot);
 
-            ShardingCatalogManager::get(opCtx)->createDatabase(opCtx, dbname.toString());
+                if (!createDatabaseDDLCoordinatorFeatureFlagEnabled) {
+                    // (Ignore FCV check): The use isEnabledAndIgnoreFCVUnsafe is intentional, we
+                    // want to check whether the feature flag is enabled on any version.
+                    // We need to maintain the FixedFCVRegion during the execution of the command
+                    // to guarantee that all in-flight legacy commands are drained after
+                    // transitioning to kUpgrading during FCV upgrade.
+                    // TODO (SERVER-102647): unconditionally exit the FixedFCVRegion here
+                    if (!feature_flags::gShardAuthoritativeDbMetadataDDL
+                             .isEnabledAndIgnoreFCVUnsafe()) {
+                        fixedFcvRegion.reset();
+                    }
+
+                    auto dbt = ShardingCatalogManager::get(opCtx)->createDatabase(
+                        opCtx,
+                        dbName,
+                        optResolvedPrimaryShard,
+                        request().getSerializationContext());
+
+                    return Response(dbt.getVersion());
+                } else {
+                    CreateDatabaseCoordinatorDocument coordinatorDoc;
+                    coordinatorDoc.setShardingDDLCoordinatorMetadata(
+                        {{NamespaceString(dbName), DDLCoordinatorTypeEnum::kCreateDatabase}});
+                    coordinatorDoc.setPrimaryShard(optResolvedPrimaryShard);
+                    coordinatorDoc.setUserSelectedPrimary(optResolvedPrimaryShard.is_initialized());
+                    coordinatorDoc.setAuthoritativeMetadataAccessLevel(
+                        authoritativeMetadataAccessLevel);
+                    auto createDatabaseCoordinator =
+                        checked_pointer_cast<CreateDatabaseCoordinator>(
+                            ShardingDDLCoordinatorService::getService(opCtx)->getOrCreateInstance(
+                                opCtx, coordinatorDoc.toBSON(), *fixedFcvRegion));
+
+                    fixedFcvRegion.reset();
+                    ddlLock.reset();
+                    return createDatabaseCoordinator->getResult(opCtx);
+                }
+            }
         }
 
     private:
@@ -113,8 +195,9 @@ public:
             uassert(ErrorCodes::Unauthorized,
                     "Unauthorized",
                     AuthorizationSession::get(opCtx->getClient())
-                        ->isAuthorizedForActionsOnResource(ResourcePattern::forClusterResource(),
-                                                           ActionType::internal));
+                        ->isAuthorizedForActionsOnResource(
+                            ResourcePattern::forClusterResource(request().getDbName().tenantId()),
+                            ActionType::internal));
         }
     };
 
@@ -131,7 +214,7 @@ private:
     bool adminOnly() const override {
         return true;
     }
-} configsvrCreateDatabaseCmd;
+};
+MONGO_REGISTER_COMMAND(ConfigSvrCreateDatabaseCommand).forShard();
 
-}  // namespace
 }  // namespace mongo

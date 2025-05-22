@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,7 +29,9 @@
 
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
+#include <js/TypeDecls.h>
 #include <jsapi.h>
 #include <memory>
 #include <string>

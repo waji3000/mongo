@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,8 +29,20 @@
 
 #pragma once
 
-#include "mongo/base/disallow_copying.h"
-#include "mongo/db/op_observer.h"
+#include <cstdint>
+#include <vector>
+
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/catalog/collection.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/op_observer/op_observer.h"
+#include "mongo/db/op_observer/op_observer_noop.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/repl/oplog.h"
+#include "mongo/db/repl/optime.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/session/logical_session_id.h"
+#include "mongo/util/uuid.h"
 
 namespace mongo {
 
@@ -39,111 +50,49 @@ namespace mongo {
  * OpObserver which is installed on the op observers chain when the server is running as a config
  * server (--configsvr).
  */
-class ConfigServerOpObserver final : public OpObserver {
-    MONGO_DISALLOW_COPYING(ConfigServerOpObserver);
+class ConfigServerOpObserver final : public OpObserverNoop {
+    ConfigServerOpObserver(const ConfigServerOpObserver&) = delete;
+    ConfigServerOpObserver& operator=(const ConfigServerOpObserver&) = delete;
 
 public:
     ConfigServerOpObserver();
-    ~ConfigServerOpObserver();
+    ~ConfigServerOpObserver() override;
 
-    void onCreateIndex(OperationContext* opCtx,
-                       const NamespaceString& nss,
-                       CollectionUUID uuid,
-                       BSONObj indexDoc,
-                       bool fromMigrate) override {}
+    NamespaceFilters getNamespaceFilters() const final {
+        return {NamespaceFilter::kConfigAndSystem, NamespaceFilter::kConfigAndSystem};
+    }
 
     void onInserts(OperationContext* opCtx,
-                   const NamespaceString& nss,
-                   OptionalCollectionUUID uuid,
+                   const CollectionPtr& coll,
                    std::vector<InsertStatement>::const_iterator begin,
                    std::vector<InsertStatement>::const_iterator end,
-                   bool fromMigrate) override {}
+                   const std::vector<RecordId>& recordIds,
+                   std::vector<bool> fromMigrate,
+                   bool defaultFromMigrate,
+                   OpStateAccumulator* opAccumulator = nullptr) override;
 
-    void onUpdate(OperationContext* opCtx, const OplogUpdateEntryArgs& args) override {}
-
-    void aboutToDelete(OperationContext* opCtx,
-                       const NamespaceString& nss,
-                       const BSONObj& doc) override {}
+    void onUpdate(OperationContext* opCtx,
+                  const OplogUpdateEntryArgs& args,
+                  OpStateAccumulator* opAccumulator = nullptr) override;
 
     void onDelete(OperationContext* opCtx,
-                  const NamespaceString& nss,
-                  OptionalCollectionUUID uuid,
+                  const CollectionPtr& coll,
                   StmtId stmtId,
-                  bool fromMigrate,
-                  const boost::optional<BSONObj>& deletedDoc) override;
-
-    void onInternalOpMessage(OperationContext* opCtx,
-                             const NamespaceString& nss,
-                             const boost::optional<UUID> uuid,
-                             const BSONObj& msgObj,
-                             const boost::optional<BSONObj> o2MsgObj) override {}
-
-    void onCreateCollection(OperationContext* opCtx,
-                            Collection* coll,
-                            const NamespaceString& collectionName,
-                            const CollectionOptions& options,
-                            const BSONObj& idIndex,
-                            const OplogSlot& createOpTime) override {}
-
-    void onCollMod(OperationContext* opCtx,
-                   const NamespaceString& nss,
-                   OptionalCollectionUUID uuid,
-                   const BSONObj& collModCmd,
-                   const CollectionOptions& oldCollOptions,
-                   boost::optional<TTLCollModInfo> ttlInfo) override {}
-
-    void onDropDatabase(OperationContext* opCtx, const std::string& dbName) override {}
+                  const BSONObj& doc,
+                  const DocumentKey& documentKey,
+                  const OplogDeleteEntryArgs& args,
+                  OpStateAccumulator* opAccumulator = nullptr) override;
 
     repl::OpTime onDropCollection(OperationContext* opCtx,
                                   const NamespaceString& collectionName,
-                                  OptionalCollectionUUID uuid,
-                                  CollectionDropType dropType) override;
+                                  const UUID& uuid,
+                                  std::uint64_t numRecords,
+                                  bool markFromMigrate) override;
 
-    void onDropIndex(OperationContext* opCtx,
-                     const NamespaceString& nss,
-                     OptionalCollectionUUID uuid,
-                     const std::string& indexName,
-                     const BSONObj& indexInfo) override {}
+    void onReplicationRollback(OperationContext* opCtx, const RollbackObserverInfo& rbInfo) final;
 
-    void onRenameCollection(OperationContext* opCtx,
-                            const NamespaceString& fromCollection,
-                            const NamespaceString& toCollection,
-                            OptionalCollectionUUID uuid,
-                            OptionalCollectionUUID dropTargetUUID,
-                            bool stayTemp) override {}
-    repl::OpTime preRenameCollection(OperationContext* opCtx,
-                                     const NamespaceString& fromCollection,
-                                     const NamespaceString& toCollection,
-                                     OptionalCollectionUUID uuid,
-                                     OptionalCollectionUUID dropTargetUUID,
-                                     bool stayTemp) override {
-        return repl::OpTime();
-    }
-    void postRenameCollection(OperationContext* opCtx,
-                              const NamespaceString& fromCollection,
-                              const NamespaceString& toCollection,
-                              OptionalCollectionUUID uuid,
-                              OptionalCollectionUUID dropTargetUUID,
-                              bool stayTemp) override {}
-
-    void onApplyOps(OperationContext* opCtx,
-                    const std::string& dbName,
-                    const BSONObj& applyOpCmd) override {}
-
-    void onEmptyCapped(OperationContext* opCtx,
-                       const NamespaceString& collectionName,
-                       OptionalCollectionUUID uuid) override {}
-
-    void onTransactionCommit(OperationContext* opCtx,
-                             boost::optional<OplogSlot> commitOplogEntryOpTime,
-                             boost::optional<Timestamp> commitTimestamp) override {}
-
-    void onTransactionPrepare(OperationContext* opCtx, const OplogSlot& prepareOpTime) override {}
-
-    void onTransactionAbort(OperationContext* opCtx,
-                            boost::optional<OplogSlot> abortOplogEntryOpTime) override {}
-
-    void onReplicationRollback(OperationContext* opCtx, const RollbackObserverInfo& rbInfo);
+    void onMajorityCommitPointUpdate(ServiceContext* service,
+                                     const repl::OpTime& newCommitPoint) override;
 };
 
 }  // namespace mongo

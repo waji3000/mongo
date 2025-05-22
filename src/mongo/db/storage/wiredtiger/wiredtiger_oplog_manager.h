@@ -1,6 +1,5 @@
-
 /**
- *    Copyright (C) 2018-present MongoDB, Inc.
+ *    Copyright (C) 2020-present MongoDB, Inc.
  *
  *    This program is free software: you can redistribute it and/or modify
  *    it under the terms of the Server Side Public License, version 1,
@@ -30,83 +29,123 @@
 
 #pragma once
 
-#include "mongo/base/disallow_copying.h"
-#include "mongo/db/storage/wiredtiger/wiredtiger_record_store.h"
+#include <cstdint>
+
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/platform/atomic_word.h"
 #include "mongo/stdx/condition_variable.h"
 #include "mongo/stdx/mutex.h"
-#include "mongo/stdx/thread.h"
 #include "mongo/util/concurrency/with_lock.h"
 
 namespace mongo {
 
-class WiredTigerRecordStore;
-class WiredTigerSessionCache;
-
-
-// Manages oplog visibility, by periodically querying WiredTiger's all_committed timestamp value and
-// then using that timestamp for all transactions that read the oplog collection.
+/**
+ * Manages oplog visibility.
+ *
+ * On demand, queries WiredTiger's all_durable timestamp value and updates the oplog read timestamp.
+ * This is done synchronously when calls to triggerOplogVisibilityUpdate() provide a timestamp
+ * greater than the current visibility timestamp.
+ *
+ * The WT all_durable timestamp is the in-memory timestamp behind which there are no oplog holes
+ * in-memory. Note, all_durable is the timestamp that has no holes in-memory, which may NOT be
+ * the case on disk, despite 'durable' in the name.
+ *
+ * The oplog read timestamp is used to read from the oplog with forward cursors, in order to ensure
+ * readers never see 'holes' in the oplog and thereby miss data that was not yet committed when
+ * scanning passed. Out-of-order primary writes allow writes with later timestamps to be committed
+ * before writes assigned earlier timestamps, creating oplog 'holes'.
+ */
 class WiredTigerOplogManager {
-    MONGO_DISALLOW_COPYING(WiredTigerOplogManager);
+    WiredTigerOplogManager(const WiredTigerOplogManager&) = delete;
+    WiredTigerOplogManager& operator=(const WiredTigerOplogManager&) = delete;
 
 public:
-    WiredTigerOplogManager() {}
-    ~WiredTigerOplogManager() {}
+    WiredTigerOplogManager() = default;
+    ~WiredTigerOplogManager() = default;
 
-    // This method will initialize the oplog read timestamp and start the background thread that
-    // refreshes the value. If `updateOldestTimestamp` is true, the background thread will also take
-    // responsibility for updating the oldest timestamp.
-    void start(OperationContext* opCtx,
-               const std::string& uri,
-               WiredTigerRecordStore* oplogRecordStore,
-               bool updateOldestTimestamp);
+    /**
+     * Starts the oplog manager, initializing the oplog read timestamp with the highest oplog
+     * timestamp.
+     */
+    void start(OperationContext*, const KVEngine&, RecordStore& oplog, bool isReplSet);
 
-    void halt();
+    /**
+     * Stops the oplog manager.
+     */
+    void stop();
 
-    bool isRunning() {
-        stdx::lock_guard<stdx::mutex> lk(_oplogVisibilityStateMutex);
-        return _isRunning && !_shuttingDown;
-    }
+    /**
+     * Updates the oplog read timestamp if the visibility timestamp is behind the provided
+     * `commitTimestamp`, and notifies any capped waiters on the oplog if the visibility point is
+     * advanced.
+     *
+     * Callers must ensure this call is not concurrent with a call to `initialize`, as this is not
+     * thread-safe.
+     */
+    void triggerOplogVisibilityUpdate();
 
-    // The oplogReadTimestamp is the timestamp used for oplog reads, to prevent readers from
-    // reading past uncommitted transactions (which may create "holes" in the oplog after an
-    // unclean shutdown).
+    /**
+     * Waits for all committed writes at this time to become visible (that is, until no holes exist
+     * in the oplog up to the time we start waiting.)
+     */
+    void waitForAllEarlierOplogWritesToBeVisible(const RecordStore* oplogRecordStore,
+                                                 OperationContext* opCtx);
+
+    /**
+     * The oplogReadTimestamp is the read timestamp used for forward cursor oplog reads to prevent
+     * such readers from missing any entries in the oplog that may not yet have committed ('holes')
+     * when the scan passes along the data. The 'oplogReadTimestamp' is a guaranteed 'no holes'
+     * point in the oplog.
+     *
+     * Holes in the oplog occur due to out-of-order primary writes, where a write with a later
+     * assigned timestamp can commit before a write assigned an earlier timestamp.
+     *
+     * This is a thread-safe call at any point.
+     */
     std::uint64_t getOplogReadTimestamp() const;
     void setOplogReadTimestamp(Timestamp ts);
 
-    // Triggers the oplogJournal thread to update its oplog read timestamp, by flushing the journal.
-    void triggerJournalFlush();
-
-    // Waits until all committed writes at this point to become visible (that is, no holes exist in
-    // the oplog.)
-    void waitForAllEarlierOplogWritesToBeVisible(const WiredTigerRecordStore* oplogRecordStore,
-                                                 OperationContext* opCtx);
-
-    // Returns the all committed timestamp. All transactions with timestamps earlier than the
-    // all committed timestamp are committed.
-    uint64_t fetchAllCommittedValue(WT_CONNECTION* conn);
+    /**
+     * Returns an empty string if `initialize` hasn't been called.
+     */
+    StringData getIdent() const;
 
 private:
-    void _oplogJournalThreadLoop(WiredTigerSessionCache* sessionCache,
-                                 WiredTigerRecordStore* oplogRecordStore,
-                                 const bool updateOldestTimestamp) noexcept;
+    enum class VisibilityUpdateResult {
+        NotUpdated,
+        Updated,
+        Stopped,
+    };
+    VisibilityUpdateResult _updateVisibility(stdx::unique_lock<stdx::mutex>&,
+                                             const KVEngine&,
+                                             const RecordStore::Capped& oplog);
 
     void _setOplogReadTimestamp(WithLock, uint64_t newTimestamp);
 
-    stdx::thread _oplogJournalThread;
+    std::string _oplogIdent;
+
+    AtomicWord<unsigned long long> _oplogReadTimestamp{0};
+
+    stdx::thread _oplogVisibilityThread;
+
+    // Signaled to trigger the oplog visibility thread to run.
+    mutable stdx::condition_variable _oplogVisibilityThreadCV;
+
+    // Signaled when oplog visibility has been updated.
+    mutable stdx::condition_variable _oplogEntriesBecameVisibleCV;
+
+    // Protects the state below.
     mutable stdx::mutex _oplogVisibilityStateMutex;
-    mutable stdx::condition_variable
-        _opsWaitingForJournalCV;  // Signaled to trigger a journal flush.
-    mutable stdx::condition_variable
-        _opsBecameVisibleCV;  // Signaled when a journal flush is complete.
 
-    bool _isRunning = false;             // Guarded by oplogVisibilityStateMutex.
-    bool _shuttingDown = false;          // Guarded by oplogVisibilityStateMutex.
-    bool _opsWaitingForJournal = false;  // Guarded by oplogVisibilityStateMutex.
+    // Whether this oplog manager is currently running.
+    bool _running = false;
 
-    // When greater than 0, indicates that there are operations waiting for oplog visibility, and
-    // journal flushing should not be delayed.
-    std::int64_t _opsWaitingForVisibility = 0;  // Guarded by oplogVisibilityStateMutex.
+    // Whether an oplog to oplog visibility is being triggered.
+    bool _triggerOplogVisibilityUpdate = false;
 
-    AtomicUInt64 _oplogReadTimestamp;
+    // The number of operations waiting for more of the oplog to become visible, to avoid update
+    // delays for batching.
+    int64_t _opsWaitingForOplogVisibilityUpdate = 0;
 };
 }  // namespace mongo

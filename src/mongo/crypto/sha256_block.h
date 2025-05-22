@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,29 +29,39 @@
 
 #pragma once
 
-#include "mongo/crypto/sha_block.h"
+#include <cstddef>
+#include <cstdint>
+#include <initializer_list>
 
+#include "mongo/base/data_range.h"
+#include "mongo/base/string_data.h"
+#include "mongo/crypto/hash_block.h"
 #include "mongo/util/make_array_type.h"
 
 namespace mongo {
 
 /**
- * A Traits type for adapting SHABlock to sha256 hashes.
+ * A Traits type for adapting HashBlock to sha256 hashes.
  */
 struct SHA256BlockTraits {
     using HashType = MakeArrayType<std::uint8_t, 32, SHA256BlockTraits>;
 
     static constexpr StringData name = "SHA256Block"_sd;
 
-    static HashType computeHash(std::initializer_list<ConstDataRange> input);
+    static void computeHash(std::initializer_list<ConstDataRange> input, HashType* output);
 
     static void computeHmac(const uint8_t* key,
                             size_t keyLen,
-                            const uint8_t* input,
-                            size_t inputLen,
-                            HashType* const output);
+                            std::initializer_list<ConstDataRange> input,
+                            HashType* output);
+
+    static void computeHmacWithCtx(HmacContext* ctx,
+                                   const uint8_t* key,
+                                   size_t keyLen,
+                                   std::initializer_list<ConstDataRange> input,
+                                   HashType* output);
 };
 
-using SHA256Block = SHABlock<SHA256BlockTraits>;
+using SHA256Block = HashBlock<SHA256BlockTraits>;
 
 }  // namespace mongo

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,18 +27,27 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <iterator>
+#include <list>
+
+#include <boost/smart_ptr/intrusive_ptr.hpp>
 
 #include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/document_metadata_fields.h"
+#include "mongo/db/exec/document_value/document_value_test_util.h"
 #include "mongo/db/pipeline/aggregation_context_fixture.h"
 #include "mongo/db/pipeline/dependencies.h"
 #include "mongo/db/pipeline/document_source_limit.h"
 #include "mongo/db/pipeline/document_source_match.h"
 #include "mongo/db/pipeline/document_source_mock.h"
-#include "mongo/db/pipeline/document_value_test_util.h"
+#include "mongo/db/pipeline/document_source_project.h"
+#include "mongo/db/pipeline/document_source_single_document_transformation.h"
 #include "mongo/db/pipeline/pipeline.h"
 #include "mongo/unittest/unittest.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 namespace {
@@ -48,7 +56,7 @@ namespace {
 using DocumentSourceLimitTest = AggregationContextFixture;
 
 TEST_F(DocumentSourceLimitTest, ShouldDisposeSourceWhenLimitIsReached) {
-    auto source = DocumentSourceMock::create({"{a: 1}", "{a: 2}"});
+    auto source = DocumentSourceMock::createForTest({"{a: 1}", "{a: 2}"}, getExpCtx());
     auto limit = DocumentSourceLimit::create(getExpCtx(), 1);
     limit->setSource(source.get());
     // The limit's result is as expected.
@@ -62,7 +70,7 @@ TEST_F(DocumentSourceLimitTest, ShouldDisposeSourceWhenLimitIsReached) {
 }
 
 TEST_F(DocumentSourceLimitTest, ShouldNotBeAbleToLimitToZeroDocuments) {
-    auto source = DocumentSourceMock::create({"{a: 1}", "{a: 2}"});
+    auto source = DocumentSourceMock::createForTest({"{a: 1}", "{a: 2}"}, getExpCtx());
     ASSERT_THROWS_CODE(DocumentSourceLimit::create(getExpCtx(), 0), AssertionException, 15958);
 }
 
@@ -91,8 +99,25 @@ TEST_F(DocumentSourceLimitTest, TwoLimitStagesShouldCombineIntoOne) {
     ASSERT_EQUALS(1U, container.size());
 }
 
+TEST_F(DocumentSourceLimitTest, DoesNotPushProjectBeforeSelf) {
+    Pipeline::SourceContainer container;
+    auto limit = DocumentSourceLimit::create(getExpCtx(), 10);
+    auto project =
+        DocumentSourceProject::create(BSON("fullDocument" << true), getExpCtx(), "$project"_sd);
+
+    container.push_back(limit);
+    container.push_back(project);
+
+    limit->optimizeAt(container.begin(), &container);
+
+    ASSERT_EQUALS(2U, container.size());
+    ASSERT(dynamic_cast<DocumentSourceLimit*>(container.begin()->get()));
+    ASSERT(dynamic_cast<DocumentSourceSingleDocumentTransformation*>(
+        std::next(container.begin())->get()));
+}
+
 TEST_F(DocumentSourceLimitTest, DisposeShouldCascadeAllTheWayToSource) {
-    auto source = DocumentSourceMock::create({"{a: 1}", "{a: 1}"});
+    auto source = DocumentSourceMock::createForTest({"{a: 1}", "{a: 1}"}, getExpCtx());
 
     // Create a DocumentSourceMatch.
     BSONObj spec = BSON("$match" << BSON("a" << 1));
@@ -117,17 +142,19 @@ TEST_F(DocumentSourceLimitTest, ShouldNotIntroduceAnyDependencies) {
     ASSERT_EQUALS(DepsTracker::State::SEE_NEXT, limit->getDependencies(&dependencies));
     ASSERT_EQUALS(0U, dependencies.fields.size());
     ASSERT_EQUALS(false, dependencies.needWholeDocument);
-    ASSERT_EQUALS(false, dependencies.getNeedsMetadata(DepsTracker::MetadataType::TEXT_SCORE));
+    ASSERT_EQUALS(false, dependencies.getNeedsMetadata(DocumentMetadataFields::kTextScore));
 }
 
 TEST_F(DocumentSourceLimitTest, ShouldPropagatePauses) {
     auto limit = DocumentSourceLimit::create(getExpCtx(), 2);
-    auto mock = DocumentSourceMock::create({DocumentSource::GetNextResult::makePauseExecution(),
-                                            Document(),
-                                            DocumentSource::GetNextResult::makePauseExecution(),
-                                            Document(),
-                                            DocumentSource::GetNextResult::makePauseExecution(),
-                                            Document()});
+    auto mock =
+        DocumentSourceMock::createForTest({DocumentSource::GetNextResult::makePauseExecution(),
+                                           Document(),
+                                           DocumentSource::GetNextResult::makePauseExecution(),
+                                           Document(),
+                                           DocumentSource::GetNextResult::makePauseExecution(),
+                                           Document()},
+                                          getExpCtx());
     limit->setSource(mock.get());
 
     ASSERT_TRUE(limit->getNext().isPaused());
@@ -140,6 +167,13 @@ TEST_F(DocumentSourceLimitTest, ShouldPropagatePauses) {
     ASSERT_TRUE(limit->getNext().isEOF());
     ASSERT_TRUE(limit->getNext().isEOF());
     ASSERT_TRUE(limit->getNext().isEOF());
+}
+
+TEST_F(DocumentSourceLimitTest, RedactsCorrectly) {
+    auto limit = DocumentSourceLimit::create(getExpCtx(), 2);
+    ASSERT_VALUE_EQ_AUTO(  // NOLINT
+        "{ $limit: \"?number\" }",
+        redact(*limit));
 }
 
 }  // namespace

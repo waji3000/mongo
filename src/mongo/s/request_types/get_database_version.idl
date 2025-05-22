@@ -32,10 +32,12 @@ global:
     cpp_namespace: "mongo"
 
 imports:
-    - "mongo/idl/basic_types.idl"
+    - "mongo/db/basic_types.idl"
 
 commands:
     getDatabaseVersion:
         description: "An internal command to get a shard server's cached database version"
+        command_name: getDatabaseVersion
         namespace: type
+        api_version: ""
         type: string

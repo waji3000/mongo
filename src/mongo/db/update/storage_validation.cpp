@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,9 +29,17 @@
 
 #include "mongo/db/update/storage_validation.h"
 
+#include "mongo/base/error_codes.h"
+#include "mongo/base/string_data.h"
 #include "mongo/bson/bson_depth.h"
-#include "mongo/bson/mutable/algorithm.h"
-#include "mongo/bson/mutable/document.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/db/exec/mutable_bson/algorithm.h"
+#include "mongo/db/exec/mutable_bson/const_element.h"
+#include "mongo/db/exec/mutable_bson/document.h"
+#include "mongo/db/query/dbref.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -42,16 +49,26 @@ namespace {
 
 const StringData idFieldName = "_id"_sd;
 
-void storageValidChildren(mutablebson::ConstElement elem,
+void scanDocumentChildren(mutablebson::ConstElement elem,
                           const bool deep,
-                          std::uint32_t recursionLevel) {
+                          std::uint32_t recursionLevel,
+                          const bool allowTopLevelDollarPrefixes,
+                          const bool shouldValidate,
+                          const bool isEmbeddedInIdField,
+                          bool* containsDotsAndDollarsField) {
     if (!elem.hasChildren()) {
         return;
     }
 
     auto curr = elem.leftChild();
     while (curr.ok()) {
-        storageValid(curr, deep, recursionLevel + 1);
+        scanDocument(curr,
+                     deep,
+                     recursionLevel + 1,
+                     allowTopLevelDollarPrefixes,
+                     shouldValidate,
+                     isEmbeddedInIdField,
+                     containsDotsAndDollarsField);
         curr = curr.rightSibling();
     }
 }
@@ -66,7 +83,7 @@ void validateDollarPrefixElement(mutablebson::ConstElement elem) {
     auto currName = elem.getFieldName();
 
     // Found a $db field.
-    if (currName == "$db") {
+    if (currName == dbref::kDbFieldName) {
         uassert(ErrorCodes::InvalidDBRef,
                 str::stream() << "The DBRef $db field must be a String, not a "
                               << typeName(curr.getType()),
@@ -81,7 +98,7 @@ void validateDollarPrefixElement(mutablebson::ConstElement elem) {
     }
 
     // Found a $id field.
-    if (currName == "$id") {
+    if (currName == dbref::kIdFieldName) {
         curr = curr.leftSibling();
         uassert(ErrorCodes::InvalidDBRef,
                 "Found $id field without a $ref before it, which is invalid.",
@@ -91,7 +108,7 @@ void validateDollarPrefixElement(mutablebson::ConstElement elem) {
     }
 
     // Found a $ref field.
-    if (currName == "$ref") {
+    if (currName == dbref::kRefFieldName) {
         uassert(ErrorCodes::InvalidDBRef,
                 str::stream() << "The DBRef $ref field must be a String, not a "
                               << typeName(curr.getType()),
@@ -101,60 +118,117 @@ void validateDollarPrefixElement(mutablebson::ConstElement elem) {
                 "The DBRef $ref field must be followed by a $id field",
                 curr.rightSibling().ok() && curr.rightSibling().getFieldName() == "$id");
     } else {
-
         // Not an okay, $ prefixed field name.
         uasserted(ErrorCodes::DollarPrefixedFieldName,
                   str::stream() << "The dollar ($) prefixed field '" << elem.getFieldName()
-                                << "' in '"
-                                << mutablebson::getFullName(elem)
-                                << "' is not valid for storage.");
+                                << "' in '" << mutablebson::getFullName(elem)
+                                << "' is not allowed in the context of an update's replacement"
+                                   " document. Consider using an aggregation pipeline with"
+                                   " $replaceWith.");
     }
 }
 }  // namespace
 
-void storageValid(const mutablebson::Document& doc) {
+Status storageValidIdField(const mongo::BSONElement& element) {
+    switch (element.type()) {
+        case BSONType::RegEx:
+        case BSONType::Array:
+        case BSONType::Undefined:
+            return Status(ErrorCodes::InvalidIdField,
+                          str::stream()
+                              << "The '_id' value cannot be of type " << typeName(element.type()));
+        case BSONType::Object: {
+            auto status = element.Obj().storageValidEmbedded();
+            if (!status.isOK() && status.code() == ErrorCodes::DollarPrefixedFieldName) {
+                return Status(status.code(),
+                              str::stream() << "_id fields may not contain '$'-prefixed fields: "
+                                            << status.reason());
+            }
+            return status;
+        }
+        default:
+            break;
+    }
+    return Status::OK();
+}
+
+void scanDocument(const mutablebson::Document& doc,
+                  const bool allowTopLevelDollarPrefixes,
+                  const bool shouldValidate,
+                  bool* containsDotsAndDollarsField) {
+    bool hasId = false;
     auto currElem = doc.root().leftChild();
     while (currElem.ok()) {
-        if (currElem.getFieldName() == idFieldName) {
-            switch (currElem.getType()) {
-                case BSONType::RegEx:
-                case BSONType::Array:
-                case BSONType::Undefined:
-                    uasserted(ErrorCodes::InvalidIdField,
-                              str::stream() << "The '_id' value cannot be of type "
-                                            << typeName(currElem.getType()));
-                default:
-                    break;
+        if (currElem.getFieldName() == idFieldName && shouldValidate) {
+            if (currElem.getType() == BSONType::Object) {
+                // We need to recursively validate the _id field while ensuring we disallow
+                // top-level $-prefix fields in the _id object.
+                scanDocument(currElem,
+                             true /* deep */,
+                             0 /* recursionLevel - forces _id fields to be treated as top-level. */,
+                             false /* Top-level _id fields cannot be $-prefixed. */,
+                             shouldValidate,
+                             true /* Indicates the element is embedded inside an _id field. */,
+                             containsDotsAndDollarsField);
+            } else {
+                uassertStatusOK(storageValidIdField(currElem.getValue()));
             }
+            uassert(ErrorCodes::BadValue, "Can't have multiple _id fields in one document", !hasId);
+            hasId = true;
+        } else {
+            // Validate this child element.
+            const auto deep = true;
+            const uint32_t recursionLevel = 1;
+            scanDocument(currElem,
+                         deep,
+                         recursionLevel,
+                         allowTopLevelDollarPrefixes,
+                         shouldValidate,
+                         false /* Not embedded inside an _id field. */,
+                         containsDotsAndDollarsField);
         }
-
-        // Validate this child element.
-        const auto deep = true;
-        const uint32_t recursionLevel = 1;
-        storageValid(currElem, deep, recursionLevel);
 
         currElem = currElem.rightSibling();
     }
 }
 
-void storageValid(mutablebson::ConstElement elem, const bool deep, std::uint32_t recursionLevel) {
-    uassert(ErrorCodes::BadValue, "Invalid elements cannot be stored.", elem.ok());
+void scanDocument(mutablebson::ConstElement elem,
+                  const bool deep,
+                  std::uint32_t recursionLevel,
+                  const bool allowTopLevelDollarPrefixes,
+                  const bool shouldValidate,
+                  const bool isEmbeddedInIdField,
+                  bool* containsDotsAndDollarsField) {
+    if (shouldValidate) {
+        uassert(ErrorCodes::BadValue, "Invalid elements cannot be stored.", elem.ok());
 
-    uassert(ErrorCodes::Overflow,
-            str::stream() << "Document exceeds maximum nesting depth of "
-                          << BSONDepth::getMaxDepthForUserStorage(),
-            recursionLevel <= BSONDepth::getMaxDepthForUserStorage());
+        uassert(ErrorCodes::Overflow,
+                str::stream() << "Document exceeds maximum nesting depth of "
+                              << BSONDepth::getMaxDepthForUserStorage(),
+                recursionLevel <= BSONDepth::getMaxDepthForUserStorage());
+    }
 
     // Field names of elements inside arrays are not meaningful in mutable bson,
     // so we do not want to validate them.
     const mutablebson::ConstElement& parent = elem.parent();
     const bool childOfArray = parent.ok() ? (parent.getType() == BSONType::Array) : false;
 
-    if (!childOfArray) {
-        auto fieldName = elem.getFieldName();
+    // Only check top-level fields if 'allowTopLevelDollarPrefixes' is false, and don't validate any
+    // fields for '$'-prefixes if 'allowTopLevelDollarPrefixes' is true. If 'isEmbeddedInIdField' is
+    // true, check for '$'-prefixes at all the levels.
+    const bool checkTopLevelFields =
+        !allowTopLevelDollarPrefixes && (recursionLevel == 1 || isEmbeddedInIdField);
 
-        // Cannot start with "$", unless dbref.
-        if (fieldName[0] == '$') {
+    auto fieldName = elem.getFieldName();
+    if (fieldName.starts_with('$')) {
+        if (containsDotsAndDollarsField) {
+            *containsDotsAndDollarsField = true;
+            // If we are not validating for storage, return once a $-prefixed field is found.
+            if (!shouldValidate)
+                return;
+        }
+        if (!childOfArray && checkTopLevelFields && shouldValidate) {
+            // Cannot start with "$", unless dbref.
             validateDollarPrefixElement(elem);
         }
     }
@@ -162,7 +236,13 @@ void storageValid(mutablebson::ConstElement elem, const bool deep, std::uint32_t
     if (deep) {
 
         // Check children if there are any.
-        storageValidChildren(elem, deep, recursionLevel);
+        scanDocumentChildren(elem,
+                             deep,
+                             recursionLevel,
+                             allowTopLevelDollarPrefixes,
+                             shouldValidate,
+                             isEmbeddedInIdField,
+                             containsDotsAndDollarsField);
     }
 }
 

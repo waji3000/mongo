@@ -1,6 +1,3 @@
-// storage_engine.h
-
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -32,33 +29,69 @@
 
 #pragma once
 
+#include <initializer_list>
+#include <memory>
 #include <string>
 #include <vector>
+
+#include <boost/serialization/strong_typedef.hpp>
 
 #include "mongo/base/status.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/timestamp.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/index_builds/index_builds.h"
+#include "mongo/db/index_builds/resumable_index_builds_gen.h"
+#include "mongo/db/storage/spill_table.h"
+#include "mongo/db/storage/temporary_record_store.h"
+#include "mongo/util/periodic_runner.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
-class DatabaseCatalogEntry;
+class BackupBlock;
 class JournalListener;
+class DurableCatalog;
+class KVEngine;
 class OperationContext;
-class RecordStore;
 class RecoveryUnit;
 class SnapshotManager;
-struct StorageGlobalParams;
 class StorageEngineLockFile;
 class StorageEngineMetadata;
 
+struct StorageGlobalParams;
+
 /**
- * The StorageEngine class is the top level interface for creating a new storage
- * engine.  All StorageEngine(s) must be registered by calling registerFactory in order
- * to possibly be activated.
+ * The StorageEngine class is the top level interface for creating a new storage engine. All
+ * StorageEngine(s) must be registered by calling registerFactory in order to possibly be
+ * activated.
  */
 class StorageEngine {
 public:
+    /**
+     * This is the minimum valid timestamp; it can be used for reads that need to see all
+     * untimestamped data but no timestamped data. We cannot use 0 here because 0 means see all
+     * timestamped data. The high-order 4 bytes are for the seconds field in a Timestamp object.
+     */
+    static const unsigned long long kMinimumTimestamp = 1ULL << 32;
+
+    /**
+     * When the storage engine needs to know how much oplog to preserve for the sake of active
+     * transactions, it executes a callback that returns either the oldest active transaction
+     * timestamp, or boost::none if there is no active transaction, or an error if it fails.
+     */
+    using OldestActiveTransactionTimestampResult = StatusWith<boost::optional<Timestamp>>;
+    using OldestActiveTransactionTimestampCallback =
+        std::function<OldestActiveTransactionTimestampResult(Timestamp stableTimestamp)>;
+
+    using DropIdentCallback = std::function<void()>;
+
+    /**
+     * Information on last storage engine shutdown state that is relevant to the recovery process.
+     * Determined by initializeStorageEngine() during mongod.lock initialization.
+     */
+    enum class LastShutdownState { kClean, kUnclean };
+
     /**
      * The interface for creating new instances of storage engines.
      *
@@ -71,11 +104,14 @@ public:
         virtual ~Factory() {}
 
         /**
-         * Return a new instance of the StorageEngine. The lockFile parameter may be null if
-         * params.readOnly is set. Caller owns the returned pointer.
+         * Return a new instance of the StorageEngine. Caller owns the returned pointer.
          */
-        virtual StorageEngine* create(const StorageGlobalParams& params,
-                                      const StorageEngineLockFile* lockFile) const = 0;
+        virtual std::unique_ptr<StorageEngine> create(OperationContext* opCtx,
+                                                      const StorageGlobalParams& params,
+                                                      const StorageEngineLockFile* lockFile,
+                                                      bool isReplSet,
+                                                      bool shouldRecoverFromOplogAsStandalone,
+                                                      bool inStandaloneMode) const = 0;
 
         /**
          * Returns the name of the storage engine.
@@ -130,83 +166,70 @@ public:
         virtual BSONObj createMetadataOptions(const StorageGlobalParams& params) const = 0;
 
         /**
-         * Returns whether the engine supports read-only mode. If read-only mode is enabled, the
-         * engine may be started on a read-only filesystem (either mounted read-only or with
-         * read-only permissions). If readOnly mode is enabled, it is undefined behavior to call
-         * methods that write data (e.g. insertRecord). This method is provided on the Factory
-         * because it must be called before the storageEngine is instantiated.
+         * Returns whether the engine supports queryable backup mode. If queryable backup mode is
+         * enabled, user writes are not permitted but internally generated writes are still
+         * permitted.
          */
-        virtual bool supportsReadOnly() const {
+        virtual bool supportsQueryableBackupMode() const {
             return false;
         }
     };
 
     /**
-    * The destructor should only be called if we are tearing down but not exiting the process.
-    */
+     * The destructor should only be called if we are tearing down but not exiting the process.
+     */
     virtual ~StorageEngine() {}
 
     /**
-     * Called after the globalStorageEngine pointer has been set up, before any other methods
-     * are called. Any initialization work that requires the ability to create OperationContexts
-     * should be done here rather than in the constructor.
+     * During the startup process, the storage engine is one of the first components to be started
+     * up and fully initialized. But that fully initialized storage engine may not be recognized as
+     * the end for the remaining storage startup tasks that still need to be performed.
+     *
+     * For example, after the storage engine has been fully initialized, we need to access it in
+     * order to set up all of the collections and indexes based on the metadata, or perform some
+     * corrective measures on the data files, etc.
+     *
+     * When all of the storage startup tasks are completed as a whole, then this function is called
+     * by the external force managing the startup process.
      */
-    virtual void finishInit() {}
+    virtual void notifyStorageStartupRecoveryComplete() {}
+
+    /**
+     * Perform any operations in the storage layer that are unblocked now that the server has exited
+     * replication startup recovery and considers itself stable.
+     *
+     * This will be called during a node's transition to steady state replication.
+     *
+     * This function may race with shutdown. As a result, any steps within this function that should
+     * not race with shutdown should obtain the global lock.
+     */
+    virtual void notifyReplStartupRecoveryComplete(RecoveryUnit&) {}
+
+    /**
+     * The storage engine can save several elements of ReplSettings on construction.  Standalone
+     * mode is one such setting that can change after construction and need to be updated.
+     */
+    virtual void setInStandaloneMode(bool inStandaloneMode) {}
 
     /**
      * Returns a new interface to the storage engine's recovery unit.  The recovery
      * unit is the durability interface.  For details, see recovery_unit.h
-     *
-     * Caller owns the returned pointer.
      */
-    virtual RecoveryUnit* newRecoveryUnit() = 0;
-
-    /**
-     * List the databases stored in this storage engine.
-     *
-     * XXX: why doesn't this take OpCtx?
-     */
-    virtual void listDatabases(std::vector<std::string>* out) const = 0;
-
-    /**
-     * Return the DatabaseCatalogEntry that describes the database indicated by 'db'.
-     *
-     * StorageEngine owns returned pointer.
-     * It should not be deleted by any caller.
-     */
-    virtual DatabaseCatalogEntry* getDatabaseCatalogEntry(OperationContext* opCtx,
-                                                          StringData db) = 0;
-
-    /**
-     * Returns whether the storage engine supports its own locking locking below the collection
-     * level. If the engine returns true, MongoDB will acquire intent locks down to the
-     * collection level and will assume that the engine will ensure consistency at the level of
-     * documents. If false, MongoDB will lock the entire collection in Shared/Exclusive mode
-     * for read/write operations respectively.
-     */
-    virtual bool supportsDocLocking() const = 0;
-
-    /**
-     * Returns whether the storage engine supports locking at a database level.
-     */
-    virtual bool supportsDBLocking() const {
-        return true;
-    }
+    virtual std::unique_ptr<RecoveryUnit> newRecoveryUnit() = 0;
 
     /**
      * Returns whether the storage engine supports capped collections.
      */
-    virtual bool supportsCappedCollections() const {
-        return true;
-    }
+    virtual bool supportsCappedCollections() const = 0;
 
     /**
-     * Returns whether the engine supports a journalling concept or not.
+     * Returns whether the storage engine supports checkpoints.
      */
-    virtual bool isDurable() const = 0;
+    virtual bool supportsCheckpoints() const = 0;
 
     /**
-     * Returns true if the engine does not persist data to disk; false otherwise.
+     * Returns true if the KVEngine is ephemeral -- that is, it is NOT persistent and all data is
+     * lost after shutdown. Otherwise, returns false.
      */
     virtual bool isEphemeral() const = 0;
 
@@ -215,24 +238,23 @@ public:
      * engines that support recoverToStableTimestamp().
      *
      * Must be called with the global lock acquired in exclusive mode.
+     *
+     * Unrecognized idents require special handling based on the context known only to the
+     * caller. For example, on starting from a previous unclean shutdown, we may try to recover
+     * orphaned idents, which are known to the storage engine but not referenced in the catalog.
      */
-    virtual void loadCatalog(OperationContext* opCtx) {}
-    virtual void closeCatalog(OperationContext* opCtx) {}
+    virtual void loadDurableCatalog(OperationContext* opCtx,
+                                    LastShutdownState lastShutdownState) = 0;
+    virtual void closeDurableCatalog(OperationContext* opCtx) = 0;
 
     /**
-     * Closes all file handles associated with a database.
+     * Checkpoints the data to disk.
+     *
+     * 'callerHoldsReadLock' signals whether the caller holds a read lock. A write lock may be taken
+     * internally, but will be skipped for callers holding a read lock because a write lock would
+     * conflict. The JournalListener will not be updated in this case.
      */
-    virtual Status closeDatabase(OperationContext* opCtx, StringData db) = 0;
-
-    /**
-     * Deletes all data and metadata for a database.
-     */
-    virtual Status dropDatabase(OperationContext* opCtx, StringData db) = 0;
-
-    /**
-     * @return number of files flushed
-     */
-    virtual int flushAllFiles(OperationContext* opCtx, bool sync) = 0;
+    virtual void flushAllFiles(OperationContext* opCtx, bool callerHoldsReadLock) = 0;
 
     /**
      * Transitions the storage engine into backup mode.
@@ -253,10 +275,7 @@ public:
      * retried, returns a non-OK status. This function may throw a WriteConflictException, which
      * should trigger a retry by the caller. All other exceptions should be treated as errors.
      */
-    virtual Status beginBackup(OperationContext* opCtx) {
-        return Status(ErrorCodes::CommandNotSupported,
-                      "The current storage engine doesn't support backup mode");
-    }
+    virtual Status beginBackup() = 0;
 
     /**
      * Transitions the storage engine out of backup mode.
@@ -265,34 +284,253 @@ public:
      *
      * Storage engines implementing this feature should fassert when unable to leave backup mode.
      */
-    virtual void endBackup(OperationContext* opCtx) {
-        return;
-    }
+    virtual void endBackup() = 0;
 
-    virtual StatusWith<std::vector<std::string>> beginNonBlockingBackup(OperationContext* opCtx) {
-        return Status(ErrorCodes::CommandNotSupported,
-                      "The current storage engine does not support a concurrent mode.");
-    }
+    /**
+     * Disables the storage of incremental backup history until a subsequent incremental backup
+     * cursor is requested.
+     *
+     * The storage engine must release all incremental backup information and resources.
+     */
+    virtual Status disableIncrementalBackup() = 0;
 
-    virtual void endNonBlockingBackup(OperationContext* opCtx) {
-        return;
-    }
+    /**
+     * Returns the timestamp of the checkpoint that the backup cursor is opened on.
+     */
+    virtual Timestamp getBackupCheckpointTimestamp() = 0;
+
+    /**
+     * Represents the options that the storage engine can use during full and incremental backups.
+     *
+     * When performing a full backup where incrementalBackup=false, the values of 'blockSizeMB',
+     * 'thisBackupName', and 'srcBackupName' should not be modified.
+     *
+     * When performing an incremental backup where incrementalBackup=true, we first need a basis for
+     * future incremental backups. This first basis (named 'thisBackupName'), which is a full
+     * backup, must pass incrementalBackup=true and should not set 'srcBackupName'. An incremental
+     * backup will include changed blocks since 'srcBackupName' was taken. This backup (also named
+     * 'thisBackupName') will then become the basis for future incremental backups.
+     *
+     * Note that 'thisBackupName' must exist if and only if incrementalBackup=true while
+     * 'srcBackupName' must not exist if incrementalBackup=false but may or may not exist if
+     * incrementalBackup=true.
+     */
+    struct BackupOptions {
+        bool disableIncrementalBackup = false;
+        bool incrementalBackup = false;
+        int blockSizeMB = 16;
+        bool takeCheckpoint = true;
+        boost::optional<std::string> thisBackupName;
+        boost::optional<std::string> srcBackupName;
+    };
+
+    /**
+     * Abstract class required for streaming both full and incremental backups. The function
+     * getNextBatch() returns a vector containing 'batchSize' or less BackupBlocks. The
+     * StreamingCursor has been exhausted if getNextBatch() returns an empty vector.
+     */
+    class StreamingCursor {
+    public:
+        StreamingCursor() = delete;
+        explicit StreamingCursor(BackupOptions options) : options(options) {};
+
+        virtual ~StreamingCursor() = default;
+
+        virtual void setCatalogEntries(
+            stdx::unordered_map<std::string, std::pair<NamespaceString, UUID>>
+                identsToNsAndUUID) = 0;
+
+        virtual StatusWith<std::deque<BackupBlock>> getNextBatch(std::size_t batchSize) = 0;
+
+    protected:
+        BackupOptions options;
+    };
+
+    virtual StatusWith<std::unique_ptr<StreamingCursor>> beginNonBlockingBackup(
+        const BackupOptions& options) = 0;
+
+    /**
+     * A TimestampMonitor is used to listen for any changes in the timestamps implemented by the
+     * storage engine and to notify any registered listeners upon changes to these timestamps.
+     *
+     * The monitor follows the same lifecycle as the storage engine, started when the storage
+     * engine starts and stopped when the storage engine stops.
+     *
+     * The PeriodicRunner must be started before the Storage Engine is started, and the Storage
+     * Engine must be shutdown after the PeriodicRunner is shutdown.
+     */
+    class TimestampMonitor {
+    public:
+        /**
+         * Timestamps that can be listened to for changes.
+         */
+        enum class TimestampType { kCheckpoint, kOldest, kStable, kMinOfCheckpointAndOldest };
+
+        /**
+         * A TimestampListener is used to listen for changes in a given timestamp and to execute the
+         * user-provided callback to the change with a custom user-provided callback.
+         *
+         * The TimestampListener must be registered in the TimestampMonitor in order to be notified
+         * of timestamp changes and react to changes for the duration it's part of the monitor.
+         *
+         * Listeners expected to run in standalone mode should handle Timestamp::min() notifications
+         * appropriately.
+         */
+        class TimestampListener {
+        public:
+            // Caller must ensure that the lifetime of the variables used in the callback are valid.
+            using Callback = std::function<void(OperationContext* opCtx, Timestamp timestamp)>;
+
+            /**
+             * A TimestampListener saves a 'callback' that will be executed whenever the specified
+             * 'type' timestamp changes. The 'callback' function will be passed the new 'type'
+             * timestamp.
+             */
+            TimestampListener(TimestampType type, Callback callback)
+                : _type(type), _callback(std::move(callback)) {}
+
+            /**
+             * Executes the appropriate function with the callback of the listener with the new
+             * timestamp.
+             */
+            void notify(OperationContext* opCtx, Timestamp newTimestamp) {
+                if (_type == TimestampType::kCheckpoint)
+                    _onCheckpointTimestampChanged(opCtx, newTimestamp);
+                else if (_type == TimestampType::kOldest)
+                    _onOldestTimestampChanged(opCtx, newTimestamp);
+                else if (_type == TimestampType::kStable)
+                    _onStableTimestampChanged(opCtx, newTimestamp);
+                else if (_type == TimestampType::kMinOfCheckpointAndOldest)
+                    _onMinOfCheckpointAndOldestTimestampChanged(opCtx, newTimestamp);
+            }
+
+            TimestampType getType() const {
+                return _type;
+            }
+
+        private:
+            void _onCheckpointTimestampChanged(OperationContext* opCtx, Timestamp newTimestamp) {
+                _callback(opCtx, newTimestamp);
+            }
+
+            void _onOldestTimestampChanged(OperationContext* opCtx, Timestamp newTimestamp) {
+                _callback(opCtx, newTimestamp);
+            }
+
+            void _onStableTimestampChanged(OperationContext* opCtx, Timestamp newTimestamp) {
+                _callback(opCtx, newTimestamp);
+            }
+
+            void _onMinOfCheckpointAndOldestTimestampChanged(OperationContext* opCtx,
+                                                             Timestamp newTimestamp) {
+                _callback(opCtx, newTimestamp);
+            }
+
+            // Timestamp type this listener monitors.
+            TimestampType _type;
+
+            // Function to execute when the timestamp changes.
+            Callback _callback;
+        };
+
+        /**
+         * Starts monitoring timestamp changes in the background with an initial listener.
+         */
+        TimestampMonitor(KVEngine* engine, PeriodicRunner* runner);
+
+        ~TimestampMonitor();
+
+        /**
+         * Adds a new listener to the monitor if it isn't already registered. A listener can only be
+         * bound to one type of timestamp at a time.
+         */
+        void addListener(TimestampListener* listener);
+
+        /**
+         * Remove a listener.
+         */
+        void removeListener(TimestampListener* listener);
+
+        /**
+         * Returns registered listeners.
+         */
+        std::vector<TimestampListener*> getListeners();
+
+        bool isRunning_forTestOnly() const {
+            return _running;
+        }
+
+    private:
+        /**
+         * Monitor changes in timestamps and to notify the listeners on change. Notifies all
+         * listeners on Timestamp::min() in order to support standalone mode that is untimestamped.
+         */
+        void _startup();
+
+        KVEngine* _engine;
+        bool _running = false;
+        bool _shuttingDown = false;
+
+        // Periodic runner that the timestamp monitor schedules its job on.
+        PeriodicRunner* _periodicRunner;
+
+        // Protects access to _listeners below.
+        stdx::mutex _monitorMutex;
+        std::vector<TimestampListener*> _listeners;
+
+        // This should remain as the last member variable so that its destructor gets executed first
+        // when the class instance is being deconstructed. This causes the PeriodicJobAnchor to stop
+        // the PeriodicJob, preventing us from accessing any destructed variables if this were to
+        // run during the destruction of this class instance.
+        PeriodicJobAnchor _job;
+    };
+
+    virtual void endNonBlockingBackup() = 0;
+
+    virtual StatusWith<std::deque<std::string>> extendBackupCursor() = 0;
 
     /**
      * Recover as much data as possible from a potentially corrupt RecordStore.
      * This only recovers the record data, not indexes or anything else.
      *
-     * Generally, this method should not be called directly except by the repairDatabase()
-     * free function.
+     * The Collection object for this namespace should be destructed and recreated after the call,
+     * because the old object has no associated RecordStore when started in repair mode.
      */
-    virtual Status repairRecordStore(OperationContext* opCtx, const std::string& ns) = 0;
+    virtual Status repairRecordStore(OperationContext* opCtx,
+                                     RecordId catalogId,
+                                     const NamespaceString& nss) = 0;
 
     /**
-     * Creates a temporary RecordStore on the storage engine. This record store should be dropped by
-     * the caller when done being used. The storage engine will drop any remaining temporary record
-     * stores on startup.
+     * Creates a temporary table that can be used for spilling in-memory state to disk. A table
+     * created using this API uses a separate SpillKVEngine instance and thus does not interfere
+     * with the reads/writes happening on the main KVEngine instance. This table is automatically
+     * dropped when the returned handle is destructed.
      */
-    virtual std::unique_ptr<RecordStore> makeTemporaryRecordStore(OperationContext* opCtx) = 0;
+    virtual std::unique_ptr<SpillTable> makeSpillTable(OperationContext* opCtx,
+                                                       KeyFormat keyFormat) = 0;
+
+    /**
+     * Creates a temporary RecordStore on the storage engine. On startup after an unclean shutdown,
+     * the storage engine will drop any un-dropped temporary record stores.
+     */
+    virtual std::unique_ptr<TemporaryRecordStore> makeTemporaryRecordStore(OperationContext* opCtx,
+                                                                           KeyFormat keyFormat) = 0;
+
+    /**
+     * Creates a temporary RecordStore on the storage engine for a resumable index build. On
+     * startup after an unclean shutdown, the storage engine will drop any un-dropped temporary
+     * record stores.
+     */
+    virtual std::unique_ptr<TemporaryRecordStore> makeTemporaryRecordStoreForResumableIndexBuild(
+        OperationContext* opCtx, KeyFormat keyFormat) = 0;
+
+    /**
+     * Creates a temporary RecordStore on the storage engine from an existing ident on disk. On
+     * startup after an unclean shutdown, the storage engine will drop any un-dropped temporary
+     * record stores.
+     */
+    virtual std::unique_ptr<TemporaryRecordStore> makeTemporaryRecordStoreFromExistingIdent(
+        OperationContext* opCtx, StringData ident, KeyFormat keyFormat) = 0;
 
     /**
      * This method will be called before there is a clean shutdown.  Storage engines should
@@ -302,20 +540,20 @@ public:
      * On error, the storage engine should assert and crash.
      * There is intentionally no uncleanShutdown().
      */
-    virtual void cleanShutdown() = 0;
+    virtual void cleanShutdown(ServiceContext* svcCtx) = 0;
 
     /**
      * Returns the SnapshotManager for this StorageEngine or NULL if not supported.
      *
      * Pointer remains owned by the StorageEngine, not the caller.
      */
-    virtual SnapshotManager* getSnapshotManager() const {
-        return nullptr;
-    }
+    virtual SnapshotManager* getSnapshotManager() const = 0;
 
     /**
      * Sets a new JournalListener, which is used by the storage engine to alert the rest of the
      * system about journaled write progress.
+     *
+     * This may only be set once.
      */
     virtual void setJournalListener(JournalListener* jl) = 0;
 
@@ -325,27 +563,95 @@ public:
      * a stable timestamp. In that case StorageEngine::recoverToStableTimestamp() will return
      * a bad status.
      */
-    virtual bool supportsRecoverToStableTimestamp() const {
-        return false;
-    }
+    virtual bool supportsRecoverToStableTimestamp() const = 0;
 
     /**
      * Returns whether the storage engine can provide a recovery timestamp.
      */
-    virtual bool supportsRecoveryTimestamp() const {
-        return false;
-    }
+    virtual bool supportsRecoveryTimestamp() const = 0;
 
     /**
      * Returns true if the storage engine supports the readConcern level "snapshot".
      */
-    virtual bool supportsReadConcernSnapshot() const {
-        return false;
-    }
+    virtual bool supportsReadConcernSnapshot() const = 0;
 
-    virtual bool supportsReadConcernMajority() const {
-        return false;
-    }
+    /**
+     * Returns a set of drop pending idents inside the storage engine.
+     */
+    virtual std::set<std::string> getDropPendingIdents() const = 0;
+
+    /**
+     * Returns the number of drop pending idents inside the storage engine.
+     */
+    virtual size_t getNumDropPendingIdents() const = 0;
+
+    /**
+     * Clears list of drop-pending idents in the storage engine.
+     * Used primarily by rollback after recovering to a stable timestamp.
+     */
+    virtual void clearDropPendingState(OperationContext* opCtx) = 0;
+
+    BOOST_STRONG_TYPEDEF(uint64_t, CheckpointIteration);
+
+    /**
+     * Adds 'ident' to a list of indexes/collections whose data will be dropped when:
+     * - the 'dropTime' is sufficiently old to ensure no future data accesses
+     * - and no holders of 'ident' remain (the index/collection is no longer in active use)
+     *
+     * 'dropTime' can be either a CheckpointIteration or a Timestamp. In the case of a Timestamp the
+     * ident will be dropped when we can guarantee that no other operation can access the ident.
+     * CheckpointIteration should be chosen when performing untimestamped drops as they
+     * will make the ident wait for a catalog checkpoint before proceeding with the ident drop.
+     */
+    virtual void addDropPendingIdent(const std::variant<Timestamp, CheckpointIteration>& dropTime,
+                                     std::shared_ptr<Ident> ident,
+                                     DropIdentCallback&& onDrop = nullptr) = 0;
+
+    /**
+     * Marks the ident as in use and prevents the reaper from dropping the ident.
+     *
+     * Returns nullptr if the ident is not known to the reaper, is already being dropped, or is
+     * already dropped.
+     */
+    virtual std::shared_ptr<Ident> markIdentInUse(StringData ident) = 0;
+
+    /**
+     * Starts the timestamp monitor. This periodically drops idents queued by addDropPendingIdent,
+     * and removes historical ident entries no longer necessary.
+     */
+    virtual void startTimestampMonitor(
+        std::initializer_list<TimestampMonitor::TimestampListener*> listeners) = 0;
+
+    /**
+     * Used by recoverToStableTimestamp() to prevent the TimestampMonitor from accessing the catalog
+     * concurrently during rollback.
+     */
+    virtual void stopTimestampMonitor() = 0;
+    virtual void restartTimestampMonitor() = 0;
+
+    /**
+     * Called when the checkpoint thread instructs the storage engine to take a checkpoint. The
+     * underlying storage engine must take a checkpoint at this point.
+     * Acquires a resource mutex before taking the checkpoint.
+     */
+    virtual void checkpoint() = 0;
+
+    /**
+     * Returns the checkpoint iteration the committed write will be part of.
+     *
+     * This token is only meaningful if obtained after a WriteUnitOfWork commit. You can use the
+     * number with StorageEngine::hasDataBeenCheckpointed(CheckpointIteration) in order to check
+     * whether the write has been checkpointed or not.
+     *
+     * Mostly of use for writes that are untimestamped. Timestamped writes should use the commit
+     * time used and the durable timestamp.
+     */
+    virtual CheckpointIteration getCheckpointIteration() const = 0;
+
+    /**
+     * Returns whether the given checkpoint iteration has been durably flushed to disk.
+     */
+    virtual bool hasDataBeenCheckpointed(CheckpointIteration checkpointIteration) const = 0;
 
     /**
      * Recovers the storage engine state to the last stable timestamp. "Stable" in this case
@@ -363,18 +669,14 @@ public:
      * It is illegal to call this concurrently with `setStableTimestamp` or
      * `setInitialDataTimestamp`.
      */
-    virtual StatusWith<Timestamp> recoverToStableTimestamp(OperationContext* opCtx) {
-        fassertFailed(40547);
-    }
+    virtual StatusWith<Timestamp> recoverToStableTimestamp(OperationContext* opCtx) = 0;
 
     /**
      * Returns the stable timestamp that the storage engine recovered to on startup. If the
      * recovery point was not stable, returns "none".
      * fasserts if StorageEngine::supportsRecoverToStableTimestamp() would return false.
      */
-    virtual boost::optional<Timestamp> getRecoveryTimestamp() const {
-        MONGO_UNREACHABLE;
-    }
+    virtual boost::optional<Timestamp> getRecoveryTimestamp() const = 0;
 
     /**
      * Returns a timestamp that is guaranteed to exist on storage engine recovery to a stable
@@ -386,95 +688,266 @@ public:
      * boost::none if the recovery time has not yet been established. Replication recoverable
      * rollback may not succeed before establishment, and restart will require resync.
      */
-    virtual boost::optional<Timestamp> getLastStableRecoveryTimestamp() const {
-        MONGO_UNREACHABLE;
-    }
+    virtual boost::optional<Timestamp> getLastStableRecoveryTimestamp() const = 0;
 
     /**
-     * Sets the highest timestamp at which the storage engine is allowed to take a checkpoint.
-     * This timestamp can never decrease, and thus should be a timestamp that can never roll back.
-     *
-     * The maximumTruncationTimestamp (and newer) must not be truncated from the oplog in order to
-     * recover from the `stableTimestamp`.  `boost::none` implies there are no additional
-     * constraints to what may be truncated.
-     *
-     * For proper truncation of the oplog, this method requires min(stableTimestamp,
-     * maximumTruncationTimestamp) to be monotonically increasing (where `min(stableTimestamp,
-     * boost::none) => stableTimestamp`). Otherwise truncation can race and remove a document
-     * before a call to this method protects it.
+     * Sets the highest timestamp at which the storage engine is allowed to take a checkpoint. This
+     * timestamp must not decrease unless force=true is set, in which case we force the stable
+     * timestamp, the oldest timestamp, and the commit timestamp backward.
      */
-    virtual void setStableTimestamp(Timestamp stableTimestamp,
-                                    boost::optional<Timestamp> maximumTruncationTimestamp) {}
+    virtual void setStableTimestamp(Timestamp stableTimestamp, bool force = false) = 0;
+
+    /**
+     * Returns the stable timestamp.
+     */
+    virtual Timestamp getStableTimestamp() const = 0;
 
     /**
      * Tells the storage engine the timestamp of the data at startup. This is necessary because
      * timestamps are not persisted in the storage layer.
      */
-    virtual void setInitialDataTimestamp(Timestamp timestamp) {}
+    virtual void setInitialDataTimestamp(Timestamp timestamp) = 0;
+
+    /**
+     * Returns the initial data timestamp.
+     */
+    virtual Timestamp getInitialDataTimestamp() const = 0;
 
     /**
      * Uses the current stable timestamp to set the oldest timestamp for which the storage engine
      * must maintain snapshot history through.
      *
      * oldest_timestamp will be set to stable_timestamp adjusted by
-     * 'targetSnapshotHistoryWindowInSeconds' to create a window of available snapshots on the
+     * 'minSnapshotHistoryWindowInSeconds' to create a window of available snapshots on the
      * storage engine from oldest to stable. Furthermore, oldest_timestamp will never be set ahead
      * of the oplog read timestamp, ensuring the oplog reader's 'read_timestamp' can always be
      * serviced.
      */
-    virtual void setOldestTimestampFromStable() {}
+    virtual void setOldestTimestampFromStable() = 0;
 
     /**
      * Sets the oldest timestamp for which the storage engine must maintain snapshot history
      * through. Additionally, all future writes must be newer or equal to this value.
      */
-    virtual void setOldestTimestamp(Timestamp timestamp) {}
+    virtual void setOldestTimestamp(Timestamp timestamp, bool force) = 0;
 
     /**
-     * Indicates whether the storage engine cache is under pressure.
-     *
-     * Retrieves a cache pressure value in the range [0, 100] from the storage engine, and compares
-     * it against storageGlobalParams.cachePressureThreshold, a dynamic server parameter, to
-     * determine whether cache pressure is too high.
+     * Gets the oldest timestamp for which the storage engine must maintain snapshot history
+     * through.
      */
-    virtual bool isCacheUnderPressure(OperationContext* opCtx) const {
-        return false;
-    }
+    virtual Timestamp getOldestTimestamp() const = 0;
 
     /**
-     * For unit tests only. Sets the cache pressure value with which isCacheUnderPressure()
-     * evalutates to 'pressure'.
+     * Sets a callback which returns the timestamp of the oldest oplog entry involved in an
+     * active MongoDB transaction. The storage engine calls this function to determine how much
+     * oplog it must preserve.
      */
-    virtual void setCachePressureForTest(int pressure) {}
+    virtual void setOldestActiveTransactionTimestampCallback(
+        OldestActiveTransactionTimestampCallback callback) = 0;
 
-    /**
-     *  Notifies the storage engine that a replication batch has completed.
-     *  This means that all the writes associated with the oplog entries in the batch are
-     *  finished and no new writes with timestamps associated with those oplog entries will show
-     *  up in the future.
-     *  This function can be used to ensure oplog visibility rules are not broken, for example.
+    struct IndexIdentifier {
+        const RecordId catalogId;
+        const NamespaceString nss;
+        const std::string indexName;
+    };
+
+    /*
+     * ReconcileResult is the result of reconciling abandoned storage engine idents and unfinished
+     * index builds.
      */
-    virtual void replicationBatchIsComplete() const {};
+    struct ReconcileResult {
+        // A map of unfinished two-phase indexes that must be restarted in the background, but
+        // not to completion; they will wait for replicated commit or abort operations. This is a
+        // mapping from index build UUID to index build.
+        IndexBuilds indexBuildsToRestart;
 
-    // (CollectionName, IndexName)
-    typedef std::pair<std::string, std::string> CollectionIndexNamePair;
-
-    /**
-     * Drop abandoned idents. In the successful case, returns a list of collection, index name
-     * pairs to rebuild.
-     */
-    virtual StatusWith<std::vector<CollectionIndexNamePair>> reconcileCatalogAndIdents(
-        OperationContext* opCtx) {
-        return std::vector<CollectionIndexNamePair>();
+        // List of index builds to be resumed. Each ResumeIndexInfo may contain multiple indexes to
+        // resume as part of the same build.
+        std::vector<ResumeIndexInfo> indexBuildsToResume;
     };
 
     /**
-     * Returns the all committed timestamp. All transactions with timestamps earlier than the
-     * all committed timestamp are committed. Only storage engines that support document level
-     * locking must provide an implementation. Other storage engines may provide a no-op
-     * implementation.
+     * Drop abandoned idents using two-phase drop at the stable timestamp. Idents may be needed for
+     * reads between the oldest and stable timestamps. If successful, returns a ReconcileResult with
+     * indexes that need to be rebuilt or builds that need to be restarted.
+     *
+     * Abandoned internal idents require special handling based on the context known only to the
+     * caller. For example, on starting from a previous unclean shutdown, we would always drop all
+     * unknown internal idents. If we started from a clean shutdown, the internal idents may contain
+     * information for resuming index builds.
      */
-    virtual Timestamp getAllCommittedTimestamp() const = 0;
+    virtual StatusWith<ReconcileResult> reconcileCatalogAndIdents(
+        OperationContext* opCtx, Timestamp stableTs, LastShutdownState lastShutdownState) = 0;
+
+    /**
+     * Returns the all_durable timestamp. All transactions with timestamps earlier than the
+     * all_durable timestamp are committed.
+     *
+     * The all_durable timestamp is the in-memory no holes point. That does not mean that there are
+     * no holes behind it on disk. The all_durable timestamp also might not correspond with any
+     * oplog entry, but instead have a timestamp value between that of two oplog entries.
+     *
+     * The all_durable timestamp only includes non-prepared transactions that have been given a
+     * commit_timestamp and prepared transactions that have been given a durable_timestamp.
+     * Previously, the deprecated all_committed timestamp would also include prepared transactions
+     * that were prepared but not committed which could make the stable timestamp briefly jump back.
+     *
+     * Returns kMinimumTimestamp if there have been no new writes since the storage engine started.
+     */
+    virtual Timestamp getAllDurableTimestamp() const = 0;
+
+    /**
+     * Returns the minimum possible Timestamp value in the oplog that replication may need for
+     * recovery in the event of a crash.
+     *
+     * Returns boost::none when called on an ephemeral database.
+     */
+    virtual boost::optional<Timestamp> getOplogNeededForCrashRecovery() const = 0;
+
+    /**
+     * Returns oplog that may not be truncated. This method is a function of oplog needed for
+     * rollback and oplog needed for crash recovery. This method considers different states the
+     * storage engine can be running in, such as running in in-memory mode.
+     *
+     * This method returning Timestamp::min() implies no oplog should be truncated and
+     * Timestamp::max() means oplog can be truncated freely based on user oplog size configuration.
+     */
+    virtual Timestamp getPinnedOplog() const = 0;
+
+    /**
+     * Returns the path to the directory which has the data files of database with `dbName`.
+     */
+    virtual std::string getFilesystemPathForDb(const DatabaseName& dbName) const = 0;
+
+    virtual bool isUsingDirectoryPerDb() const = 0;
+
+    virtual bool isUsingDirectoryForIndexes() const = 0;
+
+    virtual int64_t getIdentSize(RecoveryUnit&, StringData ident) const = 0;
+
+    virtual KVEngine* getEngine() = 0;
+    virtual const KVEngine* getEngine() const = 0;
+    virtual DurableCatalog* getDurableCatalog() = 0;
+    virtual const DurableCatalog* getDurableCatalog() const = 0;
+
+    /**
+     * A service that would like to pin the oldest timestamp registers its request here. If the
+     * request can be satisfied, OK is returned with the oldest timestamp the caller can
+     * use. Otherwise, SnapshotTooOld is returned. See the following enumerations:
+     *
+     * | Timestamp Relation  | roundUpIfTooOld | Result                    |
+     * |---------------------+-----------------+---------------------------|
+     * | requested >= oldest | false/true      | <OK, requested timestamp> |
+     * | requested < oldest  | false           | <SnapshotTooOld>          |
+     * | requested < oldest  | true            | <OK, oldest timestamp>    |
+     *
+     * If the input OperationContext is in a WriteUnitOfWork, an `onRollback` handler will be
+     * registered to return the pin for the `requestingServiceName` to the previous value.
+     */
+    virtual StatusWith<Timestamp> pinOldestTimestamp(RecoveryUnit&,
+                                                     const std::string& requestingServiceName,
+                                                     Timestamp requestedTimestamp,
+                                                     bool roundUpIfTooOld) = 0;
+
+    /**
+     * Unpins the request registered under `requestingServiceName`.
+     */
+    virtual void unpinOldestTimestamp(const std::string& requestingServiceName) = 0;
+
+    /**
+     * Prevents oplog history at 'pinnedTimestamp' and later from being truncated. Setting
+     * Timestamp::max() effectively nullifies the pin because no oplog truncation will be stopped by
+     * it.
+     */
+    virtual void setPinnedOplogTimestamp(const Timestamp& pinnedTimestamp) = 0;
+
+    /**
+     * When we write to an oplog, we call this so that that the storage engine can manage the
+     * visibility of oplog entries to ensure they are ordered.
+     *
+     * Since this is called inside of a WriteUnitOfWork while holding a std::mutex, it is
+     * illegal to acquire any LockManager locks inside of this function.
+     *
+     * If `orderedCommit` is true, the storage engine can assume the input `opTime` has become
+     * visible in the oplog. Otherwise the storage engine must continue to maintain its own
+     * visibility management. Calls with `orderedCommit` true will not be concurrent with calls of
+     * `orderedCommit` false.
+     */
+    virtual Status oplogDiskLocRegister(OperationContext* opCtx,
+                                        RecordStore* oplogRecordStore,
+                                        const Timestamp& opTime,
+                                        bool orderedCommit) = 0;
+
+    /**
+     * Waits for all writes that completed before this call to be visible to forward scans.
+     * See the comment on RecordCursor for more details about the visibility rules.
+     *
+     * It is only legal to call this on an oplog. It is illegal to call this inside a
+     * WriteUnitOfWork.
+     */
+    virtual void waitForAllEarlierOplogWritesToBeVisible(OperationContext* opCtx,
+                                                         RecordStore* oplogRecordStore) const = 0;
+
+    /**
+     * Waits until all commits that happened before this call are durable in the journal. Returns
+     * true, unless the storage engine cannot guarantee durability, which should never happen when
+     * the engine is non-ephemeral. This cannot be called from inside a unit of work, and should
+     * fail if it is. This method invariants if the caller holds any locks, except for repair.
+     *
+     * Can throw write interruption errors from the JournalListener.
+     */
+    virtual bool waitUntilDurable(OperationContext* opCtx) = 0;
+
+    /**
+     * Unlike `waitUntilDurable`, this method takes a stable checkpoint, making durable any writes
+     * on unjournaled tables that are behind the current stable timestamp. If the storage engine
+     * is starting from an "unstable" checkpoint or 'stableCheckpoint'=false, this method call will
+     * turn into an unstable checkpoint.
+     *
+     * This must not be called by a system taking user writes until after a stable timestamp is
+     * passed to the storage engine.
+     */
+    virtual bool waitUntilUnjournaledWritesDurable(OperationContext* opCtx,
+                                                   bool stableCheckpoint) = 0;
+
+    /**
+     * Returns the input storage engine options, sanitized to remove options that may not apply to
+     * this node, such as encryption. Might be called for both collection and index options. See
+     * SERVER-68122.
+     *
+     * TODO SERVER-81069: Remove this since it's intrinsically tied to encryption options only.
+     */
+    virtual BSONObj getSanitizedStorageOptionsForSecondaryReplication(
+        const BSONObj& options) const = 0;
+    /**
+     * Instructs the storage engine to dump its internal state.
+     */
+    virtual void dump() const = 0;
+
+    /**
+     * Toggles auto compact for a database. Auto compact periodically iterates through all of
+     * the files available and runs compaction if they are eligible.
+     */
+    virtual Status autoCompact(RecoveryUnit&, const AutoCompactOptions& options) = 0;
+
+    /**
+     * Return true if the storage engine indicates that it is under cache pressure.
+     */
+    virtual bool underCachePressure() {
+        return false;
+    };
+
+    /**
+     * Return the size (in megabytes) allocated to the storage engine for cache.
+     */
+    virtual size_t getCacheSizeMB() {
+        return 0;
+    }
+
+    /**
+     * Returns whether the storage engine is currently trying to live-restore its database.
+     */
+    virtual bool hasOngoingLiveRestore() = 0;
 };
 
 }  // namespace mongo

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,12 +29,14 @@
 
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <iosfwd>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "mongo/base/error_extra_info.h"
 #include "mongo/base/status.h"
 #include "mongo/base/string_data.h"
 
@@ -116,6 +117,9 @@ public:
     public:
         TagCountConstraint() {}
         TagCountConstraint(int32_t keyIndex, int32_t minCount);
+        bool operator==(const TagCountConstraint& other) const {
+            return _keyIndex == other._keyIndex && _minCount == other._minCount;
+        }
         int32_t getKeyIndex() const {
             return _keyIndex;
         }
@@ -150,6 +154,37 @@ public:
      */
     ConstraintIterator constraintsEnd() const {
         return _constraints.end();
+    }
+
+    /**
+     * Gets the number of constraints in this pattern.
+     */
+    size_t getNumConstraints() const {
+        return _constraints.size();
+    }
+
+    bool operator==(const ReplSetTagPattern& other) const {
+        if (getNumConstraints() != other.getNumConstraints()) {
+            return false;
+        }
+
+        for (auto itrA = constraintsBegin(); itrA != constraintsEnd(); itrA++) {
+            bool same = false;
+            for (auto itrB = other.constraintsBegin(); itrB != other.constraintsEnd(); itrB++) {
+                if (*itrA == *itrB) {
+                    same = true;
+                    break;
+                }
+            }
+            if (!same) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    bool operator!=(const ReplSetTagPattern& other) const {
+        return !operator==(other);
     }
 
 private:

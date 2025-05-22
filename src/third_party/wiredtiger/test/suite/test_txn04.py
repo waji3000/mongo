@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Public Domain 2014-2018 MongoDB, Inc.
+# Public Domain 2014-present MongoDB, Inc.
 # Public Domain 2008-2014 WiredTiger, Inc.
 #
 # This is free and unencumbered software released into the public domain.
@@ -25,6 +25,11 @@
 # OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
 # ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
 # OTHER DEALINGS IN THE SOFTWARE.
+#
+# [TEST_TAGS]
+# backup
+# recovery
+# [END_TAGS]
 #
 # test_txn04.py
 #   Transactions: hot backup and recovery
@@ -69,8 +74,8 @@ class test_txn04(wttest.WiredTigerTestCase, suite_subprocess):
         # deterministic manner.
         txn_sync = self.sync_list[
             self.scenario_number % len(self.sync_list)]
-        # Set archive false on the home directory.
-        return 'log=(archive=false,enabled,file_max=%s),' % self.logmax + \
+        # Set remove=false on the home directory.
+        return 'log=(enabled,file_max=%s,remove=false),' % self.logmax + \
             'transaction_sync="%s",' % txn_sync
 
     # Check that a cursor (optionally started in a new transaction), sees the
@@ -81,7 +86,7 @@ class test_txn04(wttest.WiredTigerTestCase, suite_subprocess):
         c = session.open_cursor(self.uri, None)
         actual = dict((k, v) for k, v in c if v != 0)
         # Search for the expected items as well as iterating
-        for k, v in expected.iteritems():
+        for k, v in expected.items():
             self.assertEqual(c[k], v)
         c.close()
         if txn_config:
@@ -183,12 +188,8 @@ class test_txn04(wttest.WiredTigerTestCase, suite_subprocess):
         # Backup the target we modified and verify the data.
         # print 'Call hot_backup with ' + self.uri
         self.hot_backup(self.uri, committed)
-
     def test_ops(self):
         self.backup_dir = os.path.join(self.home, "WT_BACKUP")
         self.session2 = self.conn.open_session()
         with self.expectedStdoutPattern('recreating metadata'):
             self.ops()
-
-if __name__ == '__main__':
-    wttest.run()

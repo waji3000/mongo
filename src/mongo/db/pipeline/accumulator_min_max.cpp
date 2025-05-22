@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,28 +27,40 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
 
-#include "mongo/db/pipeline/accumulator.h"
+#include <boost/smart_ptr/intrusive_ptr.hpp>
 
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/exec/document_value/value_comparator.h"
 #include "mongo/db/pipeline/accumulation_statement.h"
+#include "mongo/db/pipeline/accumulator.h"
+#include "mongo/db/pipeline/accumulator_helpers.h"
 #include "mongo/db/pipeline/expression.h"
-#include "mongo/db/pipeline/value.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/window_function/window_function_expression.h"
+#include "mongo/db/pipeline/window_function/window_function_min_max.h"
 
 namespace mongo {
 
-using boost::intrusive_ptr;
-
-REGISTER_ACCUMULATOR(max, AccumulatorMax::create);
-REGISTER_ACCUMULATOR(min, AccumulatorMin::create);
-REGISTER_EXPRESSION(max, ExpressionFromAccumulator<AccumulatorMax>::parse);
-REGISTER_EXPRESSION(min, ExpressionFromAccumulator<AccumulatorMin>::parse);
-
-const char* AccumulatorMinMax::getOpName() const {
-    if (_sense == 1)
-        return "$min";
-    return "$max";
+template <>
+Value ExpressionFromAccumulator<AccumulatorMax>::evaluate(const Document& root,
+                                                          Variables* variables) const {
+    return evaluateAccumulator(*this, root, variables);
 }
+
+template <>
+Value ExpressionFromAccumulator<AccumulatorMin>::evaluate(const Document& root,
+                                                          Variables* variables) const {
+    return evaluateAccumulator(*this, root, variables);
+}
+
+REGISTER_ACCUMULATOR(max, genericParseSingleExpressionAccumulator<AccumulatorMax>);
+REGISTER_ACCUMULATOR(min, genericParseSingleExpressionAccumulator<AccumulatorMin>);
+REGISTER_STABLE_EXPRESSION(max, ExpressionFromAccumulator<AccumulatorMax>::parse);
+REGISTER_STABLE_EXPRESSION(min, ExpressionFromAccumulator<AccumulatorMin>::parse);
+REGISTER_STABLE_REMOVABLE_WINDOW_FUNCTION(max, AccumulatorMax, WindowFunctionMax);
+REGISTER_STABLE_REMOVABLE_WINDOW_FUNCTION(min, AccumulatorMin, WindowFunctionMin);
 
 void AccumulatorMinMax::processInternal(const Value& input, bool merging) {
     // nullish values should have no impact on result
@@ -58,7 +69,7 @@ void AccumulatorMinMax::processInternal(const Value& input, bool merging) {
         int cmp = getExpressionContext()->getValueComparator().compare(_val, input) * _sense;
         if (cmp > 0 || _val.missing()) {  // missing is lower than all other values
             _val = input;
-            _memUsageBytes = sizeof(*this) + input.getApproximateSize() - sizeof(Value);
+            _memUsageTracker.set(sizeof(*this) + input.getApproximateSize() - sizeof(Value));
         }
     }
 }
@@ -70,24 +81,13 @@ Value AccumulatorMinMax::getValue(bool toBeMerged) {
     return _val;
 }
 
-AccumulatorMinMax::AccumulatorMinMax(const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                                     Sense sense)
-    : Accumulator(expCtx), _sense(sense) {
-    _memUsageBytes = sizeof(*this);
+AccumulatorMinMax::AccumulatorMinMax(ExpressionContext* const expCtx, Sense sense)
+    : AccumulatorState(expCtx), _sense(sense) {
+    _memUsageTracker.set(sizeof(*this));
 }
 
 void AccumulatorMinMax::reset() {
     _val = Value();
-    _memUsageBytes = sizeof(*this);
+    _memUsageTracker.set(sizeof(*this));
 }
-
-intrusive_ptr<Accumulator> AccumulatorMin::create(
-    const boost::intrusive_ptr<ExpressionContext>& expCtx) {
-    return new AccumulatorMin(expCtx);
-}
-
-intrusive_ptr<Accumulator> AccumulatorMax::create(
-    const boost::intrusive_ptr<ExpressionContext>& expCtx) {
-    return new AccumulatorMax(expCtx);
-}
-}
+}  // namespace mongo

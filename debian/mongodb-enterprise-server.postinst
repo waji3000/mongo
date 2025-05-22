@@ -38,6 +38,12 @@ case "$1" in
             mkdir -p /var/log/mongodb
             chown mongodb:mongodb /var/log/mongodb
         fi
+
+        # Check for changes to the service file, but ignore errors when
+        # systemd is not running.
+        if $(command systemctl --help >/dev/null); then
+            systemctl daemon-reload || true
+        fi
     ;;
 
     abort-upgrade|abort-remove|abort-deconfigure)

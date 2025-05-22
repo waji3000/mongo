@@ -1,9 +1,7 @@
-'use strict';
-
 // Validate the config object and return a normalized copy of it.
 // Normalized means all optional parameters are set to their default values,
 // and any parameters that need to be coerced have been coerced.
-function parseConfig(config) {
+export function parseConfig(config) {
     config = Object.extend({}, config, true);  // defensive deep copy
 
     var allowedKeys = [
@@ -29,7 +27,6 @@ function parseConfig(config) {
     assert.gt(config.threadCount, 0, 'expected number of threads to be positive');
 
     assert(Number.isInteger(config.iterations), 'expected number of iterations to be an integer');
-    assert.gt(config.iterations, 0, 'expected number of iterations to be positive');
 
     config.startState = config.startState || 'init';
     assert.eq('string', typeof config.startState);
@@ -61,8 +58,8 @@ function parseConfig(config) {
         assert.gt(Object.keys(config.transitions[fromState]).length, 0);
         Object.keys(config.transitions[fromState]).forEach(function(toState) {
             assert(config.states.hasOwnProperty(toState),
-                   'config.transitions.' + fromState + ' contains a state not in config.states: ' +
-                       toState);
+                   'config.transitions.' + fromState +
+                       ' contains a state not in config.states: ' + toState);
             assert.eq('number',
                       typeof config.transitions[fromState][toState],
                       'transitions.' + fromState + '.' + toState + ' should be a number');

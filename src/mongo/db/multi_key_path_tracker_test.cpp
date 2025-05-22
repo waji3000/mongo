@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -32,39 +31,22 @@
  * Unittest for MultikeyPathTracker operations.
  */
 
-#include "mongo/platform/basic.h"
+#include <boost/container/vector.hpp>
 
-#include <sstream>
-
+#include "mongo/base/string_data.h"
 #include "mongo/db/multi_key_path_tracker.h"
 #include "mongo/unittest/unittest.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 namespace {
 
-std::string dumpMultikeyPaths(const MultikeyPaths& multikeyPaths) {
-    std::stringstream ss;
-
-    ss << "[ ";
-    for (const auto multikeyComponents : multikeyPaths) {
-        ss << "[ ";
-        for (const auto multikeyComponent : multikeyComponents) {
-            ss << multikeyComponent << " ";
-        }
-        ss << "] ";
-    }
-    ss << "]";
-
-    return ss.str();
-}
-
 void assertMultikeyPathsAreEqual(const MultikeyPaths& actual, const MultikeyPaths& expected) {
     bool match = (expected == actual);
     if (!match) {
-        FAIL(str::stream() << "Expected: " << dumpMultikeyPaths(expected) << ", "
-                           << "Actual: "
-                           << dumpMultikeyPaths(actual));
+        FAIL(str::stream() << "Expected: " << MultikeyPathTracker::dumpMultikeyPaths(expected)
+                           << ", "
+                           << "Actual: " << MultikeyPathTracker::dumpMultikeyPaths(actual));
     }
     ASSERT(match);
 }

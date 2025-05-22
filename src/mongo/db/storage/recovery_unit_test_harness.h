@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,6 +29,13 @@
 
 #pragma once
 
+#include <functional>
+#include <memory>
+#include <string>
+
+#include "mongo/db/operation_context.h"
+#include "mongo/db/storage/record_store.h"
+#include "mongo/db/storage/recovery_unit.h"
 #include "mongo/db/storage/test_harness_helper.h"
 
 namespace mongo {
@@ -38,12 +44,13 @@ class RecordStore;
 
 class RecoveryUnitHarnessHelper : public HarnessHelper {
 public:
-    virtual std::unique_ptr<RecoveryUnit> newRecoveryUnit() = 0;
+    std::unique_ptr<RecoveryUnit> newRecoveryUnit() override = 0;
     virtual std::unique_ptr<RecordStore> createRecordStore(OperationContext* opCtx,
                                                            const std::string& ns) = 0;
 };
 
-inline std::unique_ptr<RecoveryUnitHarnessHelper> newRecoveryUnitHarnessHelper() {
-    return dynamic_ptr_cast<RecoveryUnitHarnessHelper>(newHarnessHelper());
-}
+void registerRecoveryUnitHarnessHelperFactory(
+    std::function<std::unique_ptr<RecoveryUnitHarnessHelper>()> factory);
+
+std::unique_ptr<RecoveryUnitHarnessHelper> newRecoveryUnitHarnessHelper();
 }  // namespace mongo

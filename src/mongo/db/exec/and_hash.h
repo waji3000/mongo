@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,11 +29,15 @@
 
 #pragma once
 
+#include <cstddef>
+#include <memory>
 #include <vector>
 
 #include "mongo/db/exec/plan_stage.h"
-#include "mongo/db/jsobj.h"
-#include "mongo/db/matcher/expression.h"
+#include "mongo/db/exec/plan_stats.h"
+#include "mongo/db/exec/working_set.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/query/stage_types.h"
 #include "mongo/db/record_id.h"
 #include "mongo/stdx/unordered_map.h"
 #include "mongo/stdx/unordered_set.h"
@@ -49,14 +52,14 @@ namespace mongo {
  */
 class AndHashStage final : public PlanStage {
 public:
-    AndHashStage(OperationContext* opCtx, WorkingSet* ws);
+    AndHashStage(ExpressionContext* expCtx, WorkingSet* ws);
 
     /**
      * For testing only. Allows tests to set memory usage threshold.
      */
-    AndHashStage(OperationContext* opCtx, WorkingSet* ws, size_t maxMemUsage);
+    AndHashStage(ExpressionContext* expCtx, WorkingSet* ws, size_t maxMemUsage);
 
-    void addChild(PlanStage* child);
+    void addChild(std::unique_ptr<PlanStage> child);
 
     /**
      * Returns memory usage.
@@ -65,7 +68,7 @@ public:
     size_t getMemUsage() const;
 
     StageState doWork(WorkingSetID* out) final;
-    bool isEOF() final;
+    bool isEOF() const final;
 
     StageType stageType() const final {
         return STAGE_AND_HASH;

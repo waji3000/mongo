@@ -27,17 +27,38 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <array>
+#include <boost/filesystem/fstream.hpp>
+#include <cstddef>
+#include <initializer_list>
+#include <memory>
+#include <ostream>
+#include <set>
+#include <utility>
+#include <vector>
 
-#include "boost/filesystem.hpp"
+#include <absl/container/node_hash_map.h>
+#include <boost/filesystem/file_status.hpp>
+#include <boost/filesystem/operations.hpp>
+#include <boost/filesystem/path.hpp>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
 
+#include "mongo/base/status_with.h"
 #include "mongo/base/string_data.h"
+#include "mongo/db/auth/auth_name.h"
 #include "mongo/db/auth/authorization_manager.h"
+#include "mongo/db/auth/cluster_auth_mode.h"
+#include "mongo/db/auth/role_name.h"
 #include "mongo/db/auth/security_file.h"
 #include "mongo/db/auth/security_key.h"
+#include "mongo/db/auth/user.h"
+#include "mongo/db/auth/user_name.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
+namespace {
 
 class TestFile {
     TestFile(TestFile&) = delete;
@@ -48,7 +69,7 @@ public:
         boost::filesystem::ofstream stream(_path, std::ios_base::out | std::ios_base::trunc);
         ASSERT_TRUE(stream.good());
 
-        stream.write(contents.rawData(), contents.size());
+        stream.write(contents.data(), contents.size());
         stream.close();
         if (fixPerms) {
             const auto perms = boost::filesystem::owner_read | boost::filesystem::owner_write;
@@ -157,17 +178,20 @@ TEST(SecurityFile, Test) {
 }
 
 TEST(SecurityKey, Test) {
-    internalSecurity.user = std::make_shared<User>(UserName("__system", "local"));
+    User user(std::make_unique<UserRequestGeneral>(UserName("__system", "local"), boost::none));
+    auto userHandle = std::make_shared<UserHandle>(std::move(user));
+    internalSecurity.setUser(userHandle);
 
     for (const auto& testCase : testCases) {
         TestFile file(testCase.fileContents, testCase.mode != TestCase::FailureMode::Permissions);
 
         if (testCase.mode == TestCase::FailureMode::Success) {
-            ASSERT_TRUE(setUpSecurityKey(file.path().string()));
+            ASSERT_TRUE(setUpSecurityKey(file.path().string(), ClusterAuthMode::keyFile()));
         } else {
-            ASSERT_FALSE(setUpSecurityKey(file.path().string()));
+            ASSERT_FALSE(setUpSecurityKey(file.path().string(), ClusterAuthMode::keyFile()));
         }
     }
 }
 
+}  // namespace
 }  // namespace mongo

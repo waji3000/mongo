@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,22 +27,24 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/repl/multiapplier.h"
-
+#include <boost/move/utility_core.hpp>
+// IWYU pragma: no_include "cxxabi.h"
+#include <memory>
+#include <mutex>
+#include <ostream>
 #include <utility>
 
+#include "mongo/base/error_codes.h"
 #include "mongo/db/client.h"
-#include "mongo/db/operation_context.h"
+#include "mongo/db/repl/multiapplier.h"
 #include "mongo/db/repl/optime.h"
-#include "mongo/util/destructor_guard.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 namespace repl {
 
 MultiApplier::MultiApplier(executor::TaskExecutor* executor,
-                           const Operations& operations,
+                           const std::vector<OplogEntry>& operations,
                            const MultiApplyFn& multiApply,
                            CallbackFn onCompletion)
     : _executor(executor),
@@ -57,15 +58,20 @@ MultiApplier::MultiApplier(executor::TaskExecutor* executor,
 }
 
 MultiApplier::~MultiApplier() {
-    DESTRUCTOR_GUARD(shutdown(); join(););
+    try {
+        shutdown();
+        join();
+    } catch (...) {
+        reportFailedDestructor(MONGO_SOURCE_LOCATION());
+    }
 }
 
 bool MultiApplier::isActive() const {
     stdx::lock_guard<stdx::mutex> lk(_mutex);
-    return _isActive_inlock();
+    return _isActive(lk);
 }
 
-bool MultiApplier::_isActive_inlock() const {
+bool MultiApplier::_isActive(WithLock lk) const {
     return State::kRunning == _state || State::kShuttingDown == _state;
 }
 
@@ -85,7 +91,7 @@ Status MultiApplier::startup() noexcept {
     }
 
     auto scheduleResult = _executor->scheduleWork(
-        [=](const executor::TaskExecutor::CallbackArgs& cbd) { return _callback(cbd); });
+        [=, this](const executor::TaskExecutor::CallbackArgs& cbd) { return _callback(cbd); });
     if (!scheduleResult.isOK()) {
         _state = State::kComplete;
         return scheduleResult.getStatus();
@@ -119,7 +125,7 @@ void MultiApplier::shutdown() {
 
 void MultiApplier::join() {
     stdx::unique_lock<stdx::mutex> lk(_mutex);
-    _condition.wait(lk, [this]() { return !_isActive_inlock(); });
+    _condition.wait(lk, [&]() { return !_isActive(lk); });
 }
 
 MultiApplier::State MultiApplier::getState_forTest() const {

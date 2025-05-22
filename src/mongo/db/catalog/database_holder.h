@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,121 +29,98 @@
 
 #pragma once
 
+#include <boost/optional/optional.hpp>
+#include <memory>
 #include <set>
 #include <string>
+#include <vector>
 
-#include "mongo/base/shim.h"
 #include "mongo/base/string_data.h"
-#include "mongo/db/namespace_string.h"
-#include "mongo/stdx/functional.h"
-#include "mongo/stdx/mutex.h"
-#include "mongo/util/concurrency/mutex.h"
-#include "mongo/util/string_map.h"
+#include "mongo/db/catalog/database.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/service_context.h"
 
 namespace mongo {
-class Database;
-class OperationContext;
 
 /**
  * Registry of opened databases.
  */
 class DatabaseHolder {
 public:
-    class Impl {
-    public:
-        virtual ~Impl() = 0;
+    // Operation Context binding.
+    static DatabaseHolder* get(ServiceContext* service);
+    static DatabaseHolder* get(ServiceContext& service);
+    static DatabaseHolder* get(OperationContext* opCtx);
+    static void set(ServiceContext* service, std::unique_ptr<DatabaseHolder> databaseHolder);
 
-        virtual Database* get(OperationContext* opCtx, StringData ns) const = 0;
-
-        virtual Database* openDb(OperationContext* opCtx, StringData ns, bool* justCreated) = 0;
-
-        virtual void close(OperationContext* opCtx, StringData ns, const std::string& reason) = 0;
-
-        virtual void closeAll(OperationContext* opCtx, const std::string& reason) = 0;
-
-        virtual std::set<std::string> getNamesWithConflictingCasing(StringData name) = 0;
-    };
-
-public:
-    static MONGO_DECLARE_SHIM(()->DatabaseHolder&) getDatabaseHolder;
-
-    static MONGO_DECLARE_SHIM((PrivateTo<DatabaseHolder>)->std::unique_ptr<Impl>) makeImpl;
-
-    inline ~DatabaseHolder() = default;
-
-    inline explicit DatabaseHolder() : _pimpl(makeImpl(PrivateCall<DatabaseHolder>{})) {}
+    DatabaseHolder() = default;
+    virtual ~DatabaseHolder() = default;
 
     /**
-     * Retrieves an already opened database or returns NULL. Must be called with the database
-     * locked in at least IS-mode.
+     * Retrieves an already opened database or returns nullptr.
+     *
+     * The caller must hold the database lock in MODE_IS.
      */
-    inline Database* get(OperationContext* const opCtx, const StringData ns) const {
-        return this->_impl().get(opCtx, ns);
-    }
+    virtual Database* getDb(OperationContext* opCtx, const DatabaseName& dbName) const = 0;
+
+    /**
+     * Checks if a database exists without holding a database-level lock. This class' internal mutex
+     * provides concurrency protection around looking up the db name of 'dbName'.
+     */
+    virtual bool dbExists(OperationContext* opCtx, const DatabaseName& dbName) const = 0;
 
     /**
      * Retrieves a database reference if it is already opened, or opens it if it hasn't been
-     * opened/created yet. Must be called with the database locked in X-mode.
+     * opened/created yet.
+     *
+     * The caller must hold the database lock in MODE_IX.
      *
      * @param justCreated Returns whether the database was newly created (true) or it already
      *          existed (false). Can be NULL if this information is not necessary.
      */
-    inline Database* openDb(OperationContext* const opCtx,
-                            const StringData ns,
-                            bool* const justCreated = nullptr) {
-        return this->_impl().openDb(opCtx, ns, justCreated);
-    }
+    virtual Database* openDb(OperationContext* opCtx,
+                             const DatabaseName& dbName,
+                             bool* justCreated = nullptr) = 0;
 
     /**
-     * Closes the specified database. Must be called with the database locked in X-mode.
-     * No background jobs must be in progress on the database when this function is called.
-     */
-    inline void close(OperationContext* const opCtx,
-                      const StringData ns,
-                      const std::string& reason) {
-        return this->_impl().close(opCtx, ns, reason);
-    }
-
-    /**
-     * Closes all opened databases. Must be called with the global lock acquired in X-mode.
-     * Will uassert if any background jobs are running when this function is called.
+     * Physically drops the specified opened database and removes it from the server's metadata. It
+     * doesn't notify the replication subsystem or do any other consistency checks, so it should
+     * not be used directly from user commands.
      *
-     * @param reason The reason for close.
+     * The caller must hold the database lock in MODE_X and ensure no index builds are in progress
+     * on the database.
      */
-    inline void closeAll(OperationContext* const opCtx, const std::string& reason) {
-        this->_impl().closeAll(opCtx, reason);
-    }
+    virtual void dropDb(OperationContext* opCtx, Database* db) = 0;
 
     /**
-     * Returns the set of existing database names that differ only in casing.
+     * Closes the specified database.
+     *
+     * The caller must hold the database lock in MODE_X. No background jobs must be in progress on
+     * the database when this function is called.
      */
-    inline std::set<std::string> getNamesWithConflictingCasing(const StringData name) {
-        return this->_impl().getNamesWithConflictingCasing(name);
-    }
+    virtual void close(OperationContext* opCtx, const DatabaseName& dbName) = 0;
 
-private:
-    // This structure exists to give us a customization point to decide how to force users of this
-    // class to depend upon the corresponding `database_holder.cpp` Translation Unit (TU).  All
-    // public forwarding functions call `_impl(), and `_impl` creates an instance of this structure.
-    struct TUHook {
-        static void hook() noexcept;
+    /**
+     * Closes all opened databases.
+     *
+     * The caller must hold the global lock in MODE_X and ensure no index builds are in progress on
+     * the databases. Will uassert if any background jobs are running when this function is called.
+     */
+    virtual void closeAll(OperationContext* opCtx) = 0;
 
-        explicit inline TUHook() noexcept {
-            if (kDebugBuild)
-                this->hook();
-        }
-    };
+    /**
+     * Returns the name of the database with conflicting casing if one exists.
+     */
+    virtual boost::optional<DatabaseName> getNameWithConflictingCasing(
+        const DatabaseName& dbName) = 0;
 
-    inline const Impl& _impl() const {
-        TUHook{};
-        return *this->_pimpl;
-    }
-
-    inline Impl& _impl() {
-        TUHook{};
-        return *this->_pimpl;
-    }
-
-    std::unique_ptr<Impl> _pimpl;
+    /**
+     * Returns all the database names (including those which are empty).
+     *
+     * Unlike CollectionCatalog::getAllDbNames(), this returns databases that are empty.
+     */
+    virtual std::vector<DatabaseName> getNames() = 0;
 };
+
 }  // namespace mongo

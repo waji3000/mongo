@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,13 +29,22 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
+#include <functional>
 #include <memory>
+#include <string>
+#include <vector>
 
 #include "mongo/base/status_with.h"
 #include "mongo/db/key_generator.h"
 #include "mongo/db/keys_collection_cache.h"
-#include "mongo/db/keys_collection_document.h"
-#include "mongo/stdx/functional.h"
+#include "mongo/db/keys_collection_document_gen.h"
+#include "mongo/db/keys_collection_manager_gen.h"
+#include "mongo/db/logical_time.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/service_context.h"
+#include "mongo/platform/atomic_word.h"
+#include "mongo/stdx/condition_variable.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/util/concurrency/notification.h"
@@ -49,7 +57,16 @@ class LogicalTime;
 class ServiceContext;
 class KeysCollectionClient;
 
-extern int KeysRotationIntervalSec;
+namespace keys_collection_manager_util {
+
+/**
+ * Returns the amount of time to wait until the monitoring thread should attempt to refresh again.
+ */
+Milliseconds howMuchSleepNeedFor(const LogicalTime& currentTime,
+                                 const LogicalTime& latestExpiredAt,
+                                 const Milliseconds& interval);
+
+}  // namespace keys_collection_manager_util
 
 /**
  * The KeysCollectionManager queries the config servers for keys that can be used for
@@ -58,7 +75,8 @@ extern int KeysRotationIntervalSec;
  */
 class KeysCollectionManager {
 public:
-    static const Seconds kKeyValidInterval;
+    static const unsigned kReadConcernMajorityNotAvailableYetMaxTries;
+    static const Milliseconds kRefreshIntervalIfErrored;
     static const std::string kKeyManagerPurposeString;
 
     KeysCollectionManager(std::string purpose,
@@ -66,28 +84,37 @@ public:
                           Seconds keyValidForInterval);
 
     /**
-     * Return a key that is valid for the given time and also matches the keyId. Note that this call
-     * can block if it will need to do a refresh.
+     * Returns the validation keys that are valid for the given time and also match the keyId. Does
+     * a blocking refresh if there is no matching internal key. If there is a matching internal key,
+     * includes it as first key in the resulting vector.
      *
-     * Throws ErrorCode::ExceededTimeLimit if it times out.
+     * Throws ExceededTimeLimit if the refresh times out, and KeyNotFound if there are no such keys.
      */
-    StatusWith<KeysCollectionDocument> getKeyForValidation(OperationContext* opCtx,
-                                                           long long keyId,
-                                                           const LogicalTime& forThisTime);
+    StatusWith<std::vector<KeysCollectionDocument>> getKeysForValidation(
+        OperationContext* opCtx, long long keyId, const LogicalTime& forThisTime);
 
     /**
-     * Returns a key that is valid for the given time. Note that unlike getKeyForValidation, this
-     * will never do a refresh.
-     *
-     * Throws ErrorCode::ExceededTimeLimit if it times out.
+     * Returns the signing key that is valid for the given time. Note that unlike
+     * getKeysForValidation, this will never do a refresh.
      */
     StatusWith<KeysCollectionDocument> getKeyForSigning(OperationContext* opCtx,
                                                         const LogicalTime& forThisTime);
 
     /**
-     * Request this manager to perform a refresh.
+     * Request this manager perform a refresh.
+     * Additionally blocks until either:
+     * 1. The refresh completes
+     * 2. The dealdine of opCtx expires
+     * 3. kDefaultRefreshWaitTime elapses
+     * In the later two cases, an exception is thrown.
      */
     void refreshNow(OperationContext* opCtx);
+
+    /**
+     * Requests this manager perform a refresh, but does not block on the refresh completing.
+     * Returns immediately after the refresh request is enqueued.
+     */
+    void requestRefreshAsync(OperationContext* opCtx);
 
     /**
      * Starts a background thread that will constantly update the internal cache of keys.
@@ -117,26 +144,40 @@ public:
      */
     void clearCache();
 
+    /**
+     * Loads the given external key into the keys collection cache.
+     */
+    void cacheExternalKey(ExternalKeysCollectionDocument key);
+
 private:
     /**
      * This is responsible for periodically performing refresh in the background.
      */
     class PeriodicRunner {
     public:
-        using RefreshFunc = stdx::function<StatusWith<KeysCollectionDocument>(OperationContext*)>;
+        using RefreshFunc = std::function<StatusWith<KeysCollectionDocument>(OperationContext*)>;
 
         /**
          * Preemptively inform the monitoring thread it needs to perform a refresh. Returns an
-         * object
-         * that gets notified after the current round of refresh is over. Note that being notified
-         * can
-         * mean either of these things:
+         * object that gets notified after the current round of refresh is over. Note that being
+         * notified can mean any of these things:
          *
          * 1. An error occurred and refresh was not performed.
          * 2. No error occurred but no new key was found.
          * 3. No error occurred and new keys were found.
          */
+        std::shared_ptr<Notification<void>> requestRefreshAsync(OperationContext* opCtx);
+
+        /**
+         * Tells the monitoring thread to refresh, as the above function does.
+         * Additionally blocks until either:
+         * 1. The refresh completes
+         * 2. The dealdine of opCtx expires
+         * 3. kDefaultRefreshWaitTime elapses
+         * In the later two cases, an exception is thrown.
+         */
         void refreshNow(OperationContext* opCtx);
+
 
         /**
          * Sets the refresh function to use.
@@ -165,34 +206,30 @@ private:
         /**
          * Returns true if keys have ever successfully been returned from the config server.
          */
-        bool hasSeenKeys();
+        bool hasSeenKeys() const;
+
+        /**
+         * Returns if the periodic runner has entered shutdown.
+         */
+        bool isInShutdown() const;
 
     private:
         void _doPeriodicRefresh(ServiceContext* service,
                                 std::string threadName,
                                 Milliseconds refreshInterval);
 
-        stdx::mutex _mutex;  // protects all the member variables below.
+        AtomicWord<bool> _hasSeenKeys{false};
+
+        // protects all the member variables below.
+        mutable stdx::mutex _mutex;
         std::shared_ptr<Notification<void>> _refreshRequest;
         stdx::condition_variable _refreshNeededCV;
 
         stdx::thread _backgroundThread;
         std::shared_ptr<RefreshFunc> _doRefresh;
 
-        bool _hasSeenKeys = false;
         bool _inShutdown = false;
     };
-
-    /**
-     * Return a key that is valid for the given time and also matches the keyId.
-     */
-    StatusWith<KeysCollectionDocument> _getKeyWithKeyIdCheck(long long keyId,
-                                                             const LogicalTime& forThisTime);
-
-    /**
-     * Return a key that is valid for the given time.
-     */
-    StatusWith<KeysCollectionDocument> _getKey(const LogicalTime& forThisTime);
 
     std::unique_ptr<KeysCollectionClient> _client;
     const std::string _purpose;

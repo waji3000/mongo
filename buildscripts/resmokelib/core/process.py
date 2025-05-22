@@ -4,37 +4,23 @@ Uses job objects when running on Windows to ensure that all created
 processes are terminated.
 """
 
-from __future__ import absolute_import
-
 import atexit
 import logging
 import os
 import os.path
+import signal
+import subprocess
 import sys
 import threading
+import time
+from shlex import quote
 
-# The subprocess32 module resolves the thread-safety issues of the subprocess module in Python 2.x
-# when the _posixsubprocess C extension module is also available. Additionally, the _posixsubprocess
-# C extension module avoids triggering invalid free() calls on Python's internal data structure for
-# thread-local storage by skipping the PyOS_AfterFork() call when the 'preexec_fn' parameter isn't
-# specified to subprocess.Popen(). See SERVER-22219 for more details.
-#
-# The subprocess32 module is untested on Windows and thus isn't recommended for use, even when it's
-# installed. See https://github.com/google/python-subprocess32/blob/3.2.7/README.md#usage.
-if os.name == "posix" and sys.version_info[0] == 2:
-    try:
-        import subprocess32 as subprocess
-    except ImportError:
-        import warnings
-        warnings.warn(("Falling back to using the subprocess module because subprocess32 isn't"
-                       " available. When using the subprocess module, a child process may trigger"
-                       " an invalid free(). See SERVER-22219 for more details."), RuntimeWarning)
-        import subprocess  # type: ignore
-else:
-    import subprocess
+import psutil
 
-from . import pipe  # pylint: disable=wrong-import-position
-from .. import utils  # pylint: disable=wrong-import-position
+from buildscripts.resmokelib import config as _config
+from buildscripts.resmokelib import errors, utils
+from buildscripts.resmokelib.core import pipe
+from buildscripts.resmokelib.testing.fixtures import interface as fixture_interface
 
 # Attempt to avoid race conditions (e.g. hangs caused by a file descriptor being left open) when
 # starting subprocesses concurrently from multiple threads by guarding calls to subprocess.Popen()
@@ -63,17 +49,20 @@ if sys.platform == "win32":
         job_object = win32job.CreateJobObject(None, "")
 
         # Get the limit and job state information of the newly-created job object.
-        job_info = win32job.QueryInformationJobObject(job_object,
-                                                      win32job.JobObjectExtendedLimitInformation)
+        job_info = win32job.QueryInformationJobObject(
+            job_object, win32job.JobObjectExtendedLimitInformation
+        )
 
         # Set up the job object so that closing the last handle to the job object
         # will terminate all associated processes and destroy the job object itself.
-        job_info["BasicLimitInformation"]["LimitFlags"] |= \
-                win32job.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        job_info["BasicLimitInformation"]["LimitFlags"] |= (
+            win32job.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        )
 
         # Update the limits of the job object.
-        win32job.SetInformationJobObject(job_object, win32job.JobObjectExtendedLimitInformation,
-                                         job_info)
+        win32job.SetInformationJobObject(
+            job_object, win32job.JobObjectExtendedLimitInformation, job_info
+        )
 
         return job_object
 
@@ -88,9 +77,7 @@ if sys.platform == "win32":
 class Process(object):
     """Wrapper around subprocess.Popen class."""
 
-    # pylint: disable=protected-access
-
-    def __init__(self, logger, args, env=None, env_vars=None):
+    def __init__(self, logger, args, env=None, env_vars=None, cwd=None):
         """Initialize the process with the specified logger, arguments, and environment."""
 
         # Ensure that executable files that don't already have an
@@ -100,18 +87,41 @@ class Process(object):
 
         self.logger = logger
         self.args = args
+
         self.env = utils.default_if_none(env, os.environ.copy())
+        if not self.env.get("RESMOKE_PARENT_PROCESS"):
+            self.env["RESMOKE_PARENT_PROCESS"] = os.environ.get(
+                "RESMOKE_PARENT_PROCESS", str(os.getpid())
+            )
+        if not self.env.get("RESMOKE_PARENT_CTIME"):
+            self.env["RESMOKE_PARENT_CTIME"] = os.environ.get(
+                "RESMOKE_PARENT_CTIME", str(psutil.Process().create_time())
+            )
         if env_vars is not None:
             self.env.update(env_vars)
 
-        self.pid = None
+        # If we are running against an External System Under Test & this is a `mongo{d,s}` process, we make this process a NOOP.
+        # `mongo{d,s}` processes are not running locally for an External System Under Test.
+        self.NOOP = _config.NOOP_MONGO_D_S_PROCESSES and os.path.basename(self.args[0]) in [
+            "mongod",
+            "mongos",
+        ]
+
+        # The `pid` attribute is assigned after the local process is started. If this process is a NOOP, we assign it a dummy value.
+        self.pid = 1 if self.NOOP else None
 
         self._process = None
         self._stdout_pipe = None
         self._stderr_pipe = None
+        self._cwd = cwd
+
+        if sys.platform == "win32":
+            self._windows_shutdown_event_set = False
 
     def start(self):
         """Start the process and the logger pipes for its stdout and stderr."""
+        if self.NOOP:
+            return None
 
         creation_flags = 0
         if sys.platform == "win32" and _JOB_OBJECT is not None:
@@ -126,12 +136,19 @@ class Process(object):
         # thread, or concurrently from multiple threads -- from causing another subprocess to wait
         # for the completion of the newly spawned child process. Closing other file descriptors
         # isn't supported on Windows when stdout and stderr are redirected.
-        close_fds = (sys.platform != "win32")
+        close_fds = sys.platform != "win32"
 
         with _POPEN_LOCK:
-            self._process = subprocess.Popen(self.args, bufsize=buffer_size, stdout=subprocess.PIPE,
-                                             stderr=subprocess.PIPE, close_fds=close_fds,
-                                             env=self.env, creationflags=creation_flags)
+            self._process = subprocess.Popen(
+                self.args,
+                bufsize=buffer_size,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                close_fds=close_fds,
+                env=self.env,
+                creationflags=creation_flags,
+                cwd=self._cwd,
+            )
             self.pid = self._process.pid
 
         self._stdout_pipe = pipe.LoggerPipe(self.logger, logging.INFO, self._process.stdout)
@@ -151,60 +168,36 @@ class Process(object):
                 if return_code == win32con.STILL_ACTIVE:
                     raise
 
-    def stop(self, kill=False):  # pylint: disable=too-many-branches
+    def stop(self, mode=None):
         """Terminate the process."""
+        if self.NOOP:
+            return None
+
+        if mode is None:
+            mode = fixture_interface.TeardownMode.TERMINATE
+
         if sys.platform == "win32":
-
-            # Attempt to cleanly shutdown mongod.
-            if not kill and self.args and self.args[0].find("mongod") != -1:
-                mongo_signal_handle = None
-                try:
-                    mongo_signal_handle = win32event.OpenEvent(
-                        win32event.EVENT_MODIFY_STATE, False,
-                        "Global\\Mongo_" + str(self._process.pid))
-
-                    if not mongo_signal_handle:
-                        # The process has already died.
-                        return
-                    win32event.SetEvent(mongo_signal_handle)
-                    # Wait 60 seconds for the program to exit.
-                    status = win32event.WaitForSingleObject(self._process._handle, 60 * 1000)
-                    if status == win32event.WAIT_OBJECT_0:
-                        return
-                except win32process.error as err:
-                    # ERROR_FILE_NOT_FOUND (winerror=2)
-                    # ERROR_ACCESS_DENIED (winerror=5)
-                    # ERROR_INVALID_HANDLE (winerror=6)
-                    # One of the above errors is received if the process has
-                    # already died.
-                    if err[0] not in (2, 5, 6):
-                        raise
-                finally:
-                    win32api.CloseHandle(mongo_signal_handle)
-
-                print "Failed to cleanly exit the program, calling TerminateProcess() on PID: " +\
-                    str(self._process.pid)
-
-            # Adapted from implementation of Popen.terminate() in subprocess.py of Python 2.7
-            # because earlier versions do not catch exceptions.
-            try:
-                # Have the process exit with code 0 if it is terminated by us to simplify the
-                # success-checking logic later on.
-                win32process.TerminateProcess(self._process._handle, 0)
-            except win32process.error as err:
-                # ERROR_ACCESS_DENIED (winerror=5) is received when the process
-                # has already died.
-                if err.winerror != winerror.ERROR_ACCESS_DENIED:
-                    raise
-                return_code = win32process.GetExitCodeProcess(self._process._handle)
-                if return_code == win32con.STILL_ACTIVE:
-                    raise
+            if (
+                mode != fixture_interface.TeardownMode.KILL
+                and self.args
+                and self.args[0].find("mongod") != -1
+            ):
+                self._request_clean_shutdown_on_windows()
+            else:
+                self._terminate_on_windows()
         else:
             try:
-                if kill:
+                if mode == fixture_interface.TeardownMode.KILL:
                     self._process.kill()
-                else:
+                elif mode == fixture_interface.TeardownMode.TERMINATE:
                     self._process.terminate()
+                elif mode == fixture_interface.TeardownMode.ABORT:
+                    self._process.send_signal(mode.value)
+                else:
+                    raise errors.ProcessError(
+                        "Process wrapper given unrecognized teardown mode: " + mode.value
+                    )
+
             except OSError as err:
                 # ESRCH (errno=3) is received when the process has already died.
                 if err.errno != 3:
@@ -212,12 +205,37 @@ class Process(object):
 
     def poll(self):
         """Poll."""
+        if self.NOOP:
+            return None
         return self._process.poll()
 
-    def wait(self):
+    def wait(self, timeout=None):
         """Wait until process has terminated and all output has been consumed by the logger pipes."""
+        if self.NOOP:
+            return None
 
-        return_code = self._process.wait()
+        if sys.platform == "win32" and self._windows_shutdown_event_set:
+            status = None
+            try:
+                # Wait 60 seconds for the program to exit.
+                status = win32event.WaitForSingleObject(self._process._handle, 60 * 1000)
+            except win32process.error as err:
+                # ERROR_FILE_NOT_FOUND (winerror=2)
+                # ERROR_ACCESS_DENIED (winerror=5)
+                # ERROR_INVALID_HANDLE (winerror=6)
+                # One of the above errors is received if the process has
+                # already died.
+                if err.winerror not in (2, 5, 6):
+                    raise
+
+            if status is not None and status != win32event.WAIT_OBJECT_0:
+                self.logger.info(
+                    f"Failed to cleanly exit the program, calling TerminateProcess() on PID:"
+                    f" {str(self._process.pid)}"
+                )
+                self._terminate_on_windows()
+
+        return_code = self._process.wait(timeout)
 
         if self._stdout_pipe:
             self._stdout_pipe.wait_until_finished()
@@ -239,12 +257,76 @@ class Process(object):
 
         sb = []  # String builder.
         for env_var in env_diff:
-            sb.append("%s=%s" % (env_var, env_diff[env_var]))
-        sb.extend(self.args)
+            sb.append(quote("%s=%s" % (env_var, env_diff[env_var])))
+        sb.extend(map(quote, self.args))
 
         return " ".join(sb)
+
+    def pause(self):
+        """Send the SIGSTOP signal to the process and wait for it to be stopped."""
+        if self.NOOP:
+            return None
+        while True:
+            self._process.send_signal(signal.SIGSTOP)
+            mongod_process = psutil.Process(self.pid)
+            process_status = mongod_process.status()
+            if process_status == psutil.STATUS_STOPPED:
+                break
+            self.logger.info("Process status: {}".format(process_status))
+            time.sleep(1)
+
+    def resume(self):
+        """Send the SIGCONT signal to the process."""
+        if self.NOOP:
+            return None
+        self._process.send_signal(signal.SIGCONT)
 
     def __str__(self):
         if self.pid is None:
             return self.as_command()
         return "%s (%d)" % (self.as_command(), self.pid)
+
+    if sys.platform == "win32":
+
+        def _request_clean_shutdown_on_windows(self):
+            """Request clean shutdown on Windows."""
+            _windows_mongo_signal_handle = None
+            try:
+                _windows_mongo_signal_handle = win32event.OpenEvent(
+                    win32event.EVENT_MODIFY_STATE, False, "Global\\Mongo_" + str(self._process.pid)
+                )
+
+                if not _windows_mongo_signal_handle:
+                    # The process has already died.
+                    return
+                win32event.SetEvent(_windows_mongo_signal_handle)
+                self._windows_shutdown_event_set = True
+
+            except win32process.error as err:
+                # ERROR_FILE_NOT_FOUND (winerror=2)
+                # ERROR_ACCESS_DENIED (winerror=5)
+                # ERROR_INVALID_HANDLE (winerror=6)
+                # One of the above errors is received if the process has
+                # already died.
+                if err.winerror not in (2, 5, 6):
+                    raise
+
+            finally:
+                win32api.CloseHandle(_windows_mongo_signal_handle)
+
+        def _terminate_on_windows(self):
+            """Terminate the process on Windows."""
+            # Adapted from implementation of Popen.terminate() in subprocess.py of Python 2.7
+            # because earlier versions do not catch exceptions.
+            try:
+                # Have the process exit with code 0 if it is terminated by us to simplify the
+                # success-checking logic later on.
+                win32process.TerminateProcess(self._process._handle, 0)
+            except win32process.error as err:
+                # ERROR_ACCESS_DENIED (winerror=5) is received when the process
+                # has already died.
+                if err.winerror != winerror.ERROR_ACCESS_DENIED:
+                    raise
+                return_code = win32process.GetExitCodeProcess(self._process._handle)
+                if return_code == win32con.STILL_ACTIVE:
+                    raise

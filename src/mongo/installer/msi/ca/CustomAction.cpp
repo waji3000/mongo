@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -103,10 +102,11 @@ std::string do_replace(MSIHANDLE hInstall,
 
     if (pos == std::string::npos) {
         LogMessage(hInstall,
-                   INSTALLMESSAGE_WARNING,
+                   INSTALLMESSAGE_INFO,
                    "Failed to find '%s' in '%s'",
                    original.c_str(),
                    source.c_str());
+        return source;
     }
 
     return source.replace(pos, original.length(), replacement);
@@ -193,6 +193,15 @@ std::string toUtf8String(MSIHANDLE hInstall, const std::wstring& wide) {
         goto Exit;                                                                      \
     }
 
+#define CHECKGLE_AND_LOG_NOFAIL_EXIT(...)                                            \
+                                                                                     \
+    {                                                                                \
+        LONG _gle = GetLastError();                                                  \
+        LogMessage(hInstall, INSTALLMESSAGE_INFO, "Received GetLastError %x", _gle); \
+        LogMessage(hInstall, INSTALLMESSAGE_INFO, __VA_ARGS__);                      \
+        goto Exit;                                                                   \
+    }
+
 #define CHECKUINT_AND_LOG(x)                                                                   \
                                                                                                \
     {                                                                                          \
@@ -205,9 +214,11 @@ std::string toUtf8String(MSIHANDLE hInstall, const std::wstring& wide) {
         }                                                                                      \
     }
 
-#define LOG_INFO(...) \
-                      \
-    { LogMessage(hInstall, INSTALLMESSAGE_INFO, __VA_ARGS__); }
+#define LOG_INFO(...)                                           \
+                                                                \
+    {                                                           \
+        LogMessage(hInstall, INSTALLMESSAGE_INFO, __VA_ARGS__); \
+    }
 
 /**
  * UpdateMongoYAML - MSI custom action entry point
@@ -271,7 +282,7 @@ extern "C" UINT __stdcall UpdateMongoYAML(MSIHANDLE hInstall) {
 
         long gle = GetFileAttributesW(YamlFile.c_str());
         if (gle == INVALID_FILE_ATTRIBUTES) {
-            CHECKGLE_AND_LOG("Failed to find yaml file");
+            CHECKGLE_AND_LOG_NOFAIL_EXIT("Failed to find yaml file");
         }
 
         HANDLE hFile = CreateFileW(YamlFile.c_str(),
@@ -285,7 +296,9 @@ extern "C" UINT __stdcall UpdateMongoYAML(MSIHANDLE hInstall) {
             CHECKGLE_AND_LOG("Failed to open yaml file");
         }
 
-        const auto handleGuard = mongo::MakeGuard([&] { CloseHandle(hFile); });
+        const mongo::ScopeGuard handleGuard = [&] {
+            CloseHandle(hFile);
+        };
 
         LARGE_INTEGER fileSize;
         if (GetFileSizeEx(hFile, &fileSize) == 0) {
@@ -322,6 +335,9 @@ extern "C" UINT __stdcall UpdateMongoYAML(MSIHANDLE hInstall) {
         DWORD written;
         if (!WriteFile(hFile, str.c_str(), str.length(), &written, NULL)) {
             CHECKGLE_AND_LOG("Failed to write yaml file");
+        }
+        if (!SetEndOfFile(hFile)) {
+            CHECKGLE_AND_LOG("Failed to truncate yaml file");
         }
     } catch (const std::exception& e) {
         CHECKHR_AND_LOG(E_FAIL, "Caught C++ exception %s", e.what());

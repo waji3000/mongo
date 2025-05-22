@@ -2,32 +2,27 @@ test_kind: js_test
 
 selector:
   roots:
-  - jstests/core/**/*.js
+    - jstests/core/**/*.js
+    - jstests/fle2/**/*.js
+    - src/mongo/db/modules/*/jstests/fle2/**/*.js
   exclude_files:
-  # These tests are not expected to pass with replica-sets:
-  - jstests/core/dbadmin.js
-  - jstests/core/opcounters_write_cmd.js
-  - jstests/core/read_after_optime.js
-  - jstests/core/capped_update.js
-  # Having duplicate namespaces is not supported and will cause initial sync to fail.
-  - jstests/core/views/duplicate_ns.js
-  # TODO (SERVER-36492): Unblacklist when we correctly reconstruct prepared transactions after
-  # initial sync.
-  - jstests/core/txns/abort_prepared_transaction.js
-  - jstests/core/txns/commit_prepared_transaction_errors.js
-  - jstests/core/txns/empty_prepare.js
-  - jstests/core/txns/no_new_transactions_when_prepared_transaction_in_progress.js
-  - jstests/core/txns/no_writes_to_config_transactions_with_prepared_transaction.js
-  - jstests/core/txns/prepare_conflict.js
-  - jstests/core/txns/prepare_prepared_transaction.js
-  - jstests/core/txns/statement_ids_accepted.js
-  # TODO (SERVER-35865): Unblacklist when we also correctly write and apply 'commitTransaction'
-  # oplog entries, besides SERVER-36492.
-  - jstests/core/txns/commit_prepared_transaction.js
-  - jstests/core/txns/disallow_operations_on_prepared_transaction.js
-  - jstests/core/txns/ensure_active_txn_for_prepare_transaction.js
-  - jstests/core/txns/prepare_requires_fcv42.js
-  - jstests/core/txns/timestamped_reads_wait_for_prepare_oplog_visibility.js
+    # Duplicate namespace may cause cloner to try and clone view instead of collection
+    - jstests/core/catalog/views/duplicate_ns.js
+    # Change stream pre-images are not cloned during initial sync.
+    - jstests/core/**/write_change_stream_pit_preimage.js
+
+  exclude_with_any_tags:
+    - assumes_standalone_mongod
+    - incompatible_with_initial_sync
+    # Tests that query the system.profile collection cannot run in this suite since an initial sync
+    # may insert unexpected operations into the profile collection.
+    - queries_system_profile_collection
+    # Tests that examine the SBE plan cache, which initial sync may change the contents of.
+    - examines_sbe_cache
+    # The tests below do not expect concurrent reads against their test collections (e.g. the checks aren't expecting concurrent reads but initial sync will be reading those collections).
+    - does_not_support_concurrent_reads
+    # Tests that run getLatestProfilerEntry(). The downstream syncing node affects the profiler.
+    - run_getLatestProfilerEntry
 
 run_hook_interval: &run_hook_interval 20
 executor:
@@ -36,19 +31,17 @@ executor:
       - IntermediateInitialSync
   config:
     shell_options:
-      eval: "testingReplication = true;"
-      readMode: commands
+      eval: "globalThis.testingReplication = true;"
   hooks:
-  - class: IntermediateInitialSync
-    n: *run_hook_interval
-  - class: CleanEveryN
-    n: *run_hook_interval
+    - class: IntermediateInitialSync
+      n: *run_hook_interval
+    - class: CleanEveryN
+      n: *run_hook_interval
   fixture:
     class: ReplicaSetFixture
     mongod_options:
       set_parameters:
         enableTestCommands: 1
-        numInitialSyncAttempts: 1
         collectionClonerBatchSize: 10
         initialSyncOplogFetcherBatchSize: 10
     num_nodes: 2

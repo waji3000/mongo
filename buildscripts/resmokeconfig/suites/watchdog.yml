@@ -2,15 +2,13 @@ test_kind: js_test
 
 selector:
   roots:
-  - src/mongo/db/modules/*/jstests/watchdog/*.js
+    - jstests/watchdog/*.js
 
 executor:
-  config:
-    shell_options:
-      readMode: commands
+  config: {}
   hooks:
-  - class: CleanEveryN
-    n: 20
+    - class: CleanEveryN
+      n: 20
   fixture:
     class: MongoDFixture
     mongod_options:

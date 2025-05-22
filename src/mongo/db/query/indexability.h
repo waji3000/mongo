@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,9 +27,10 @@
  *    it in the license file.
  */
 
-#include "mongo/db/matcher/expression.h"
-
 #pragma once
+
+#include "mongo/db/matcher/expression.h"
+#include "mongo/db/matcher/expression_leaf.h"
 
 namespace mongo {
 
@@ -53,6 +53,45 @@ public:
         }
 
         return isIndexOnOwnFieldTypeNode(me);
+    }
+
+    /**
+     * Type bracketing does not apply to internal Expressions. This could cause the use of a sparse
+     * index return incomplete results. For example, a query {$expr: {$lt: ["$missing", "r"]}} would
+     * expect a document like, {a: 1}, with field "missing" missing be returned. However, a sparse
+     * index, {missing: 1} does not index the document. Therefore, we should ban use of any sparse
+     * index on following expression types.
+     */
+    static bool nodeSupportedBySparseIndex(const MatchExpression* me) {
+        switch (me->matchType()) {
+            case MatchExpression::INTERNAL_EXPR_EQ:
+            case MatchExpression::INTERNAL_EXPR_GT:
+            case MatchExpression::INTERNAL_EXPR_GTE:
+            case MatchExpression::INTERNAL_EXPR_LT:
+            case MatchExpression::INTERNAL_EXPR_LTE:
+                return false;
+            default:
+                return true;
+        }
+    }
+
+    /**
+     * Some node types, such as MOD, REGEX, TYPE_OPERATOR, or ELEM_MATCH_VALUE, cannot use index if
+     * they are under negation.
+     */
+    static bool nodeCannotUseIndexUnderNot(const MatchExpression* me) {
+        switch (me->matchType()) {
+            case MatchExpression::REGEX:
+            case MatchExpression::MOD:
+            case MatchExpression::TYPE_OPERATOR:
+            case MatchExpression::ELEM_MATCH_VALUE:
+            case MatchExpression::GEO:
+            case MatchExpression::GEO_NEAR:
+            case MatchExpression::INTERNAL_BUCKET_GEO_WITHIN:
+                return true;
+            default:
+                return false;
+        }
     }
 
     /**
@@ -117,6 +156,20 @@ public:
     }
 
     /**
+     * Returns true if 'me' is ELEM_MATCH_OBJECT and has non-empty path component.
+     *
+     * Note: we skip empty path components since they are not allowed in index key patterns.
+     * Therefore, $elemMatch with an empty path component can never use an index.
+     *
+     * Example: {"": {$elemMatch: {a: "hi", b: "bye"}}.
+     * In this case the predicate cannot use any indexes since the $elemMatch is with an empty path
+     * component.
+     */
+    static bool isBoundsGeneratingElemMatchObject(const MatchExpression* me) {
+        return arrayUsesIndexOnChildren(me) && !me->path().empty();
+    }
+
+    /**
      * Returns true if 'me' is a NOT, and the child of the NOT can use
      * an index on its own field.
      */
@@ -159,6 +212,35 @@ public:
         }
     }
 
+    /**
+     * Check if this match expression is a leaf and is supported by a hashed index.
+     */
+    static bool nodeIsSupportedByHashedIndex(const MatchExpression* queryExpr) {
+        // Hashed fields can answer simple equality predicates.
+        if (ComparisonMatchExpressionBase::isEquality(queryExpr->matchType())) {
+            return true;
+        }
+        if (queryExpr->matchType() == MatchExpression::INTERNAL_EQ_HASHED_KEY) {
+            return true;
+        }
+        // An $in can be answered so long as its operand contains only simple equalities.
+        if (queryExpr->matchType() == MatchExpression::MATCH_IN) {
+            const InMatchExpression* expr = static_cast<const InMatchExpression*>(queryExpr);
+            return expr->getRegexes().empty();
+        }
+        // {$exists:false} produces a single point-interval index bound on [null,null].
+        if (queryExpr->matchType() == MatchExpression::NOT) {
+            return queryExpr->getChild(0)->matchType() == MatchExpression::EXISTS;
+        }
+        // {$exists:true} can be answered using [MinKey, MaxKey] bounds.
+        return (queryExpr->matchType() == MatchExpression::EXISTS);
+    }
+
+    static bool canUseIndexForNin(const InMatchExpression* ime) {
+        return !ime->hasRegex() && ime->getEqualities().size() == 2 && ime->hasNull() &&
+            ime->hasEmptyArray();
+    }
+
 private:
     /**
      * Returns true if 'me' is "sargable" but is not a negation and
@@ -174,10 +256,16 @@ private:
             me->matchType() == MatchExpression::MATCH_IN ||
             me->matchType() == MatchExpression::TYPE_OPERATOR ||
             me->matchType() == MatchExpression::GEO ||
+            me->matchType() == MatchExpression::INTERNAL_BUCKET_GEO_WITHIN ||
             me->matchType() == MatchExpression::GEO_NEAR ||
             me->matchType() == MatchExpression::EXISTS ||
             me->matchType() == MatchExpression::TEXT ||
-            me->matchType() == MatchExpression::INTERNAL_EXPR_EQ;
+            me->matchType() == MatchExpression::INTERNAL_EXPR_EQ ||
+            me->matchType() == MatchExpression::INTERNAL_EXPR_GT ||
+            me->matchType() == MatchExpression::INTERNAL_EXPR_GTE ||
+            me->matchType() == MatchExpression::INTERNAL_EXPR_LT ||
+            me->matchType() == MatchExpression::INTERNAL_EXPR_LTE ||
+            me->matchType() == MatchExpression::INTERNAL_EQ_HASHED_KEY;
     }
 };
 

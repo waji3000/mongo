@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,18 +27,34 @@
  *    it in the license file.
  */
 
-#include "mongo/db/auth/sasl_mechanism_registry.h"
+#include <absl/container/node_hash_map.h>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/bson/bsonmisc.h"
 #include "mongo/crypto/mechanism_scram.h"
+#include "mongo/crypto/sha256_block.h"
+#include "mongo/db/auth/auth_name.h"
+#include "mongo/db/auth/authorization_backend_interface.h"
+#include "mongo/db/auth/authorization_backend_local.h"
+#include "mongo/db/auth/authorization_backend_mock.h"
+#include "mongo/db/auth/authorization_client_handle_shard.h"
 #include "mongo/db/auth/authorization_manager.h"
+#include "mongo/db/auth/authorization_manager_factory_mock.h"
 #include "mongo/db/auth/authorization_manager_impl.h"
-#include "mongo/db/auth/authz_manager_external_state_mock.h"
+#include "mongo/db/auth/authorization_router_impl.h"
+#include "mongo/db/auth/sasl_mechanism_registry.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/repl/replication_coordinator_mock.h"
 #include "mongo/db/service_context_test_fixture.h"
+#include "mongo/db/service_entry_point_shard_role.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
 namespace {
-
 
 TEST(SecurityProperty, emptyHasEmptyProperties) {
     SecurityPropertySet set(SecurityPropertySet{});
@@ -70,6 +85,14 @@ public:
     explicit BaseMockMechanism(std::string authenticationDatabase)
         : MakeServerMechanism<Policy>(std::move(authenticationDatabase)) {}
 
+    boost::optional<unsigned int> currentStep() const override {
+        return boost::none;
+    }
+
+    boost::optional<unsigned int> totalSteps() const override {
+        return boost::none;
+    }
+
 protected:
     StatusWith<std::tuple<bool, std::string>> stepImpl(OperationContext* opCtx,
                                                        StringData input) final {
@@ -80,6 +103,7 @@ protected:
 template <typename Policy, bool argIsInternal>
 class BaseMockMechanismFactory : public MakeServerFactory<Policy> {
 public:
+    using MakeServerFactory<Policy>::MakeServerFactory;
     static constexpr bool isInternal = argIsInternal;
     bool canMakeMechanismForUser(const User* user) const final {
         return true;
@@ -112,7 +136,10 @@ public:
 };
 
 template <bool argIsInternal>
-class FooMechanismFactory : public BaseMockMechanismFactory<FooMechanism, argIsInternal> {};
+class FooMechanismFactory : public BaseMockMechanismFactory<FooMechanism, argIsInternal> {
+public:
+    using BaseMockMechanismFactory<FooMechanism, argIsInternal>::BaseMockMechanismFactory;
+};
 
 // Policy for a hypothetical "BAR" SASL mechanism.
 struct BarPolicy {
@@ -139,7 +166,10 @@ public:
 };
 
 template <bool argIsInternal>
-class BarMechanismFactory : public BaseMockMechanismFactory<BarMechanism, argIsInternal> {};
+class BarMechanismFactory : public BaseMockMechanismFactory<BarMechanism, argIsInternal> {
+public:
+    using BaseMockMechanismFactory<BarMechanism, argIsInternal>::BaseMockMechanismFactory;
+};
 
 // Policy for a hypothetical "InternalAuth" SASL mechanism.
 struct InternalAuthPolicy {
@@ -166,81 +196,78 @@ public:
 };
 
 class InternalAuthMechanismFactory : public BaseMockMechanismFactory<InternalAuthMechanism, true> {
+public:
+    using BaseMockMechanismFactory<InternalAuthMechanism, true>::BaseMockMechanismFactory;
 };
 
 class MechanismRegistryTest : public ServiceContextTest {
 public:
     MechanismRegistryTest()
         : opCtx(makeOperationContext()),
-          authManagerExternalState(new AuthzManagerExternalStateMock()),
-          authManager(new AuthorizationManagerImpl(
-              std::unique_ptr<AuthzManagerExternalStateMock>(authManagerExternalState),
-              AuthorizationManagerImpl::InstallMockForTestingOrAuthImpl{})),
           // By default the registry is initialized with all mechanisms enabled.
-          registry({"FOO", "BAR", "InternalAuth"}) {
-        AuthorizationManager::set(getServiceContext(),
-                                  std::unique_ptr<AuthorizationManager>(authManager));
+          registry(opCtx->getService(), {"FOO", "BAR", "InternalAuth"}) {
 
-        ASSERT_OK(authManagerExternalState->updateOne(
+        auto globalAuthzManagerFactory = std::make_unique<AuthorizationManagerFactoryMock>();
+        AuthorizationManager::set(getService(),
+                                  globalAuthzManagerFactory->createShard(getService()));
+
+        auth::AuthorizationBackendInterface::set(
+            getService(), globalAuthzManagerFactory->createBackendInterface(getService()));
+        authzBackend = reinterpret_cast<auth::AuthorizationBackendMock*>(
+            auth::AuthorizationBackendInterface::get(getService()));
+
+        // Initialize the serviceEntryPoint so that DBDirectClient can function.
+        getService()->setServiceEntryPoint(std::make_unique<ServiceEntryPointShardRole>());
+
+        // Setup the repl coordinator in standalone mode so we don't need an oplog etc.
+        repl::ReplicationCoordinator::set(getServiceContext(),
+                                          std::make_unique<repl::ReplicationCoordinatorMock>(
+                                              getServiceContext(), repl::ReplSettings()));
+
+        ASSERT_OK(authzBackend->insert(
             opCtx.get(),
-            AuthorizationManager::versionCollectionNamespace,
-            AuthorizationManager::versionDocumentQuery,
-            BSON("$set" << BSON(AuthorizationManager::schemaVersionFieldName
-                                << AuthorizationManager::schemaVersion26Final)),
-            true,
+            NamespaceString::createNamespaceString_forTest("admin.system.users"),
+            BSON("_id" << "test.sajack"
+                       << "user"
+                       << "sajack"
+                       << "db"
+                       << "test"
+                       << "credentials"
+                       << BSON("SCRAM-SHA-256" << scram::Secrets<SHA256Block>::generateCredentials(
+                                   "sajack‍", 15000))
+                       << "roles" << BSONArray()),
             BSONObj()));
 
-        ASSERT_OK(authManagerExternalState->insert(
+
+        ASSERT_OK(authzBackend->insert(
             opCtx.get(),
-            NamespaceString("admin.system.users"),
-            BSON("_id"
-                 << "test.sajack"
-                 << "user"
-                 << "sajack"
-                 << "db"
-                 << "test"
-                 << "credentials"
-                 << BSON("SCRAM-SHA-256"
-                         << scram::Secrets<SHA256Block>::generateCredentials("sajack‍", 15000))
-                 << "roles"
-                 << BSONArray()),
+            NamespaceString::createNamespaceString_forTest("admin.system.users"),
+            BSON("_id" << "$external.sajack"
+                       << "user"
+                       << "sajack"
+                       << "db"
+                       << "$external"
+                       << "credentials" << BSON("external" << true) << "roles" << BSONArray()),
             BSONObj()));
 
-
-        ASSERT_OK(authManagerExternalState->insert(opCtx.get(),
-                                                   NamespaceString("admin.system.users"),
-                                                   BSON("_id"
-                                                        << "$external.sajack"
-                                                        << "user"
-                                                        << "sajack"
-                                                        << "db"
-                                                        << "$external"
-                                                        << "credentials"
-                                                        << BSON("external" << true)
-                                                        << "roles"
-                                                        << BSONArray()),
-                                                   BSONObj()));
-
-        internalSecurity.user = std::make_shared<User>(UserName("__system", "local"));
+        std::unique_ptr<UserRequest> systemLocal =
+            std::make_unique<UserRequestGeneral>(UserName("__system"_sd, "local"_sd), boost::none);
+        internalSecurity.setUser(std::make_shared<UserHandle>(User(std::move(systemLocal))));
     }
 
     BSONObj getMechsFor(const UserName user) {
         BSONObjBuilder builder;
-        registry.advertiseMechanismNamesForUser(
-            opCtx.get(),
-            BSON("isMaster" << 1 << "saslSupportedMechs" << user.getUnambiguousName()),
-            &builder);
+        registry.advertiseMechanismNamesForUser(opCtx.get(), user, &builder);
         return builder.obj();
     }
 
     ServiceContext::UniqueOperationContext opCtx;
-    AuthzManagerExternalStateMock* authManagerExternalState;
-    AuthorizationManager* authManager;
+    auth::AuthorizationBackendMock* authzBackend;
 
     SASLServerMechanismRegistry registry;
 
     const UserName internalSajack = {"sajack"_sd, "test"_sd};
-    const UserName externalSajack = {"sajack"_sd, "$external"_sd};
+    const UserName externalSajack = {"sajack"_sd, DatabaseName::kExternal.db(omitTenant)};
 };
 
 TEST_F(MechanismRegistryTest, acquireInternalMechanism) {
@@ -316,13 +343,11 @@ TEST_F(MechanismRegistryTest, internalAuth) {
         SASLServerMechanismRegistry::kValidateGlobalMechanisms);
 
     ASSERT_BSONOBJ_EQ(BSON("saslSupportedMechs" << BSON_ARRAY("BAR")), getMechsFor(internalSajack));
-    ASSERT_BSONOBJ_EQ(BSON("saslSupportedMechs" << BSON_ARRAY("InternalAuth"
-                                                              << "BAR")),
-                      getMechsFor(internalSecurity.user->getName()));
+    ASSERT_BSONOBJ_EQ(BSON("saslSupportedMechs" << BSON_ARRAY("InternalAuth" << "BAR")),
+                      getMechsFor((*internalSecurity.getUser())->getName()));
 
     registry.setEnabledMechanisms({"BAR", "InternalAuth"});
-    ASSERT_BSONOBJ_EQ(BSON("saslSupportedMechs" << BSON_ARRAY("InternalAuth"
-                                                              << "BAR")),
+    ASSERT_BSONOBJ_EQ(BSON("saslSupportedMechs" << BSON_ARRAY("InternalAuth" << "BAR")),
                       getMechsFor(internalSajack));
 }
 

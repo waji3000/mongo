@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -32,6 +31,11 @@
 
 #include <memory>
 
+#include "mongo/base/status.h"
+#include "mongo/db/auth/cluster_auth_mode.h"
+#include "mongo/db/auth/validated_tenancy_scope.h"
+#include "mongo/db/keys_collection_document_gen.h"
+#include "mongo/db/logical_time.h"
 #include "mongo/db/signed_logical_time.h"
 #include "mongo/db/time_proof_service.h"
 #include "mongo/stdx/mutex.h"
@@ -50,8 +54,8 @@ class KeysCollectionManager;
 class LogicalTimeValidator {
 public:
     // Decorate ServiceContext with LogicalTimeValidator instance.
-    static LogicalTimeValidator* get(ServiceContext* service);
-    static LogicalTimeValidator* get(OperationContext* ctx);
+    static std::shared_ptr<LogicalTimeValidator> get(ServiceContext* service);
+    static std::shared_ptr<LogicalTimeValidator> get(OperationContext* ctx);
     static void set(ServiceContext* service, std::unique_ptr<LogicalTimeValidator> validator);
 
     /**
@@ -72,7 +76,7 @@ public:
     SignedLogicalTime signLogicalTime(OperationContext* opCtx, const LogicalTime& newTime);
 
     /**
-     * Returns true if the signature of newTime is valid.
+     * Validates the signature of newTime and returns the resulting status.
      */
     Status validate(OperationContext* opCtx, const SignedLogicalTime& newTime);
 
@@ -110,6 +114,11 @@ public:
     void stopKeyManager();
 
     /**
+     * Load the given external key into the key manager's keys cache.
+     */
+    void cacheExternalKey(ExternalKeysCollectionDocument key);
+
+    /**
      * Reset the key manager cache of keys.
      */
     void resetKeyManagerCache();
@@ -123,8 +132,7 @@ private:
 
     SignedLogicalTime _getProof(const KeysCollectionDocument& keyDoc, LogicalTime newTime);
 
-    stdx::mutex _mutex;            // protects _lastSeenValidTime
-    stdx::mutex _mutexKeyManager;  // protects _keyManager
+    stdx::mutex _mutex;  // protects _lastSeenValidTime
     SignedLogicalTime _lastSeenValidTime;
     TimeProofService _timeProofService;
     std::shared_ptr<KeysCollectionManager> _keyManager;

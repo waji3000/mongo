@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -32,19 +31,23 @@
 
 #include <memory>
 #include <utility>
-#include <vector>
 
-#include "mongo/stdx/mutex.h"
 #include "mongo/util/clock_source.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/functional.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
 
 /**
  * Mock clock source that returns a fixed time until explicitly advanced.
+ *
+ * Each ClockSourceMock that is constructed tracks the same shared global understanding of time.
  */
 class ClockSourceMock : public ClockSource {
 public:
+    static constexpr auto kInitialNow = Date_t::fromMillisSinceEpoch(1);
+
     /**
      * Constructs a ClockSourceMock with the current time set to the Unix epoch.
      */
@@ -54,7 +57,7 @@ public:
 
     Milliseconds getPrecision() override;
     Date_t now() override;
-    Status setAlarm(Date_t when, unique_function<void()> action) override;
+    void setAlarm(Date_t when, unique_function<void()> action) override;
 
     /**
      * Advances the current time by the given value.
@@ -64,15 +67,7 @@ public:
     /**
      * Resets the current time to the given value.
      */
-    void reset(Date_t newNow);
-
-private:
-    using Alarm = std::pair<Date_t, unique_function<void()>>;
-    void _processAlarms(stdx::unique_lock<stdx::mutex> lk);
-
-    stdx::mutex _mutex;
-    Date_t _now{Date_t::fromMillisSinceEpoch(1)};
-    std::vector<Alarm> _alarms;
+    void reset(Date_t newNow = kInitialNow);
 };
 
 /**
@@ -106,12 +101,12 @@ public:
         return _source->now();
     }
 
-    Status setAlarm(Date_t when, unique_function<void()> action) override {
-        return _source->setAlarm(when, std::move(action));
+    void setAlarm(Date_t when, unique_function<void()> action) override {
+        _source->setAlarm(when, std::move(action));
     }
 
 private:
-    std::shared_ptr<ClockSource> _source;
+    const std::shared_ptr<ClockSource> _source;
 };
 
 }  // namespace mongo

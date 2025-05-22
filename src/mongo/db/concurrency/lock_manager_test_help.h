@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -31,27 +30,15 @@
 #pragma once
 
 #include "mongo/db/concurrency/lock_manager.h"
-#include "mongo/db/concurrency/lock_state.h"
+#include "mongo/db/transaction_resources.h"
 
 namespace mongo {
-
-class LockerForTests : public LockerImpl {
-public:
-    explicit LockerForTests(LockMode globalLockMode) {
-        lockGlobal(globalLockMode);
-    }
-
-    ~LockerForTests() {
-        unlockGlobal();
-    }
-};
-
 
 class TrackingLockGrantNotification : public LockGrantNotification {
 public:
     TrackingLockGrantNotification() : numNotifies(0), lastResult(LOCK_INVALID) {}
 
-    virtual void notify(ResourceId resId, LockResult result) {
+    void notify(ResourceId resId, LockResult result) override {
         numNotifies++;
         lastResId = resId;
         lastResult = result;
@@ -64,31 +51,11 @@ public:
     LockResult lastResult;
 };
 
-
 struct LockRequestCombo : public LockRequest, TrackingLockGrantNotification {
 public:
     explicit LockRequestCombo(Locker* locker) {
         initNew(locker, this);
     }
-};
-
-/**
- * A RAII object that temporarily forces setting of the _supportsDocLocking global variable (defined
- * in db/service_context.cpp and returned by mongo::supportsDocLocking()) for testing purposes.
- */
-extern bool _supportsDocLocking;
-class ForceSupportsDocLocking {
-public:
-    explicit ForceSupportsDocLocking(bool supported) : _oldSupportsDocLocking(_supportsDocLocking) {
-        _supportsDocLocking = supported;
-    }
-
-    ~ForceSupportsDocLocking() {
-        _supportsDocLocking = _oldSupportsDocLocking;
-    }
-
-private:
-    const bool _oldSupportsDocLocking;
 };
 
 }  // namespace mongo

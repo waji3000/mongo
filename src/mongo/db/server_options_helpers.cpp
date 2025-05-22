@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,8 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kControl
-
 #include "mongo/db/server_options_helpers.h"
 
 #ifdef _WIN32
@@ -38,31 +35,33 @@
 #define SYSLOG_NAMES
 #include <syslog.h>
 #endif
-#include <boost/filesystem.hpp>
-#include <boost/filesystem/operations.hpp>
-#include <ios>
-#include <iostream>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <fmt/format.h>
+// IWYU pragma: no_include "ext/alloc_traits.h"
+#include <cstddef>
+#include <utility>
 
+#include "mongo/base/error_codes.h"
 #include "mongo/base/status.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/bson/json.h"
 #include "mongo/bson/util/builder.h"
-#include "mongo/config.h"
+#include "mongo/bson/util/builder_fwd.h"
+#include "mongo/config.h"  // IWYU pragma: keep
 #include "mongo/db/server_options.h"
-#include "mongo/db/server_parameters.h"
-#include "mongo/logger/log_component.h"
-#include "mongo/logger/message_event_utf8_encoder.h"
-#include "mongo/transport/message_compressor_registry.h"
+#include "mongo/db/tenant_id.h"
+#include "mongo/logv2/log.h"
+#include "mongo/logv2/log_format.h"
+#include "mongo/platform/atomic_word.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/cmdline_utils/censor_cmdline.h"
-#include "mongo/util/fail_point_service.h"
-#include "mongo/util/log.h"
-#include "mongo/util/map_util.h"
-#include "mongo/util/mongoutils/str.h"
-#include "mongo/util/net/sock.h"
-#include "mongo/util/net/socket_utils.h"
-#include "mongo/util/net/ssl_options.h"
-#include "mongo/util/options_parser/startup_options.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/str.h"
 
-using std::endl;
-using std::string;
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
 
 namespace mongo {
 
@@ -93,164 +92,10 @@ CODE facilitynames[] = {{"auth", LOG_AUTH},     {"cron", LOG_CRON},     {"daemon
                         {"syslog", LOG_SYSLOG}, {"user", LOG_USER},     {"uucp", LOG_UUCP},
                         {"local0", LOG_LOCAL0}, {"local1", LOG_LOCAL1}, {"local2", LOG_LOCAL2},
                         {"local3", LOG_LOCAL3}, {"local4", LOG_LOCAL4}, {"local5", LOG_LOCAL5},
-                        {"local6", LOG_LOCAL6}, {"local7", LOG_LOCAL7}, {NULL, -1}};
+                        {"local6", LOG_LOCAL6}, {"local7", LOG_LOCAL7}, {nullptr, -1}};
 
 #endif  // !defined(INTERNAL_NOPRI)
 #endif  // defined(SYSLOG_NAMES)
-
-
-}  // namespace
-
-Status addBaseServerOptions(moe::OptionSection* options) {
-    StringBuilder portInfoBuilder;
-
-    portInfoBuilder << "specify port number - " << ServerGlobalParams::DefaultDBPort
-                    << " by default";
-
-    // The verbosity level can be set at startup in the following ways.  Note that if multiple
-    // methods for setting the verbosity are specified simultaneously, the verbosity will be set
-    // based on the whichever option specifies the highest level
-    //
-    // Command Line Option | Resulting Verbosity
-    // _________________________________________
-    // (none)              | 0
-    // --verbose ""        | Error after Boost 1.59
-    // --verbose           | 1
-    // --verbose v         | 1
-    // --verbose vv        | 2 (etc.)
-    // -v                  | 1
-    // -vv                 | 2 (etc.)
-    //
-    // INI Config Option   | Resulting Verbosity
-    // _________________________________________
-    // verbose=            | 0
-    // verbose=v           | 1
-    // verbose=vv          | 2 (etc.)
-    // v=true              | 1
-    // vv=true             | 2 (etc.)
-    //
-    // YAML Config Option  | Resulting Verbosity
-    // _________________________________________
-    // systemLog:          |
-    //    verbosity: 5     | 5
-    // systemLog:          |
-    //   component:        |
-    //     verbosity: 5    | 5
-    // systemLog:          |
-    //   component:        |
-    //     Sharding:       |
-    //       verbosity: 5  | 5 (for Sharding only, 0 for default)
-    options
-        ->addOptionChaining(
-            "verbose",
-            "verbose,v",
-            moe::String,
-            "be more verbose (include multiple times for more verbosity e.g. -vvvvv)")
-        .setImplicit(moe::Value(std::string("v")))
-        .setSources(moe::SourceAllLegacy);
-
-    options->addOptionChaining("systemLog.verbosity", "", moe::Int, "set verbose level")
-        .setSources(moe::SourceYAMLConfig);
-
-    // log component hierarchy verbosity levels
-    for (int i = 0; i < int(logger::LogComponent::kNumLogComponents); ++i) {
-        logger::LogComponent component = static_cast<logger::LogComponent::Value>(i);
-        if (component == logger::LogComponent::kDefault) {
-            continue;
-        }
-        options
-            ->addOptionChaining("systemLog.component." + component.getDottedName() + ".verbosity",
-                                "",
-                                moe::Int,
-                                "set component verbose level for " + component.getDottedName())
-            .setSources(moe::SourceYAMLConfig);
-    }
-
-    options->addOptionChaining("systemLog.quiet", "quiet", moe::Switch, "quieter output");
-
-    options->addOptionChaining("net.port", "port", moe::Int, portInfoBuilder.str().c_str());
-
-    options
-        ->addOptionChaining(
-            "logpath",
-            "logpath",
-            moe::String,
-            "log file to send write to instead of stdout - has to be a file, not directory")
-        .setSources(moe::SourceAllLegacy)
-        .incompatibleWith("syslog");
-
-    options
-        ->addOptionChaining(
-            "systemLog.path",
-            "",
-            moe::String,
-            "log file to send writes to if logging to a file - has to be a file, not directory")
-        .setSources(moe::SourceYAMLConfig)
-        .hidden();
-
-    options
-        ->addOptionChaining("systemLog.destination",
-                            "",
-                            moe::String,
-                            "Destination of system log output.  (syslog/file)")
-        .setSources(moe::SourceYAMLConfig)
-        .hidden()
-        .format("(:?syslog)|(:?file)", "(syslog/file)");
-
-#ifndef _WIN32
-    options
-        ->addOptionChaining("syslog",
-                            "syslog",
-                            moe::Switch,
-                            "log to system's syslog facility instead of file or stdout")
-        .incompatibleWith("logpath")
-        .setSources(moe::SourceAllLegacy);
-
-    options->addOptionChaining("systemLog.syslogFacility",
-                               "syslogFacility",
-                               moe::String,
-                               "syslog facility used for mongodb syslog message");
-
-#endif  // _WIN32
-    options->addOptionChaining("systemLog.logAppend",
-                               "logappend",
-                               moe::Switch,
-                               "append to logpath instead of over-writing");
-
-    options->addOptionChaining("systemLog.logRotate",
-                               "logRotate",
-                               moe::String,
-                               "set the log rotation behavior (rename|reopen)");
-
-    options->addOptionChaining("systemLog.timeStampFormat",
-                               "timeStampFormat",
-                               moe::String,
-                               "Desired format for timestamps in log messages. One of ctime, "
-                               "iso8601-utc or iso8601-local");
-
-    options
-        ->addOptionChaining(
-            "setParameter", "setParameter", moe::StringMap, "Set a configurable parameter")
-        .composing();
-
-    /* support for -vv -vvvv etc. */
-    for (string s = "vv"; s.length() <= 12; s.append("v")) {
-        options->addOptionChaining(s.c_str(), s.c_str(), moe::Switch, "verbose")
-            .hidden()
-            .setSources(moe::SourceAllLegacy);
-    }
-
-    options
-        ->addOptionChaining("systemLog.traceAllExceptions",
-                            "traceExceptions",
-                            moe::Switch,
-                            "log stack traces for every exception")
-        .hidden();
-
-    return Status::OK();
-}
-
-namespace {
 
 Status setArgvArray(const std::vector<std::string>& argv) {
     BSONArrayBuilder b;
@@ -287,15 +132,43 @@ Status validateBaseOptions(const moe::Environment& params) {
         }
     }
 
+    std::map<std::string, std::string> parameters;
     if (params.count("setParameter")) {
-        std::map<std::string, std::string> parameters =
-            params["setParameter"].as<std::map<std::string, std::string>>();
+        parameters = params["setParameter"].as<std::map<std::string, std::string>>();
+    }
 
+    const bool enableTestCommandsValue = ([&parameters] {
+        const auto etc = parameters.find("enableTestCommands");
+        if (etc == parameters.end()) {
+            return false;
+        }
+        const auto& val = etc->second;
+        return (0 == val.compare("1")) || (0 == val.compare("true"));
+    })();
+
+    if (enableTestCommandsValue) {
         // Only register failpoint server parameters if enableTestCommands=1.
-        auto enableTestCommandsParameter = parameters.find("enableTestCommands");
-        if (enableTestCommandsParameter != parameters.end() &&
-            enableTestCommandsParameter->second.compare("1") == 0) {
-            getGlobalFailPointRegistry()->registerAllFailPointsAsServerParameters();
+        globalFailPointRegistry().registerAllFailPointsAsServerParameters();
+    } else {
+        // Deregister test-only parameters.
+        ServerParameterSet::getNodeParameterSet()->disableTestParameters();
+        ServerParameterSet::getClusterParameterSet()->disableTestParameters();
+    }
+
+    // Must come after registerAllFailPointsAsServerParameters() above.
+    auto* paramSet = ServerParameterSet::getNodeParameterSet();
+    for (const auto& setParam : parameters) {
+        auto* param = paramSet->getIfExists(setParam.first);
+
+        if (!param) {
+            return {ErrorCodes::BadValue,
+                    str::stream() << "Unknown --setParameter '" << setParam.first << "'"};
+        }
+
+        if (!param->isEnabled()) {
+            return {ErrorCodes::BadValue,
+                    str::stream() << "--setParameter '" << setParam.first
+                                  << "' only available when used with 'enableTestCommands'"};
         }
     }
 
@@ -387,6 +260,30 @@ Status setupBaseOptions(const std::vector<std::string>& args) {
     return Status::OK();
 }
 
+namespace server_options_detail {
+StatusWith<BSONObj> applySetParameterOptions(const std::map<std::string, std::string>& toApply,
+                                             ServerParameterSet& parameterSet) {
+    BSONObjBuilder summaryBuilder;
+    for (const auto& [name, value] : toApply) {
+        auto sp = parameterSet.getIfExists(name);
+        if (!sp)
+            return Status(ErrorCodes::BadValue,
+                          fmt::format("Illegal --setParameter parameter: \"{}\"", name));
+        if (!sp->allowedToChangeAtStartup())
+            return Status(ErrorCodes::BadValue,
+                          fmt::format("Cannot use --setParameter to set \"{}\" at startup", name));
+        BSONObjBuilder sub(summaryBuilder.subobjStart(name));
+        sp->append(nullptr, &sub, "default", boost::none);
+        Status status = sp->setFromString(value, boost::none);
+        if (!status.isOK())
+            return Status(ErrorCodes::BadValue,
+                          fmt::format("Bad value for parameter \"{}\": {}", name, status.reason()));
+        sp->append(nullptr, &sub, "value", boost::none);
+    }
+    return summaryBuilder.obj();
+}
+}  // namespace server_options_detail
+
 Status storeBaseOptions(const moe::Environment& params) {
     Status ret = setParsedOpts(params);
     if (!ret.isOK()) {
@@ -400,31 +297,29 @@ Status storeBaseOptions(const moe::Environment& params) {
             return Status(ErrorCodes::BadValue,
                           "systemLog.verbosity YAML Config cannot be negative");
         }
-        logger::globalLogDomain()->setMinimumLoggedSeverity(logger::LogSeverity::Debug(verbosity));
+        logv2::LogManager::global().getGlobalSettings().setMinimumLoggedSeverity(
+            mongo::logv2::LogComponent::kDefault, logv2::LogSeverity::Debug(verbosity));
     }
 
     // log component hierarchy verbosity levels
-    for (int i = 0; i < int(logger::LogComponent::kNumLogComponents); ++i) {
-        logger::LogComponent component = static_cast<logger::LogComponent::Value>(i);
-        if (component == logger::LogComponent::kDefault) {
+    for (int i = 0; i < int(logv2::LogComponent::kNumLogComponents); ++i) {
+        logv2::LogComponent component = static_cast<logv2::LogComponent::Value>(i);
+        if (component == logv2::LogComponent::kDefault) {
             continue;
         }
-        const string dottedName = "systemLog.component." + component.getDottedName() + ".verbosity";
+        const std::string dottedName =
+            "systemLog.component." + component.getDottedName() + ".verbosity";
         if (params.count(dottedName)) {
             int verbosity = params[dottedName].as<int>();
             // Clear existing log level if log level is negative.
             if (verbosity < 0) {
-                logger::globalLogDomain()->clearMinimumLoggedSeverity(component);
+                logv2::LogManager::global().getGlobalSettings().clearMinimumLoggedSeverity(
+                    component);
             } else {
-                logger::globalLogDomain()->setMinimumLoggedSeverity(
-                    component, logger::LogSeverity::Debug(verbosity));
+                logv2::LogManager::global().getGlobalSettings().setMinimumLoggedSeverity(
+                    component, logv2::LogSeverity::Debug(verbosity));
             }
         }
-    }
-
-    if (params.count("enableExperimentalStorageDetailsCmd")) {
-        serverGlobalParams.experimental.storageDetailsCmdEnabled =
-            params["enableExperimentalStorageDetailsCmd"].as<bool>();
     }
 
     if (params.count("systemLog.quiet")) {
@@ -436,21 +331,21 @@ Status storeBaseOptions(const moe::Environment& params) {
     }
 
     if (params.count("systemLog.timeStampFormat")) {
-        using logger::MessageEventDetailsEncoder;
-        std::string formatterName = params["systemLog.timeStampFormat"].as<string>();
-        if (formatterName == "ctime") {
-            MessageEventDetailsEncoder::setDateFormatter(outputDateAsCtime);
-        } else if (formatterName == "iso8601-utc") {
-            MessageEventDetailsEncoder::setDateFormatter(outputDateAsISOStringUTC);
+        std::string formatterName = params["systemLog.timeStampFormat"].as<std::string>();
+        if (formatterName == "iso8601-utc") {
+            serverGlobalParams.logTimestampFormat = logv2::LogTimestampFormat::kISO8601UTC;
+            setDateFormatIsLocalTimezone(false);
         } else if (formatterName == "iso8601-local") {
-            MessageEventDetailsEncoder::setDateFormatter(outputDateAsISOStringLocal);
+            serverGlobalParams.logTimestampFormat = logv2::LogTimestampFormat::kISO8601Local;
+            setDateFormatIsLocalTimezone(true);
         } else {
             StringBuilder sb;
-            sb << "Value of logTimestampFormat must be one of ctime, iso8601-utc "
+            sb << "Value of logTimestampFormat must be one of iso8601-utc "
                << "or iso8601-local; not \"" << formatterName << "\".";
             return Status(ErrorCodes::BadValue, sb.str());
         }
     }
+
     if (params.count("systemLog.destination")) {
         std::string systemLogDestination = params["systemLog.destination"].as<std::string>();
         if (systemLogDestination == "file") {
@@ -483,11 +378,12 @@ Status storeBaseOptions(const moe::Environment& params) {
 
 #ifndef _WIN32
     if (params.count("systemLog.syslogFacility")) {
-        std::string facility = params["systemLog.syslogFacility"].as<string>();
+        std::string facility = params["systemLog.syslogFacility"].as<std::string>();
         bool set = false;
         // match facility string to facility value
         size_t facilitynamesLength = sizeof(facilitynames) / sizeof(facilitynames[0]);
-        for (unsigned long i = 0; i < facilitynamesLength && facilitynames[i].c_name != NULL; i++) {
+        for (unsigned long i = 0; i < facilitynamesLength && facilitynames[i].c_name != nullptr;
+             i++) {
             if (!facility.compare(facilitynames[i].c_name)) {
                 serverGlobalParams.syslogFacility = facilitynames[i].c_val;
                 set = true;
@@ -509,7 +405,7 @@ Status storeBaseOptions(const moe::Environment& params) {
     }
 
     if (params.count("systemLog.logRotate")) {
-        std::string logRotateParam = params["systemLog.logRotate"].as<string>();
+        std::string logRotateParam = params["systemLog.logRotate"].as<std::string>();
         if (logRotateParam == "reopen") {
             serverGlobalParams.logRenameOnRotate = false;
 
@@ -530,58 +426,46 @@ Status storeBaseOptions(const moe::Environment& params) {
     }
 
     if (params.count("processManagement.pidFilePath")) {
-        serverGlobalParams.pidFile = params["processManagement.pidFilePath"].as<string>();
+        serverGlobalParams.pidFile = params["processManagement.pidFilePath"].as<std::string>();
     }
 
     if (params.count("processManagement.timeZoneInfo")) {
-        serverGlobalParams.timeZoneInfoPath = params["processManagement.timeZoneInfo"].as<string>();
+        serverGlobalParams.timeZoneInfoPath =
+            params["processManagement.timeZoneInfo"].as<std::string>();
     }
 
     if (params.count("setParameter")) {
-        std::map<std::string, std::string> parameters =
-            params["setParameter"].as<std::map<std::string, std::string>>();
-        for (std::map<std::string, std::string>::iterator parametersIt = parameters.begin();
-             parametersIt != parameters.end();
-             parametersIt++) {
-            ServerParameter* parameter =
-                mapFindWithDefault(ServerParameterSet::getGlobal()->getMap(),
-                                   parametersIt->first,
-                                   static_cast<ServerParameter*>(NULL));
-            if (NULL == parameter) {
-                StringBuilder sb;
-                sb << "Illegal --setParameter parameter: \"" << parametersIt->first << "\"";
-                return Status(ErrorCodes::BadValue, sb.str());
-            }
-            if (!parameter->allowedToChangeAtStartup()) {
-                StringBuilder sb;
-                sb << "Cannot use --setParameter to set \"" << parametersIt->first
-                   << "\" at startup";
-                return Status(ErrorCodes::BadValue, sb.str());
-            }
-            Status status = parameter->setFromString(parametersIt->second);
-            if (!status.isOK()) {
-                StringBuilder sb;
-                sb << "Bad value for parameter \"" << parametersIt->first
-                   << "\": " << status.reason();
-                return Status(ErrorCodes::BadValue, sb.str());
-            }
-        }
+        auto swObj = server_options_detail::applySetParameterOptions(
+            params["setParameter"].as<std::map<std::string, std::string>>(),
+            *ServerParameterSet::getNodeParameterSet());
+        if (!swObj.isOK())
+            return swObj.getStatus();
+        if (const BSONObj& obj = swObj.getValue(); !obj.isEmpty())
+            LOGV2(5760901, "Applied --setParameter options", "serverParameters"_attr = obj);
     }
 
     if (params.count("operationProfiling.slowOpThresholdMs")) {
-        serverGlobalParams.slowMS = params["operationProfiling.slowOpThresholdMs"].as<int>();
+        serverGlobalParams.slowMS.store(params["operationProfiling.slowOpThresholdMs"].as<int>());
     }
 
     if (params.count("operationProfiling.slowOpSampleRate")) {
-        serverGlobalParams.sampleRate = params["operationProfiling.slowOpSampleRate"].as<double>();
+        serverGlobalParams.sampleRate.store(
+            params["operationProfiling.slowOpSampleRate"].as<double>());
+    }
+
+    if (params.count("operationProfiling.filter")) {
+        try {
+            serverGlobalParams.defaultProfileFilter =
+                fromjson(params["operationProfiling.filter"].as<std::string>()).getOwned();
+        } catch (AssertionException& e) {
+            // Add more context to the error
+            uasserted(ErrorCodes::FailedToParse,
+                      str::stream()
+                          << "Failed to parse option operationProfiling.filter: " << e.reason());
+        }
     }
 
     return Status::OK();
 }
-
-ExportedServerParameter<std::vector<std::string>, ServerParameterType::kStartupOnly>
-    SecureAllocatorDomains(ServerParameterSet::getGlobal(),
-                           "disabledSecureAllocatorDomains",
-                           &serverGlobalParams.disabledSecureAllocatorDomains);
 
 }  // namespace mongo

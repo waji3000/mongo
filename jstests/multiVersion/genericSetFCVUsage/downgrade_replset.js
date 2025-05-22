@@ -1,12 +1,10 @@
-// Test the downgrade of a replica set from latest version
-// to last-stable version succeeds, while reads and writes continue.
+import "jstests/multiVersion/libs/multi_rs.js";
 
-load('./jstests/multiVersion/libs/multi_rs.js');
-load('./jstests/libs/test_background_ops.js');
-load('./jstests/libs/feature_compatibility_version.js');
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {isFinished, startParallelOps} from "jstests/libs/test_background_ops.js";
+import {reconnect} from "jstests/replsets/rslib.js";
 
 let newVersion = "latest";
-let oldVersion = "last-stable";
 
 let name = "replsetdowngrade";
 let nodes = {
@@ -15,10 +13,12 @@ let nodes = {
     n3: {binVersion: newVersion}
 };
 
-function runDowngradeTest() {
+function runDowngradeTest(downgradeVersion) {
+    jsTestLog("Running test with 'downgradeVersion': " + downgradeVersion);
+    const downgradeFCV = binVersionToFCV(downgradeVersion);
     let rst = new ReplSetTest({name: name, nodes: nodes, waitForKeys: true});
     rst.startSet();
-    rst.initiate();
+    rst.initiate(null, null, {initiateWithDefaultElectionTimeout: true});
 
     let primary = rst.getPrimary();
     let coll = "test.foo";
@@ -27,11 +27,12 @@ function runDowngradeTest() {
     let primaryAdminDB = rst.getPrimary().getDB("admin");
     checkFCV(primaryAdminDB, latestFCV);
 
-    // We wait for the feature compatibility version to be set to lastStableFCV on all nodes of the
-    // replica set in order to ensure that all nodes can be successfully downgraded. This
+    // We wait for the feature compatibility version to be set to the downgraded FCV on all nodes of
+    // the replica set in order to ensure that all nodes can be successfully downgraded. This
     // effectively allows us to emulate upgrading to the latest version with existing data files and
-    // then trying to downgrade back to lastStableFCV.
-    assert.commandWorked(primary.adminCommand({setFeatureCompatibilityVersion: lastStableFCV}));
+    // then trying to downgrade the FCV.
+    assert.commandWorked(
+        primary.adminCommand({setFeatureCompatibilityVersion: downgradeFCV, confirm: true}));
     rst.awaitReplication();
 
     jsTest.log("Inserting documents into collection.");
@@ -43,7 +44,7 @@ function runDowngradeTest() {
         let coll = new Mongo(rsURL).getCollection(collParam);
         let count = 10;
         while (!isFinished()) {
-            assert.writeOK(coll.insert({_id: count, str: "hello world"}));
+            assert.commandWorked(coll.insert({_id: count, str: "hello world"}));
             count++;
         }
     }
@@ -52,7 +53,7 @@ function runDowngradeTest() {
     let joinFindInsert = startParallelOps(primary, insertDocuments, [rst.getURL(), coll]);
 
     jsTest.log("Downgrading replica set..");
-    rst.upgradeSet({binVersion: oldVersion});
+    rst.upgradeSet({binVersion: downgradeVersion});
     jsTest.log("Downgrade complete.");
 
     // We save a reference to the old primary so that we can call reconnect() on it before
@@ -64,11 +65,12 @@ function runDowngradeTest() {
     printjson(rst.status());
 
     // Since the old primary was restarted as part of the downgrade process, we explicitly reconnect
-    // to it so that sending it an update operation silently fails with an unchecked NotMaster error
-    // rather than a network error.
+    // to it so that sending it an update operation silently fails with an unchecked
+    // NotWritablePrimary error rather than a network error.
     reconnect(oldPrimary.getDB("admin"));
     joinFindInsert();
     rst.stopSet();
 }
 
-runDowngradeTest();
+runDowngradeTest('last-continuous');
+runDowngradeTest('last-lts');

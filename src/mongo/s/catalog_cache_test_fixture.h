@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,22 +29,46 @@
 
 #pragma once
 
+#include <memory>
+#include <string>
 #include <vector>
 
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/oid.h"
+#include "mongo/bson/timestamp.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/query/collation/collator_interface.h"
+#include "mongo/executor/network_test_env.h"
+#include "mongo/s/catalog/type_chunk.h"
+#include "mongo/s/catalog/type_collection.h"
+#include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/catalog_cache.h"
-#include "mongo/s/sharding_router_test_fixture.h"
-#include "mongo/stdx/memory.h"
+#include "mongo/s/chunk_manager.h"
+#include "mongo/s/shard_key_pattern.h"
+#include "mongo/s/sharding_mongos_test_fixture.h"
+#include "mongo/util/net/hostandport.h"
+#include "mongo/util/uuid.h"
 
 namespace mongo {
 
-class BSONObj;
-class ChunkManager;
-class CollatorInterface;
-class ShardKeyPattern;
-
-class CatalogCacheTestFixture : public ShardingTestFixture {
+/**
+ * The ServerRole-independent core of `RouterCatalogCacheTestFixture` and its
+ * `ShardCatalogCacheTestFixture` counterpart.
+ */
+class CoreCatalogCacheTestFixture : public ShardingTestFixture {
 protected:
+    CoreCatalogCacheTestFixture()
+        : ShardingTestFixture(false,  // No mock catalog cache
+                              std::make_unique<ScopedGlobalServiceContextForTest>(shouldSetupTL)) {}
+
+    explicit CoreCatalogCacheTestFixture(
+        std::unique_ptr<ScopedGlobalServiceContextForTest> scopedServiceContext)
+        : ShardingTestFixture(false,  // No mock catalog cache
+                              std::move(scopedServiceContext)) {}
+
     void setUp() override;
 
     /**
@@ -53,46 +76,93 @@ protected:
      * points. Each individual chunk is placed on a separate shard with shard id being a single
      * number ranging from "0" to the number of chunks.
      */
-    std::shared_ptr<ChunkManager> makeChunkManager(
+    CollectionRoutingInfo makeCollectionRoutingInfo(
         const NamespaceString& nss,
         const ShardKeyPattern& shardKeyPattern,
         std::unique_ptr<CollatorInterface> defaultCollator,
         bool unique,
-        const std::vector<BSONObj>& splitPoints);
+        const std::vector<BSONObj>& splitPoints,
+        boost::optional<ReshardingFields> reshardingFields = boost::none,
+        boost::optional<TypeCollectionTimeseriesFields> timeseriesFields = boost::none,
+        boost::optional<bool> unsplittable = boost::none,
+        size_t chunksPerShard = 1);
+
+    /**
+     * Returns a chunk manager representing an unsharded collection tracked on the configsvr.
+     */
+    CollectionRoutingInfo makeUnshardedCollectionRoutingInfo(const NamespaceString& nss);
+
+    /**
+     * Returns a chunk manager representing an unsharded collection not tracked on the configsvr,
+     * or a non-existent collection.
+     */
+    CollectionRoutingInfo makeUntrackedCollectionRoutingInfo(const NamespaceString& nss);
 
     /**
      * Invalidates the catalog cache for 'kNss' and schedules a thread to invoke the blocking 'get'
      * call, returning a future which can be obtained to get the specified routing information.
      *
+     * The notion of 'forced' in the function name implies that we will always indicate to the
+     * catalog cache that a refresh will happen.
+     *
      * NOTE: The returned value is always set. The reason to use optional is a deficiency of
      * std::future with the MSVC STL library, which requires the templated type to be default
      * constructible.
      */
-    executor::NetworkTestEnv::FutureHandle<boost::optional<CachedCollectionRoutingInfo>>
-    scheduleRoutingInfoRefresh(const NamespaceString& nss);
+    executor::NetworkTestEnv::FutureHandle<boost::optional<CollectionRoutingInfo>>
+    scheduleRoutingInfoForcedRefresh(const NamespaceString& nss);
+
+    /**
+     * Gets the routing information from the catalog cache. Unforced means the refresh will only
+     * happen if the cache has been invalidated elsewhere.
+     *
+     * NOTE: The returned value is always set. The reason to use optional is a deficiency of
+     * std::future with the MSVC STL library, which requires the templated type to be default
+     * constructible.
+     */
+    executor::NetworkTestEnv::FutureHandle<boost::optional<CollectionRoutingInfo>>
+    scheduleRoutingInfoUnforcedRefresh(const NamespaceString& nss);
+
+    /**
+     * Advance the time in the cache for 'kNss' and schedules a thread to make an incremental
+     * refresh.
+     *
+     * NOTE: The returned value is always set. The reason to use optional is a deficiency of
+     * std::future with the MSVC STL library, which requires the templated type to be default
+     * constructible.
+     */
+    executor::NetworkTestEnv::FutureHandle<boost::optional<CollectionRoutingInfo>>
+    scheduleRoutingInfoIncrementalRefresh(const NamespaceString& nss);
 
     /**
      * Ensures that there are 'numShards' available in the shard registry. The shard ids are
      * generated as "0", "1", etc.
+     *
+     * Returns the mock shard descriptors that were used for the setup.
      */
-    void setupNShards(int numShards);
+    std::vector<ShardType> setupNShards(int numShards);
 
     /**
      * Triggers a refresh for the given namespace and mocks network calls to simulate loading
      * metadata with two chunks: [minKey, 0) and [0, maxKey) on two shards with ids: "0" and "1".
      */
-    CachedCollectionRoutingInfo loadRoutingTableWithTwoChunksAndTwoShards(NamespaceString nss);
+    ChunkManager loadRoutingTableWithTwoChunksAndTwoShards(NamespaceString nss);
 
     /**
      * Same as the above method but the sharding key is hashed.
      */
-    CachedCollectionRoutingInfo loadRoutingTableWithTwoChunksAndTwoShardsHash(NamespaceString nss);
+    ChunkManager loadRoutingTableWithTwoChunksAndTwoShardsHash(NamespaceString nss);
 
     /**
      * The common implementation for any shard key.
      */
-    CachedCollectionRoutingInfo loadRoutingTableWithTwoChunksAndTwoShardsImpl(
-        NamespaceString nss, const BSONObj& shardKey);
+    ChunkManager loadRoutingTableWithTwoChunksAndTwoShardsImpl(
+        NamespaceString nss,
+        const BSONObj& shardKey,
+        boost::optional<std::string> primaryShardId = boost::none,
+        UUID uuid = UUID::gen(),
+        OID epoch = OID::gen(),
+        Timestamp timestamp = Timestamp(1));
 
     /**
      * Mocks network responses for loading a sharded database and collection from the config server.
@@ -100,9 +170,26 @@ protected:
     void expectGetDatabase(NamespaceString nss, std::string primaryShard = "0");
     void expectGetCollection(NamespaceString nss,
                              OID epoch,
+                             Timestamp timestamp,
+                             UUID uuid,
                              const ShardKeyPattern& shardKeyPattern);
-
+    void expectCollectionAndChunksAggregation(NamespaceString nss,
+                                              OID epoch,
+                                              Timestamp timestamp,
+                                              UUID uuid,
+                                              const ShardKeyPattern& shardKeyPattern,
+                                              const std::vector<ChunkType>& chunks);
     const HostAndPort kConfigHostAndPort{"DummyConfig", 1234};
+};
+
+class RouterCatalogCacheTestFixture : public virtual service_context_test::RouterRoleOverride,
+                                      public CoreCatalogCacheTestFixture {
+    using CoreCatalogCacheTestFixture::CoreCatalogCacheTestFixture;
+};
+
+class ShardCatalogCacheTestFixture : public virtual service_context_test::ShardRoleOverride,
+                                     public CoreCatalogCacheTestFixture {
+    using CoreCatalogCacheTestFixture::CoreCatalogCacheTestFixture;
 };
 
 }  // namespace mongo

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,10 +27,16 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+// IWYU pragma: no_include "ext/alloc_traits.h"
+#include <vector>
 
+#include "mongo/base/string_data.h"
+#include "mongo/bson/json.h"
+#include "mongo/db/catalog/clustered_collection_util.h"
 #include "mongo/db/query/collation/collator_interface_mock.h"
+#include "mongo/db/query/query_planner_params.h"
 #include "mongo/db/query/query_planner_test_fixture.h"
+#include "mongo/unittest/unittest.h"
 
 namespace {
 
@@ -172,7 +177,7 @@ TEST_F(QueryPlannerTest, TypeStringCannotBeCoveredWithCollator) {
     assertSolutionExists(
         "{proj: {spec: {_id: 0, a: 1}, node: {fetch: {filter: {a:{$type:'string'}}, collation: "
         "{locale: 'reverse'}, node: {ixscan: {pattern: {a: 1}, filter: null, "
-        "bounds: {a: [['',{},true,true]]}}}}}}}");
+        "bounds: {a: [['',{},true,false]]}}}}}}}");
 }
 
 TEST_F(QueryPlannerTest, NotWithStringBoundsCannotBeCoveredWithCollator) {
@@ -194,7 +199,7 @@ TEST_F(QueryPlannerTest, NotWithStringBoundsCannotBeCoveredWithCollator) {
 TEST_F(QueryPlannerTest, ExistsTrueCannotBeCoveredWithSparseIndexAndCollator) {
     CollatorInterfaceMock collator(CollatorInterfaceMock::MockType::kReverseString);
     addIndex(fromjson("{a: 1}"), &collator);
-    params.indices.back().sparse = true;
+    params.mainCollectionInfo.indexes.back().sparse = true;
 
     runQueryAsCommand(fromjson(
         "{find: 'testns', filter: {a: {$exists: true}}, projection: {_id: 0, a: 1}, collation: "
@@ -212,9 +217,9 @@ TEST_F(QueryPlannerTest, MinMaxWithStringBoundsCannotBeCoveredWithCollator) {
     CollatorInterfaceMock collator(CollatorInterfaceMock::MockType::kReverseString);
     addIndex(fromjson("{a: 1, b: 1}"), &collator);
 
-    runQueryAsCommand(
-        fromjson("{find: 'testns', min: {a: 1, b: 2}, max: {a: 2, b: 1}, "
-                 "projection: {_id: 0, a: 1, b: 1}, collation: {locale: 'reverse'}}"));
+    runQueryAsCommand(fromjson(
+        "{find: 'testns', min: {a: 1, b: 2}, max: {a: 2, b: 1}, "
+        "projection: {_id: 0, a: 1, b: 1}, hint: {a: 1, b: 1}, collation: {locale: 'reverse'}}"));
 
     assertNumSolutions(1U);
     assertSolutionExists(
@@ -222,23 +227,18 @@ TEST_F(QueryPlannerTest, MinMaxWithStringBoundsCannotBeCoveredWithCollator) {
         "{locale: 'reverse'}, node: {ixscan: {pattern: {a: 1, b: 1}}}}}}}");
 }
 
-TEST_F(QueryPlannerTest, SimpleRegexCanUseAnIndexWithACollatorWithLooseBounds) {
+TEST_F(QueryPlannerTest, PrefixOnlyRegexCannotUseAnIndexWithACollator) {
     CollatorInterfaceMock collator(CollatorInterfaceMock::MockType::kReverseString);
     addIndex(fromjson("{a: 1}"), &collator);
 
-    // Since the index has a collation, the regex must be applied after fetching the documents
-    // (INEXACT_FETCH tightness).
     runQueryAsCommand(
         fromjson("{find: 'testns', filter: {a: /^simple/}, collation: {locale: 'reverse'}}"));
 
-    assertNumSolutions(2U);
+    assertNumSolutions(1U);
     assertSolutionExists("{cscan: {dir: 1}}");
-    assertSolutionExists(
-        "{fetch: {filter: {a: /^simple/}, node: {ixscan: {pattern: {a: 1}, filter: null, bounds: "
-        "{a: [['', {}, true, false], [/^simple/, /^simple/, true, true]]}}}}}");
 }
 
-TEST_F(QueryPlannerTest, SimpleRegexCanUseAnIndexWithoutACollatorWithTightBounds) {
+TEST_F(QueryPlannerTest, PrefixOnlyRegexCanUseAnIndexWithoutACollatorWithTightBounds) {
     addIndex(fromjson("{a: 1}"));
 
     runQueryAsCommand(
@@ -251,11 +251,10 @@ TEST_F(QueryPlannerTest, SimpleRegexCanUseAnIndexWithoutACollatorWithTightBounds
         "{a: [['simple', 'simplf', true, false], [/^simple/, /^simple/, true, true]]}}}}}");
 }
 
-TEST_F(QueryPlannerTest, NonSimpleRegexCanUseAnIndexWithoutACollatorAsInexactCovered) {
+TEST_F(QueryPlannerTest, NonPrefixRegexCanUseAnIndexWithoutACollatorAsInexactCovered) {
     addIndex(fromjson("{a: 1}"));
 
-    runQueryAsCommand(
-        fromjson("{find: 'testns', filter: {a: /nonsimple/}, collation: {locale: 'reverse'}}"));
+    runQueryAsCommand(fromjson("{find: 'testns', filter: {a: /nonsimple/}}"));
 
     assertNumSolutions(2U);
     assertSolutionExists("{cscan: {dir: 1}}");
@@ -360,8 +359,8 @@ TEST_F(QueryPlannerTest, CannotUseIndexWithNonMatchingCollatorForSort) {
 
     assertNumSolutions(1U);
     assertSolutionExists(
-        "{sort: {pattern: {a: 1}, limit: 0, node: {sortKeyGen:"
-        "{node: {cscan: {dir: 1, filter: {b: 1}}}}}}}");
+        "{sort: {pattern: {a: 1}, type: 'simple', limit: 0,"
+        "node: {cscan: {dir: 1, filter: {b: 1}}}}}");
 }
 
 TEST_F(QueryPlannerTest, CanUseIndexWithMatchingCollatorForSort) {
@@ -373,8 +372,8 @@ TEST_F(QueryPlannerTest, CanUseIndexWithMatchingCollatorForSort) {
 
     assertNumSolutions(2U);
     assertSolutionExists(
-        "{sort: {pattern: {a: 1}, limit: 0, node: {sortKeyGen:"
-        "{node: {cscan: {dir: 1, filter: {b: 1}, collation: {locale: 'reverse'}}}}}}}");
+        "{sort: {pattern: {a: 1}, type: 'simple', limit: 0,"
+        "node: {cscan: {dir: 1, filter: {b: 1}, collation: {locale: 'reverse'}}}}}");
     assertSolutionExists(
         "{fetch: {filter: {b: 1}, collation: {locale: 'reverse'}, node: {ixscan: {pattern: {a: "
         "1}}}}}");
@@ -388,11 +387,11 @@ TEST_F(QueryPlannerTest, IndexWithNonMatchingCollatorCausesInMemorySort) {
 
     assertNumSolutions(2U);
     assertSolutionExists(
-        "{sort: {pattern: {a: 1}, limit: 0, node: {sortKeyGen:"
-        "{node: {fetch: {node : {ixscan: {pattern: {a: 1}}}}}}}}}");
+        "{sort: {pattern: {a: 1}, limit: 0, type: 'simple', node:"
+        "{fetch: {node : {ixscan: {pattern: {a: 1}}}}}}}");
     assertSolutionExists(
-        "{sort: {pattern: {a: 1}, limit: 0, node: {sortKeyGen:"
-        "{node: {cscan: {dir: 1, filter: {a: {'$exists': true}}}}}}}}");
+        "{sort: {pattern: {a: 1}, limit: 0, type: 'simple', node:"
+        "{cscan: {dir: 1, filter: {a: {'$exists': true}}}}}}");
 }
 
 TEST_F(QueryPlannerTest, IndexWithMatchingCollatorDoesNotCauseInMemorySort) {
@@ -406,8 +405,8 @@ TEST_F(QueryPlannerTest, IndexWithMatchingCollatorDoesNotCauseInMemorySort) {
     assertNumSolutions(2U);
     assertSolutionExists("{fetch: {node : {ixscan: {pattern: {a: 1}}}}}");
     assertSolutionExists(
-        "{sort: {pattern: {a: 1}, limit: 0, node: {sortKeyGen:"
-        "{node: {cscan: {dir: 1, filter: {a: {'$exists': true}}}}}}}}");
+        "{sort: {pattern: {a: 1}, limit: 0, type: 'simple', node:"
+        "{cscan: {dir: 1, filter: {a: {'$exists': true}}}}}}");
 }
 
 TEST_F(QueryPlannerTest, CompoundIndexWithNonMatchingCollatorCausesInMemorySort) {
@@ -420,11 +419,11 @@ TEST_F(QueryPlannerTest, CompoundIndexWithNonMatchingCollatorCausesInMemorySort)
 
     assertNumSolutions(2U);
     assertSolutionExists(
-        "{sort: {pattern: {a: 1, b: 1, c: 1}, limit: 0, node: {sortKeyGen:"
-        "{node: {fetch: {node: {ixscan: {pattern: {a: 1, b: 1, c: 1, d: 1}}}}}}}}}");
+        "{sort: {pattern: {a: 1, b: 1, c: 1}, limit: 0, type: 'simple', node:"
+        "{fetch: {node: {ixscan: {pattern: {a: 1, b: 1, c: 1, d: 1}}}}}}}");
     assertSolutionExists(
-        "{sort: {pattern: {a: 1, b: 1, c: 1}, limit: 0, node: {sortKeyGen:"
-        "{node: {cscan: {dir: 1, filter: {a: 1, b: 2, c: {a: 1}}}}}}}}");
+        "{sort: {pattern: {a: 1, b: 1, c: 1}, limit: 0, type: 'simple', node:"
+        "{cscan: {dir: 1, filter: {a: 1, b: 2, c: {a: 1}}}}}}");
 }
 
 TEST_F(QueryPlannerTest, CompoundIndexWithNonMatchingPrefixedCollatorDoesNotCauseInMemorySort) {
@@ -438,8 +437,8 @@ TEST_F(QueryPlannerTest, CompoundIndexWithNonMatchingPrefixedCollatorDoesNotCaus
     assertNumSolutions(2U);
     assertSolutionExists("{fetch: {node : {ixscan: {pattern: {a: 1, b: 1, c: 1, d: 1}}}}}");
     assertSolutionExists(
-        "{sort: {pattern: {a: 1, b: 1}, limit: 0, node: {sortKeyGen:"
-        "{node: {cscan: {dir: 1, filter : {a: 1, b: 2, c: {a: 1}}}}}}}}");
+        "{sort: {pattern: {a: 1, b: 1}, limit: 0, type: 'simple', node: "
+        "{cscan: {dir: 1, filter : {a: 1, b: 2, c: {a: 1}}}}}}");
 }
 
 TEST_F(QueryPlannerTest, SuccessfullyPlanWhenMinMaxHaveNumberBoundariesAndCollationsDontMatch) {
@@ -447,7 +446,8 @@ TEST_F(QueryPlannerTest, SuccessfullyPlanWhenMinMaxHaveNumberBoundariesAndCollat
     addIndex(fromjson("{a: 1, b: 1, c: 1}"), &indexCollator);
 
     runQueryAsCommand(
-        fromjson("{find: 'testns', min: {a: 1, b: 1, c: 1}, max: {a: 3, b: 3, c: 3}}"));
+        fromjson("{find: 'testns', min: {a: 1, b: 1, c: 1}, max: {a: 3, b: 3, c: 3},"
+                 "hint: {a:1, b: 1, c: 1}}"));
 
     assertNumSolutions(1U);
     assertSolutionExists("{fetch: {node: {ixscan: {pattern: {a: 1, b: 1, c: 1}}}}}");
@@ -456,37 +456,48 @@ TEST_F(QueryPlannerTest, SuccessfullyPlanWhenMinMaxHaveNumberBoundariesAndCollat
 TEST_F(QueryPlannerTest, FailToPlanWhenMinHasStringBoundaryAndCollationsDontMatch) {
     CollatorInterfaceMock indexCollator(CollatorInterfaceMock::MockType::kToLowerString);
     addIndex(fromjson("{a: 1, b: 1, c: 1}"), &indexCollator);
-    runInvalidQueryAsCommand(fromjson("{find: 'testns', min: {a: 1, b: 'foo', c: 1}}"));
+    runInvalidQueryAsCommand(
+        fromjson("{find: 'testns', min: {a: 1, b: 'foo', c: 1}, "
+                 "hint: {a: 1, b: 1, c: 1}}"));
 }
 
 TEST_F(QueryPlannerTest, FailToPlanWhenMaxHasStringBoundaryAndCollationsDontMatch) {
     CollatorInterfaceMock indexCollator(CollatorInterfaceMock::MockType::kToLowerString);
     addIndex(fromjson("{a: 1, b: 1, c: 1}"), &indexCollator);
-    runInvalidQueryAsCommand(fromjson("{find: 'testns', max: {a: 1, b: 'foo', c: 1}}"));
+    runInvalidQueryAsCommand(
+        fromjson("{find: 'testns', max: {a: 1, b: 'foo', c: 1}, hint: {a: 1, b: 1, c: 1}}"));
 }
 
 TEST_F(QueryPlannerTest, FailToPlanWhenMinHasObjectBoundaryAndCollationsDontMatch) {
     CollatorInterfaceMock indexCollator(CollatorInterfaceMock::MockType::kToLowerString);
     addIndex(fromjson("{a: 1, b: 1, c: 1}"), &indexCollator);
-    runInvalidQueryAsCommand(fromjson("{find: 'testns', min: {a: 1, b: {d: 'foo'}, c: 1}}"));
+    runInvalidQueryAsCommand(
+        fromjson("{find: 'testns', min: {a: 1, b: {d: 'foo'}, c: 1}, "
+                 "hint: {a: 1, b: 1, c: 1}}"));
 }
 
 TEST_F(QueryPlannerTest, FailToPlanWhenMaxHasObjectBoundaryAndCollationsDontMatch) {
     CollatorInterfaceMock indexCollator(CollatorInterfaceMock::MockType::kToLowerString);
     addIndex(fromjson("{a: 1, b: 1, c: 1}"), &indexCollator);
-    runInvalidQueryAsCommand(fromjson("{find: 'testns', max: {a: 1, b: {d: 'foo'}, c: 1}}"));
+    runInvalidQueryAsCommand(
+        fromjson("{find: 'testns', max: {a: 1, b: {d: 'foo'}, c: 1}, "
+                 "hint: {a: 1, b: 1, c: 1}}"));
 }
 
 TEST_F(QueryPlannerTest, FailToPlanWhenMinHasArrayBoundaryAndCollationsDontMatch) {
     CollatorInterfaceMock indexCollator(CollatorInterfaceMock::MockType::kToLowerString);
     addIndex(fromjson("{a: 1, b: 1, c: 1}"), &indexCollator);
-    runInvalidQueryAsCommand(fromjson("{find: 'testns', min: {a: 1, b: 1, c: [1, 'foo']}}"));
+    runInvalidQueryAsCommand(
+        fromjson("{find: 'testns', min: {a: 1, b: 1, c: [1, 'foo']}, "
+                 "hint: {a: 1, b: 1, c: 1}}"));
 }
 
 TEST_F(QueryPlannerTest, FailToPlanWhenMaxHasArrayBoundaryAndCollationsDontMatch) {
     CollatorInterfaceMock indexCollator(CollatorInterfaceMock::MockType::kToLowerString);
     addIndex(fromjson("{a: 1, b: 1, c: 1}"), &indexCollator);
-    runInvalidQueryAsCommand(fromjson("{find: 'testns', max: {a: 1, b: 1, c: [1, 'foo']}}"));
+    runInvalidQueryAsCommand(
+        fromjson("{find: 'testns', max: {a: 1, b: 1, c: [1, 'foo']}, "
+                 "hint: {a: 1, b: 1, c: 1}}"));
 }
 
 TEST_F(QueryPlannerTest, FailToPlanWhenHintingIndexIncompatibleWithMinDueToCollation) {
@@ -503,62 +514,341 @@ TEST_F(QueryPlannerTest, FailToPlanWhenHintingIndexIncompatibleWithMaxDueToColla
     runInvalidQueryAsCommand(fromjson("{find: 'testns', max: {a: 'foo'}, hint: 'indexToHint'}"));
 }
 
-TEST_F(QueryPlannerTest, SelectIndexWithMatchingSimpleCollationWhenMinHasStringBoundary) {
-    CollatorInterfaceMock indexCollator(CollatorInterfaceMock::MockType::kToLowerString);
-    addIndex(fromjson("{a: 1}"), &indexCollator, "withCollation"_sd);
+TEST_F(QueryPlannerTest, SuccessWithIndexWithMatchingSimpleCollationWhenMinHasStringBoundary) {
     addIndex(fromjson("{a: 1}"), nullptr, "noCollation"_sd);
 
-    runQueryAsCommand(fromjson("{find: 'testns', min: {a: 'foo'}}"));
+    runQueryAsCommand(fromjson("{find: 'testns', min: {a: 'foo'}, hint: {a: 1}}"));
 
     assertNumSolutions(1U);
     assertSolutionExists("{fetch: {node: {ixscan: {pattern: {a: 1}, name: 'noCollation'}}}}");
 }
 
-TEST_F(QueryPlannerTest, SelectIndexWithMatchingNonSimpleCollationWhenMinHasStringBoundary) {
+TEST_F(QueryPlannerTest, SuccessWithIndexWithMatchingNonSimpleCollationWhenMinHasStringBoundary) {
     CollatorInterfaceMock indexCollator(CollatorInterfaceMock::MockType::kReverseString);
     addIndex(fromjson("{a: 1}"), &indexCollator, "withCollation"_sd);
-    addIndex(fromjson("{a: 1}"), nullptr, "noCollation"_sd);
 
-    runQueryAsCommand(
-        fromjson("{find: 'testns', min: {a: 'foo'}, collation: {locale: 'reverse'}}"));
+    runQueryAsCommand(fromjson(
+        "{find: 'testns', min: {a: 'foo'}, hint: {a: 1}, collation: {locale: 'reverse'}}"));
 
     assertNumSolutions(1U);
     assertSolutionExists("{fetch: {node: {ixscan: {pattern: {a: 1}, name: 'withCollation'}}}}");
 }
 
-TEST_F(QueryPlannerTest, SelectIndexWithMatchingSimpleCollationWhenMaxHasStringBoundary) {
-    CollatorInterfaceMock indexCollator(CollatorInterfaceMock::MockType::kToLowerString);
-    addIndex(fromjson("{a: 1}"), &indexCollator, "withCollation"_sd);
+TEST_F(QueryPlannerTest, SuccessWithIndexWithMatchingSimpleCollationWhenMaxHasStringBoundary) {
     addIndex(fromjson("{a: 1}"), nullptr, "noCollation"_sd);
 
-    runQueryAsCommand(fromjson("{find: 'testns', max: {a: 'foo'}}"));
+    runQueryAsCommand(fromjson("{find: 'testns', max: {a: 'foo'}, hint: {a: 1}}"));
 
     assertNumSolutions(1U);
     assertSolutionExists("{fetch: {node: {ixscan: {pattern: {a: 1}, name: 'noCollation'}}}}");
 }
 
-TEST_F(QueryPlannerTest, MustSortInMemoryWhenMinMaxIndexCollationDoesNotMatch) {
+TEST_F(QueryPlannerTest, MustSortInMemoryWhenMinMaxQueryHasCollationAndIndexDoesNot) {
     addIndex(fromjson("{a: 1, b: 1}"));
 
     runQueryAsCommand(
-        fromjson("{find: 'testns', min: {a: 1, b: 1}, max: {a: 2, b: 1}, collation: {locale: "
+        fromjson("{find: 'testns', min: {a: 1, b: 1}, max: {a: 2, b: 1}, hint: {a:1, b:1}, "
+                 "collation: {locale: 'reverse'}, sort: {a: 1, b: 1}}"));
+
+    assertNumSolutions(1U);
+
+    assertSolutionExists(
+        "{fetch: {node: {sort: {pattern: {a: 1, b: 1}, limit: 0, type: 'default', node: {ixscan: "
+        "{pattern: {a: 1, b: 1}}}}}}}");
+}
+
+TEST_F(QueryPlannerTest, MustSortInMemoryWhenMinMaxIndexHasCollationAndQueryDoesNot) {
+    CollatorInterfaceMock collator(CollatorInterfaceMock::MockType::kReverseString);
+    addIndex(fromjson("{a: 1, b:1}"), &collator);
+
+    runQueryAsCommand(
+        fromjson("{find: 'testns', min: {a: 1, b: 1}, max: {a: 2, b: 1}, sort: {a: 1, b: 1}, "
+                 "hint: {a: 1, b: 1}}"));
+
+    assertNumSolutions(1U);
+
+    assertSolutionExists(
+        "{sort: {pattern: {a: 1, b: 1}, limit: 0, type: 'simple', node:"
+        "{fetch: {node: {ixscan: {pattern: {a: 1, b: 1}}}}}}}");
+}
+
+TEST_F(QueryPlannerTest, CanProduceCoveredSortPlanWhenQueryHasCollationButIndexDoesNot) {
+    addIndex(fromjson("{a: 1, b: 1}"));
+
+    runQueryAsCommand(fromjson(
+        "{find: 'testns', projection: {a: 1, b: 1, _id: 0}, min: {a: 1, b: 1}, max: {a: 2, "
+        "b: 1}, hint: {a: 1, b: 1}, collation: {locale: 'reverse'}, sort: {a: 1, b: 1}}"));
+
+    assertNumSolutions(1U);
+    assertSolutionExists(
+        "{sort: {pattern: {a: 1, b: 1}, limit: 0, type: 'default', node: "
+        "{proj: {spec: {a: 1, b: 1, _id: 0}, node: {ixscan: {pattern: {a: 1, b: 1}}}}}}}");
+}
+
+TEST_F(QueryPlannerTest, CannotUseIndexWhenQueryHasNoCollationButIndexHasNonSimpleCollation) {
+    CollatorInterfaceMock collator(CollatorInterfaceMock::MockType::kToLowerString);
+    addIndex(fromjson("{a: 1, b: 1}"), &collator);
+
+    runQueryAsCommand(
+        fromjson("{find: 'testns', projection: {a: 1, b:1, _id: 0}, sort: {a: 1, b: 1}}"));
+
+    assertNumSolutions(1U);
+    assertSolutionExists(
+        "{sort: {pattern: {a: 1, b: 1}, limit: 0, type: 'simple', node: "
+        "{proj: {spec: {a: 1, b: 1, _id: 0}, node: {cscan: {dir: 1}}}}}}");
+}
+
+TEST_F(QueryPlannerTest, CannotUseIndexWhenQueryHasDifferentNonSimpleCollationThanIndex) {
+    CollatorInterfaceMock collator(CollatorInterfaceMock::MockType::kToLowerString);
+    addIndex(fromjson("{a: 1, b: 1}"), &collator);
+
+    runQueryAsCommand(
+        fromjson("{find: 'testns', projection: {a: 1, b:1, _id: 0}, collation: {locale: "
                  "'reverse'}, sort: {a: 1, b: 1}}"));
 
     assertNumSolutions(1U);
     assertSolutionExists(
-        "{sort: {pattern: {a: 1, b: 1}, limit: 0, node: {sortKeyGen:"
-        "{node: {fetch: {node: {ixscan: {pattern: {a: 1, b: 1}}}}}}}}}");
+        "{sort: {pattern: {a: 1, b: 1}, limit: 0, type: 'simple', node: "
+        "{proj: {spec: {a: 1, b: 1, _id: 0}, node: {cscan: {dir: 1}}}}}}");
+}
+
+// This test verifies that an in-memory sort stage is added and sort provided by an index is not
+// used when the collection has a compound index with a non-simple collation and we issue a
+// non-collatable point-query on the prefix of the index key together with a sort on a suffix of the
+// index key. This is a test for SERVER-48993.
+TEST_F(QueryPlannerTest,
+       MustSortInMemoryWhenPointPrefixQueryHasSimpleCollationButIndexHasNonSimpleCollation) {
+    CollatorInterfaceMock collator(CollatorInterfaceMock::MockType::kToLowerString);
+    addIndex(fromjson("{a: 1, b: 1}"), &collator);
+
+    // No explicit collation on the query. This will implicitly use the simple collation since the
+    // collection does not have a default collation.
+    runQueryAsCommand(fromjson("{find: 'testns', filter: {a: 2}, sort: {b: 1}}"));
+
+    assertNumSolutions(2U);
+    assertSolutionExists(
+        "{sort: {pattern: {b: 1}, limit: 0, type: 'simple', node: "
+        "{cscan: {dir: 1}}}}");
+    assertSolutionExists(
+        "{sort: {pattern: {b: 1}, limit: 0, type: 'simple', node: "
+        "{fetch: {node: "
+        "{ixscan: {pattern: {a: 1, b: 1}}}}}}}");
+
+    // A query with an explicit simple collation.
+    runQueryAsCommand(
+        fromjson("{find: 'testns', filter: {a: 2}, sort: {b: 1}, collation: {locale: 'simple'}}"));
+
+    assertNumSolutions(2U);
+    assertSolutionExists(
+        "{sort: {pattern: {b: 1}, limit: 0, type: 'simple', node: "
+        "{cscan: {dir: 1}}}}");
+    assertSolutionExists(
+        "{sort: {pattern: {b: 1}, limit: 0, type: 'simple', node: "
+        "{fetch: {node: "
+        "{ixscan: {pattern: {a: 1, b: 1}}}}}}}");
+}
+
+// This test verifies that an in-memory sort stage is added and sort provided by an index is not
+// used when the collection has a compound index with a non-specified collation and we issue a
+// non-collatable point-query on the prefix of the index key together with a sort on the suffix and
+// an explicit non-simple collation. This is a test for SERVER-48993.
+TEST_F(QueryPlannerTest,
+       MustSortInMemoryWhenPointPrefixQueryHasNonSimpleCollationButIndexHasSimpleCollation) {
+    addIndex(fromjson("{a: 1, b: 1}"));
+
+    runQueryAsCommand(
+        fromjson("{find: 'testns', filter: {a: 2}, sort: {b: 1}, collation: {locale: "
+                 "'reverse'}}"));
+
+    assertSolutionExists(
+        "{fetch: {node: "
+        "{sort: {pattern: {b: 1}, limit: 0, type: 'default', node: "
+        "{ixscan: {pattern: {a: 1, b: 1}}}}}}}");
+}
+
+// This test verifies that an in-memory sort stage is added and sort provided by indexes is not used
+// when the collection has a compound index with a non-simple collation and we issue a
+// non-collatable point-query on the prefix of the index key together with a sort on the suffix and
+// an explicit non-simple collation that differs from the index collation. This is a test for
+// SERVER-48993.
+TEST_F(QueryPlannerTest, MustSortInMemoryWhenPointPrefixQueryCollationDoesNotMatchIndexCollation) {
+    CollatorInterfaceMock collator(CollatorInterfaceMock::MockType::kToLowerString);
+    addIndex(fromjson("{a: 1, b: 1}"), &collator);
+
+    runQueryAsCommand(
+        fromjson("{find: 'testns', filter: {a: 2}, sort: {b: 1}, collation: {locale: 'reverse'}}"));
+
+    assertNumSolutions(2U);
+    assertSolutionExists(
+        "{sort: {pattern: {b: 1}, limit: 0, type: 'simple', node: "
+        "{cscan: {dir: 1}}}}");
+    assertSolutionExists(
+        "{sort: {pattern: {b: 1}, limit: 0, type: 'simple', node: "
+        "{fetch: {node: "
+        "{ixscan: {pattern: {a: 1, b: 1}}}}}}}");
+}
+
+// This test verifies that a sort is provided by an index when the collection has a compound index
+// with a non-simple collation and we issue a query with a different non-simple collation is a
+// non-collatable point-query on the prefix, a non-collatable range-query on the suffix, and a sort
+// on the suffix key. This is a test for SERVER-48993.
+TEST_F(QueryPlannerTest,
+       IndexCanSortWhenPointPrefixQueryCollationDoesNotMatchIndexButSortRangeIsNonCollatable) {
+    CollatorInterfaceMock collator(CollatorInterfaceMock::MockType::kToLowerString);
+    addIndex(fromjson("{a: 1, b: 1}"), &collator);
+
+    runQueryAsCommand(
+        fromjson("{find: 'testns', filter: {a: 2, b: {$gte: 0, $lt: 10}}, sort: {b: 1}}"));
+
+    assertNumSolutions(2U);
+    assertSolutionExists(
+        "{sort: {pattern: {b: 1}, limit: 0, type: 'simple', node: "
+        "{cscan: {dir: 1}}}}");
+    assertSolutionExists(
+        "{fetch: {node: "
+        "{ixscan: {pattern: {a: 1, b: 1}, bounds: {a: [[2, 2, true, true]], b: [[0, 10, true, "
+        "false]]}}}}}");
+}
+
+// This test verifies that an in-memory sort stage is added when the collection has a compound index
+// with a non-simple collation and we issue a query with a different non-simple collation is a
+// non-collatable point-query on the prefix, a collatable range-query on the suffix, and a sort on
+// the suffix key. This is a test for SERVER-48993.
+TEST_F(QueryPlannerTest,
+       MustSortInMemoryWhenPointPrefixQueryCollationDoesNotMatchIndexAndSortRangeIsCollatable) {
+    CollatorInterfaceMock collator(CollatorInterfaceMock::MockType::kToLowerString);
+    addIndex(fromjson("{a: 1, b: 1}"), &collator);
+
+    runQueryAsCommand(
+        fromjson("{find: 'testns', filter: {a: 2, b: {$gte: 'B', $lt: 'T'}}, sort: {b: 1}}"));
+
+    assertNumSolutions(2U);
+    assertSolutionExists(
+        "{sort: {pattern: {b: 1}, limit: 0, type: 'simple', node: "
+        "{cscan: {dir: 1}}}}");
+    assertSolutionExists(
+        "{sort: {pattern: {b: 1}, limit: 0, type: 'simple', node: "
+        "{fetch: {node: "
+        "{ixscan: {pattern: {a: 1, b: 1}, bounds: {a: [[2, 2, true, true]]}}}}}}}");
+}
+
+// This test verifies that a SORT_MERGE stage is added when the collection has a compound index with
+// a non-simple collation and we issue a query with a different non-simple collation is a
+// non-collatable multi-point query on the prefix, a non-collatable range-query on the suffix, and a
+// sort on the suffix key.This is a test for SERVER-48993.
+TEST_F(QueryPlannerTest,
+       CanExplodeForSortWhenPointPrefixQueryCollationDoesNotMatchIndexButSortRangeIsNonCollatable) {
+    CollatorInterfaceMock collator(CollatorInterfaceMock::MockType::kToLowerString);
+    addIndex(fromjson("{a: 1, b: 1, c: 1}"), &collator);
+
+    runQueryAsCommand(fromjson(
+        "{find: 'testns', filter: {a: {$in: [2, 5]}, b: {$gte: 0, $lt: 10}}, sort: {b: 1}}"));
+
+    assertNumSolutions(2U);
+    assertSolutionExists(
+        "{fetch: {node: "
+        "{mergeSort: {nodes: {"
+        "n0: {ixscan: {pattern: {a: 1, b: 1, c: 1}, bounds: {a: [[2, 2, true, true]], b: [[0, 10, "
+        "true, false]]}}}, "
+        "n1: {ixscan: {pattern: {a: 1, b: 1, c: 1}, bounds: {a: [[5, 5, true, true]], b: [[0, 10, "
+        "true, false]]}}} "
+        "}}}}}");
+}
+
+/**
+ * This test confirms that we place a fetch stage before sort in the case where both query
+ * and index have the same non-simple collation. To handle this scenario without this fetch would
+ * require a mechanism to ensure we don't attempt to encode for collation an already encoded index
+ * key entry when generating the sort key.
+ */
+TEST_F(QueryPlannerTest, MustFetchBeforeSortWhenQueryHasSameNonSimpleCollationAsIndex) {
+    params.mainCollectionInfo.options &= ~QueryPlannerParams::INCLUDE_COLLSCAN;
+    CollatorInterfaceMock collator(CollatorInterfaceMock::MockType::kReverseString);
+    addIndex(fromjson("{a: 1, b: 1}"), &collator);
+
+    runQueryAsCommand(
+        fromjson("{find: 'testns', filter: {a: {$gt: 0}}, projection: {a: 1, b:1, _id: 0}, "
+                 "collation: {locale: 'reverse'}, sort: {b: 1, a: 1}}"));
+
+    assertNumSolutions(1U);
+    assertSolutionExists(
+        "{sort: {pattern: {b: 1, a: 1}, limit: 0, type: 'simple', node: "
+        "{proj: {spec: {a: 1, b: 1, _id: 0}, node:"
+        "{fetch: {filter: null, collation: {locale: 'reverse'}, node:"
+        "{ixscan: {pattern: {a: 1, b: 1}}}}}}}}}");
 }
 
 TEST_F(QueryPlannerTest, NoSortStageWhenMinMaxIndexCollationDoesNotMatchButBoundsContainNoStrings) {
     addIndex(fromjson("{a: 1, b: 1, c: 1}"));
 
     runQueryAsCommand(
-        fromjson("{find: 'testns', min: {a: 1, b: 8, c: 1}, max: {a: 1, b: 8, c: 100}, collation: "
-                 "{locale: 'reverse'}, sort: {a: 1, b: 1, c: 1}}"));
+        fromjson("{find: 'testns', min: {a: 1, b: 8, c: 1}, max: {a: 1, b: 8, c: 100}, "
+                 "hint: {a: 1, b: 1, c: 1}, collation: {locale: 'reverse'}, "
+                 "sort: {a: 1, b: 1, c: 1}}"));
 
     assertNumSolutions(1U);
     assertSolutionExists("{fetch: {node: {ixscan: {pattern: {a: 1, b: 1, c: 1}}}}}");
+}
+
+TEST_F(QueryPlannerTest, NoFilterWhenMinMaxRecordSufficientAndCollationSame) {
+    // Test that a clustered collection scan can drop elements from the filter if the underlying
+    // scan can apply equivalent filtering using min/max record id.
+    params.clusteredInfo = mongo::clustered_util::makeDefaultClusteredIdIndex();
+
+    runQueryAsCommand(
+        fromjson("{find: 'testns', filter: {_id: {$gte: 'x', $lt: 'z'}}, hint: {_id: 1}}"));
+
+    assertNumSolutions(1U);
+    assertSolutionExists("{cscan: {dir: 1, filter: {}}}");
+}
+
+TEST_F(QueryPlannerTest, PartialFilterCollationSame) {
+    // Test that a clustered collection scan can drop elements from the filter if the underlying
+    // scan can apply equivalent filtering using min/max record id, but will retain any
+    // other filter terms which _cannot_ be so represented as limits on the record id.
+    params.clusteredInfo = mongo::clustered_util::makeDefaultClusteredIdIndex();
+
+    runQueryAsCommand(
+        fromjson("{find: 'testns', filter: {$and: [ { _id: { $gte: 'x' } }, { foo: { $lt: 'z' } } "
+                 "]}, hint: {_id: 1}}"));
+
+    assertNumSolutions(1U);
+    assertSolutionExists("{cscan: {dir: 1, filter: { $and: [ { foo: { $lt: 'z' } } ] }}}");
+}
+
+TEST_F(QueryPlannerTest, FilterWhenMinMaxRecordNotSufficientWhenCollationIsNotSame) {
+    // Test that a clustered collection scan will NOT drop elements from the filter
+    // if collation differs between the clustered collection and the query.
+    params.clusteredInfo = mongo::clustered_util::makeDefaultClusteredIdIndex();
+
+    runQueryAsCommand(
+        fromjson("{find: 'testns', filter: {_id: {$gte: 'x', $lt: 'z'}}, hint: {_id: 1}, "
+                 "collation: {locale: 'lt'}}"));
+
+    assertNumSolutions(1U);
+    assertSolutionExists(
+        "{cscan: {dir: 1, filter: { $and: [ { _id: { $gte: 'x' } }, { _id: { $lt: 'z' } } ] }, "
+        "collation: {locale: 'lt'}}}");
+}
+
+TEST_F(QueryPlannerTest, FilterWhenCollationIsNotSameEvenForUnaffected) {
+    // Test that a clustered collection scan will NOT drop elements from the filter
+    // if collation differs between the clustered collection and the query, _even_ if
+    // the parameters to the query are not affected by collation (e.g., numbers).
+
+    // For a single specific query, the filter _could_ be simplified, but it would not
+    // be correct to allow that query to be cached, as a later reuse may use
+    // values which _are_ affected.
+    params.clusteredInfo = mongo::clustered_util::makeDefaultClusteredIdIndex();
+
+    runQueryAsCommand(
+        fromjson("{find: 'testns', filter: {_id: {$gte: 1, $lt: 2}}, hint: {_id: 1}, "
+                 "collation: {locale: 'lt'}}"));
+
+    assertNumSolutions(1U);
+    assertSolutionExists(
+        "{cscan: {dir: 1, filter: { $and: [ { _id: { $gte: 1 } }, { _id: { $lt: 2 } } ] }, "
+        "collation: {locale: 'lt'}}}");
 }
 
 }  // namespace

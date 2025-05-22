@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,8 +29,17 @@
 
 #pragma once
 
+#include <string>
+#include <vector>
+
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
 #include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/auth/validated_tenancy_scope.h"
+#include "mongo/db/repl/optime.h"
 #include "mongo/db/write_concern_options.h"
+#include "mongo/idl/generic_argument_gen.h"
 #include "mongo/util/net/hostandport.h"
 
 namespace mongo {
@@ -47,14 +55,16 @@ class OpTime;
 /**
  * Returns true if 'cmdObj' has a 'writeConcern' field.
  */
-bool commandSpecifiesWriteConcern(const BSONObj& cmdObj);
+bool commandSpecifiesWriteConcern(const GenericArguments& requestArgs);
 
 /**
- * Attempts to extract a writeConcern from cmdObj.
- * Verifies that the writeConcern is of type Object (BSON type) and
- * that the resulting writeConcern is valid for this particular host.
+ * Attempts to extract a WriteConcernOptions from a command's generic arguments.
+ * Verifies that the resulting writeConcern is valid for this particular host.
  */
-StatusWith<WriteConcernOptions> extractWriteConcern(OperationContext* opCtx, const BSONObj& cmdObj);
+StatusWith<WriteConcernOptions> extractWriteConcern(OperationContext* opCtx,
+                                                    const GenericArguments& invocation,
+                                                    StringData commandName,
+                                                    bool isInternalClient);
 
 /**
  * Verifies that a WriteConcern is valid for this particular host.
@@ -72,18 +82,22 @@ struct WriteConcernResult {
         wTimedOut = false;
         wTime = -1;
         err = "";
+        wcUsed = WriteConcernOptions();
     }
 
-    void appendTo(const WriteConcernOptions& writeConcern, BSONObjBuilder* result) const;
+    void appendTo(BSONObjBuilder* result) const;
 
     int syncMillis;
-    int fsyncFiles;
-
     bool wTimedOut;
     int wTime;
     std::vector<HostAndPort> writtenTo;
+    WriteConcernOptions wcUsed;
 
     std::string err;  // this is the old err field, should deprecate
+
+    // This field has had a dummy value since MMAP went away. It is undocumented.
+    // Maintaining it so as not to cause unnecessary user pain across upgrades.
+    int fsyncFiles;
 };
 
 /**
@@ -95,7 +109,7 @@ struct WriteConcernResult {
  * if this opTime.isNull() no replication-related write concern options will be enforced.
  *
  * Returns result of the write concern if successful.
- * Returns NotMaster if the host steps down while waiting for replication
+ * Returns NotWritablePrimary if the host steps down while waiting for replication
  * Returns UnknownReplWriteConcern if the wMode specified was not enforceable
  */
 Status waitForWriteConcern(OperationContext* opCtx,

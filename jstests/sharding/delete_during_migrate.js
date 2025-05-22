@@ -7,39 +7,50 @@
  * of 5MB across all sharding tests in wiredTiger.
  * @tags: [resource_intensive]
  */
-(function() {
-    'use strict';
 
-    var st = new ShardingTest({shards: 2, mongos: 1});
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
-    var dbname = "test";
-    var coll = "foo";
-    var ns = dbname + "." + coll;
+var st = new ShardingTest({
+    shards: 2,
+    mongos: 1,
+    rs: {nodes: 2, setParameter: {defaultConfigCommandTimeoutMS: 5 * 60 * 1000}}
+});
 
-    assert.commandWorked(st.s0.adminCommand({enablesharding: dbname}));
-    st.ensurePrimaryShard(dbname, st.shard1.shardName);
+var dbname = "test";
+var coll = "foo";
+var ns = dbname + "." + coll;
 
-    var t = st.s0.getDB(dbname).getCollection(coll);
+assert.commandWorked(
+    st.s0.adminCommand({enablesharding: dbname, primaryShard: st.shard1.shardName}));
 
-    var bulk = t.initializeUnorderedBulkOp();
-    for (var i = 0; i < 200000; i++) {
-        bulk.insert({a: i});
-    }
-    assert.writeOK(bulk.execute());
+var t = st.s0.getDB(dbname).getCollection(coll);
 
-    // enable sharding of the collection. Only 1 chunk.
-    t.ensureIndex({a: 1});
+var bulk = t.initializeUnorderedBulkOp();
+const numDocs = 200000;
+for (var i = 0; i < numDocs; i++) {
+    bulk.insert({a: i});
+}
+assert.commandWorked(bulk.execute());
 
-    assert.commandWorked(st.s0.adminCommand({shardcollection: ns, key: {a: 1}}));
+// enable sharding of the collection. Only 1 chunk.
+t.createIndex({a: 1});
 
-    // start a parallel shell that deletes things
-    var join = startParallelShell("db." + coll + ".remove({});", st.s0.port);
+assert.commandWorked(st.s0.adminCommand({shardcollection: ns, key: {a: 1}}));
 
-    // migrate while deletions are happening
-    assert.commandWorked(st.s0.adminCommand(
-        {moveChunk: ns, find: {a: 1}, to: st.getOther(st.getPrimaryShard(dbname)).name}));
+// start a parallel shell that deletes things
+var join = startParallelShell("db." + coll + ".remove({});", st.s0.port);
 
-    join();
+// migrate while deletions are happening
+const res = st.s0.adminCommand(
+    {moveChunk: ns, find: {a: 1}, to: st.getOther(st.getPrimaryShard(dbname)).name});
+if (res.code == ErrorCodes.CommandFailed &&
+    res.errmsg.includes("timed out waiting for the catch up completion")) {
+    jsTest.log("Ignoring the critical section timeout error since this test deletes " + numDocs +
+               " documents in the chunk being migrated " + tojson(res));
+} else {
+    assert.commandWorked(res);
+}
 
-    st.stop();
-})();
+join();
+
+st.stop();

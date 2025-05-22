@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,7 +29,21 @@
 
 #pragma once
 
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+#include <string>
+
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/document_source_single_document_transformation.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/field_path.h"
+#include "mongo/db/query/projection.h"
+#include "mongo/db/query/projection_parser.h"
+#include "mongo/db/query/projection_policies.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/intrusive_counter.h"
 
 namespace mongo {
 
@@ -42,11 +55,40 @@ namespace mongo {
  */
 class DocumentSourceProject final {
 public:
+    static constexpr StringData kStageName = "$project"_sd;
+    static constexpr StringData kAliasNameUnset = "$unset"_sd;
+
+    /**
+     * Method to create a $project stage from a Projection AST.
+     */
+    static boost::intrusive_ptr<DocumentSource> create(
+        projection_ast::Projection projection,
+        const boost::intrusive_ptr<ExpressionContext>& expCtx,
+        StringData specifiedName);
+
     /**
      * Convenience method to create a $project stage from 'projectSpec'.
      */
     static boost::intrusive_ptr<DocumentSource> create(
-        BSONObj projectSpec, const boost::intrusive_ptr<ExpressionContext>& expCtx);
+        BSONObj projectSpec,
+        const boost::intrusive_ptr<ExpressionContext>& expCtx,
+        StringData specifiedName) try {
+
+        auto projection = projection_ast::parseAndAnalyze(
+            expCtx, projectSpec, ProjectionPolicies::aggregateProjectionPolicies());
+        return create(projection, expCtx, specifiedName);
+    } catch (DBException& ex) {
+        ex.addContext("Invalid " + specifiedName.toString());
+        throw;
+    }
+
+    /**
+     * Create an '$unset' stage, which removes a single top-level field.
+     *
+     * 'fieldPath' must be a top-level field.
+     */
+    static boost::intrusive_ptr<DocumentSource> createUnset(
+        const FieldPath& fieldPath, const boost::intrusive_ptr<ExpressionContext>& expCtx);
 
     /**
      * Parses a $project stage from the user-supplied BSON.

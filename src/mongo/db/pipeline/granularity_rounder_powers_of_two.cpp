@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,12 +27,22 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <cmath>
+#include <string>
 
-#include "mongo/db/pipeline/granularity_rounder.h"
+#include <boost/smart_ptr/intrusive_ptr.hpp>
 
+#include "mongo/bson/bsontypes.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/pipeline/expression.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/granularity_rounder.h"
 #include "mongo/platform/bits.h"
+#include "mongo/platform/decimal128.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/intrusive_counter.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -82,7 +91,8 @@ Value GranularityRounderPowersOfTwo::roundUp(Value value) {
         exp = Value(63 - countLeadingZeros64(number) + 1);
     }
 
-    return ExpressionPow::create(getExpCtx(), Value(2), exp)->evaluate(Document());
+    return ExpressionPow::create(getExpCtx(), Value(2), exp)
+        ->evaluate(Document(), &getExpCtx()->variables);
 }
 
 Value GranularityRounderPowersOfTwo::roundDown(Value value) {
@@ -114,7 +124,8 @@ Value GranularityRounderPowersOfTwo::roundDown(Value value) {
         }
     }
 
-    return ExpressionPow::create(getExpCtx(), Value(2), exp)->evaluate(Document());
+    return ExpressionPow::create(getExpCtx(), Value(2), exp)
+        ->evaluate(Document(), &getExpCtx()->variables);
 }
 
 string GranularityRounderPowersOfTwo::getName() {

@@ -1,13 +1,12 @@
 """Interface for customizing the behavior of a test fixture."""
 
-from __future__ import absolute_import
-
 import sys
+import threading
+from typing import Optional
 
-from ..testcases import interface as testcase
-from ... import errors
-from ...logging import loggers
-from ...utils import registry
+from buildscripts.resmokelib import errors
+from buildscripts.resmokelib.testing.testcases import interface as testcase
+from buildscripts.resmokelib.utils import registry
 
 _HOOKS = {}  # type: ignore
 
@@ -21,31 +20,36 @@ def make_hook(class_name, *args, **kwargs):
     return _HOOKS[class_name](*args, **kwargs)
 
 
-class Hook(object):
+class Hook(object, metaclass=registry.make_registry_metaclass(_HOOKS)):
     """Common interface all Hooks will inherit from."""
-
-    __metaclass__ = registry.make_registry_metaclass(_HOOKS)  # type: ignore
 
     REGISTERED_NAME = registry.LEAVE_UNREGISTERED
 
+    # Whether the hook runs in the background of a test. Typically background jobs start their own threads,
+    # except for Server-side background activity like initial sync, which is also considered background.
+    IS_BACKGROUND = None
+
     def __init__(self, hook_logger, fixture, description):
         """Initialize the Hook with the specified fixture."""
-
-        if not isinstance(hook_logger, loggers.HookLogger):
-            raise TypeError("logger must be a HookLogger instance")
 
         self.logger = hook_logger
         self.fixture = fixture
         self.description = description
 
+        if self.IS_BACKGROUND is None:
+            raise ValueError(
+                "Concrete Hook subclasses must override the IS_BACKGROUND class property"
+            )
+
     def before_suite(self, test_report):
         """Test runner calls this exactly once before they start running the suite."""
         pass
 
-    def after_suite(self, test_report):
+    def after_suite(self, test_report, teardown_flag: Optional[threading.Event] = None):
         """Invoke by test runner calls this exactly once after all tests have finished executing.
 
         Be sure to reset the behavior back to its original state so that it can be run again.
+        Hook failures in this function should set 'teardown_flag' since there is no testcase available.
         """
         pass
 
@@ -58,11 +62,10 @@ class Hook(object):
         pass
 
 
-class DynamicTestCase(testcase.TestCase):  # pylint: disable=abstract-method
+class DynamicTestCase(testcase.TestCase):
     """DynamicTestCase class."""
 
-    def __init__(  # pylint: disable=too-many-arguments
-            self, logger, test_name, description, base_test_name, hook):
+    def __init__(self, logger, test_name, description, base_test_name, hook):
         """Initialize DynamicTestCase."""
         testcase.TestCase.__init__(self, logger, "Hook", test_name, dynamic=True)
         self.description = description

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,14 +27,12 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include <benchmark/benchmark.h>
+// IWYU pragma: no_include "cxxabi.h"
+#include <condition_variable>
+#include <mutex>
 
-#include "mongo/bson/inline_decls.h"
 #include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/mutex.h"
-#include "mongo/stdx/thread.h"
 
 namespace mongo {
 
@@ -57,7 +54,7 @@ void BM_stdxNotifyOneNoNotifyables(benchmark::State& state) {
     }
 }
 
-volatile bool alwaysTrue = true;
+volatile bool alwaysTrue = true;  // NOLINT
 
 void BM_stdWaitWithTruePredicate(benchmark::State& state) {
     std::condition_variable cv;  // NOLINT

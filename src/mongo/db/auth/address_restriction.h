@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,22 +29,30 @@
 
 #pragma once
 
+#include <fmt/format.h>
+#include <memory>
+#include <ostream>
+#include <string>
+#include <tuple>
+#include <vector>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
 #include "mongo/bson/bsonelement.h"
 #include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/auth/restriction.h"
 #include "mongo/db/auth/restriction_environment.h"
 #include "mongo/db/auth/restriction_set.h"
 #include "mongo/util/net/cidr.h"
 
-#include <memory>
-#include <string>
-#include <vector>
-
 namespace mongo {
 
 namespace address_restriction_detail {
-using mongo::operator""_sd;
+
 struct ClientSource {
     static constexpr auto label = "Client source "_sd;
     static constexpr auto field = "clientSource"_sd;
@@ -68,7 +75,7 @@ public:
     /**
      * Construct an empty AddressRestriction.
      * Note that an empty AddressRestriciton will not validate
-     * against any addresses, since nothing has been whitelisted.
+     * against any addresses, since nothing has been allowlisted.
      */
     AddressRestriction() = default;
 
@@ -93,6 +100,13 @@ public:
      */
     Status validate(const RestrictionEnvironment& environment) const override {
         auto const addr = T::addr(environment);
+        if (addr.getType() == AF_UNSPEC) {
+            // GRPCTransportLayer doesn't know server local address.
+            return {ErrorCodes::AuthenticationRestrictionUnmet,
+                    fmt::format("{} restriction can not be verified when address is unknown",
+                                T::label)};
+        }
+
         if (!addr.isIP()) {
             std::ostringstream s;
             s << T::label << " is not an IP address: " << addr.getAddr();
@@ -123,18 +137,17 @@ public:
         builder->append(T::field, b.arr());
     }
 
-    friend bool operator==(const AddressRestriction<T>& lhs, const AddressRestriction<T>& rhs) {
-        return lhs.equalityLens() == rhs.equalityLens();
+    friend bool operator==(const AddressRestriction& lhs, const AddressRestriction& rhs) {
+        return lhs._ranges == rhs._ranges;
     }
-    friend bool operator!=(const AddressRestriction<T>& lhs, const AddressRestriction<T>& rhs) {
-        return !(lhs == rhs);
+
+    friend BSONObjBuilder& operator<<(BSONObjBuilder::ValueStream& stream,
+                                      const AddressRestriction& value) {
+        value.appendToBuilder(&BSONObjBuilder{stream.subobjStart()}.lvalue());
+        return stream.builder();
     }
 
 private:
-    auto equalityLens() const {
-        return std::tie(_ranges);
-    }
-
     void serialize(std::ostream& os) const override {
         os << "{\"" << T::field << "\": [";
         auto sz = _ranges.size() - 1;
@@ -172,27 +185,6 @@ StatusWith<SharedRestrictionDocument> parseAuthenticationRestriction(const BSONA
  * Parse and validate a BSONArray containing AuthenticationRestrictions
  * and return a new BSONArray representing a sanitized portion thereof.
  */
-StatusWith<BSONArray> getRawAuthenticationRestrictions(const BSONArray& arr) noexcept;
-
-
-template <>
-inline BSONObjBuilder& BSONObjBuilderValueStream::operator<<<ClientSourceRestriction>(
-    ClientSourceRestriction value) {
-    BSONObjBuilder b;
-    value.appendToBuilder(&b);
-    _builder->append(_fieldName, b.obj());
-    _fieldName = StringData();
-    return *_builder;
-}
-
-template <>
-inline BSONObjBuilder& BSONObjBuilderValueStream::operator<<<ServerAddressRestriction>(
-    ServerAddressRestriction value) {
-    BSONObjBuilder b;
-    value.appendToBuilder(&b);
-    _builder->append(_fieldName, b.obj());
-    _fieldName = StringData();
-    return *_builder;
-}
+StatusWith<BSONArray> getRawAuthenticationRestrictions(const BSONArray& arr);
 
 }  // namespace mongo

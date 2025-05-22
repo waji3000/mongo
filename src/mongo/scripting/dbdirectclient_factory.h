@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,20 +29,22 @@
 
 #pragma once
 
+#include <functional>
 #include <memory>
 
-#include "mongo/stdx/functional.h"
+#include "mongo/client/dbclient_base.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/service_context.h"
 
 namespace mongo {
 
-class DBClientBase;
 class OperationContext;
 class ServiceContext;
 
 class DBDirectClientFactory {
 public:
     using Result = std::unique_ptr<DBClientBase>;
-    using Impl = stdx::function<Result(OperationContext*)>;
+    using Impl = std::function<Result(OperationContext*)>;
 
     static DBDirectClientFactory& get(ServiceContext* service);
     static DBDirectClientFactory& get(OperationContext* opCtx);

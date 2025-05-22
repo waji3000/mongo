@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,39 +29,49 @@
 
 #pragma once
 
+#include <cstddef>
 #include <memory>
 #include <queue>
+#include <string>
 
-#include "mongo/db/exec/requires_collection_stage.h"
+#include "mongo/base/status.h"
+#include "mongo/db/exec/plan_stage.h"
+#include "mongo/db/exec/plan_stats.h"
+#include "mongo/db/exec/requires_all_indices_stage.h"
 #include "mongo/db/exec/working_set.h"
-#include "mongo/db/jsobj.h"
+#include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/query/canonical_query.h"
+#include "mongo/db/query/plan_executor.h"
+#include "mongo/db/query/plan_yield_policy.h"
 #include "mongo/db/query/query_planner_params.h"
 #include "mongo/db/query/query_solution.h"
-#include "mongo/db/record_id.h"
+#include "mongo/db/query/stage_types.h"
 
 namespace mongo {
 
 class PlanYieldPolicy;
 
 /**
- * This stage outputs its mainChild, and possibly its backup child
- * and also updates the cache.
+ * Runs a trial period in order to evaluate the cost of a cached plan. If the cost is unexpectedly
+ * high, the plan cache entry is deactivated and we use multi-planning to select an entirely new
+ * winning plan. This process is called "replanning".
  *
- * Preconditions: Valid RecordId.
- *
+ * This stage requires all indices to stay intact during the trial period so that replanning can
+ * occur with the set of indices in 'params'. As a future improvement, we could instead refresh the
+ * list of indices in 'params' prior to replanning, and thus avoid inheriting from
+ * RequiresAllIndicesStage.
  */
-class CachedPlanStage final : public RequiresCollectionStage {
+class CachedPlanStage final : public RequiresAllIndicesStage {
 public:
-    CachedPlanStage(OperationContext* opCtx,
-                    Collection* collection,
+    CachedPlanStage(ExpressionContext* expCtx,
+                    VariantCollectionPtrOrAcquisition collection,
                     WorkingSet* ws,
                     CanonicalQuery* cq,
-                    const QueryPlannerParams& params,
                     size_t decisionWorks,
-                    PlanStage* root);
+                    std::unique_ptr<PlanStage> root,
+                    size_t cachedPlanHash = 0);
 
-    bool isEOF() final;
+    bool isEOF() const final;
 
     StageState doWork(WorkingSetID* out) final;
 
@@ -84,22 +93,13 @@ public:
      * than expected, the old plan is evicted and a new plan is selected from scratch (again
      * yielding according to 'yieldPolicy'). Otherwise, the cached plan is run.
      */
-    Status pickBestPlan(PlanYieldPolicy* yieldPolicy);
+    Status pickBestPlan(const QueryPlannerParams& plannerParams, PlanYieldPolicy* yieldPolicy);
 
-protected:
-    void saveState(RequiresCollTag) final {}
-
-    void restoreState(RequiresCollTag) final {}
+    bool bestPlanChosen() const {
+        return _bestPlanChosen;
+    }
 
 private:
-    /**
-     * Passes stats from the trial period run of the cached plan to the plan cache.
-     *
-     * If the plan cache entry is deleted before we get a chance to update it, then this
-     * is a no-op.
-     */
-    void updatePlanCache();
-
     /**
      * Uses the QueryPlanner and the MultiPlanStage to re-generate candidate plans for this
      * query and select a new winner.
@@ -109,7 +109,10 @@ private:
      *
      * We only modify the plan cache if 'shouldCache' is true.
      */
-    Status replan(PlanYieldPolicy* yieldPolicy, bool shouldCache);
+    Status replan(const QueryPlannerParams& plannerParams,
+                  PlanYieldPolicy* yieldPolicy,
+                  bool shouldCache,
+                  std::string reason);
 
     /**
      * May yield during the cached plan stage's trial period or replanning phases.
@@ -126,11 +129,13 @@ private:
     // Not owned.
     CanonicalQuery* _canonicalQuery;
 
-    QueryPlannerParams _plannerParams;
-
     // The number of work cycles taken to decide on a winning plan when the plan was first
     // cached.
     size_t _decisionWorks;
+
+    // The hash of the QuerySolution that was retrieved from the plan cache. It is used to compare
+    // against the result of replanning for metrics gathering purposes.
+    const size_t _cachedPlanHash;
 
     // If we fall back to re-planning the query, and there is just one resulting query solution,
     // that solution is owned here.
@@ -141,6 +146,9 @@ private:
 
     // Stats
     CachedPlanStats _specificStats;
+
+    // Picked best plan
+    bool _bestPlanChosen = false;
 };
 
 }  // namespace mongo

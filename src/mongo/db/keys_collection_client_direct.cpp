@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,29 +27,33 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
-
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/keys_collection_client_direct.h"
 
-#include <boost/optional.hpp>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <utility>
 #include <vector>
 
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobjbuilder.h"
-#include "mongo/bson/util/bson_extract.h"
 #include "mongo/client/read_preference.h"
-#include "mongo/db/dbdirectclient.h"
-#include "mongo/db/keys_collection_document.h"
-#include "mongo/db/logical_clock.h"
+#include "mongo/db/generic_argument_util.h"
+#include "mongo/db/keys_collection_document_gen.h"
 #include "mongo/db/logical_time.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/service_context.h"
-#include "mongo/rpc/get_status_from_command_result.h"
+#include "mongo/db/query/write_ops/write_ops_gen.h"
+#include "mongo/idl/idl_parser.h"
+#include "mongo/logv2/log.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/write_ops/batched_command_request.h"
 #include "mongo/s/write_ops/batched_command_response.h"
-#include "mongo/util/log.h"
+#include "mongo/util/assert_util.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
+
 
 namespace mongo {
 namespace {
@@ -63,7 +66,7 @@ bool isRetriableError(ErrorCodes::Error code, Shard::RetryPolicy options) {
     }
 
     if (options == Shard::RetryPolicy::kIdempotent) {
-        return code == ErrorCodes::WriteConcernFailed;
+        return code == ErrorCodes::WriteConcernTimeout;
     } else {
         invariant(options == Shard::RetryPolicy::kNotIdempotent);
         return false;
@@ -72,20 +75,53 @@ bool isRetriableError(ErrorCodes::Error code, Shard::RetryPolicy options) {
 
 }  // namespace
 
-KeysCollectionClientDirect::KeysCollectionClientDirect() : _rsLocalClient() {}
+KeysCollectionClientDirect::KeysCollectionClientDirect(bool mustUseLocalReads)
+    : _rsLocalClient(), _mustUseLocalReads(mustUseLocalReads) {}
 
-StatusWith<std::vector<KeysCollectionDocument>> KeysCollectionClientDirect::getNewKeys(
-    OperationContext* opCtx, StringData purpose, const LogicalTime& newerThanThis) {
+StatusWith<std::vector<KeysCollectionDocument>> KeysCollectionClientDirect::getNewInternalKeys(
+    OperationContext* opCtx,
+    StringData purpose,
+    const LogicalTime& newerThanThis,
+    bool tryUseMajority) {
 
+    return _getNewKeys<KeysCollectionDocument>(
+        opCtx, NamespaceString::kKeysCollectionNamespace, purpose, newerThanThis, tryUseMajority);
+}
 
+StatusWith<std::vector<ExternalKeysCollectionDocument>>
+KeysCollectionClientDirect::getAllExternalKeys(OperationContext* opCtx, StringData purpose) {
+    return _getNewKeys<ExternalKeysCollectionDocument>(
+        opCtx,
+        NamespaceString::kExternalKeysCollectionNamespace,
+        purpose,
+        LogicalTime(),
+        // It is safe to read external keys with local read concern because they are only used to
+        // validate incoming signatures, not to sign them. If a cached key is rolled back, it will
+        // eventually be reaped from the cache.
+        false /* tryUseMajority */);
+}
+
+template <typename KeyDocumentType>
+StatusWith<std::vector<KeyDocumentType>> KeysCollectionClientDirect::_getNewKeys(
+    OperationContext* opCtx,
+    const NamespaceString& nss,
+    StringData purpose,
+    const LogicalTime& newerThanThis,
+    bool tryUseMajority) {
     BSONObjBuilder queryBuilder;
     queryBuilder.append("purpose", purpose);
     queryBuilder.append("expiresAt", BSON("$gt" << newerThanThis.asTimestamp()));
 
+    // Use majority read concern if the caller wants that and the client supports it. Otherwise fall
+    // back to local read concern.
+    auto readConcern = (tryUseMajority && !_mustUseLocalReads)
+        ? repl::ReadConcernLevel::kMajorityReadConcern
+        : repl::ReadConcernLevel::kLocalReadConcern;
+
     auto findStatus = _query(opCtx,
                              ReadPreferenceSetting(ReadPreference::Nearest, TagSet{}),
-                             repl::ReadConcernLevel::kLocalReadConcern,
-                             KeysCollectionDocument::ConfigNS,
+                             readConcern,
+                             nss,
                              queryBuilder.obj(),
                              BSON("expiresAt" << 1),
                              boost::none);
@@ -95,14 +131,15 @@ StatusWith<std::vector<KeysCollectionDocument>> KeysCollectionClientDirect::getN
     }
 
     const auto& keyDocs = findStatus.getValue().docs;
-    std::vector<KeysCollectionDocument> keys;
+    std::vector<KeyDocumentType> keys;
     for (auto&& keyDoc : keyDocs) {
-        auto parseStatus = KeysCollectionDocument::fromBSON(keyDoc);
-        if (!parseStatus.isOK()) {
-            return parseStatus.getStatus();
+        KeyDocumentType key;
+        try {
+            key = KeyDocumentType::parse(IDLParserContext("keyDoc"), keyDoc);
+        } catch (...) {
+            return exceptionToStatus();
         }
-
-        keys.push_back(std::move(parseStatus.getValue()));
+        keys.push_back(std::move(key));
     }
 
     return keys;
@@ -132,29 +169,43 @@ StatusWith<Shard::QueryResponse> KeysCollectionClientDirect::_query(
 }
 
 Status KeysCollectionClientDirect::_insert(OperationContext* opCtx,
-                                           const NamespaceString& nss,
                                            const BSONObj& doc,
                                            const WriteConcernOptions& writeConcern) {
-    BatchedCommandRequest request([&] {
-        write_ops::Insert insertOp(nss);
+    // TODO SERVER-88742 Just use write_ops::InsertCommandRequest
+    BatchedCommandRequest batchRequest([&] {
+        write_ops::InsertCommandRequest insertOp(NamespaceString::kKeysCollectionNamespace);
         insertOp.setDocuments({doc});
         return insertOp;
     }());
-    request.setWriteConcern(writeConcern.toBSON());
-    const BSONObj cmdObj = request.toBSON();
+
+    // A request dispatched through a local client is served within the same thread that submits it
+    // (so that the opCtx needs to be used as the vehicle to pass the WC to the ServiceEntryPoint).
+    const auto originalWC = opCtx->getWriteConcern();
+    ScopeGuard resetWCGuard([&] { opCtx->setWriteConcern(originalWC); });
+    opCtx->setWriteConcern(writeConcern);
+
+    const BSONObj cmdObj = [&] {
+        BSONObjBuilder cmdObjBuilder;
+        batchRequest.serialize(&cmdObjBuilder);
+        return cmdObjBuilder.obj();
+    }();
 
     for (int retry = 1; retry <= kOnErrorNumRetries; ++retry) {
         // Note: write commands can only be issued against a primary.
-        auto swResponse = _rsLocalClient.runCommandOnce(opCtx, nss.db().toString(), cmdObj);
+        auto swResponse = _rsLocalClient.runCommandOnce(
+            opCtx, NamespaceString::kKeysCollectionNamespace.dbName(), cmdObj);
 
         BatchedCommandResponse batchResponse;
         auto writeStatus =
             Shard::CommandResponse::processBatchWriteResponse(swResponse, &batchResponse);
         if (retry < kOnErrorNumRetries &&
             isRetriableError(writeStatus.code(), Shard::RetryPolicy::kIdempotent)) {
-            LOG(2) << "Batch write command to " << nss.db()
-                   << "failed with retriable error and will be retried"
-                   << causedBy(redact(writeStatus));
+            LOGV2_DEBUG(20704,
+                        2,
+                        "Batch write command to {nss_db}failed with retriable error and will be "
+                        "retried{causedBy_writeStatus}",
+                        "nss_db"_attr = NamespaceString::kKeysCollectionNamespace.db(omitTenant),
+                        "causedBy_writeStatus"_attr = causedBy(redact(writeStatus)));
             continue;
         }
 
@@ -164,8 +215,7 @@ Status KeysCollectionClientDirect::_insert(OperationContext* opCtx,
 }
 
 Status KeysCollectionClientDirect::insertNewKey(OperationContext* opCtx, const BSONObj& doc) {
-    return _insert(
-        opCtx, KeysCollectionDocument::ConfigNS, doc, ShardingCatalogClient::kMajorityWriteConcern);
+    return _insert(opCtx, doc, defaultMajorityWriteConcernDoNotUse());
 }
 
 }  // namespace mongo

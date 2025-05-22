@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,8 +29,11 @@
 
 #include "mongo/util/options_parser/option_description.h"
 
-#include <algorithm>
+#include <utility>
 
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/util/builder.h"
+#include "mongo/bson/util/builder_fwd.h"
 #include "mongo/util/assert_util.h"
 
 namespace mongo {
@@ -113,6 +115,11 @@ OptionDescription::OptionDescription(const std::string& dottedName,
 
 OptionDescription& OptionDescription::hidden() {
     _isVisible = false;
+    return *this;
+}
+
+OptionDescription& OptionDescription::redact() {
+    _redact = true;
     return *this;
 }
 
@@ -234,38 +241,12 @@ OptionDescription& OptionDescription::addConstraint(Constraint* c) {
     return *this;
 }
 
-OptionDescription& OptionDescription::validRange(long min, long max) {
-    if (_type != Double && _type != Int && _type != Long && _type != UnsignedLongLong &&
-        _type != Unsigned) {
-        StringBuilder sb;
-        sb << "Could not register option \"" << _dottedName << "\": "
-           << "only options registered as a numeric type can have a valid range, "
-           << "but option has type: " << _type;
-        uasserted(ErrorCodes::InternalError, sb.str());
-    }
-
-    return addConstraint(new NumericKeyConstraint(_dottedName, min, max));
-}
-
 OptionDescription& OptionDescription::incompatibleWith(const std::string& otherDottedName) {
     return addConstraint(new MutuallyExclusiveKeyConstraint(_dottedName, otherDottedName));
 }
 
-OptionDescription& OptionDescription::requires(const std::string& otherDottedName) {
+OptionDescription& OptionDescription::requiresOption(const std::string& otherDottedName) {
     return addConstraint(new RequiresOtherKeyConstraint(_dottedName, otherDottedName));
-}
-
-OptionDescription& OptionDescription::format(const std::string& regexFormat,
-                                             const std::string& displayFormat) {
-    if (_type != String) {
-        StringBuilder sb;
-        sb << "Could not register option \"" << _dottedName << "\": "
-           << "only options registered as a string type can have a required format, "
-           << "but option has type: " << _type;
-        uasserted(ErrorCodes::InternalError, sb.str());
-    }
-
-    return addConstraint(new StringFormatKeyConstraint(_dottedName, regexFormat, displayFormat));
 }
 
 OptionDescription& OptionDescription::canonicalize(Canonicalize_t canonicalize) {

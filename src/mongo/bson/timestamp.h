@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,9 +29,19 @@
 
 #pragma once
 
+#include <compare>
+#include <cstdint>
+#include <iosfwd>
+#include <string>
+#include <tuple>
+
 #include "mongo/base/data_view.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsontypes.h"
 #include "mongo/bson/util/builder.h"
+#include "mongo/bson/util/builder_fwd.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/duration.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
@@ -57,18 +66,17 @@ public:
     }
 
     /**
-     * DEPRECATED Constructor that builds a Timestamp from a Date_t by using the
-     * high-order 4 bytes of "date" for the "secs" field and the low-order 4 bytes
-     * for the "i" field.
+     * Constructor that builds a Timestamp from a Date_t by using the high-order 4 bytes of "date"
+     * for the "secs" field and the low-order 4 bytes for the "i" field.
      */
     explicit Timestamp(Date_t date) : Timestamp(date.toULL()) {}
 
     /**
-     * DEPRECATED Constructor that builds a Timestamp from a 64-bit unsigned integer by using
+     * Constructor that builds a Timestamp from a 64-bit unsigned integer by using
      * the high-order 4 bytes of "v" for the "secs" field and the low-order 4 bytes for the "i"
      * field.
      */
-    explicit Timestamp(unsigned long long v) : Timestamp(v >> 32, v) {}
+    explicit Timestamp(unsigned long long val) : Timestamp(val >> 32, val) {}
 
     Timestamp(Seconds s, unsigned increment) : Timestamp(s.count(), increment) {}
 
@@ -92,6 +100,10 @@ public:
     }
     long long asLL() const {
         return static_cast<long long>(asULL());
+    }
+
+    std::int64_t asInt64() const {
+        return static_cast<std::int64_t>(asLL());
     }
 
     bool isNull() const {
@@ -121,9 +133,25 @@ public:
         return tie() >= r.tie();
     }
 
+    Timestamp operator+(unsigned long long inc) const {
+        return Timestamp(asULL() + inc);
+    }
+
+    Timestamp operator-(unsigned long long inc) const {
+        return Timestamp(asULL() - inc);
+    }
+
     // Append the BSON representation of this Timestamp to the given BufBuilder with the given
     // name. This lives here because Timestamp manages its own serialization format.
-    void append(BufBuilder& builder, const StringData& fieldName) const;
+
+    template <class Builder>
+    void append(Builder& builder, StringData fieldName) const {
+        // No endian conversions needed, since we store in-memory representation
+        // in little endian format, regardless of target endian.
+        builder.appendNum(static_cast<char>(bsonTimestamp));
+        builder.appendCStr(fieldName);
+        builder.appendNum(asULL());
+    }
     BSONObj toBSON() const;
 
 private:
@@ -134,5 +162,13 @@ private:
     unsigned i = 0;
     unsigned secs = 0;
 };
+
+inline std::ostream& operator<<(std::ostream& s, const Timestamp& t) {
+    return (s << t.toString());
+}
+
+inline StringBuilder& operator<<(StringBuilder& s, const Timestamp& t) {
+    return (s << t.toString());
+}
 
 }  // namespace mongo

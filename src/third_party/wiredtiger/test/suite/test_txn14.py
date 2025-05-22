@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Public Domain 2014-2018 MongoDB, Inc.
+# Public Domain 2014-present MongoDB, Inc.
 # Public Domain 2008-2014 WiredTiger, Inc.
 #
 # This is free and unencumbered software released into the public domain.
@@ -30,47 +30,33 @@
 #   Transactions: commits and rollbacks
 #
 
-import fnmatch, os, shutil, time
+from helper import simulate_crash_restart
 from suite_subprocess import suite_subprocess
 from wtscenario import make_scenarios
 import wttest
 
 class test_txn14(wttest.WiredTigerTestCase, suite_subprocess):
     t1 = 'table:test_txn14_1'
-    create_params = 'key_format=i,value_format=i'
     entries = 10000
     extra_entries = 5
-    conn_config = 'log=(archive=false,enabled,file_max=100K)'
+    conn_config = 'log=(enabled,file_max=100K,remove=false)'
 
     sync_list = [
         ('write', dict(sync='off')),
         ('sync', dict(sync='on')),
-        ('bg', dict(sync='background')),
     ]
-    scenarios = make_scenarios(sync_list)
+    format_values = [
+        ('integer-row', dict(key_format='i', value_format='i')),
+        ('column', dict(key_format='r', value_format='i')),
+        ('column-fix', dict(key_format='r', value_format='8t')),
+    ]
+    scenarios = make_scenarios(sync_list, format_values)
 
-    def simulate_crash_restart(self, olddir, newdir):
-        ''' Simulate a crash from olddir and restart in newdir. '''
-        # with the connection still open, copy files to new directory
-        shutil.rmtree(newdir, ignore_errors=True)
-        os.mkdir(newdir)
-        for fname in os.listdir(olddir):
-            fullname = os.path.join(olddir, fname)
-            # Skip lock file on Windows since it is locked
-            if os.path.isfile(fullname) and \
-                "WiredTiger.lock" not in fullname and \
-                "Tmplog" not in fullname and \
-                "Preplog" not in fullname:
-                shutil.copy(fullname, newdir)
-        #
-        # close the original connection and open to new directory
-        # NOTE:  This really cannot test the difference between the
-        # write-no-sync (off) version of log_flush and the sync
-        # version since we're not crashing the system itself.
-        #
-        self.close_conn()
-        self.conn = self.setUpConnectionOpen(newdir)
-        self.session = self.setUpSessionOpen(self.conn)
+    def mkvalue(self, i):
+        if self.value_format == '8t':
+            # Use 255 instead of 256 just for variety.
+            return i % 255
+        return i
 
     def test_log_flush(self):
         # Here's the strategy:
@@ -81,33 +67,25 @@ class test_txn14(wttest.WiredTigerTestCase, suite_subprocess):
         #    - Make recovery run.
         #    - Confirm flushed data is in the table.
         #
-        self.session.create(self.t1, self.create_params)
+        create_params = 'key_format={},value_format={}'.format(self.key_format, self.value_format)
+        self.session.create(self.t1, create_params)
         c = self.session.open_cursor(self.t1, None, None)
-        for i in range(self.entries):
-            c[i] = i + 1
+        for i in range(1, self.entries + 1):
+            c[i] = self.mkvalue(i + 1)
         cfgarg='sync=%s' % self.sync
         self.pr('cfgarg ' + cfgarg)
         self.session.log_flush(cfgarg)
-        for i in range(self.extra_entries):
-            c[i+self.entries] = i + self.entries + 1
+        for i in range(1, self.extra_entries + 1):
+            c[i+self.entries] = self.mkvalue(i + self.entries + 1)
         c.close()
         self.session.log_flush(cfgarg)
-        if self.sync == 'background':
-            # If doing a background flush, wait 30 seconds. I have seen an
-            # individual log file's fsync take more than a second on some
-            # systems, and we've seen timeouts at 10 seconds on systems
-            # with slow I/O. So give it time to flush perhaps a few files.
-            self.session.transaction_sync('timeout_ms=30000')
-        self.simulate_crash_restart(".", "RESTART")
+        simulate_crash_restart(self, ".", "RESTART")
         c = self.session.open_cursor(self.t1, None, None)
-        i = 0
+        i = 1
         for key, value in c:
             self.assertEqual(i, key)
-            self.assertEqual(i+1, value)
+            self.assertEqual(self.mkvalue(i+1), value)
             i += 1
         all = self.entries + self.extra_entries
-        self.assertEqual(i, all)
+        self.assertEqual(i, all + 1)
         c.close()
-
-if __name__ == '__main__':
-    wttest.run()

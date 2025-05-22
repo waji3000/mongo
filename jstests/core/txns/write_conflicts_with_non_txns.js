@@ -17,130 +17,139 @@
  * @tags: [uses_transactions]
  */
 
-(function() {
+import {withRetryOnTransientTxnError} from "jstests/libs/auto_retry_transaction_in_sharding.js";
+import {Thread} from "jstests/libs/parallelTester.js";
 
-    "use strict";
+const dbName = "test";
+const collName = "write_conflicts_with_non_txns";
 
-    load('jstests/libs/parallelTester.js');  // for ScopedThread.
+const testDB = db.getSiblingDB(dbName);
+const testColl = testDB[collName];
 
-    const dbName = "test";
-    const collName = "write_conflicts_with_non_txns";
+// Clean up and create test collection.
+testDB.runCommand({drop: collName, writeConcern: {w: "majority"}});
+assert.commandWorked(testDB.runCommand({create: collName, writeConcern: {w: "majority"}}));
 
-    const testDB = db.getSiblingDB(dbName);
-    const testColl = testDB[collName];
+const sessionOptions = {
+    causalConsistency: false
+};
+const session = db.getMongo().startSession(sessionOptions);
+const sessionDb = session.getDatabase(dbName);
+const sessionColl = sessionDb[collName];
 
-    // Clean up and create test collection.
-    testDB.runCommand({drop: collName, writeConcern: {w: "majority"}});
-    assert.commandWorked(testDB.runCommand({create: collName, writeConcern: {w: "majority"}}));
+// Two conflicting documents to be inserted by a multi-document transaction and a
+// non-transactional write, respectively.
+const txnDoc = {
+    _id: 1
+};
+const nonTxnDoc = {
+    _id: 1,
+    nonTxn: true
+};
 
-    const sessionOptions = {causalConsistency: false};
-    const session = db.getMongo().startSession(sessionOptions);
-    const sessionDb = session.getDatabase(dbName);
-    const sessionColl = sessionDb[collName];
+// Performs a single document insert on the test collection. Returns the command result object.
+function singleDocWrite(dbName, collName, doc) {
+    const testColl = db.getSiblingDB(dbName)[collName];
+    return testColl.runCommand({insert: collName, documents: [doc]});
+}
 
-    // Two conflicting documents to be inserted by a multi-document transaction and a
-    // non-transactional write, respectively.
-    const txnDoc = {_id: 1};
-    const nonTxnDoc = {_id: 1, nonTxn: true};
+// Returns true if a single document insert has started running on the server.
+function writeStarted() {
+    return testDB.currentOp().inprog.some(op => {
+        return op.active && (op.ns === testColl.getFullName()) && (op.op === "insert") &&
+            (op.writeConflicts > 0);
+    });
+}
 
-    // Performs a single document insert on the test collection. Returns the command result object.
-    function singleDocWrite(dbName, collName, doc) {
-        const testColl = db.getSiblingDB(dbName)[collName];
-        return testColl.runCommand({insert: collName, documents: [doc]});
-    }
+/**
+ * A non-transactional (single document) write should keep retrying when attempting to insert a
+ * document that conflicts with a previous write done by a running transaction, and should be
+ * allowed to continue after the transaction commits. If 'maxTimeMS' is specified, a single
+ * document write should timeout after the given time limit if there is a write conflict.
+ */
 
-    // Returns true if a single document insert has started running on the server.
-    function writeStarted() {
-        return testDB.currentOp().inprog.some(op => {
-            return op.active && (op.ns === testColl.getFullName()) && (op.op === "insert");
-        });
-    }
+jsTestLog("Start a multi-document transaction with a document insert.");
+session.startTransaction();
+assert.commandWorked(sessionColl.insert(txnDoc));
 
-    /**
-     * A non-transactional (single document) write should block when trying to insert a document
-     * that conflicts with a previous write done by a running transaction, and should be allowed to
-     * continue after the transaction commits. If 'maxTimeMS' is specified, a single document write
-     * should timeout after the given time limit if there is a write conflict.
-     */
+jsTestLog("Do a conflicting single document insert outside of transaction with maxTimeMS.");
+assert.commandFailedWithCode(
+    testColl.runCommand({insert: collName, documents: [nonTxnDoc], maxTimeMS: 100}),
+    ErrorCodes.MaxTimeMSExpired);
 
-    jsTestLog("Start a multi-document transaction with a document insert.");
-    session.startTransaction();
-    assert.commandWorked(sessionColl.insert(txnDoc));
+jsTestLog("Doing conflicting single document write in separate thread.");
+let thread = new Thread(singleDocWrite, dbName, collName, nonTxnDoc);
+thread.start();
 
-    jsTestLog("Do a conflicting single document insert outside of transaction with maxTimeMS.");
-    assert.commandFailedWithCode(
-        testColl.runCommand({insert: collName, documents: [nonTxnDoc], maxTimeMS: 100}),
-        ErrorCodes.MaxTimeMSExpired);
+// Wait for the single doc write to start.
+assert.soon(writeStarted);
 
-    jsTestLog("Doing conflicting single document write in separate thread.");
-    let thread = new ScopedThread(singleDocWrite, dbName, collName, nonTxnDoc);
-    thread.start();
+// Commit the transaction, which should allow the single document write to finish. Since the
+// single doc write should get serialized after the transaction, we expect it to fail with a
+// duplicate key error.
+jsTestLog("Commit the multi-document transaction.");
+assert.commandWorked(session.commitTransaction_forTesting());
+thread.join();
+assert.commandFailedWithCode(thread.returnData(), ErrorCodes.DuplicateKey);
 
-    // Wait for the single doc write to start.
-    assert.soon(writeStarted);
+// Check the final documents.
+assert.sameMembers([txnDoc], testColl.find().toArray());
 
-    // Commit the transaction, which should allow the single document write to finish. Since the
-    // single doc write should get serialized after the transaction, we expect it to fail with a
-    // duplicate key error.
-    jsTestLog("Commit the multi-document transaction.");
-    session.commitTransaction();
-    thread.join();
-    assert.commandFailedWithCode(thread.returnData(), ErrorCodes.DuplicateKey);
+// Clean up the test collection.
+assert.commandWorked(testColl.remove({}));
 
-    // Check the final documents.
-    assert.sameMembers([txnDoc], testColl.find().toArray());
+/**
+ * A non-transactional (single document) write should keep retrying when attempting to insert a
+ * document that conflicts with a previous write done by a running transaction, and should be
+ * allowed to continue and complete successfully after the transaction aborts.
+ */
 
-    // Clean up the test collection.
-    assert.commandWorked(testColl.remove({}));
+jsTestLog("Start a multi-document transaction with a document insert.");
+session.startTransaction();
+assert.commandWorked(sessionColl.insert(txnDoc));
 
-    /**
-     * A non-transactional (single document) write should block when trying to insert a document
-     * that conflicts with a previous write done by a running transaction, and should be allowed to
-     * continue and complete successfully after the transaction aborts.
-     */
+jsTestLog("Doing conflicting single document write in separate thread.");
+thread = new Thread(singleDocWrite, dbName, collName, nonTxnDoc);
+thread.start();
 
-    jsTestLog("Start a multi-document transaction with a document insert.");
-    session.startTransaction();
-    assert.commandWorked(sessionColl.insert(txnDoc));
+// Wait for the single doc write to start.
+assert.soon(writeStarted);
 
-    jsTestLog("Doing conflicting single document write in separate thread.");
-    thread = new ScopedThread(singleDocWrite, dbName, collName, nonTxnDoc);
-    thread.start();
+// Abort the transaction, which should allow the single document write to finish and insert its
+// document successfully.
+jsTestLog("Abort the multi-document transaction.");
+assert.commandWorked(session.abortTransaction_forTesting());
+thread.join();
+assert.commandWorked(thread.returnData());
 
-    // Wait for the single doc write to start.
-    assert.soon(writeStarted);
+// Check the final documents.
+assert.sameMembers([nonTxnDoc], testColl.find().toArray());
 
-    // Abort the transaction, which should allow the single document write to finish and insert its
-    // document successfully.
-    jsTestLog("Abort the multi-document transaction.");
-    session.abortTransaction_forTesting();
-    thread.join();
-    assert.commandWorked(thread.returnData());
+// Clean up the test collection.
+assert.commandWorked(testColl.remove({}));
 
-    // Check the final documents.
-    assert.sameMembers([nonTxnDoc], testColl.find().toArray());
+/**
+ * A transaction that tries to write to a document that was updated by a non-transaction after
+ * it started should fail with a WriteConflict.
+ */
 
-    // Clean up the test collection.
-    assert.commandWorked(testColl.remove({}));
+jsTestLog("Start a multi-document transaction.");
+withRetryOnTransientTxnError(
+    () => {
+        session.startTransaction();
+        assert.commandWorked(sessionColl.runCommand({find: collName}));
 
-    /**
-     * A transaction that tries to write to a document that was updated by a non-transaction after
-     * it started should fail with a WriteConflict.
-     */
+        jsTestLog("Do a single document insert outside of the transaction.");
+        assert.commandWorked(testColl.insert(nonTxnDoc));
 
-    jsTestLog("Start a multi-document transaction.");
-    session.startTransaction();
-    assert.commandWorked(sessionColl.runCommand({find: collName}));
+        jsTestLog("Insert a conflicting document inside the multi-document transaction.");
+        assert.commandFailedWithCode(sessionColl.insert(txnDoc), ErrorCodes.WriteConflict);
+        assert.commandFailedWithCode(session.commitTransaction_forTesting(),
+                                     ErrorCodes.NoSuchTransaction);
+    },
+    () => {
+        session.abortTransaction_forTesting();
+    });
 
-    jsTestLog("Do a single document insert outside of the transaction.");
-    assert.commandWorked(testColl.insert(nonTxnDoc));
-
-    jsTestLog("Insert a conflicting document inside the multi-document transaction.");
-    assert.commandFailedWithCode(sessionColl.insert(txnDoc), ErrorCodes.WriteConflict);
-    assert.commandFailedWithCode(session.commitTransaction_forTesting(),
-                                 ErrorCodes.NoSuchTransaction);
-
-    // Check the final documents.
-    assert.sameMembers([nonTxnDoc], testColl.find().toArray());
-
-}());
+// Check the final documents.
+assert.sameMembers([nonTxnDoc], testColl.find().toArray());

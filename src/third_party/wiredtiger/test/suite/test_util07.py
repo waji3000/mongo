@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Public Domain 2014-2018 MongoDB, Inc.
+# Public Domain 2014-present MongoDB, Inc.
 # Public Domain 2008-2014 WiredTiger, Inc.
 #
 # This is free and unencumbered software released into the public domain.
@@ -26,9 +26,8 @@
 # ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
 # OTHER DEALINGS IN THE SOFTWARE.
 
-import os, struct
 from suite_subprocess import suite_subprocess
-import wiredtiger, wttest
+import wttest
 
 # test_util07.py
 #    Utilities: wt read
@@ -92,6 +91,3 @@ class test_util07(wttest.WiredTigerTestCase, suite_subprocess):
             outfilename=outfile, errfilename=errfile, failure=True)
         self.check_empty_file(outfile)
         self.check_file_contains(errfile, 'key49: not found\n')
-
-if __name__ == '__main__':
-    wttest.run()

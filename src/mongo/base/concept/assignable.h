@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -34,9 +33,9 @@
 
 namespace mongo {
 namespace concept {
-/*!
- * The Assignable concept models a type which can be copy assigned and copy constructed.
- */
-struct Assignable : CopyConstructible, CopyAssignable {};
+    /*!
+     * The Assignable concept models a type which can be copy assigned and copy constructed.
+     */
+    struct Assignable : CopyConstructible, CopyAssignable {};
 }  // namespace concept
 }  // namespace mongo

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,19 +29,23 @@
 
 #include "mongo/db/update/path_support.h"
 
+#include <utility>
+
+#include <absl/container/node_hash_map.h>
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
 #include "mongo/base/string_data.h"
-#include "mongo/bson/mutable/algorithm.h"
-#include "mongo/bson/mutable/document.h"
-#include "mongo/bson/mutable/element.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/db/exec/mutable_bson/algorithm.h"
+#include "mongo/db/exec/mutable_bson/document.h"
+#include "mongo/db/exec/mutable_bson/element.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/mongoutils/str.h"
-#include "mongo/util/stringutils.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 namespace pathsupport {
-
-using std::string;
-using mongoutils::str::stream;
 
 namespace {
 
@@ -55,9 +58,8 @@ Status maybePadTo(mutablebson::Element* elemArray, size_t sizeRequired) {
 
         if (toPad > kMaxPaddingAllowed) {
             return Status(ErrorCodes::CannotBackfillArray,
-                          mongoutils::str::stream() << "can't backfill more than "
-                                                    << kMaxPaddingAllowed
-                                                    << " elements");
+                          str::stream()
+                              << "can't backfill more than " << kMaxPaddingAllowed << " elements");
         }
 
         for (size_t i = 0; i < toPad; i++) {
@@ -72,22 +74,22 @@ Status maybePadTo(mutablebson::Element* elemArray, size_t sizeRequired) {
 
 }  // unnamed namespace
 
-Status findLongestPrefix(const FieldRef& prefix,
-                         mutablebson::Element root,
-                         size_t* idxFound,
-                         mutablebson::Element* elemFound) {
+StatusWith<bool> findLongestPrefix(const FieldRef& prefix,
+                                   mutablebson::Element root,
+                                   FieldIndex* idxFound,
+                                   mutablebson::Element* elemFound) {
     // If root is empty or the prefix is so, there's no point in looking for a prefix.
-    const size_t prefixSize = prefix.numParts();
+    const FieldIndex prefixSize = prefix.numParts();
     if (!root.hasChildren() || prefixSize == 0) {
-        return Status(ErrorCodes::NonExistentPath, "either the document or the path are empty");
+        return false;
     }
 
     // Loop through prefix's parts. At each iteration, check that the part ('curr') exists
     // in 'root' and that the type of the previous part ('prev') allows for children.
     mutablebson::Element curr = root;
     mutablebson::Element prev = root;
-    size_t i = 0;
-    boost::optional<size_t> numericPart;
+    FieldIndex i = 0;
+    boost::optional<FieldIndex> numericPart;
     bool viable = true;
     for (; i < prefixSize; i++) {
         // If prefix wants to reach 'curr' by applying a non-numeric index to an array
@@ -101,7 +103,7 @@ Status findLongestPrefix(const FieldRef& prefix,
                 break;
 
             case Array:
-                numericPart = parseUnsignedBase10Integer(prefixPart);
+                numericPart = str::parseUnsignedBase10Integer(prefixPart);
                 if (!numericPart) {
                     viable = false;
                 } else {
@@ -125,30 +127,27 @@ Status findLongestPrefix(const FieldRef& prefix,
     // parts in 'prefix' exist in 'root', or (d) all parts do. In each case, we need to
     // figure out what index and Element pointer to return.
     if (i == 0) {
-        return Status(ErrorCodes::NonExistentPath, "cannot find path in the document");
+        return false;
     } else if (!viable) {
         *idxFound = i - 1;
         *elemFound = prev;
         return Status(ErrorCodes::PathNotViable,
-                      mongoutils::str::stream() << "cannot use the part (" << prefix.getPart(i - 1)
-                                                << " of "
-                                                << prefix.dottedField()
-                                                << ") to traverse the element ({"
-                                                << curr.toString()
-                                                << "})");
+                      str::stream() << "cannot use the part (" << prefix.getPart(i - 1) << " of "
+                                    << prefix.dottedField() << ") to traverse the element ({"
+                                    << curr.toString() << "})");
     } else if (curr.ok()) {
         *idxFound = i - 1;
         *elemFound = curr;
-        return Status::OK();
+        return true;
     } else {
         *idxFound = i - 1;
         *elemFound = prev;
-        return Status::OK();
+        return true;
     }
 }
 
 StatusWith<mutablebson::Element> createPathAt(const FieldRef& prefix,
-                                              size_t idxFound,
+                                              FieldIndex idxFound,
                                               mutablebson::Element elemFound,
                                               mutablebson::Element newElem) {
     Status status = Status::OK();
@@ -157,13 +156,11 @@ StatusWith<mutablebson::Element> createPathAt(const FieldRef& prefix,
     if (elemFound.getType() != BSONType::Object && elemFound.getType() != BSONType::Array) {
         return Status(ErrorCodes::PathNotViable,
                       str::stream() << "Cannot create field '" << prefix.getPart(idxFound)
-                                    << "' in element {"
-                                    << elemFound.toString()
-                                    << "}");
+                                    << "' in element {" << elemFound.toString() << "}");
     }
 
     // Sanity check that 'idxField' is an actual part.
-    const size_t size = prefix.numParts();
+    const FieldIndex size = prefix.numParts();
     if (idxFound >= size) {
         return Status(ErrorCodes::BadValue, "index larger than path size");
     }
@@ -172,16 +169,14 @@ StatusWith<mutablebson::Element> createPathAt(const FieldRef& prefix,
 
     // If we are creating children under an array and a numeric index is next, then perhaps
     // we need padding.
-    size_t i = idxFound;
+    FieldIndex i = idxFound;
     bool inArray = false;
     if (elemFound.getType() == mongo::Array) {
-        boost::optional<size_t> newIdx = parseUnsignedBase10Integer(prefix.getPart(idxFound));
+        boost::optional<size_t> newIdx = str::parseUnsignedBase10Integer(prefix.getPart(idxFound));
         if (!newIdx) {
             return Status(ErrorCodes::PathNotViable,
                           str::stream() << "Cannot create field '" << prefix.getPart(idxFound)
-                                        << "' in element {"
-                                        << elemFound.toString()
-                                        << "}");
+                                        << "' in element {" << elemFound.toString() << "}");
         }
 
         status = maybePadTo(&elemFound, *newIdx);
@@ -275,21 +270,21 @@ StatusWith<mutablebson::Element> createPathAt(const FieldRef& prefix,
 Status setElementAtPath(const FieldRef& path,
                         const BSONElement& value,
                         mutablebson::Document* doc) {
-    size_t deepestElemPathPart;
+    FieldIndex deepestElemPathPart;
     mutablebson::Element deepestElem(doc->end());
 
     // Get the existing parents of this path
-    Status status = findLongestPrefix(path, doc->root(), &deepestElemPathPart, &deepestElem);
+    auto swFound = findLongestPrefix(path, doc->root(), &deepestElemPathPart, &deepestElem);
 
     // TODO: All this is pretty awkward, why not return the position immediately after the
     // consumed path or use a signed sentinel?  Why is it a special case when we've consumed the
     // whole path?
 
-    if (!status.isOK() && status.code() != ErrorCodes::NonExistentPath)
-        return status;
+    if (!swFound.isOK())
+        return swFound.getStatus();
 
     // Inc the path by one *unless* we matched nothing
-    if (status.code() != ErrorCodes::NonExistentPath) {
+    if (swFound.getValue()) {
         ++deepestElemPathPart;
     } else {
         deepestElemPathPart = 0;
@@ -343,37 +338,17 @@ static Status checkEqualityConflicts(const EqualityMatches& equalities, const Fi
     if (parentEl.eoo())
         return Status::OK();
 
-    string errMsg = "cannot infer query fields to set, ";
-
     StringData pathStr = path.dottedField();
     StringData prefixStr = path.dottedSubstring(0, parentPathPart);
     StringData suffixStr = path.dottedSubstring(parentPathPart, path.numParts());
 
-    if (suffixStr.size() != 0)
-        errMsg += stream() << "both paths '" << pathStr << "' and '" << prefixStr
-                           << "' are matched";
-    else
-        errMsg += stream() << "path '" << pathStr << "' is matched twice";
-
-    return Status(ErrorCodes::NotSingleValueField, errMsg);
-}
-
-/**
- * Helper function to check if path conflicts are all prefixes.
- */
-static Status checkPathIsPrefixOf(const FieldRef& path, const FieldRefSet& conflictPaths) {
-    for (FieldRefSet::const_iterator it = conflictPaths.begin(); it != conflictPaths.end(); ++it) {
-        const FieldRef* conflictingPath = *it;
-        // Conflicts are always prefixes (or equal to) the path, or vice versa
-        if (path.numParts() > conflictingPath->numParts()) {
-            string errMsg = stream() << "field at '" << conflictingPath->dottedField()
-                                     << "' must be exactly specified, field at sub-path '"
-                                     << path.dottedField() << "'found";
-            return Status(ErrorCodes::NotExactValueField, errMsg);
-        }
-    }
-
-    return Status::OK();
+    return Status(ErrorCodes::NotSingleValueField, [&] {
+        static constexpr auto pre = "cannot infer query fields to set, "_sd;
+        if (!suffixStr.empty())
+            return fmt::format("{}both paths '{}' and '{}' are matched", pre, pathStr, prefixStr);
+        else
+            return fmt::format("{}path '{}' is matched twice", pre, pathStr);
+    }());
 }
 
 static Status _extractFullEqualityMatches(const MatchExpression& root,
@@ -387,16 +362,18 @@ static Status _extractFullEqualityMatches(const MatchExpression& root,
 
         if (fullPathsToExtract) {
             FieldRefSet conflictPaths;
-            fullPathsToExtract->findConflicts(&path, &conflictPaths);
+            auto swFlag = fullPathsToExtract->checkForConflictsAndPrefix(&path);
+
+            // Found a conflicting path that is not a prefix
+            if (!swFlag.isOK()) {
+                return swFlag.getStatus();
+            }
 
             // Ignore if this path is unrelated to the full paths
-            if (conflictPaths.empty())
+            const bool hasConflict = swFlag.getValue();
+            if (!hasConflict) {
                 return Status::OK();
-
-            // Make sure we're a prefix of all the conflict paths
-            Status status = checkPathIsPrefixOf(path, conflictPaths);
-            if (!status.isOK())
-                return status;
+            }
         }
 
         Status status = checkEqualityConflicts(*equalities, path);
@@ -424,7 +401,7 @@ Status extractFullEqualityMatches(const MatchExpression& root,
 }
 
 Status extractEqualityMatches(const MatchExpression& root, EqualityMatches* equalities) {
-    return _extractFullEqualityMatches(root, NULL, equalities);
+    return _extractFullEqualityMatches(root, nullptr, equalities);
 }
 
 Status addEqualitiesToDoc(const EqualityMatches& equalities, mutablebson::Document* doc) {

@@ -1,105 +1,191 @@
 /**
- * Tests that initial sync is completed successfully if a 'renameCollection' operation
- * occurs on the sync source during initial sync.
- * See SERVER-4941.
+ * Test that CollectionCloner completes without error when a collection is renamed during cloning.
  */
 
-(function() {
-    'use strict';
+import {kDefaultWaitForFailPointTimeout} from "jstests/libs/fail_point_util.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {extractUUIDFromObject, getUUIDFromListCollections} from "jstests/libs/uuid_util.js";
 
-    load('jstests/replsets/rslib.js');
-    const basename = 'initial_sync_rename_collection';
+// Set up replica set. Disallow chaining so nodes always sync from primary.
+const testName = "initial_sync_rename_collection";
+const dbName = testName;
+const replTest = new ReplSetTest(
+    {name: testName, nodes: [{}, {rsConfig: {priority: 0}}], settings: {chainingAllowed: false}});
+replTest.startSet();
+replTest.initiate();
 
-    jsTestLog('Bring up a replica set');
-    const rst = new ReplSetTest({name: basename, nodes: 1});
-    rst.startSet();
-    rst.initiate();
+const collName = "testcoll";
+const primary = replTest.getPrimary();
+const primaryDB = primary.getDB(dbName);
+const primaryColl = primaryDB[collName];
+const pRenameColl = primaryDB["r_" + collName];
 
-    const db0_name = "db0";
-    const db1_name = "db1";
+// The default WC is majority and this test can't satisfy majority writes.
+assert.commandWorked(primary.adminCommand(
+    {setDefaultRWConcern: 1, defaultWriteConcern: {w: 1}, writeConcern: {w: "majority"}}));
 
-    const primary = rst.getPrimary();
+// Used for cross-DB renames.
+const secondDbName = testName + "_cross";
+const primarySecondDB = primary.getDB(secondDbName);
+const pCrossDBRenameColl = primarySecondDB[collName + "_cross"];
 
-    // Create two separate databases so that we can rename a collection across databases.
-    const primary_db0 = primary.getDB(db0_name);
-    const primary_db1 = primary.getDB(db1_name);
+const nss = primaryColl.getFullName();
+const rnss = pRenameColl.getFullName();
+let secondary = replTest.getSecondary();
+let secondaryDB = secondary.getDB(dbName);
+let secondaryColl = secondaryDB[collName];
 
-    jsTestLog("Create collections on primary");
-    const collRenameWithinDB_name = 'coll_1';
-    const collRenameAcrossDBs_name = 'coll_2';
-    const collWithinFinal_name = 'renamed';
-    const collAcrossFinal_name = 'renamed_across';
+// This function adds data to the collection, restarts the secondary node with the given
+// parameters and setting the given failpoint, waits for the failpoint to be hit,
+// renames the collection, then disables the failpoint.  It then optionally waits for the
+// expectedLog message and waits for the secondary to complete initial sync, then ensures
+// the collection on the secondary has been properly cloned.
+function setupTest({failPoint, extraFailPointData, secondaryStartupParams}) {
+    jsTestLog("Writing data to collection.");
+    assert.commandWorked(primaryColl.insert([{_id: 1}, {_id: 2}]));
+    const data = Object.merge(extraFailPointData || {}, {nss: nss});
 
-    // Create two collections on the same database. One will be renamed within the database
-    // and the other will be renamed to a different database.
-    assert.writeOK(primary_db0[collRenameWithinDB_name].save({}));
-    assert.writeOK(primary_db0[collRenameAcrossDBs_name].save({}));
+    jsTestLog("Restarting secondary with failPoint " + failPoint + " set for " + nss);
+    secondaryStartupParams = secondaryStartupParams || {};
+    secondaryStartupParams['failpoint.' + failPoint] = tojson({mode: 'alwaysOn', data: data});
+    // Skip clearing initial sync progress after a successful initial sync attempt so that we
+    // can check initialSyncStatus fields after initial sync is complete.
+    secondaryStartupParams['failpoint.skipClearInitialSyncState'] = tojson({mode: 'alwaysOn'});
+    secondaryStartupParams['numInitialSyncAttempts'] = 1;
+    secondary =
+        replTest.restart(secondary, {startClean: true, setParameter: secondaryStartupParams});
+    secondaryDB = secondary.getDB(dbName);
+    secondaryColl = secondaryDB[collName];
 
-    jsTestLog('Waiting for replication');
-    rst.awaitReplication();
-
-    jsTestLog('Bring up a new node');
-    const secondary = rst.add({setParameter: 'numInitialSyncAttempts=1'});
-
-    // Add a fail point that causes the secondary's initial sync to hang before
-    // copying databases.
-    assert.commandWorked(secondary.adminCommand(
-        {configureFailPoint: 'initialSyncHangBeforeCopyingDatabases', mode: 'alwaysOn'}));
-
-    jsTestLog('Begin initial sync on secondary');
-    let conf = rst.getPrimary().getDB('admin').runCommand({replSetGetConfig: 1}).config;
-    conf.members.push({_id: 1, host: secondary.host, priority: 0, votes: 0});
-    conf.version++;
-    assert.commandWorked(rst.getPrimary().getDB('admin').runCommand({replSetReconfig: conf}));
-    assert.eq(primary, rst.getPrimary(), 'Primary changed after reconfig');
-
-    // Confirm that initial sync started on the secondary node.
-    jsTestLog('Waiting for initial sync to start');
-    checkLog.contains(secondary,
-                      'initial sync - initialSyncHangBeforeCopyingDatabases fail point enabled');
-
-    // Start renaming collections while initial sync is hanging.
-    jsTestLog('Rename collection ' + db0_name + '.' + collRenameWithinDB_name + ' to ' + db0_name +
-              '.' + collWithinFinal_name + ' on the sync source ' + db0_name);
-    assert.commandWorked(
-        primary_db0[collRenameWithinDB_name].renameCollection(collWithinFinal_name));
-
-    jsTestLog('Rename collection ' + db0_name + '.' + collRenameAcrossDBs_name + ' to ' + db1_name +
-              '.' + collAcrossFinal_name + ' on the sync source ' + db0_name);
-    assert.commandWorked(primary.adminCommand({
-        renameCollection: primary_db0[collRenameAcrossDBs_name].getFullName(),
-        to: primary_db1[collAcrossFinal_name]
-                .getFullName()  // Collection 'renamed_across' is implicitly created.
+    jsTestLog("Waiting for secondary to reach failPoint " + failPoint);
+    assert.commandWorked(secondary.adminCommand({
+        waitForFailPoint: failPoint,
+        timesEntered: 1,
+        maxTimeMS: kDefaultWaitForFailPointTimeout
     }));
 
-    // Disable fail point so that the secondary can finish its initial sync.
-    assert.commandWorked(secondary.adminCommand(
-        {configureFailPoint: 'initialSyncHangBeforeCopyingDatabases', mode: 'off'}));
+    // Restarting the secondary may have resulted in an election.  Wait until the system
+    // stabilizes and reaches RS_STARTUP2 state.
+    replTest.getPrimary();
+    replTest.waitForState(secondary, ReplSetTest.State.STARTUP_2);
+}
 
-    jsTestLog('Wait for both nodes to be up-to-date');
-    rst.awaitSecondaryNodes();
-    rst.awaitReplication();
+function finishTest({failPoint, expectedLog, createNew, renameAcrossDBs}) {
+    // Get the uuid for use in checking the log line.
+    const uuid_obj = getUUIDFromListCollections(primaryDB, collName);
+    const uuid = extractUUIDFromObject(uuid_obj);
+    const target = (renameAcrossDBs ? pCrossDBRenameColl : pRenameColl);
 
-    const secondary_db0 = secondary.getDB(db0_name);
-    const secondary_db1 = secondary.getDB(db1_name);
+    jsTestLog("Renaming collection on primary: " + target.getFullName());
+    assert.commandWorked(primary.adminCommand({
+        renameCollection: primaryColl.getFullName(),
+        to: target.getFullName(),
+        dropTarget: false
+    }));
 
-    jsTestLog('Check that collection was renamed correctly on the secondary');
-    assert.eq(secondary_db0[collWithinFinal_name].find().itcount(),
-              1,
-              'renamed collection does not exist');
-    assert.eq(secondary_db1[collAcrossFinal_name].find().itcount(),
-              1,
-              'renamed_across collection does not exist');
-    assert.eq(secondary_db0[collRenameWithinDB_name].find().itcount(),
-              0,
-              'collection ' + collRenameWithinDB_name +
-                  ' still exists after it was supposed to be renamed');
-    assert.eq(secondary_db0[collRenameAcrossDBs_name].find().itcount(),
-              0,
-              'collection ' + collRenameAcrossDBs_name +
-                  ' still exists after it was supposed to be renamed');
+    if (createNew) {
+        jsTestLog("Creating a new collection with the same name: " + primaryColl.getFullName());
+        assert.commandWorked(primaryColl.insert({_id: "not the same collection"}));
+    }
 
-    rst.checkReplicatedDataHashes();
-    rst.checkOplogs();
-    rst.stopSet();
-})();
+    jsTestLog("Allowing secondary to continue.");
+    assert.commandWorked(secondary.adminCommand({configureFailPoint: failPoint, mode: 'off'}));
+
+    if (expectedLog) {
+        expectedLog = eval(expectedLog);
+        jsTestLog(expectedLog);
+        checkLog.contains(secondary, expectedLog);
+    }
+
+    jsTestLog("Waiting for initial sync to complete.");
+    replTest.awaitSecondaryNodes(null, [secondary]);
+
+    let res = assert.commandWorked(secondary.adminCommand({replSetGetStatus: 1}));
+    assert.eq(0, res.initialSyncStatus.failedInitialSyncAttempts);
+
+    if (createNew) {
+        assert.eq([{_id: "not the same collection"}], secondaryColl.find().toArray());
+        assert(primaryColl.drop());
+    } else {
+        assert.eq(0, secondaryColl.find().itcount());
+    }
+    replTest.checkReplicatedDataHashes();
+
+    // Drop the renamed collection so we can start fresh the next time around.
+    assert(target.drop());
+}
+
+function runRenameTest(params) {
+    setupTest(params);
+    finishTest(params);
+}
+
+jsTestLog("[1] Testing rename between listIndexes and find.");
+runRenameTest({
+    failPoint: "hangBeforeClonerStage",
+    extraFailPointData: {cloner: "CollectionCloner", stage: "query"}
+});
+
+jsTestLog("[2] Testing cross-DB rename between listIndexes and find.");
+runRenameTest({
+    failPoint: "hangBeforeClonerStage",
+    extraFailPointData: {cloner: "CollectionCloner", stage: "query"},
+    renameAcrossDBs: true
+});
+
+jsTestLog(
+    "[3] Testing rename between listIndexes and find, with new same-name collection created.");
+runRenameTest({
+    failPoint: "hangBeforeClonerStage",
+    extraFailPointData: {cloner: "CollectionCloner", stage: "query"},
+    createNew: true
+});
+
+jsTestLog(
+    "[4] Testing cross-DB rename between listIndexes and find, with new same-name collection created.");
+runRenameTest({
+    failPoint: "hangBeforeClonerStage",
+    extraFailPointData: {cloner: "CollectionCloner", stage: "query"},
+    createNew: true,
+    renameAcrossDBs: true
+});
+
+const expectedLogFor5and7 =
+    '`Sync process retrying cloner stage due to error","attr":{"cloner":"CollectionCloner","stage":"query","error":{"code":175,"codeName":"QueryPlanKilled","errmsg":"collection renamed from \'${nss}\' to \'${rnss}\'. UUID ${uuid}"}}}`';
+
+jsTestLog("[5] Testing rename between getMores.");
+runRenameTest({
+    failPoint: "initialSyncHangCollectionClonerAfterHandlingBatchResponse",
+    secondaryStartupParams: {collectionClonerBatchSize: 1},
+    expectedLog: expectedLogFor5and7
+});
+
+// A cross-DB rename will appear as a drop in the context of the source DB.
+// Double escape the backslash as eval will do unescaping
+let expectedLogFor6and8 =
+    '`CollectionCloner stopped because collection was dropped on source","attr":{"namespace":"${nss}","uuid":{"uuid":{"$uuid":"${uuid}"}}}}`';
+
+jsTestLog("[6] Testing cross-DB rename between getMores.");
+runRenameTest({
+    failPoint: "initialSyncHangCollectionClonerAfterHandlingBatchResponse",
+    secondaryStartupParams: {collectionClonerBatchSize: 1},
+    renameAcrossDBs: true,
+    expectedLog: expectedLogFor6and8
+});
+
+jsTestLog("[7] Testing rename with new same-name collection created, between getMores.");
+runRenameTest({
+    failPoint: "initialSyncHangCollectionClonerAfterHandlingBatchResponse",
+    secondaryStartupParams: {collectionClonerBatchSize: 1},
+    expectedLog: expectedLogFor5and7
+});
+
+jsTestLog("[8] Testing cross-DB rename with new same-name collection created, between getMores.");
+runRenameTest({
+    failPoint: "initialSyncHangCollectionClonerAfterHandlingBatchResponse",
+    secondaryStartupParams: {collectionClonerBatchSize: 1},
+    renameAcrossDBs: true,
+    expectedLog: expectedLogFor6and8
+});
+
+replTest.stopSet();

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,10 +29,19 @@
 
 #include "mongo/db/geo/big_polygon.h"
 
-#include <map>
+#include <memory>
+#include <s2.h>
+#include <s2cap.h>
+#include <s2cell.h>
+#include <s2loop.h>
+#include <s2polygon.h>
+#include <s2polyline.h>
+#include <s2region.h>
+#include <util/math/vector3-inl.h>
+#include <vector>
 
-#include "mongo/base/owned_pointer_vector.h"
-#include "mongo/stdx/memory.h"
+#include <s2latlngrect.h>
+
 #include "mongo/util/assert_util.h"
 #include "mongo/util/transitional_tools_do_not_use/vector_spooling.h"
 
@@ -173,7 +181,7 @@ const S2Polygon& BigSimplePolygon::GetPolygonBorder() const {
 
     std::vector<S2Loop*> loops;
     loops.push_back(cloned.release());
-    _borderPoly = stdx::make_unique<S2Polygon>(&loops);
+    _borderPoly = std::make_unique<S2Polygon>(&loops);
     return *_borderPoly;
 }
 
@@ -219,14 +227,14 @@ bool BigSimplePolygon::VirtualContainsPoint(const S2Point& p) const {
 }
 
 void BigSimplePolygon::Encode(Encoder* const encoder) const {
-    MONGO_UNREACHABLE;
+    MONGO_UNREACHABLE_TASSERT(9911951);
 }
 
 bool BigSimplePolygon::Decode(Decoder* const decoder) {
-    MONGO_UNREACHABLE;
+    MONGO_UNREACHABLE_TASSERT(9911952);
 }
 
 bool BigSimplePolygon::DecodeWithinScope(Decoder* const decoder) {
-    MONGO_UNREACHABLE;
+    MONGO_UNREACHABLE_TASSERT(9911953);
 }
-}
+}  // namespace mongo

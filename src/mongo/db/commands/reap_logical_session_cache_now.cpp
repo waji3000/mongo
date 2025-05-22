@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,22 +27,23 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <string>
 
-#include "mongo/base/init.h"
-#include "mongo/db/client.h"
+#include "mongo/base/init.h"  // IWYU pragma: keep
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/commands/test_commands_enabled.h"
-#include "mongo/db/logical_session_cache.h"
+#include "mongo/db/database_name.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/session/logical_session_cache.h"
 
 namespace mongo {
-
 namespace {
 
 class ReapLogicalSessionCacheNowCommand final : public BasicCommand {
-    MONGO_DISALLOW_COPYING(ReapLogicalSessionCacheNowCommand);
-
 public:
     ReapLogicalSessionCacheNowCommand() : BasicCommand("reapLogicalSessionCacheNow") {}
 
@@ -64,28 +64,25 @@ public:
     }
 
     // No auth needed because it only works when enabled via command line.
-    Status checkAuthForOperation(OperationContext* opCtx,
-                                 const std::string& dbname,
-                                 const BSONObj& cmdObj) const override {
+    // See docs/test_commands.md.
+    Status checkAuthForOperation(OperationContext*,
+                                 const DatabaseName&,
+                                 const BSONObj&) const override {
         return Status::OK();
     }
 
-    virtual bool run(OperationContext* opCtx,
-                     const std::string& db,
-                     const BSONObj& cmdObj,
-                     BSONObjBuilder& result) override {
-        auto cache = LogicalSessionCache::get(opCtx);
-        auto client = opCtx->getClient();
+    bool run(OperationContext* opCtx,
+             const DatabaseName&,
+             const BSONObj& cmdObj,
+             BSONObjBuilder& result) override {
+        const auto cache = LogicalSessionCache::get(opCtx);
 
-        auto res = cache->reapNow(client);
-        uassertStatusOK(res);
-
+        cache->reapNow(opCtx);
         return true;
     }
 };
 
-MONGO_REGISTER_TEST_COMMAND(ReapLogicalSessionCacheNowCommand);
+MONGO_REGISTER_COMMAND(ReapLogicalSessionCacheNowCommand).testOnly().forRouter().forShard();
 
 }  // namespace
-
 }  // namespace mongo

@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Public Domain 2014-2018 MongoDB, Inc.
+# Public Domain 2014-present MongoDB, Inc.
 # Public Domain 2008-2014 WiredTiger, Inc.
 #
 # This is free and unencumbered software released into the public domain.
@@ -26,85 +26,63 @@
 # ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
 # OTHER DEALINGS IN THE SOFTWARE.
 
-import wiredtiger, wttest
-import os, shutil
-from helper import compare_files
-from suite_subprocess import suite_subprocess
-from wtdataset import simple_key
+import wttest
+import os
+from wtbackup import backup_base
 from wtscenario import make_scenarios
 
 # test_backup07.py
-# Test cursor backup with target URIs, logging and create during backup
-
-class test_backup07(wttest.WiredTigerTestCase, suite_subprocess):
+# Test cursor backup with target URIs, logging and create during backup.
+class test_backup07(backup_base):
     dir='backup.dir'                    # Backup directory name
     logmax="100K"
     newuri="table:newtable"
 
     pfx = 'test_backup'
     scenarios = make_scenarios([
-        ('table', dict(uri='table:test',dsize=100,nops=100,nthreads=1)),
+        ('table', dict(uri='table:test',dsize=100,nthreads=1))
     ])
 
     # Create a large cache, otherwise this test runs quite slowly.
     def conn_config(self):
-        return 'cache_size=1G,log=(archive=false,enabled,file_max=%s)' % \
+        return 'cache_size=1G,log=(enabled,file_max=%s,remove=false)' % \
             self.logmax
 
-    # Run background inserts while running checkpoints and incremental backups
-    # repeatedly.
+    # Run background inserts while running checkpoints repeatedly.
     def test_backup07(self):
         log2 = "WiredTigerLog.0000000002"
 
         self.session.create(self.uri, "key_format=S,value_format=S")
 
         # Insert small amounts of data at a time stopping just after we
-        # cross into log file 2.  That way we can add more operations into
-        # log file 2 during the full backup.
-        loop = 0
-        c = self.session.open_cursor(self.uri)
+        # cross into log file 2.
         while not os.path.exists(log2):
-            for i in range(0, self.nops):
-                num = i + (loop * self.nops)
-                key = 'key' + str(num)
-                val = 'value' + str(num)
-                c[key] = val
-            loop += 1
+            self.add_data(self.uri, 'key', 'value')
 
         # Test a potential bug in full backups and creates.
         # We allow creates during backup because the file doesn't exist
         # when the backup metadata is created on cursor open and the newly
-        # created file is not in the cursor list.  However, if using logging
-        # and the create and inserts/updates appear in a log file copied,
-        # then currently there will be an error opening the backup directory.
+        # created file is not in the cursor list.
+        os.mkdir(self.dir)
 
         # Open up the backup cursor, create and add data to a new table
         # and then copy the files.
-        os.mkdir(self.dir)
         bkup_c = self.session.open_cursor('backup:', None, None)
 
         # Now create and populate the new table. Make sure the log records
         # are on disk and will be copied to the backup.
         self.session.create(self.newuri, "key_format=S,value_format=S")
-        c = self.session.open_cursor(self.newuri)
-        for i in range(0, self.nops):
-            key = 'key' + str(i)
-            val = 'value' + str(i)
-            c[key] = val
-        c.close()
+        self.add_data(self.newuri, 'key', 'value')
         self.session.log_flush('sync=on')
 
-        # Now copy the files returned by the backup cursor.  This will
-        # include the log file that has updates for the newly created table.
-        while True:
-            ret = bkup_c.next()
-            if ret != 0:
-                break
-            newfile = bkup_c.get_key()
-            sz = os.path.getsize(newfile)
-            self.pr('Copy from: ' + newfile + ' (' + str(sz) + ') to ' + self.dir)
-            shutil.copy(newfile, self.dir)
-        self.assertEqual(ret, wiredtiger.WT_NOTFOUND)
+        # Now copy the files using full backup. This should not include the newly
+        # created table.
+        all_files = self.take_full_backup(self.dir, bkup_c)
+        orig_logs = [file for file in all_files if "WiredTigerLog" in file]
+        self.assertFalse(self.newuri in all_files)
+
+        # Now open a duplicate backup cursor and copy all the logs into the backup directory.
+        dup_logs = self.take_log_backup(bkup_c, self.dir, orig_logs)
         bkup_c.close()
 
         # After the full backup, open and recover the backup database.
@@ -112,6 +90,3 @@ class test_backup07(wttest.WiredTigerTestCase, suite_subprocess):
         # records for the newly created table file id.
         backup_conn = self.wiredtiger_open(self.dir)
         backup_conn.close()
-
-if __name__ == '__main__':
-    wttest.run()

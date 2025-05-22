@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,9 +29,8 @@
 
 #pragma once
 
-#include "mongo/platform/basic.h"
-
 #include <boost/filesystem.hpp>
+#include <boost/filesystem/path.hpp>
 
 #include "mongo/base/status.h"
 

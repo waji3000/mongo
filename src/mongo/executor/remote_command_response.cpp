@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,65 +27,62 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <boost/optional.hpp>
+#include <fmt/format.h>
+#include <utility>
 
-#include "mongo/executor/remote_command_response.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
 
+#include "mongo/base/string_data.h"
 #include "mongo/bson/simple_bsonobj_comparator.h"
+#include "mongo/executor/remote_command_response.h"
 #include "mongo/rpc/reply_interface.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/duration.h"
 
 namespace mongo {
 namespace executor {
 
-RemoteCommandResponse::RemoteCommandResponse(ErrorCodes::Error code, std::string reason)
-    : status(code, reason){};
-
-RemoteCommandResponse::RemoteCommandResponse(ErrorCodes::Error code,
-                                             std::string reason,
-                                             Milliseconds millis)
-    : elapsedMillis(millis), status(code, reason) {}
-
-RemoteCommandResponse::RemoteCommandResponse(Status s) : status(std::move(s)) {
+RemoteCommandResponse::RemoteCommandResponse(HostAndPort hp, Status s)
+    : status(std::move(s)), target(std::move(hp)) {
     invariant(!isOK());
-};
+}
 
-RemoteCommandResponse::RemoteCommandResponse(Status s, Milliseconds millis)
-    : elapsedMillis(millis), status(std::move(s)) {
+RemoteCommandResponse::RemoteCommandResponse(HostAndPort hp, Status s, Microseconds elapsed)
+    : elapsed(elapsed.count() == 0 ? boost::none : boost::make_optional(elapsed)),
+      status(std::move(s)),
+      target(std::move(hp)) {
     invariant(!isOK());
-};
+}
 
-RemoteCommandResponse::RemoteCommandResponse(BSONObj dataObj, Milliseconds millis)
-    : data(std::move(dataObj)), elapsedMillis(millis) {
+RemoteCommandResponse::RemoteCommandResponse(HostAndPort hp,
+                                             BSONObj dataObj,
+                                             Microseconds elapsed,
+                                             bool moreToCome)
+    : data(std::move(dataObj)), elapsed(elapsed), moreToCome(moreToCome), target(std::move(hp)) {
     // The buffer backing the default empty BSONObj has static duration so it is effectively
     // owned.
     invariant(data.isOwned() || data.objdata() == BSONObj().objdata());
-};
-
-RemoteCommandResponse::RemoteCommandResponse(Message messageArg,
-                                             BSONObj dataObj,
-                                             Milliseconds millis)
-    : message(std::make_shared<const Message>(std::move(messageArg))),
-      data(std::move(dataObj)),
-      elapsedMillis(millis) {
-    if (!data.isOwned()) {
-        data.shareOwnershipWith(message->sharedBuffer());
-    }
-}
-
-// TODO(amidvidy): we currently discard output docs when we use this constructor. We should
-// have RCR hold those too, but we need more machinery before that is possible.
-RemoteCommandResponse::RemoteCommandResponse(const rpc::ReplyInterface& rpcReply,
-                                             Milliseconds millis)
-    : RemoteCommandResponse(rpcReply.getCommandReply(), std::move(millis)) {}
-
-bool RemoteCommandResponse::isOK() const {
-    return status.isOK();
 }
 
 std::string RemoteCommandResponse::toString() const {
-    return str::stream() << "RemoteResponse -- "
-                         << " cmd:" << data.toString();
+    return fmt::format(
+        "RemoteResponse -- "
+        " cmd: {}"
+        " target: {}"
+        " status: {}"
+        " elapsedMicros: {}"
+        " moreToCome: {}",
+        data.toString(),
+        target.toString(),
+        status.toString(),
+        elapsed ? StringData(elapsed->toString()) : "n/a"_sd,
+        moreToCome);
+}
+
+bool RemoteCommandResponse::isOK() const {
+    return status.isOK();
 }
 
 bool RemoteCommandResponse::operator==(const RemoteCommandResponse& rhs) const {
@@ -94,7 +90,7 @@ bool RemoteCommandResponse::operator==(const RemoteCommandResponse& rhs) const {
         return true;
     }
     SimpleBSONObjComparator bsonComparator;
-    return bsonComparator.evaluate(data == rhs.data) && elapsedMillis == rhs.elapsedMillis;
+    return bsonComparator.evaluate(data == rhs.data) && elapsed == rhs.elapsed;
 }
 
 bool RemoteCommandResponse::operator!=(const RemoteCommandResponse& rhs) const {
@@ -104,6 +100,34 @@ bool RemoteCommandResponse::operator!=(const RemoteCommandResponse& rhs) const {
 std::ostream& operator<<(std::ostream& os, const RemoteCommandResponse& response) {
     return os << response.toString();
 }
+
+RemoteCommandResponse RemoteCommandResponse::make_forTest(Status s) {
+    return RemoteCommandResponse(std::move(s));
+}
+
+RemoteCommandResponse RemoteCommandResponse::make_forTest(Status s, Microseconds elapsed) {
+    return RemoteCommandResponse(std::move(s), elapsed);
+}
+
+RemoteCommandResponse RemoteCommandResponse::make_forTest(BSONObj dataObj,
+                                                          Microseconds elapsed,
+                                                          bool moreToCome) {
+    return RemoteCommandResponse(std::move(dataObj), elapsed, moreToCome);
+}
+
+RemoteCommandResponse::RemoteCommandResponse(Status s) : status(std::move(s)) {
+    invariant(!isOK());
+}
+
+RemoteCommandResponse::RemoteCommandResponse(Status s, Microseconds elapsed)
+    : elapsed(elapsed.count() == 0 ? boost::none : boost::make_optional(elapsed)),
+      status(std::move(s)) {
+    invariant(!isOK());
+}
+
+RemoteCommandResponse::RemoteCommandResponse(BSONObj dataObj, Microseconds elapsed, bool moreToCome)
+    : data(std::move(dataObj)), elapsed(elapsed), moreToCome(moreToCome) {}
+
 
 }  // namespace executor
 }  // namespace mongo

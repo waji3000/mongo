@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,11 +27,13 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <cstddef>
+#include <cstdint>
+#include <string>
 
+#include "mongo/base/string_data.h"
 #include "mongo/unittest/death_test.h"
 #include "mongo/unittest/unittest.h"
-#include "mongo/util/assert_util.h"
 #include "mongo/util/secure_zero_memory.h"
 
 namespace mongo {
@@ -43,7 +44,7 @@ TEST(SecureZeroMemoryTest, zeroZeroLengthNull) {
     ASSERT_TRUE(true);
 }
 
-DEATH_TEST(SecureZeroMemoryTest, zeroNonzeroLengthNull, "Fatal Assertion") {
+DEATH_TEST(SecureZeroMemoryTest, zeroNonzeroLengthNull, "Fatal assertion") {
     void* ptr = nullptr;
     secureZeroMemory(ptr, 1000);
 }

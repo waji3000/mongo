@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,11 +27,14 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
 
-#include "mongo/db/matcher/expression_text_base.h"
-
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/util/builder.h"
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/fts/fts_query.h"
+#include "mongo/db/matcher/expression_text_base.h"
 
 namespace mongo {
 
@@ -42,29 +44,25 @@ const bool TextMatchExpressionBase::kDiacriticSensitiveDefault = false;
 TextMatchExpressionBase::TextMatchExpressionBase(StringData path)
     : LeafMatchExpression(TEXT, path) {}
 
-void TextMatchExpressionBase::debugString(StringBuilder& debug, int level) const {
+void TextMatchExpressionBase::debugString(StringBuilder& debug, int indentationLevel) const {
     const fts::FTSQuery& ftsQuery = getFTSQuery();
-    _debugAddSpace(debug, level);
+    _debugAddSpace(debug, indentationLevel);
     debug << "TEXT : query=" << ftsQuery.getQuery() << ", language=" << ftsQuery.getLanguage()
           << ", caseSensitive=" << ftsQuery.getCaseSensitive()
-          << ", diacriticSensitive=" << ftsQuery.getDiacriticSensitive() << ", tag=";
-    MatchExpression::TagData* td = getTag();
-    if (NULL != td) {
-        td->debugString(&debug);
-    } else {
-        debug << "NULL";
-    }
-    debug << "\n";
+          << ", diacriticSensitive=" << ftsQuery.getDiacriticSensitive();
+    _debugStringAttachTagInfo(&debug);
 }
 
-void TextMatchExpressionBase::serialize(BSONObjBuilder* out) const {
+void TextMatchExpressionBase::serialize(BSONObjBuilder* out,
+                                        const SerializationOptions& opts,
+                                        bool includePath) const {
     const fts::FTSQuery& ftsQuery = getFTSQuery();
     out->append("$text",
-                BSON("$search" << ftsQuery.getQuery() << "$language" << ftsQuery.getLanguage()
-                               << "$caseSensitive"
-                               << ftsQuery.getCaseSensitive()
+                BSON("$search" << opts.serializeLiteral(ftsQuery.getQuery()) << "$language"
+                               << opts.serializeLiteral(ftsQuery.getLanguage()) << "$caseSensitive"
+                               << opts.serializeLiteral(ftsQuery.getCaseSensitive())
                                << "$diacriticSensitive"
-                               << ftsQuery.getDiacriticSensitive()));
+                               << opts.serializeLiteral(ftsQuery.getDiacriticSensitive())));
 }
 
 bool TextMatchExpressionBase::equivalent(const MatchExpression* other) const {

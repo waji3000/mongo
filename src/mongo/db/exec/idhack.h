@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -32,10 +31,17 @@
 
 #include <memory>
 
-#include "mongo/db/catalog/collection.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/db/exec/plan_stage.h"
+#include "mongo/db/exec/plan_stats.h"
+#include "mongo/db/exec/requires_index_stage.h"
+#include "mongo/db/exec/working_set.h"
+#include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/query/canonical_query.h"
-#include "mongo/db/record_id.h"
+#include "mongo/db/query/plan_executor.h"
+#include "mongo/db/query/stage_types.h"
+#include "mongo/db/storage/record_store.h"
 
 namespace mongo {
 
@@ -47,45 +53,43 @@ class RecordCursor;
  * the _id index always has the collection default collation, the IDHackStage can only be used when
  * the query's collation is equal to the collection default.
  */
-class IDHackStage final : public PlanStage {
+class IDHackStage final : public RequiresIndexStage {
 public:
     /** Takes ownership of all the arguments -collection. */
-    IDHackStage(OperationContext* opCtx,
-                const Collection* collection,
+    IDHackStage(ExpressionContext* expCtx,
                 CanonicalQuery* query,
                 WorkingSet* ws,
+                VariantCollectionPtrOrAcquisition collection,
                 const IndexDescriptor* descriptor);
 
-    IDHackStage(OperationContext* opCtx,
-                Collection* collection,
+    IDHackStage(ExpressionContext* expCtx,
                 const BSONObj& key,
                 WorkingSet* ws,
+                VariantCollectionPtrOrAcquisition collection,
                 const IndexDescriptor* descriptor);
 
-    ~IDHackStage();
+    ~IDHackStage() override;
 
-    bool isEOF() final;
+    bool isEOF() const final;
     StageState doWork(WorkingSetID* out) final;
 
-    void doSaveState() final;
-    void doRestoreState() final;
     void doDetachFromOperationContext() final;
     void doReattachToOperationContext() final;
-
-    /**
-     * ID Hack has a very strict criteria for the queries it supports.
-     */
-    static bool supportsQuery(Collection* collection, const CanonicalQuery& query);
 
     StageType stageType() const final {
         return STAGE_IDHACK;
     }
 
-    std::unique_ptr<PlanStageStats> getStats();
+    std::unique_ptr<PlanStageStats> getStats() override;
 
     const SpecificStats* getSpecificStats() const final;
 
     static const char* kStageType;
+
+protected:
+    void doSaveStateRequiresIndex() final;
+
+    void doRestoreStateRequiresIndex() final;
 
 private:
     /**
@@ -95,25 +99,19 @@ private:
      */
     StageState advance(WorkingSetID id, WorkingSetMember* member, WorkingSetID* out);
 
-    // Not owned here.
-    const Collection* _collection;
-
     std::unique_ptr<SeekableRecordCursor> _recordCursor;
 
     // The WorkingSet we annotate with results.  Not owned by us.
     WorkingSet* _workingSet;
 
-    // Not owned here.
-    const IndexAccessMethod* _accessMethod;
-
     // The value to match against the _id field.
     BSONObj _key;
 
     // Have we returned our one document?
-    bool _done;
+    bool _done = false;
 
     // Do we need to add index key metadata for returnKey?
-    bool _addKeyMetadata;
+    bool _addKeyMetadata = false;
 
     IDHackStats _specificStats;
 };

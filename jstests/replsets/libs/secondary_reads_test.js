@@ -2,11 +2,9 @@
  * This is a library for testing secondary reads against a replica set
  */
 
-"use strict";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
-load("jstests/replsets/rslib.js");
-
-function SecondaryReadsTest(name = "secondary_reads_test") {
+export function SecondaryReadsTest(name = "secondary_reads_test") {
     let rst = performStandardSetup();
     let dbName = name;
 
@@ -14,7 +12,7 @@ function SecondaryReadsTest(name = "secondary_reads_test") {
     let primaryDB = primary.getDB(dbName);
     let secondary = rst.getSecondary();
     let secondaryDB = secondary.getDB(dbName);
-    secondaryDB.getMongo().setSlaveOk();
+    secondaryDB.getMongo().setSecondaryOk();
 
     let readers = [];
     let signalColl = "signalColl";
@@ -36,13 +34,12 @@ function SecondaryReadsTest(name = "secondary_reads_test") {
     }
 
     this.startSecondaryReaders = function(nReaders, readFn) {
-
         let read = function() {
-            db.getMongo().setSlaveOk();
-            db = db.getSiblingDB(TestData.dbName);
+            db.getMongo().setSecondaryOk();
+            const testDb = db.getSiblingDB(TestData.dbName);
             while (true) {
                 readFn();
-                let signalDoc = db.getCollection(TestData.signalColl)
+                let signalDoc = testDb.getCollection(TestData.signalColl)
                                     .find({_id: TestData.testDoneId})
                                     .itcount();
                 if (signalDoc != 0) {
@@ -70,7 +67,6 @@ function SecondaryReadsTest(name = "secondary_reads_test") {
     // The returned function will return once the batch has reached the point where it has applied
     // but not updated the last applied optime.
     this.pauseSecondaryBatchApplication = function() {
-
         clearRawMongoProgramOutput();
 
         assert.commandWorked(
@@ -78,7 +74,7 @@ function SecondaryReadsTest(name = "secondary_reads_test") {
 
         return function() {
             assert.soon(function() {
-                return rawMongoProgramOutput().match(failPoint + " fail point enabled");
+                return rawMongoProgramOutput("fail point enabled").match(failPoint);
             });
         };
     };
@@ -99,10 +95,10 @@ function SecondaryReadsTest(name = "secondary_reads_test") {
     this.stopReaders = function() {
         print("signaling readers to stop...");
         assert.gt(readers.length, 0, "no readers to stop");
-        assert.writeOK(primaryDB.getCollection(signalColl).insert({_id: testDoneId}));
+        assert.commandWorked(primaryDB.getCollection(signalColl).insert({_id: testDoneId}));
         for (let i = 0; i < readers.length; i++) {
-            const await = readers[i];
-            await();
+            const awaitReader = readers[i];
+            awaitReader();
             print("reader " + i + " done");
         }
         readers = [];

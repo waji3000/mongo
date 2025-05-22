@@ -3,30 +3,44 @@
  *
  * Unlike run_check_repl_dbhash.js, this version of the hook doesn't require that all operations
  * have finished replicating, nor does it require that the test has finished running. The dbHash
- * command is run inside of a transaction specifying atClusterTime in order for an identical
- * snapshot to be used by all members of the replica set.
+ * command reads at a particular clusterTime in order for an identical snapshot to be used by all
+ * members of the replica set.
  *
- * The find and getMore commands used to generate the collection diff run as part of the same
- * transaction as the dbHash command. This ensures the diagnostics for a dbhash mismatch aren't
- * subjected to changes from any operations in flight.
+ * The find and getMore commands used to generate the collection diff read at the same clusterTime
+ * as the dbHash command. While this ensures the diagnostics for a dbhash mismatch aren't subjected
+ * to changes from any operations in flight, it is possible for the collection or an index on the
+ * collection to be dropped due to no locks being held.
  *
- * If a transient transaction error occurs, then the dbhash check is retried until it succeeds, or
- * until it fails with a non-transient error.
+ * If a transient error occurs, then the dbhash check is retried until it succeeds, or until it
+ * fails with a non-transient error. The most common case of a transient error is attempting to read
+ * from a collection after a catalog operation has been performed on the collection or database.
  */
-'use strict';
+import {DiscoverTopology, Topology} from "jstests/libs/discover_topology.js";
+import {Thread} from "jstests/libs/parallelTester.js";
 
-(function() {
-    load('jstests/libs/discover_topology.js');  // For Topology and DiscoverTopology.
+if (typeof db === 'undefined') {
+    throw new Error(
+        "Expected mongo shell to be connected a server, but global 'db' object isn't defined");
+}
 
-    if (typeof db === 'undefined') {
-        throw new Error(
-            "Expected mongo shell to be connected a server, but global 'db' object isn't defined");
-    }
+// We turn off printing the JavaScript stacktrace in doassert() to avoid generating an
+// overwhelming amount of log messages when handling transient errors.
+TestData = TestData || {};
+TestData.traceExceptions = false;
 
-    // We turn off printing the JavaScript stacktrace in doassert() to avoid generating an
-    // overwhelming amount of log messages when handling transient transaction errors.
-    TestData = TestData || {};
-    TestData.traceExceptions = false;
+// Disable implicit sessions so FSM workloads that kill random sessions won't interrupt the
+// operations in this test that aren't resilient to interruptions.
+TestData.disableImplicitSessions = true;
+
+const buildInfo = assert.commandWorked(db.runCommand({"buildInfo": 1}));
+const conn = db.getMongo();
+const topology = DiscoverTopology.findConnectedNodes(conn);
+
+async function checkReplDbhashBackgroundThread(hosts) {
+    const {ReplSetTest} = await import("jstests/libs/replsettest.js");
+    const {RetryableWritesUtil} = await import("jstests/libs/retryable_writes_util.js");
+
+    let debugInfo = [];
 
     // Calls 'func' with the print() function overridden to be a no-op.
     const quietly = (func) => {
@@ -39,22 +53,21 @@
         }
     };
 
-    const conn = db.getMongo();
-    const topology = DiscoverTopology.findConnectedNodes(conn);
-
-    if (topology.type !== Topology.kReplicaSet) {
-        throw new Error('Unsupported topology configuration: ' + tojson(topology));
-    }
-
     let rst;
-
-    // We construct the ReplSetTest instance with the print() function overridden to be a no-op in
-    // order to suppress the log messages about the replica set configuration. The
+    // We construct the ReplSetTest instance with the print() function overridden to be a no-op
+    // in order to suppress the log messages about the replica set configuration. The
     // run_check_repl_dbhash_background.js hook is executed frequently by resmoke.py and would
     // otherwise lead to generating an overwhelming amount of log messages.
     quietly(() => {
-        rst = new ReplSetTest(topology.nodes[0]);
+        rst = new ReplSetTest(hosts[0]);
     });
+
+    if (!rst.getPrimary().adminCommand("serverStatus").storageEngine.supportsSnapshotReadConcern) {
+        print("Skipping data consistency checks for replica set: " + rst.getURL() +
+              " because storage engine does not support snapshot reads.");
+        return {ok: 1};
+    }
+    print("Running data consistency checks for replica set: " + rst.getURL());
 
     const sessions = [
         rst.getPrimary(),
@@ -64,97 +77,108 @@
     ].map(conn => conn.startSession({causalConsistency: false}));
 
     const resetFns = [];
-    const kForeverSeconds = 1e9;
-    const dbNames = new Set();
+    const dbs = new Map();
 
-    // We enable the "WTPreserveSnapshotHistoryIndefinitely" failpoint and extend the
-    // "transactionLifetimeLimitSeconds" server parameter to ensure that
-    //
-    //   (1) the same snapshot will be available to read at on the primary and secondaries, and
-    //
-    //   (2) the potentally long-running transaction isn't killed while we are part-way through
-    //       verifying data consistency.
+    // We enable the "WTPreserveSnapshotHistoryIndefinitely" failpoint to ensure that the same
+    // snapshot will be available to read at on the primary and secondaries.
     for (let session of sessions) {
-        const db = session.getDatabase('admin');
+        // Use the session's client directly so FSM workloads that kill random sessions won't
+        // interrupt these operations.
+        const dbNoSession = session.getClient().getDB('admin');
 
-        assert.commandWorked(db.runCommand({
+        let preserveRes = assert.commandWorked(dbNoSession.runCommand({
             configureFailPoint: 'WTPreserveSnapshotHistoryIndefinitely',
             mode: 'alwaysOn',
-        }));
+        }),
+                                               debugInfo);
+        debugInfo.push({
+            "node": dbNoSession.getMongo(),
+            "session": session,
+            "preserveFailPointOpTime": preserveRes['operationTime']
+        });
 
         resetFns.push(() => {
-            assert.commandWorked(db.runCommand({
+            assert.commandWorked(dbNoSession.runCommand({
                 configureFailPoint: 'WTPreserveSnapshotHistoryIndefinitely',
                 mode: 'off',
             }));
         });
+    }
 
-        const res = assert.commandWorked(db.runCommand({
-            setParameter: 1,
-            transactionLifetimeLimitSeconds: kForeverSeconds,
-        }));
+    const multitenancyRes =
+        rst.getPrimary().adminCommand({getParameter: 1, multitenancySupport: 1});
+    const multitenancy = multitenancyRes.ok && multitenancyRes["multitenancySupport"];
 
-        const transactionLifetimeLimitSecondsOriginal = res.was;
-        resetFns.push(() => {
-            assert.commandWorked(db.runCommand({
-                setParameter: 1,
-                transactionLifetimeLimitSeconds: transactionLifetimeLimitSecondsOriginal,
-            }));
+    for (let session of sessions) {
+        // Use the session's client directly so FSM workloads that kill random sessions won't
+        // interrupt these operations.
+        const dbNoSession = session.getClient().getDB('admin');
+
+        const cmdObj = multitenancy ? {listDatabasesForAllTenants: 1} : {listDatabases: 1};
+        const res = RetryableWritesUtil.runCommandWithRetries(dbNoSession, cmdObj);
+        for (let dbInfo of res.databases) {
+            const key = `${dbInfo.tenantId}_${dbInfo.name}`;
+            const obj = {name: dbInfo.name, tenant: dbInfo.tenantId};
+            dbs.set(key, obj);
+        }
+        debugInfo.push({
+            "node": dbNoSession.getMongo(),
+            "session": session,
+            "listDatabaseOpTime": res['operationTime']
         });
     }
 
-    // We run the "listDatabases" command on each of the nodes after having enabled the
-    // "WTPreserveSnapshotHistoryIndefinitely" failpoint on all of the nodes so that
-    // 'sessions[0].getOperationTime()' is guaranteed to be greater than the clusterTime at which
-    // the secondaries have stopped truncating their snapshot history.
-    for (let session of sessions) {
-        const db = session.getDatabase('admin');
-        const res = assert.commandWorked(db.runCommand({listDatabases: 1, nameOnly: true}));
-        for (let dbInfo of res.databases) {
-            dbNames.add(dbInfo.name);
+    // Transactions cannot be run on the following databases so we don't attempt to read at a
+    // clusterTime on them either. (The "local" database is also not replicated.)
+    dbs.forEach((db, key) => {
+        if (["admin", "config", "local"].includes(db.name)) {
+            dbs.delete(key);
         }
-    }
-
-    // Transactions cannot be run on the following databases. (The "local" database is also not
-    // replicated.)
-    dbNames.delete('admin');
-    dbNames.delete('config');
-    dbNames.delete('local');
+    });
 
     const results = [];
 
     // The waitForSecondaries() function waits for all secondaries to have applied up to
-    // 'clusterTime' locally. This ensures that a later atClusterTime read inside a transaction
-    // doesn't stall as a result of a pending global X lock (e.g. from a dropDatabase command) on
-    // the primary preventing getMores on the oplog from receiving a response.
-    const waitForSecondaries = (clusterTime) => {
+    // 'clusterTime' locally. This ensures that a later $_internalReadAtClusterTime read doesn't
+    // fail as a result of the secondary's clusterTime being behind 'clusterTime'.
+    const waitForSecondaries = (clusterTime, signedClusterTime) => {
+        debugInfo.push({"waitForSecondaries": clusterTime, "signedClusterTime": signedClusterTime});
         for (let i = 1; i < sessions.length; ++i) {
             const session = sessions[i];
             const db = session.getDatabase('admin');
 
-            // We advance the clusterTime on the secondary's session to ensure that 'clusterTime'
-            // doesn't exceed the node's notion of the latest clusterTime.
-            session.advanceClusterTime(sessions[0].getClusterTime());
+            // We advance the clusterTime on the secondary's session to ensure that
+            // 'clusterTime' doesn't exceed the node's notion of the latest clusterTime.
+            session.advanceClusterTime(signedClusterTime);
 
-            // We do an afterClusterTime read on a nonexistent collection to wait for the secondary
-            // to have applied up to 'clusterTime' and advanced its majority commit point.
-            assert.commandWorked(db.runCommand({
+            // We need to make sure the secondary has applied up to 'clusterTime' and advanced
+            // its majority commit point. Issue an afterClusterTime read on  a nonexistent
+            // collection and wait on it. This has the advantage of being easier to debug in case of
+            // a timeout.
+            let res = assert.commandWorked(db.runCommand({
                 find: 'run_check_repl_dbhash_background',
                 readConcern: {level: 'majority', afterClusterTime: clusterTime},
                 limit: 1,
                 singleBatch: true,
-            }));
+            }),
+                                           debugInfo);
+            debugInfo.push({
+                "node": db.getMongo(),
+                "session": session,
+                "majorityReadOpTime": res['operationTime']
+            });
         }
     };
 
-    // The checkCollectionHashesForDB() function identifies a collection by its UUID and ignores the
-    // case where a collection isn't present on a node to work around how the collection catalog
-    // isn't multi-versioned. Unlike with ReplSetTest#checkReplicatedDataHashes(), it is possible
-    // for a collection catalog operation (e.g. a drop or rename) to have been applied on the
-    // primary but not yet applied on the secondary.
-    const checkCollectionHashesForDB = (dbName) => {
+    // The checkCollectionHashesForDB() function identifies a collection by its UUID and ignores
+    // the case where a collection isn't present on a node to work around how the collection
+    // catalog isn't multi-versioned. Unlike with ReplSetTest#checkReplicatedDataHashes(), it is
+    // possible for a collection catalog operation (e.g. a drop or rename) to have been applied
+    // on the primary but not yet applied on the secondary.
+    const checkCollectionHashesForDB = (dbName, clusterTime) => {
         const result = [];
-        const hashes = rst.getHashesUsingSessions(sessions, dbName);
+        const hashes =
+            rst.getHashesUsingSessions(sessions, dbName, {readAtClusterTime: clusterTime});
         const hashesByUUID = hashes.map((response, i) => {
             const info = {};
 
@@ -199,8 +223,11 @@
                 }
 
                 if (primaryInfo.hash !== secondaryInfo.hash) {
-                    const diff = rst.getCollectionDiffUsingSessions(
-                        primarySession, secondarySession, dbName, primaryInfo.uuid);
+                    print("DBHash mismatch found for collection with uuid: " + uuid +
+                          ". Primary info: " + tojsononeline(primaryInfo) +
+                          ". Secondary info: " + tojsononeline(secondaryInfo));
+                    const diff = DataConsistencyChecker.getCollectionDiffUsingSessions(
+                        primarySession, secondarySession, dbName, primaryInfo.uuid, clusterTime);
 
                     result.push({
                         primary: primaryInfo,
@@ -215,56 +242,139 @@
         return result;
     };
 
-    for (let dbName of dbNames) {
+    // When token is not empty, set it on each connection before calling checkCollectionHashesForDB.
+    const checkCollectionHashesForDBWithToken = (dbName, clusterTime, token) => {
+        try {
+            jsTestLog(`About to run setSecurity token on ${rst}`);
+            rst.nodes.forEach(node => node._setSecurityToken(token));
+
+            jsTestLog(`Running checkcollection for ${dbName} with token ${token}`);
+            return checkCollectionHashesForDB(dbName, clusterTime);
+        } finally {
+            rst.nodes.forEach(node => node._setSecurityToken(undefined));
+        }
+    };
+
+    // Outside of checkCollectionHashesForDB(), operations in this function are not resilient to
+    // their session being killed by a concurrent FSM workload, so the driver sessions started above
+    // have not been used and will have contain null logical time values. The process for selecting
+    // a read timestamp below assumes each session has valid logical times, so run a dummy command
+    // through each session to populate its logical times.
+    sessions.forEach(session => session.getDatabase('admin').runCommand({ping: 1}));
+
+    for (const [key, db] of dbs) {
+        let result;
+        let clusterTime;
+        let previousClusterTime;
         let hasTransientError;
+        let performNoopWrite;
 
-        do {
-            const clusterTime = sessions[0].getOperationTime();
-            waitForSecondaries(clusterTime);
+        const dbName = db.name;
+        const token = db.tenant ? _createTenantToken({tenant: db.tenant}) : undefined;
 
-            for (let session of sessions) {
-                session.startTransaction(
-                    {readConcern: {level: 'snapshot', atClusterTime: clusterTime}});
+        // The isTransientError() function is responsible for setting hasTransientError to true.
+        const isTransientError = (e) => {
+            // It is possible for the ReplSetTest#getHashesUsingSessions() function to be
+            // interrupted due to active sessions being killed by a test running concurrently.
+            // We treat this as a transient error and simply retry running the dbHash check.
+            //
+            // Note that unlike auto_retry_transaction.js, we do not treat CursorKilled or
+            // CursorNotFound error responses as transient errors because the
+            // run_check_repl_dbhash_background.js hook would only establish a cursor via
+            // DataConsistencyChecker#getCollectionDiffUsingSessions() upon detecting a dbHash
+            // mismatch. It is still useful to know that a bug exists even if we cannot
+            // get more diagnostics for it.
+            if (e.code === ErrorCodes.Interrupted) {
+                hasTransientError = true;
             }
 
-            let commitErrorSessionId = undefined;
+            // Perform a no-op write to the primary if the clusterTime between each call remain
+            // the same and if we encounter the SnapshotUnavailable error as the secondaries
+            // minimum timestamp can be greater than the primaries minimum timestamp.
+            if (e.code === ErrorCodes.SnapshotUnavailable) {
+                if (bsonBinaryEqual(clusterTime, previousClusterTime)) {
+                    performNoopWrite = true;
+                }
+                hasTransientError = true;
+            }
+
+            // InvalidOptions can be returned when $_internalReadAtClusterTime is greater than
+            // the all-committed timestamp. As the dbHash command is running in the background
+            // at varying times, it's possible that we may run dbHash while a prepared
+            // transactions has yet to commit or abort.
+            if (e.code === ErrorCodes.InvalidOptions) {
+                hasTransientError = true;
+            }
+
+            // In debug builds, read-only operations can receive write conflicts when the storage
+            // engine cache is full. Since dbHash holds open a read snapshot for an extended period
+            // of time and pulls all collection data into cache, the storage engine may abort the
+            // operation if it needs to free up space. Try again after space has been freed.
+            if (e.code === ErrorCodes.WriteConflict && buildInfo.debug) {
+                hasTransientError = true;
+            }
+
+            return hasTransientError;
+        };
+
+        do {
+            // SERVER-38928: Due to races around advancing last applied, there's technically no
+            // guarantee that a primary will report a later operation time than its
+            // secondaries. Perform the snapshot read at the latest reported operation time.
+            previousClusterTime = clusterTime;
+            clusterTime = sessions[0].getOperationTime();
+            let signedClusterTime = sessions[0].getClusterTime();
+            for (let sess of sessions.slice(1)) {
+                let ts = sess.getOperationTime();
+                if (timestampCmp(ts, clusterTime) > 0) {
+                    clusterTime = ts;
+                    signedClusterTime = sess.getClusterTime();
+                }
+            }
+
             hasTransientError = false;
+            performNoopWrite = false;
 
             try {
-                const result = checkCollectionHashesForDB(dbName);
+                waitForSecondaries(clusterTime, signedClusterTime);
 
                 for (let session of sessions) {
-                    // commitTransaction() calls assert.commandWorked(), which may fail with a
-                    // WriteConflict error response, which is ignored.
-                    try {
-                        session.commitTransaction();
-                    } catch (e) {
-                        commitErrorSessionId = session.getSessionId();
-                        throw e;
-                    }
+                    debugInfo.push({
+                        "node": session.getClient(),
+                        "session": session,
+                        "readAtClusterTime": clusterTime
+                    });
                 }
 
-                for (let mismatchInfo of result) {
-                    mismatchInfo.atClusterTime = clusterTime;
-                    results.push(mismatchInfo);
-                }
+                result = checkCollectionHashesForDBWithToken(dbName, clusterTime, token);
             } catch (e) {
-                for (let session of sessions) {
-                    if ((commitErrorSessionId === undefined) ||
-                        bsonWoCompare(session.getSessionId(), commitErrorSessionId) !== 0) {
-                        session.abortTransaction_forTesting();
-                    }
-                }
+                if (isTransientError(e)) {
+                    if (performNoopWrite) {
+                        // Use the session's client directly so FSM workloads that kill random
+                        // sessions won't interrupt appendOplogNote.
+                        const primaryConn = sessions[0].getClient();
 
-                if (e.hasOwnProperty('errorLabels') &&
-                    e.errorLabels.includes('TransientTransactionError')) {
-                    hasTransientError = true;
+                        // If the no-op write fails due to the global lock not being able to be
+                        // acquired within 1 millisecond, retry the operation again at a later
+                        // time.
+                        assert.commandWorkedOrFailedWithCode(
+                            primaryConn.adminCommand({appendOplogNote: 1, data: {}}),
+                            ErrorCodes.LockFailed);
+                    }
+
+                    debugInfo.push({"transientError": e, "performNoopWrite": performNoopWrite});
                     continue;
                 }
 
+                jsTestLog(debugInfo);
                 throw e;
             }
         } while (hasTransientError);
+
+        for (let mismatchInfo of result) {
+            mismatchInfo.atClusterTime = clusterTime;
+            results.push(mismatchInfo);
+        }
     }
 
     for (let resetFn of resetFns) {
@@ -292,28 +402,26 @@
         if (diff.docsWithDifferentContents.length > 0) {
             errorBlob += '\nThe following documents have different contents on the primary and' +
                 ' secondary:';
-            for (let {
-                     primary, secondary
-                 } of diff.docsWithDifferentContents) {
-                errorBlob += `\n  primary:   ${tojsononeline(primary)}`;
-                errorBlob += `\n  secondary: ${tojsononeline(secondary)}`;
+            for (let {sourceNode, syncingNode} of diff.docsWithDifferentContents) {
+                errorBlob += `\n  primary:   ${tojsononeline(sourceNode)}`;
+                errorBlob += `\n  secondary: ${tojsononeline(syncingNode)}`;
             }
         } else {
             errorBlob += '\nNo documents have different contents on the primary and secondary';
         }
 
-        if (diff.docsMissingOnPrimary.length > 0) {
+        if (diff.docsMissingOnSource.length > 0) {
             errorBlob += "\nThe following documents aren't present on the primary:";
-            for (let doc of diff.docsMissingOnPrimary) {
+            for (let doc of diff.docsMissingOnSource) {
                 errorBlob += `\n  ${tojsononeline(doc)}`;
             }
         } else {
             errorBlob += '\nNo documents are missing from the primary';
         }
 
-        if (diff.docsMissingOnSecondary.length > 0) {
+        if (diff.docsMissingOnSyncing.length > 0) {
             errorBlob += "\nThe following documents aren't present on the secondary:";
-            for (let doc of diff.docsMissingOnSecondary) {
+            for (let doc of diff.docsMissingOnSyncing) {
                 errorBlob += `\n  ${tojsononeline(doc)}`;
             }
         } else {
@@ -329,6 +437,76 @@
         }
 
         print(errorBlob);
-        throw new Error(`dbhash mismatch (search for the following headings): ${tojson(headings)}`);
+        return {
+            ok: 0,
+            hosts: hosts,
+            error: `dbhash mismatch (search for the following headings): ${tojson(headings)}`
+        };
     }
-})();
+
+    return {ok: 1};
+}
+
+if (topology.type === Topology.kReplicaSet) {
+    let res = await checkReplDbhashBackgroundThread(topology.nodes);
+    assert.commandWorked(res, () => 'data consistency checks failed: ' + tojson(res));
+} else if (topology.type === Topology.kShardedCluster) {
+    const threads = [];
+    try {
+        if (topology.configsvr.nodes.length > 1) {
+            const thread = new Thread(checkReplDbhashBackgroundThread, topology.configsvr.nodes);
+            threads.push(thread);
+            thread.start();
+        } else {
+            print('Skipping data consistency checks for 1-node CSRS: ' +
+                  tojsononeline(topology.configsvr));
+        }
+
+        for (let shardName of Object.keys(topology.shards)) {
+            const shard = topology.shards[shardName];
+
+            if (shard.type === Topology.kStandalone) {
+                print('Skipping data consistency checks for stand-alone shard ' + shardName + ": " +
+                      tojsononeline(shard));
+                continue;
+            }
+
+            if (shard.type !== Topology.kReplicaSet) {
+                throw new Error('Unrecognized topology format: ' + tojson(topology));
+            }
+
+            if (shard.nodes.length > 1) {
+                const thread = new Thread(checkReplDbhashBackgroundThread, shard.nodes);
+                threads.push(thread);
+                thread.start();
+            } else {
+                print('Skipping data consistency checks for stand-alone shard ' + shardName + ": " +
+                      tojsononeline(shard));
+            }
+        }
+    } finally {
+        // Wait for each thread to finish. Throw an error if any thread fails.
+        let exception;
+        const returnData = threads.map(thread => {
+            try {
+                thread.join();
+                return thread.returnData();
+            } catch (e) {
+                if (!exception) {
+                    exception = e;
+                }
+            }
+        });
+        if (exception) {
+            // eslint-disable-next-line
+            throw exception;
+        }
+
+        returnData.forEach(res => {
+            assert.commandWorked(
+                res, () => 'data consistency checks (point-in-time) failed: ' + tojson(res));
+        });
+    }
+} else {
+    throw new Error('Unsupported topology configuration: ' + tojson(topology));
+}

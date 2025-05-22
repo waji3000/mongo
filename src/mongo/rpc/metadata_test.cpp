@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,20 +27,29 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
+#include <cstddef>
+#include <initializer_list>
+#include <memory>
 #include <utility>
+#include <vector>
 
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/json.h"
-#include "mongo/db/dbmessage.h"
-#include "mongo/db/jsobj.h"
+#include "mongo/db/tenant_id.h"
 #include "mongo/rpc/metadata.h"
+#include "mongo/stdx/type_traits.h"
 #include "mongo/unittest/unittest.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/shared_buffer.h"
 
 namespace {
 using namespace mongo;
 using namespace mongo::rpc;
-using mongo::unittest::assertGet;
 
 BSONObj addDollarDB(BSONObj command, StringData db) {
     return BSONObjBuilder(std::move(command)).append("$db", db).obj();
@@ -51,7 +59,9 @@ void checkUpconvert(const BSONObj& legacyCommand,
                     const int legacyQueryFlags,
                     BSONObj upconvertedCommand) {
     upconvertedCommand = addDollarDB(std::move(upconvertedCommand), "db");
-    auto converted = upconvertRequest("db", legacyCommand, legacyQueryFlags);
+    auto converted = upconvertRequest(DatabaseName::createDatabaseName_forTest(boost::none, "db"),
+                                      legacyCommand,
+                                      legacyQueryFlags);
 
     // We don't care about the order of the fields in the metadata object
     const auto sorted = [](const BSONObj& obj) {
@@ -67,90 +77,44 @@ void checkUpconvert(const BSONObj& legacyCommand,
 }
 
 TEST(Metadata, UpconvertValidMetadata) {
-    // Wrapped in $query, with readPref and slaveOk bit set.
-    checkUpconvert(BSON("$query" << BSON("ping" << 1) <<  //
-                        "$readPreference"
-                                 << BSON("mode"
-                                         << "secondary")),
-                   mongo::QueryOption_SlaveOk,
-                   BSON("ping" << 1 << "$readPreference" << BSON("mode"
-                                                                 << "secondary")));
-
-    // Wrapped in 'query', with readPref.
-    checkUpconvert(BSON("query" << BSON("pong" << 1 << "foo"
-                                               << "bar")
-                                << "$readPreference"
-                                << BSON("mode"
-                                        << "primary"
-                                        << "tags"
-                                        << BSON("dc"
-                                                << "ny"))),
-                   0,
-                   BSON("pong" << 1 << "foo"
-                               << "bar"
-                               << "$readPreference"
-                               << BSON("mode"
-                                       << "primary"
-                                       << "tags"
-                                       << BSON("dc"
-                                               << "ny"))));
     // Unwrapped, no readPref, no slaveOk
     checkUpconvert(BSON("ping" << 1), 0, BSON("ping" << 1));
 
     // Readpref wrapped in $queryOptions
-    checkUpconvert(BSON("pang"
-                        << "pong"
-                        << "$queryOptions"
-                        << BSON("$readPreference" << BSON("mode"
-                                                          << "nearest"
-                                                          << "tags"
-                                                          << BSON("rack"
-                                                                  << "city")))),
-                   0,
-                   BSON("pang"
-                        << "pong"
-                        << "$readPreference"
-                        << BSON("mode"
-                                << "nearest"
-                                << "tags"
-                                << BSON("rack"
-                                        << "city"))));
+    checkUpconvert(
+        BSON("pang" << "pong"
+                    << "$queryOptions"
+                    << BSON("$readPreference" << BSON("mode" << "nearest"
+                                                             << "tags" << BSON("rack" << "city")))),
+        0,
+        BSON("pang" << "pong"
+                    << "$readPreference"
+                    << BSON("mode" << "nearest"
+                                   << "tags" << BSON("rack" << "city"))));
 }
 
-TEST(Metadata, UpconvertInvalidMetadata) {
-    // has $maxTimeMS option
-    ASSERT_THROWS_CODE(upconvertRequest("db",
-                                        BSON("query" << BSON("foo"
-                                                             << "bar")
-                                                     << "$maxTimeMS"
-                                                     << 200),
-                                        0),
-                       AssertionException,
-                       ErrorCodes::InvalidOptions);
-    ASSERT_THROWS_CODE(upconvertRequest("db",
-                                        BSON("$query" << BSON("foo"
-                                                              << "bar")
-                                                      << "$maxTimeMS"
-                                                      << 200),
-                                        0),
-                       AssertionException,
-                       ErrorCodes::InvalidOptions);
+TEST(Metadata, UpconvertDuplicateReadPreference) {
+    auto secondaryReadPref = BSON("mode" << "secondary");
+    auto nearestReadPref = BSON("mode" << "nearest");
 
-    // invalid wrapped query
-    ASSERT_THROWS(upconvertRequest("db", BSON("$query" << 1), 0), AssertionException);
-    ASSERT_THROWS(upconvertRequest("db",
-                                   BSON("$query"
-                                        << ""),
-                                   0),
-                  AssertionException);
-    ASSERT_THROWS(upconvertRequest("db", BSON("query" << 0), 0), AssertionException);
-    ASSERT_THROWS(upconvertRequest("db",
-                                   BSON("query"
-                                        << ""),
-                                   0),
-                  AssertionException);
+    BSONObjBuilder bob;
+    bob.append("$queryOptions", BSON("$readPreference" << secondaryReadPref));
+    bob.append("$readPreference", nearestReadPref);
+
+    ASSERT_THROWS_CODE(
+        rpc::upconvertRequest(
+            DatabaseName::createDatabaseName_forTest(boost::none, "db"), bob.obj(), 0),
+        AssertionException,
+        ErrorCodes::InvalidOptions);
 }
 
+TEST(Metadata, UpconvertOnlyExtractsReadPreference) {
+    const auto dbName = DatabaseName::createDatabaseName_forTest(boost::none, "db");
+    auto legacyCmdObj = fromjson(
+        "{aggregate: 'someCollection', $queryOptions: {someRandomField: 'Hello, world!'}}");
+    auto expectedCmdObj = fromjson("{aggregate: 'someCollection'}");
+    checkUpconvert(legacyCmdObj, /* queryFlags */ 0, expectedCmdObj);
+}
 
 TEST(Metadata, UpconvertUsesDocumentSequecesCorrectly) {
     // These are cases where it is valid to use document sequences.
@@ -170,8 +134,9 @@ TEST(Metadata, UpconvertUsesDocumentSequecesCorrectly) {
         fromjson("{NOT_insert: 'coll', documents:[{a:1}]}"),
     };
 
-    for (auto cmd : valid) {
-        const auto converted = rpc::upconvertRequest("db", cmd, 0);
+    for (const auto& cmd : valid) {
+        const auto converted = rpc::upconvertRequest(
+            DatabaseName::createDatabaseName_forTest(boost::none, "db"), cmd, 0);
         ASSERT_BSONOBJ_EQ(converted.body, fromjson("{insert: 'coll', $db: 'db'}"));
         ASSERT_EQ(converted.sequences.size(), 1u);
         ASSERT_EQ(converted.sequences[0].name, "documents");
@@ -192,8 +157,9 @@ TEST(Metadata, UpconvertUsesDocumentSequecesCorrectly) {
         }
     }
 
-    for (auto cmd : invalid) {
-        const auto converted = rpc::upconvertRequest("db", cmd, 0);
+    for (const auto& cmd : invalid) {
+        const auto converted = rpc::upconvertRequest(
+            DatabaseName::createDatabaseName_forTest(boost::none, "db"), cmd, 0);
         ASSERT_BSONOBJ_EQ(converted.body, addDollarDB(cmd, "db"));
         ASSERT_EQ(converted.sequences.size(), 0u);
     }

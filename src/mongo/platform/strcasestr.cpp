@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,25 +29,16 @@
 
 #include "mongo/platform/strcasestr.h"
 
-#if defined(__sun)
-#include <dlfcn.h>
-
-#include "mongo/base/init.h"
-#include "mongo/base/status.h"
-#endif
-
-#if defined(_WIN32) || defined(__sun)
+#if defined(_WIN32)
 
 #include <algorithm>
-#include <cctype>
 #include <cstring>
 #include <string>
 
-#if defined(__sun)
-#define STRCASESTR_EMULATION_NAME strcasestr_emulation
-#else
 #define STRCASESTR_EMULATION_NAME strcasestr
-#endif
+
+#include "mongo/util/ctype.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 namespace pal {
@@ -61,52 +51,18 @@ namespace pal {
  * @return              ptr to start of 'needle' within 'haystack' if found, NULL otherwise
  */
 const char* STRCASESTR_EMULATION_NAME(const char* haystack, const char* needle) {
-    std::string haystackLower(haystack);
-    std::transform(haystackLower.begin(), haystackLower.end(), haystackLower.begin(), ::tolower);
-
-    std::string needleLower(needle);
-    std::transform(needleLower.begin(), needleLower.end(), needleLower.begin(), ::tolower);
-
-    // Use strstr() to find 'lowercased needle' in 'lowercased haystack'
-    // If found, use the location to compute the matching location in the original string
-    // If not found, return NULL
-    const char* haystackLowerStart = haystackLower.c_str();
-    const char* location = strstr(haystackLowerStart, needleLower.c_str());
-    return location ? (haystack + (location - haystackLowerStart)) : NULL;
+    StringData hay(haystack);
+    StringData pat(needle);
+    auto caseEq = [](char a, char b) {
+        return ctype::toLower(a) == ctype::toLower(b);
+    };
+    auto pos = std::search(hay.begin(), hay.end(), pat.begin(), pat.end(), caseEq);
+    if (pos == hay.end())
+        return nullptr;
+    return haystack + (pos - hay.begin());
 }
-
-#if defined(__sun)
-
-typedef const char* (*StrCaseStrFunc)(const char* haystack, const char* needle);
-static StrCaseStrFunc strcasestr_switcher = mongo::pal::strcasestr_emulation;
-
-const char* strcasestr(const char* haystack, const char* needle) {
-    return strcasestr_switcher(haystack, needle);
-}
-
-#endif  // #if defined(__sun)
 
 }  // namespace pal
 }  // namespace mongo
 
-#endif  // #if defined(_WIN32) || defined(__sun)
-
-#if defined(__sun)
-
-namespace mongo {
-
-// 'strcasestr()' on Solaris will call the emulation if the symbol is not found
-//
-MONGO_INITIALIZER_GENERAL(SolarisStrCaseCmp, MONGO_NO_PREREQUISITES, ("default"))
-(InitializerContext* context) {
-    void* functionAddress = dlsym(RTLD_DEFAULT, "strcasestr");
-    if (functionAddress != NULL) {
-        mongo::pal::strcasestr_switcher =
-            reinterpret_cast<mongo::pal::StrCaseStrFunc>(functionAddress);
-    }
-    return Status::OK();
-}
-
-}  // namespace mongo
-
-#endif  // __sun
+#endif  // #if defined(_WIN32)

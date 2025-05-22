@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Public Domain 2014-2018 MongoDB, Inc.
+# Public Domain 2014-present MongoDB, Inc.
 # Public Domain 2008-2014 WiredTiger, Inc.
 #
 # This is free and unencumbered software released into the public domain.
@@ -45,7 +45,6 @@ class test_cursor01(wttest.WiredTigerTestCase):
         ('file-col', dict(tablekind='col',uri='file')),
         ('file-fix', dict(tablekind='fix',uri='file')),
         ('file-row', dict(tablekind='row',uri='file')),
-        ('lsm-row', dict(tablekind='row',uri='lsm')),
         ('table-col', dict(tablekind='col',uri='table')),
         ('table-fix', dict(tablekind='fix',uri='table')),
         ('table-row', dict(tablekind='row',uri='table'))
@@ -55,7 +54,7 @@ class test_cursor01(wttest.WiredTigerTestCase):
         if self.tablekind == 'row':
             return 'key' + str(i)
         else:
-            return long(i+1)
+            return self.recno(i+1)
 
     def genvalue(self, i):
         if self.tablekind == 'fix':
@@ -142,7 +141,7 @@ class test_cursor01(wttest.WiredTigerTestCase):
             self.assertEqual(key, self.genkey(i))
             self.assertEqual(value, self.genvalue(i))
             dupc = self.session.open_cursor(None, cursor, None)
-            self.assertEquals(cursor.compare(dupc), 0)
+            self.assertEqual(cursor.compare(dupc), 0)
             key = dupc.get_key()
             value = dupc.get_value()
             self.assertEqual(key, self.genkey(i))
@@ -201,7 +200,7 @@ class test_cursor01(wttest.WiredTigerTestCase):
             self.assertEqual(value, self.genvalue(i))
             i -= 1
             dupc = self.session.open_cursor(None, cursor, None)
-            self.assertEquals(cursor.compare(dupc), 0)
+            self.assertEqual(cursor.compare(dupc), 0)
             cursor.close()
             cursor = dupc
 
@@ -217,6 +216,3 @@ class test_cursor01(wttest.WiredTigerTestCase):
         cursor = self.backward_iter(cursor)
         cursor = self.backward_iter_with_dup(cursor)
         cursor.close()
-
-if __name__ == '__main__':
-    wttest.run()

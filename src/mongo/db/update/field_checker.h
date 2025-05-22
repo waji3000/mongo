@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,7 +29,10 @@
 
 #pragma once
 
+#include <cstddef>
+
 #include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
 
 namespace mongo {
 
@@ -49,7 +51,7 @@ Status isUpdatable(const FieldRef& field);
 /**
  * Returns true iff 'field' is the position element (which is "$").
  */
-bool isPositionalElement(const StringData& field);
+bool isPositionalElement(StringData field);
 
 /**
  * Returns true, the position 'pos' of the first $-sign if present in 'fieldRef', and
@@ -59,12 +61,12 @@ bool isPositionalElement(const StringData& field);
  *   isPositional assumes that the field is updatable. Call isUpdatable() above to
  *   verify.
  */
-bool isPositional(const FieldRef& fieldRef, size_t* pos, size_t* count = NULL);
+bool isPositional(const FieldRef& fieldRef, size_t* pos, size_t* count = nullptr);
 
 /**
  * Returns true iff 'field' is an array filter (matching the regular expression /\$\[.*\]/).
  */
-bool isArrayFilterIdentifier(const StringData& field);
+bool isArrayFilterIdentifier(StringData field);
 
 /**
  * Returns true if isArrayFilterIdentifier is true for any component in 'fieldRef' or returns false

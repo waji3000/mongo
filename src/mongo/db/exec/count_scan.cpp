@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,11 +29,22 @@
 
 #include "mongo/db/exec/count_scan.h"
 
-#include "mongo/db/catalog/index_catalog.h"
-#include "mongo/db/concurrency/write_conflict_exception.h"
-#include "mongo/db/exec/scoped_timer.h"
+#include <absl/container/node_hash_map.h>
+#include <boost/container/small_vector.hpp>
+// IWYU pragma: no_include "boost/intrusive/detail/iterator.hpp"
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <memory>
+
+
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/ordering.h"
 #include "mongo/db/index/index_access_method.h"
-#include "mongo/stdx/memory.h"
+#include "mongo/db/index_names.h"
+#include "mongo/db/query/plan_executor_impl.h"
+#include "mongo/db/storage/index_entry_comparison.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 
@@ -62,11 +72,14 @@ BSONObj replaceBSONFieldNames(const BSONObj& replace, const BSONObj& fieldNames)
 
     return bob.obj();
 }
+
+bool isCompoundWildcardIndex(const IndexDescriptor* indexDescriptor) {
+    return indexDescriptor->getIndexType() == IndexType::INDEX_WILDCARD &&
+        indexDescriptor->keyPattern().nFields() > 1;
 }
+}  // namespace
 
 using std::unique_ptr;
-using std::vector;
-using stdx::make_unique;
 
 // static
 const char* CountScan::kStageType = "COUNT_SCAN";
@@ -74,26 +87,34 @@ const char* CountScan::kStageType = "COUNT_SCAN";
 // When building the CountScan stage we take the keyPattern, index name, and multikey details from
 // the CountScanParams rather than resolving them via the IndexDescriptor, since these may differ
 // from the descriptor's contents.
-CountScan::CountScan(OperationContext* opCtx, CountScanParams params, WorkingSet* workingSet)
-    : PlanStage(kStageType, opCtx),
+CountScan::CountScan(ExpressionContext* expCtx,
+                     VariantCollectionPtrOrAcquisition collection,
+                     CountScanParams params,
+                     WorkingSet* workingSet)
+    : RequiresIndexStage(kStageType, expCtx, collection, params.indexDescriptor, workingSet),
       _workingSet(workingSet),
-      _iam(params.accessMethod),
-      _shouldDedup(params.isMultiKey),
-      _params(std::move(params)) {
-    _specificStats.indexName = _params.name;
-    _specificStats.keyPattern = _params.keyPattern;
-    _specificStats.isMultiKey = _params.isMultiKey;
-    _specificStats.multiKeyPaths = _params.multikeyPaths;
-    _specificStats.isUnique = _params.isUnique;
-    _specificStats.isSparse = _params.isSparse;
-    _specificStats.isPartial = _params.isPartial;
-    _specificStats.indexVersion = static_cast<int>(_params.version);
-    _specificStats.collation = _params.collation.getOwned();
+      _keyPattern(std::move(params.keyPattern)),
+      _shouldDedup(params.isMultiKey || isCompoundWildcardIndex(params.indexDescriptor)),
+      _startKey(std::move(params.startKey)),
+      _startKeyInclusive(params.startKeyInclusive),
+      _endKey(std::move(params.endKey)),
+      _endKeyInclusive(params.endKeyInclusive) {
+    _specificStats.indexName = params.name;
+    _specificStats.keyPattern = _keyPattern;
+    _specificStats.isMultiKey = params.isMultiKey;
+    _specificStats.multiKeyPaths = params.multikeyPaths;
+    _specificStats.isUnique = params.indexDescriptor->unique();
+    _specificStats.isSparse = params.indexDescriptor->isSparse();
+    _specificStats.isPartial = params.indexDescriptor->isPartial();
+    _specificStats.indexVersion = static_cast<int>(params.indexDescriptor->version());
+    _specificStats.collation = params.indexDescriptor->infoObj()
+                                   .getObjectField(IndexDescriptor::kCollationFieldName)
+                                   .getOwned();
 
     // endKey must be after startKey in index order since we only do forward scans.
-    dassert(_params.startKey.woCompare(_params.endKey,
-                                       Ordering::make(_params.keyPattern),
-                                       /*compareFieldNames*/ false) <= 0);
+    dassert(_startKey.woCompare(_endKey,
+                                Ordering::make(_keyPattern),
+                                /*compareFieldNames*/ false) <= 0);
 }
 
 PlanStage::StageState CountScan::doWork(WorkingSetID* out) {
@@ -102,26 +123,42 @@ PlanStage::StageState CountScan::doWork(WorkingSetID* out) {
 
     boost::optional<IndexKeyEntry> entry;
     const bool needInit = !_cursor;
-    try {
-        // We don't care about the keys.
-        const auto kWantLoc = SortedDataInterface::Cursor::kWantLoc;
 
-        if (needInit) {
-            // First call to work().  Perform cursor init.
-            _cursor = _iam->newCursor(getOpCtx());
-            _cursor->setEndPosition(_params.endKey, _params.endKeyInclusive);
+    const auto ret = handlePlanStageYield(
+        expCtx(),
+        "CountScan",
+        [&] {
+            if (needInit) {
+                // First call to work().  Perform cursor init.
+                _cursor = indexAccessMethod()->newCursor(opCtx());
+                _cursor->setEndPosition(_endKey, _endKeyInclusive);
 
-            entry = _cursor->seek(_params.startKey, _params.startKeyInclusive, kWantLoc);
-        } else {
-            entry = _cursor->next(kWantLoc);
-        }
-    } catch (const WriteConflictException&) {
-        if (needInit) {
-            // Release our cursor and try again next time.
-            _cursor.reset();
-        }
-        *out = WorkingSet::INVALID_ID;
-        return PlanStage::NEED_YIELD;
+                key_string::Builder builder(
+                    indexAccessMethod()->getSortedDataInterface()->getKeyStringVersion());
+                auto keyStringForSeek = IndexEntryComparison::makeKeyStringFromBSONKeyForSeek(
+                    _startKey,
+                    indexAccessMethod()->getSortedDataInterface()->getOrdering(),
+                    true, /* forward */
+                    _startKeyInclusive,
+                    builder);
+                entry = _cursor->seek(keyStringForSeek,
+                                      SortedDataInterface::Cursor::KeyInclusion::kExclude);
+            } else {
+                entry = _cursor->next(SortedDataInterface::Cursor::KeyInclusion::kExclude);
+            }
+            return PlanStage::ADVANCED;
+        },
+        [&] {
+            // yieldHandler
+            if (needInit) {
+                // Release our cursor and try again next time.
+                _cursor.reset();
+            }
+            *out = WorkingSet::INVALID_ID;
+        });
+
+    if (ret != PlanStage::ADVANCED) {
+        return ret;
     }
 
     ++_specificStats.keysExamined;
@@ -138,21 +175,23 @@ PlanStage::StageState CountScan::doWork(WorkingSetID* out) {
     }
 
     WorkingSetID id = _workingSet->allocate();
+    WorkingSetMember* member = _workingSet->get(id);
+    member->recordId = entry->loc;
     _workingSet->transitionToRecordIdAndObj(id);
     *out = id;
     return PlanStage::ADVANCED;
 }
 
-bool CountScan::isEOF() {
+bool CountScan::isEOF() const {
     return _commonStats.isEOF;
 }
 
-void CountScan::doSaveState() {
+void CountScan::doSaveStateRequiresIndex() {
     if (_cursor)
         _cursor->save();
 }
 
-void CountScan::doRestoreState() {
+void CountScan::doRestoreStateRequiresIndex() {
     if (_cursor)
         _cursor->restore();
 }
@@ -164,19 +203,20 @@ void CountScan::doDetachFromOperationContext() {
 
 void CountScan::doReattachToOperationContext() {
     if (_cursor)
-        _cursor->reattachToOperationContext(getOpCtx());
+        _cursor->reattachToOperationContext(opCtx());
 }
 
 unique_ptr<PlanStageStats> CountScan::getStats() {
-    unique_ptr<PlanStageStats> ret = make_unique<PlanStageStats>(_commonStats, STAGE_COUNT_SCAN);
+    unique_ptr<PlanStageStats> ret =
+        std::make_unique<PlanStageStats>(_commonStats, STAGE_COUNT_SCAN);
 
-    unique_ptr<CountScanStats> countStats = make_unique<CountScanStats>(_specificStats);
+    unique_ptr<CountScanStats> countStats = std::make_unique<CountScanStats>(_specificStats);
     countStats->keyPattern = _specificStats.keyPattern.getOwned();
 
-    countStats->startKey = replaceBSONFieldNames(_params.startKey, countStats->keyPattern);
-    countStats->startKeyInclusive = _params.startKeyInclusive;
-    countStats->endKey = replaceBSONFieldNames(_params.endKey, countStats->keyPattern);
-    countStats->endKeyInclusive = _params.endKeyInclusive;
+    countStats->startKey = replaceBSONFieldNames(_startKey, countStats->keyPattern);
+    countStats->startKeyInclusive = _startKeyInclusive;
+    countStats->endKey = replaceBSONFieldNames(_endKey, countStats->keyPattern);
+    countStats->endKeyInclusive = _endKeyInclusive;
 
     ret->specific = std::move(countStats);
 

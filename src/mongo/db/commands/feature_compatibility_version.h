@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,95 +29,138 @@
 
 #pragma once
 
+#include <boost/optional/optional.hpp>
+
 #include "mongo/base/status_with.h"
-#include "mongo/base/string_data.h"
 #include "mongo/bson/bsonobj.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/commands/set_feature_compatibility_version_gen.h"
+#include "mongo/db/concurrency/d_concurrency.h"
+#include "mongo/db/feature_compatibility_version_document_gen.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/server_options.h"
+#include "mongo/util/version/releases.h"
 
 namespace mongo {
-
-class BSONObj;
-class OperationContext;
-
-/**
- * Startup parameter to ignore featureCompatibilityVersion checks. This parameter cannot be set if
- * the node is started with --replSet. This should never be set by end users.
- */
-extern bool internalValidateFeaturesAsMaster;
 
 class FeatureCompatibilityVersion {
 public:
     /**
-     * Should be taken in shared mode by any operations that should not run while
-     * setFeatureCompatibilityVersion is running.
+     * Reads the featureCompatibilityVersion (FCV) document in admin.system.version and initializes
+     * the FCV global state. Returns an error if the FCV document exists and is invalid. Does not
+     * return an error if it is missing. This should be checked after startup with
+     * fassertInitializedAfterStartup.
      *
-     * setFCV takes this lock in exclusive mode so that it both does not run with the shared mode
-     * operations and does not run with itself.
+     * Throws a MustDowngrade error if an existing FCV document contains an invalid version.
      */
-    static Lock::ResourceMutex fcvLock;
+    static void initializeForStartup(OperationContext* opCtx);
 
     /**
-     * Records intent to perform a 4.0 -> 4.2 upgrade by updating the on-disk feature
-     * compatibility version document to have 'version'=4.0, 'targetVersion'=4.2.
-     * Should be called before schemas are modified.
+     * Fatally asserts if the featureCompatibilityVersion is not properly initialized after startup.
      */
-    static void setTargetUpgrade(OperationContext* opCtx);
+    static void fassertInitializedAfterStartup(OperationContext* opCtx);
 
     /**
-     * Records intent to perform a 4.2 -> 4.0 downgrade by updating the on-disk feature
-     * compatibility version document to have 'version'=4.0, 'targetVersion'=4.0.
-     * Should be called before schemas are modified.
+     * Adds a transition that allows users to downgrade from latest FCV to last continuous FCV.
+     * This function should only be called if the 'disableTransitionFromLatestToLastContinuous'
+     * server parameter is set to 'false'. That parameter is test-only and defaulted to 'true'.
      */
-    static void setTargetDowngrade(OperationContext* opCtx);
+    static void addTransitionFromLatestToLastContinuous();
 
     /**
-     * Records the completion of a 4.0 <-> 4.2 upgrade or downgrade by updating the on-disk feature
-     * compatibility version document to have 'version'=version and unsetting the 'targetVersion'
-     * field.
-     * Should be called after schemas are modified.
+     * Returns the on-disk feature compatibility version document if it can be found.
+     * If there was an error finding the document, returns the error reason.
      */
-    static void unsetTargetUpgradeOrDowngrade(OperationContext* opCtx, StringData version);
+    static StatusWith<BSONObj> findFeatureCompatibilityVersionDocument(OperationContext* opCtx);
 
     /**
-     * If there are no non-local databases, store the featureCompatibilityVersion document. If we
-     * are not running with --shardsvr, set the version to be the upgrade value. If we are running
-     * with --shardsvr, set the version to be the downgrade value.
+     * uassert that a transition from fromVersion to newVersion is permitted. Different rules apply
+     * if the request is from a config server.
+     */
+    static void validateSetFeatureCompatibilityVersionRequest(
+        OperationContext* opCtx,
+        const SetFeatureCompatibilityVersion& setFCVRequest,
+        multiversion::FeatureCompatibilityVersion fromVersion);
+
+    /**
+     * Updates the on-disk feature compatibility version document for the transition fromVersion ->
+     * newVersion. This is required to be a valid transition.
+     */
+    static void updateFeatureCompatibilityVersionDocument(
+        OperationContext* opCtx,
+        multiversion::FeatureCompatibilityVersion fromVersion,
+        multiversion::FeatureCompatibilityVersion newVersion,
+        bool isFromConfigServer,
+        boost::optional<Timestamp> timestamp,
+        bool setTargetVersion,
+        boost::optional<bool> setIsCleaningServerMetadata);
+
+    /**
+     * If we are in clean startup (the server has no replicated collections), store the
+     * featureCompatibilityVersion document. If we are not running with --shardsvr, set the version
+     * to be the upgrade value. If we are running with --shardsvr, set the version to be the
+     * downgrade value.
      */
     static void setIfCleanStartup(OperationContext* opCtx,
                                   repl::StorageInterface* storageInterface);
 
     /**
-     * Returns true if the server is on a clean startup. A clean startup means there are no
-     * databases on disk besides the local database.
+     * Returns true if the server has no replicated collections.
      */
-    static bool isCleanStartUp();
-
-    /**
-     * Examines a document inserted or updated in the server configuration collection
-     * (admin.system.version). If it is the featureCompatibilityVersion document, validates the
-     * document and on commit, updates the server parameter.
-     */
-    static void onInsertOrUpdate(OperationContext* opCtx, const BSONObj& doc);
+    static bool hasNoReplicatedCollections(OperationContext* opCtx);
 
     /**
      * Sets the server's outgoing and incomingInternalClient minWireVersions according to the
      * current featureCompatibilityVersion value.
      */
-    static void updateMinWireVersion();
-
-private:
-    /**
-     * Validate version. Uasserts if invalid.
-     */
-    static void _validateVersion(StringData version);
+    static void updateMinWireVersion(OperationContext* opCtx);
 
     /**
-     * Build update command.
+     * Returns a scoped object, which holds the 'fcvLock' in exclusive mode for the given scope. It
+     * must only be used by the setFeatureCompatibilityVersion command in order to serialise with
+     * concurrent 'FixedFCVRegions'.
      */
-    typedef stdx::function<void(BSONObjBuilder)> UpdateBuilder;
-    static void _runUpdateCommand(OperationContext* opCtx, UpdateBuilder callback);
+    static Lock::ExclusiveLock enterFCVChangeRegion(OperationContext* opCtx);
+
+    /**
+     * Used by the FCV OpObserver to set the timestamp of the last opTime where the FCV was updated.
+     * We use this to ensure the user does not see a non-transitional FCV that is not in the
+     * majority snapshot, since upgrading or downgrading will not work in that circumstance.
+     */
+    static void advanceLastFCVUpdateTimestamp(Timestamp fcvUpdateTimestamp);
+
+    /**
+     * Used by the FCV OpObserver at rollback time.  The rollback FCV is always in the
+     * majority snapshot, so it is safe to clear the lastFCVUpdateTimestamp then.
+     *
+     * Also used in rare cases when the replication coordinator majority snapshot is cleared.
+     */
+    static void clearLastFCVUpdateTimestamp();
 };
 
+/**
+ * Utility class to prevent the on-disk FCV from changing while the FixedFCVRegion is in scope.
+ *
+ * Note that this does not prevent the in-memory FCV from changing (which for example could be reset
+ * during initial sync). The operator* and operator-> functions return a MutableFCV, which could
+ * change at different points in time, so if you wanted to get a consistent snapshot of the
+ * in-memory FCV, you should still use the ServerGlobalParams::MutableFCV's acquireFCVSnapshot()
+ * function.
+ */
+class FixedFCVRegion {
+public:
+    explicit FixedFCVRegion(OperationContext* opCtx);
+    ~FixedFCVRegion();
+
+    bool operator==(const multiversion::FeatureCompatibilityVersion& other) const;
+    bool operator!=(const multiversion::FeatureCompatibilityVersion& other) const;
+
+    const ServerGlobalParams::MutableFCV& operator*() const;
+    const ServerGlobalParams::MutableFCV* operator->() const;
+
+private:
+    Lock::SharedLock _lk;
+};
 
 }  // namespace mongo

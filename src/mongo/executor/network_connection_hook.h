@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -33,6 +32,7 @@
 #include <boost/optional.hpp>
 
 #include "mongo/bson/bsonobj.h"
+#include "mongo/executor/remote_command_request.h"
 
 namespace mongo {
 
@@ -44,7 +44,6 @@ struct HostAndPort;
 namespace executor {
 
 struct RemoteCommandResponse;
-struct RemoteCommandRequest;
 
 /**
  * An hooking interface for augmenting an implementation of NetworkInterface with domain-specific
@@ -55,16 +54,16 @@ public:
     virtual ~NetworkConnectionHook() = default;
 
     /**
-     * Optionally augments the isMaster request sent while initializing the wire protocol.
+     * Optionally augments the "hello" request sent while initializing the wire protocol.
      *
      * By default this will just return the cmdObj passed in unaltered.
      */
-    virtual BSONObj augmentIsMasterRequest(BSONObj cmdObj) {
+    virtual BSONObj augmentHelloRequest(const HostAndPort& remoteHost, BSONObj cmdObj) {
         return cmdObj;
     }
 
     /**
-     * Runs optional validation logic on an isMaster reply from a remote host. If a non-OK
+     * Runs optional validation logic on an "hello" reply from a remote host. If a non-OK
      * Status is returned, it will be propagated up to the completion handler for the command
      * that initiated the request that caused this connection to be created. This will
      * be called once for each connection that is created, even if a remote host with the
@@ -78,8 +77,8 @@ public:
      * std::terminate.
      */
     virtual Status validateHost(const HostAndPort& remoteHost,
-                                const BSONObj& isMasterRequest,
-                                const RemoteCommandResponse& isMasterReply) = 0;
+                                const BSONObj& helloRequest,
+                                const RemoteCommandResponse& helloReply) = 0;
 
     /**
      * Generates a command to run on the remote host immediately after connecting to it.

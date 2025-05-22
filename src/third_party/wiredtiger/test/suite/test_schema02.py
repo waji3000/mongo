@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Public Domain 2014-2018 MongoDB, Inc.
+# Public Domain 2014-present MongoDB, Inc.
 # Public Domain 2008-2014 WiredTiger, Inc.
 #
 # This is free and unencumbered software released into the public domain.
@@ -27,20 +27,23 @@
 # OTHER DEALINGS IN THE SOFTWARE.
 
 import wiredtiger, wttest
+from helper_tiered import TieredConfigMixin, gen_tiered_storage_sources
 from wtscenario import make_scenarios
 
 # test_schema02.py
 #    Columns, column groups, indexes
-class test_schema02(wttest.WiredTigerTestCase):
+class test_schema02(TieredConfigMixin, wttest.WiredTigerTestCase):
     """
     Test basic operations
     """
     nentries = 1000
 
-    scenarios = make_scenarios([
-        ('normal', { 'idx_config' : '' }),
-        ('lsm', { 'idx_config' : ',type=lsm' }),
-    ])
+    types = [
+        ('normal', dict(type='normal', idx_config='')),
+    ]
+
+    tiered_storage_sources = gen_tiered_storage_sources()
+    scenarios = make_scenarios(tiered_storage_sources, types)
 
     def expect_failure_colgroup(self, name, configstr, match):
         self.assertRaisesWithMessage(wiredtiger.WiredTigerError,
@@ -182,7 +185,7 @@ class test_schema02(wttest.WiredTigerTestCase):
         cursor = self.session.open_cursor('table:main', None, None)
         # spot check via search
         n = self.nentries
-        for i in (n / 5, 0, n - 1, n - 2, 1):
+        for i in (n // 5, 0, n - 1, n - 2, 1):
             cursor.set_key(i, 'key' + str(i))
             square = i * i
             cube = square * i
@@ -278,6 +281,3 @@ class test_schema02(wttest.WiredTigerTestCase):
         self.session.create("colgroup:main:c2", "columns=(S3,i4)")
         self.populate()
         self.check_entries()
-
-if __name__ == '__main__':
-    wttest.run()

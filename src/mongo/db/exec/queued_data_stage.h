@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,10 +29,14 @@
 
 #pragma once
 
+#include <memory>
 #include <queue>
 
 #include "mongo/db/exec/plan_stage.h"
+#include "mongo/db/exec/plan_stats.h"
 #include "mongo/db/exec/working_set.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/query/stage_types.h"
 
 namespace mongo {
 
@@ -49,11 +52,11 @@ class RecordId;
  */
 class QueuedDataStage final : public PlanStage {
 public:
-    QueuedDataStage(OperationContext* opCtx, WorkingSet* ws);
+    QueuedDataStage(ExpressionContext* expCtx, WorkingSet* ws);
 
     StageState doWork(WorkingSetID* out) final;
 
-    bool isEOF() final;
+    bool isEOF() const final;
 
     StageType stageType() const final {
         return STAGE_QUEUED_DATA;
@@ -70,17 +73,6 @@ public:
     /**
      * Add a result to the back of the queue.
      *
-     * Note: do not add PlanStage::ADVANCED with this method, ADVANCED can
-     * only be added with a data member.
-     *
-     * Work() goes through the queue.
-     * Either no data is returned (just a state), or...
-     */
-    void pushBack(const PlanStage::StageState state);
-
-    /**
-     * ...data is returned (and we ADVANCED)
-     *
      * The caller is responsible for allocating 'id' and filling out the WSM keyed by 'id'
      * appropriately.
      *
@@ -92,11 +84,7 @@ public:
     static const char* kStageType;
 
 private:
-    // We don't own this.
-    WorkingSet* _ws;
-
     // The data we return.
-    std::queue<PlanStage::StageState> _results;
     std::queue<WorkingSetID> _members;
 
     // Stats

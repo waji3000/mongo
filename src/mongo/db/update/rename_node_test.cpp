@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,24 +27,25 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <boost/smart_ptr/intrusive_ptr.hpp>
 
-#include "mongo/db/update/rename_node.h"
-
-#include "mongo/bson/mutable/algorithm.h"
-#include "mongo/bson/mutable/mutable_bson_test_utils.h"
-#include "mongo/db/json.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/json.h"
+#include "mongo/db/exec/mutable_bson/algorithm.h"
+#include "mongo/db/exec/mutable_bson/document.h"
+#include "mongo/db/exec/mutable_bson/element.h"
 #include "mongo/db/pipeline/expression_context_for_test.h"
+#include "mongo/db/update/rename_node.h"
+#include "mongo/db/update/update_executor.h"
 #include "mongo/db/update/update_node_test_fixture.h"
-#include "mongo/unittest/death_test.h"
 #include "mongo/unittest/unittest.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/intrusive_counter.h"
 
 namespace mongo {
 namespace {
 
-using RenameNodeTest = UpdateNodeTest;
-using mongo::mutablebson::Element;
-using mongo::mutablebson::countChildren;
+using RenameNodeTest = UpdateTestFixture;
 
 TEST(RenameNodeTest, PositionalNotAllowedInFromField) {
     auto update = fromjson("{$rename: {'a.$': 'b'}}");
@@ -120,11 +120,13 @@ TEST_F(RenameNodeTest, SimpleNumberAtRoot) {
     mutablebson::Document doc(fromjson("{a: 2}"));
     setPathToCreate("b");
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()));
+    auto result = node.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
-    ASSERT_TRUE(result.indexesAffected);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{b: 2}"), doc);
-    ASSERT_EQUALS(fromjson("{$set: {b: 2}, $unset: {a: true}}"), getLogDoc());
+
+    assertOplogEntry(fromjson("{$v: 2, diff: {d: {a: false}, i: {b: 2}}}"));
+    ASSERT_EQUALS(getModifiedPaths(), "{a, b}");
 }
 
 TEST_F(RenameNodeTest, ToExistsAtSameLevel) {
@@ -134,13 +136,15 @@ TEST_F(RenameNodeTest, ToExistsAtSameLevel) {
     ASSERT_OK(node.init(update["$rename"]["a"], expCtx));
 
     mutablebson::Document doc(fromjson("{a: 2, b: 1}"));
-    setPathTaken("b");
+    setPathTaken(makeRuntimeUpdatePathForTest("b"));
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()["b"]));
+    auto result = node.apply(getApplyParams(doc.root()["b"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
-    ASSERT_TRUE(result.indexesAffected);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{b: 2}"), doc);
-    ASSERT_EQUALS(fromjson("{$set: {b: 2}, $unset: {a: true}}"), getLogDoc());
+
+    assertOplogEntry(fromjson("{$v: 2, diff: {d: {a: false}, u: {b: 2}}}"));
+    ASSERT_EQUALS(getModifiedPaths(), "{a, b}");
 }
 
 TEST_F(RenameNodeTest, ToAndFromHaveSameValue) {
@@ -150,13 +154,15 @@ TEST_F(RenameNodeTest, ToAndFromHaveSameValue) {
     ASSERT_OK(node.init(update["$rename"]["a"], expCtx));
 
     mutablebson::Document doc(fromjson("{a: 2, b: 2}"));
-    setPathTaken("b");
+    setPathTaken(makeRuntimeUpdatePathForTest("b"));
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()["b"]));
+    auto result = node.apply(getApplyParams(doc.root()["b"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
-    ASSERT_TRUE(result.indexesAffected);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{b: 2}"), doc);
-    ASSERT_EQUALS(fromjson("{$set: {b: 2}, $unset: {a: true}}"), getLogDoc());
+
+    assertOplogEntry(fromjson("{$v: 2, diff: {d: {a: false}, u: {b: 2}}}"));
+    ASSERT_EQUALS(getModifiedPaths(), "{a, b}");
 }
 
 TEST_F(RenameNodeTest, RenameToFieldWithSameValueButDifferentType) {
@@ -166,13 +172,15 @@ TEST_F(RenameNodeTest, RenameToFieldWithSameValueButDifferentType) {
     ASSERT_OK(node.init(update["$rename"]["a"], expCtx));
 
     mutablebson::Document doc(fromjson("{a: 1, b: NumberLong(1)}"));
-    setPathTaken("b");
+    setPathTaken(makeRuntimeUpdatePathForTest("b"));
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()["b"]));
+    auto result = node.apply(getApplyParams(doc.root()["b"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
-    ASSERT_TRUE(result.indexesAffected);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{b: 1}"), doc);
-    ASSERT_EQUALS(fromjson("{$set: {b: 1}, $unset: {a: true}}"), getLogDoc());
+
+    assertOplogEntry(fromjson("{$v: 2, diff: {d: {a: false}, u: {b: 1}}}"));
+    ASSERT_EQUALS(getModifiedPaths(), "{a, b}");
 }
 
 TEST_F(RenameNodeTest, FromDottedElement) {
@@ -182,13 +190,15 @@ TEST_F(RenameNodeTest, FromDottedElement) {
     ASSERT_OK(node.init(update["$rename"]["a.c"], expCtx));
 
     mutablebson::Document doc(fromjson("{a: {c: {d: 6}}, b: 1}"));
-    setPathTaken("b");
+    setPathTaken(makeRuntimeUpdatePathForTest("b"));
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()["b"]));
+    auto result = node.apply(getApplyParams(doc.root()["b"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
-    ASSERT_TRUE(result.indexesAffected);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{a: {}, b: {d: 6}}"), doc);
-    ASSERT_EQUALS(fromjson("{$set: {b: {d: 6}}, $unset: {'a.c': true}}"), getLogDoc());
+
+    assertOplogEntry(fromjson("{$v: 2, diff: {u: {b: {d: 6}}, sa: {d: {c: false}}}}"));
+    ASSERT_EQUALS(getModifiedPaths(), "{a.c, b}");
 }
 
 TEST_F(RenameNodeTest, RenameToExistingNestedFieldDoesNotReorderFields) {
@@ -198,13 +208,15 @@ TEST_F(RenameNodeTest, RenameToExistingNestedFieldDoesNotReorderFields) {
     ASSERT_OK(node.init(update["$rename"]["c.d"], expCtx));
 
     mutablebson::Document doc(fromjson("{a: {b: {c: 1, d: 2}}, b: 3, c: {d: 4}}"));
-    setPathTaken("a.b.c");
+    setPathTaken(makeRuntimeUpdatePathForTest("a.b.c"));
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()["a"]["b"]["c"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]["b"]["c"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
-    ASSERT_TRUE(result.indexesAffected);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{a: {b: {c: 4, d: 2}}, b: 3, c: {}}"), doc);
-    ASSERT_EQUALS(fromjson("{$set: {'a.b.c': 4}, $unset: {'c.d': true}}"), getLogDoc());
+
+    assertOplogEntry(fromjson("{$v: 2, diff: {sa: {sb: {u: {c: 4}}}, sc: {d: {d: false}}}}"));
+    ASSERT_EQUALS(getModifiedPaths(), "{a.b.c, c.d}");
 }
 
 TEST_F(RenameNodeTest, MissingCompleteTo) {
@@ -215,13 +227,15 @@ TEST_F(RenameNodeTest, MissingCompleteTo) {
 
     mutablebson::Document doc(fromjson("{a: 2, b: 1, c: {}}"));
     setPathToCreate("r.d");
-    setPathTaken("c");
+    setPathTaken(makeRuntimeUpdatePathForTest("c"));
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()["c"]));
+    auto result = node.apply(getApplyParams(doc.root()["c"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
-    ASSERT_TRUE(result.indexesAffected);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{b: 1, c: {r: {d: 2}}}"), doc);
-    ASSERT_EQUALS(fromjson("{$set: {'c.r.d': 2}, $unset: {'a': true}}"), getLogDoc());
+
+    assertOplogEntry(fromjson("{$v: 2, diff: {d: {a: false}, sc: {i: {r: {d: 2}}}}}"));
+    ASSERT_EQUALS(getModifiedPaths(), "{a, c.r.d}");
 }
 
 TEST_F(RenameNodeTest, ToIsCompletelyMissing) {
@@ -233,11 +247,13 @@ TEST_F(RenameNodeTest, ToIsCompletelyMissing) {
     mutablebson::Document doc(fromjson("{a: 2}"));
     setPathToCreate("b.c.d");
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()));
+    auto result = node.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
-    ASSERT_TRUE(result.indexesAffected);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{b: {c: {d: 2}}}"), doc);
-    ASSERT_EQUALS(fromjson("{$set: {'b.c.d': 2}, $unset: {'a': true}}"), getLogDoc());
+
+    assertOplogEntry(fromjson("{$v: 2, diff: {d: {a: false}, i: {b: {c: {d: 2}}}}}"));
+    ASSERT_EQUALS(getModifiedPaths(), "{a, b.c.d}");
 }
 
 TEST_F(RenameNodeTest, ToMissingDottedField) {
@@ -249,11 +265,13 @@ TEST_F(RenameNodeTest, ToMissingDottedField) {
     mutablebson::Document doc(fromjson("{a: [{a:2, b:1}]}"));
     setPathToCreate("b.c.d");
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()));
+    auto result = node.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
-    ASSERT_TRUE(result.indexesAffected);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{b: {c: {d: [{a:2, b:1}]}}}"), doc);
-    ASSERT_EQUALS(fromjson("{$set: {'b.c.d': [{a:2, b:1}]}, $unset: {'a': true}}"), getLogDoc());
+
+    assertOplogEntry(fromjson("{$v: 2, diff: {d: {a: false}, i: {b: {c: {d: [{a: 2, b: 1}]}}}}}"));
+    ASSERT_EQUALS(getModifiedPaths(), "{a, b.c.d}");
 }
 
 TEST_F(RenameNodeTest, MoveIntoArray) {
@@ -264,13 +282,14 @@ TEST_F(RenameNodeTest, MoveIntoArray) {
 
     mutablebson::Document doc(fromjson("{_id: 'test_object', a: [1, 2], b: 2}"));
     setPathToCreate("2");
-    setPathTaken("a");
+    setPathTaken(makeRuntimeUpdatePathForTest("a"));
     addIndexedPath("a");
-    ASSERT_THROWS_CODE_AND_WHAT(node.apply(getApplyParams(doc.root()["a"])),
-                                AssertionException,
-                                ErrorCodes::BadValue,
-                                "The destination field cannot be an array element, 'a.2' in doc "
-                                "with _id: \"test_object\" has an array field called 'a'");
+    ASSERT_THROWS_CODE_AND_WHAT(
+        node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams()),
+        AssertionException,
+        ErrorCodes::BadValue,
+        "The destination field cannot be an array element, 'a.2' in doc "
+        "with _id: \"test_object\" has an array field called 'a'");
 }
 
 TEST_F(RenameNodeTest, MoveIntoArrayNoId) {
@@ -281,13 +300,14 @@ TEST_F(RenameNodeTest, MoveIntoArrayNoId) {
 
     mutablebson::Document doc(fromjson("{a: [1, 2], b: 2}"));
     setPathToCreate("2");
-    setPathTaken("a");
+    setPathTaken(makeRuntimeUpdatePathForTest("a"));
     addIndexedPath("a");
-    ASSERT_THROWS_CODE_AND_WHAT(node.apply(getApplyParams(doc.root()["a"])),
-                                AssertionException,
-                                ErrorCodes::BadValue,
-                                "The destination field cannot be an array element, 'a.2' in doc "
-                                "with no id has an array field called 'a'");
+    ASSERT_THROWS_CODE_AND_WHAT(
+        node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams()),
+        AssertionException,
+        ErrorCodes::BadValue,
+        "The destination field cannot be an array element, 'a.2' in doc "
+        "with no id has an array field called 'a'");
 }
 
 TEST_F(RenameNodeTest, MoveToArrayElement) {
@@ -297,13 +317,14 @@ TEST_F(RenameNodeTest, MoveToArrayElement) {
     ASSERT_OK(node.init(update["$rename"]["b"], expCtx));
 
     mutablebson::Document doc(fromjson("{_id: 'test_object', a: [1, 2], b: 2}"));
-    setPathTaken("a.1");
+    setPathTaken(makeRuntimeUpdatePathForTest("a.1"));
     addIndexedPath("a");
-    ASSERT_THROWS_CODE_AND_WHAT(node.apply(getApplyParams(doc.root()["a"][1])),
-                                AssertionException,
-                                ErrorCodes::BadValue,
-                                "The destination field cannot be an array element, 'a.1' in doc "
-                                "with _id: \"test_object\" has an array field called 'a'");
+    ASSERT_THROWS_CODE_AND_WHAT(
+        node.apply(getApplyParams(doc.root()["a"][1]), getUpdateNodeApplyParams()),
+        AssertionException,
+        ErrorCodes::BadValue,
+        "The destination field cannot be an array element, 'a.1' in doc "
+        "with _id: \"test_object\" has an array field called 'a'");
 }
 
 TEST_F(RenameNodeTest, MoveOutOfArray) {
@@ -315,7 +336,7 @@ TEST_F(RenameNodeTest, MoveOutOfArray) {
     mutablebson::Document doc(fromjson("{_id: 'test_object', a: [1, 2]}"));
     setPathToCreate("b");
     addIndexedPath("a");
-    ASSERT_THROWS_CODE_AND_WHAT(node.apply(getApplyParams(doc.root())),
+    ASSERT_THROWS_CODE_AND_WHAT(node.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams()),
                                 AssertionException,
                                 ErrorCodes::BadValue,
                                 "The source field cannot be an array element, 'a.0' in doc with "
@@ -332,7 +353,7 @@ TEST_F(RenameNodeTest, MoveNonexistentEmbeddedFieldOut) {
     setPathToCreate("b");
     addIndexedPath("a");
     ASSERT_THROWS_CODE_AND_WHAT(
-        node.apply(getApplyParams(doc.root())),
+        node.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams()),
         AssertionException,
         ErrorCodes::PathNotViable,
         "cannot use the part (a of a.a) to traverse the element ({a: [ { a: 1 }, { b: 2 } ]})");
@@ -347,7 +368,7 @@ TEST_F(RenameNodeTest, MoveEmbeddedFieldOutWithElementNumber) {
     mutablebson::Document doc(fromjson("{_id: 'test_object', a: [{a: 1}, {b: 2}]}"));
     setPathToCreate("b");
     addIndexedPath("a");
-    ASSERT_THROWS_CODE_AND_WHAT(node.apply(getApplyParams(doc.root())),
+    ASSERT_THROWS_CODE_AND_WHAT(node.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams()),
                                 AssertionException,
                                 ErrorCodes::BadValue,
                                 "The source field cannot be an array element, 'a.0.a' in doc with "
@@ -361,13 +382,15 @@ TEST_F(RenameNodeTest, ReplaceArrayField) {
     ASSERT_OK(node.init(update["$rename"]["a"], expCtx));
 
     mutablebson::Document doc(fromjson("{a: 2, b: []}"));
-    setPathTaken("b");
+    setPathTaken(makeRuntimeUpdatePathForTest("b"));
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()["b"]));
+    auto result = node.apply(getApplyParams(doc.root()["b"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
-    ASSERT_TRUE(result.indexesAffected);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{b: 2}"), doc);
-    ASSERT_EQUALS(fromjson("{$set: {b: 2}, $unset: {a: true}}"), getLogDoc());
+
+    assertOplogEntry(fromjson("{$v: 2, diff: {d: {a: false}, u: {b: 2}}}"));
+    ASSERT_EQUALS(getModifiedPaths(), "{a, b}");
 }
 
 TEST_F(RenameNodeTest, ReplaceWithArrayField) {
@@ -377,13 +400,15 @@ TEST_F(RenameNodeTest, ReplaceWithArrayField) {
     ASSERT_OK(node.init(update["$rename"]["a"], expCtx));
 
     mutablebson::Document doc(fromjson("{a: [], b: 2}"));
-    setPathTaken("b");
+    setPathTaken(makeRuntimeUpdatePathForTest("b"));
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()["b"]));
+    auto result = node.apply(getApplyParams(doc.root()["b"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
-    ASSERT_TRUE(result.indexesAffected);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{b: []}"), doc);
-    ASSERT_EQUALS(fromjson("{$set: {b: []}, $unset: {a: true}}"), getLogDoc());
+
+    assertOplogEntry(fromjson("{$v: 2, diff: {d: {a: false}, u: {b: []}}}"));
+    ASSERT_EQUALS(getModifiedPaths(), "{a, b}");
 }
 
 TEST_F(RenameNodeTest, CanRenameFromInvalidFieldName) {
@@ -395,11 +420,13 @@ TEST_F(RenameNodeTest, CanRenameFromInvalidFieldName) {
     mutablebson::Document doc(fromjson("{$a: 2}"));
     setPathToCreate("a");
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()));
+    auto result = node.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
-    ASSERT_TRUE(result.indexesAffected);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{a: 2}"), doc);
-    ASSERT_EQUALS(fromjson("{$set: {a: 2}, $unset: {'$a': true}}"), getLogDoc());
+
+    assertOplogEntry(fromjson("{$v: 2, diff: {d: {$a: false}, i: {a: 2}}}"));
+    ASSERT_EQUALS(getModifiedPaths(), "{$a, a}");
 }
 
 TEST_F(RenameNodeTest, RenameWithoutLogBuilderOrIndexData) {
@@ -411,7 +438,7 @@ TEST_F(RenameNodeTest, RenameWithoutLogBuilderOrIndexData) {
     mutablebson::Document doc(fromjson("{a: 2}"));
     setPathToCreate("b");
     setLogBuilderToNull();
-    auto result = node.apply(getApplyParams(doc.root()));
+    auto result = node.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_EQUALS(fromjson("{b: 2}"), doc);
 }
@@ -423,27 +450,15 @@ TEST_F(RenameNodeTest, RenameFromNonExistentPathIsNoOp) {
     ASSERT_OK(node.init(update["$rename"]["a"], expCtx));
 
     mutablebson::Document doc(fromjson("{b: 2}"));
-    setPathTaken("b");
+    setPathTaken(makeRuntimeUpdatePathForTest("b"));
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()["b"]));
+    auto result = node.apply(getApplyParams(doc.root()["b"]), getUpdateNodeApplyParams());
     ASSERT_TRUE(result.noop);
-    ASSERT_FALSE(result.indexesAffected);
+    ASSERT_FALSE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{b: 2}"), doc);
-    ASSERT_EQUALS(fromjson("{}"), getLogDoc());
-}
 
-TEST_F(RenameNodeTest, ApplyCannotRemoveRequiredPartOfDBRef) {
-    auto update = fromjson("{$rename: {'a.$id': 'b'}}");
-    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    RenameNode node;
-    ASSERT_OK(node.init(update["$rename"]["a.$id"], expCtx));
-
-    mutablebson::Document doc(fromjson("{a: {$ref: 'c', $id: 0}}"));
-    setPathToCreate("b");
-    ASSERT_THROWS_CODE_AND_WHAT(node.apply(getApplyParams(doc.root())),
-                                AssertionException,
-                                ErrorCodes::InvalidDBRef,
-                                "The DBRef $ref field must be followed by a $id field");
+    assertOplogEntryIsNoop();
+    ASSERT_EQUALS(getModifiedPaths(), "{a, b}");
 }
 
 TEST_F(RenameNodeTest, ApplyCanRemoveRequiredPartOfDBRefIfValidateForStorageIsFalse) {
@@ -456,16 +471,15 @@ TEST_F(RenameNodeTest, ApplyCanRemoveRequiredPartOfDBRefIfValidateForStorageIsFa
     setPathToCreate("b");
     addIndexedPath("a");
     setValidateForStorage(false);
-    auto result = node.apply(getApplyParams(doc.root()));
+    auto result = node.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
-    ASSERT_TRUE(result.indexesAffected);
-    auto updated = BSON("a" << BSON("$ref"
-                                    << "c")
-                            << "b"
-                            << 0);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
+    auto updated = BSON("a" << BSON("$ref" << "c") << "b" << 0);
     ASSERT_EQUALS(updated, doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(fromjson("{$set: {'b': 0}, $unset: {'a.$id': true}}"), getLogDoc());
+
+    assertOplogEntry(fromjson("{$v: 2, diff: {i: {b: 0}, sa: {d: {$id: false}}}}"));
+    ASSERT_EQUALS(getModifiedPaths(), "{a.$id, b}");
 }
 
 TEST_F(RenameNodeTest, ApplyCannotRemoveImmutablePath) {
@@ -478,7 +492,7 @@ TEST_F(RenameNodeTest, ApplyCannotRemoveImmutablePath) {
     setPathToCreate("c");
     addImmutablePath("a.b");
     ASSERT_THROWS_CODE_AND_WHAT(
-        node.apply(getApplyParams(doc.root())),
+        node.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams()),
         AssertionException,
         ErrorCodes::ImmutableField,
         "Performing an update on the path 'a.b' would modify the immutable field 'a.b'");
@@ -494,7 +508,7 @@ TEST_F(RenameNodeTest, ApplyCannotRemovePrefixOfImmutablePath) {
     setPathToCreate("c");
     addImmutablePath("a.b");
     ASSERT_THROWS_CODE_AND_WHAT(
-        node.apply(getApplyParams(doc.root())),
+        node.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams()),
         AssertionException,
         ErrorCodes::ImmutableField,
         "Performing an update on the path 'a' would modify the immutable field 'a.b'");
@@ -510,7 +524,7 @@ TEST_F(RenameNodeTest, ApplyCannotRemoveSuffixOfImmutablePath) {
     setPathToCreate("d");
     addImmutablePath("a.b");
     ASSERT_THROWS_CODE_AND_WHAT(
-        node.apply(getApplyParams(doc.root())),
+        node.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams()),
         AssertionException,
         ErrorCodes::ImmutableField,
         "Performing an update on the path 'a.b.c' would modify the immutable field 'a.b'");
@@ -526,27 +540,14 @@ TEST_F(RenameNodeTest, ApplyCanRemoveImmutablePathIfNoop) {
     setPathToCreate("d");
     addImmutablePath("a.b");
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()));
+    auto result = node.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
     ASSERT_TRUE(result.noop);
-    ASSERT_FALSE(result.indexesAffected);
+    ASSERT_FALSE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{a: {b: {}}}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(fromjson("{}"), getLogDoc());
-}
 
-TEST_F(RenameNodeTest, ApplyCannotCreateDollarPrefixedField) {
-    auto update = fromjson("{$rename: {a: '$bad'}}");
-    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    RenameNode node;
-    ASSERT_OK(node.init(update["$rename"]["a"], expCtx));
-
-    mutablebson::Document doc(fromjson("{a: 0}"));
-    setPathToCreate("$bad");
-    ASSERT_THROWS_CODE_AND_WHAT(
-        node.apply(getApplyParams(doc.root())),
-        AssertionException,
-        ErrorCodes::DollarPrefixedFieldName,
-        "The dollar ($) prefixed field '$bad' in '$bad' is not valid for storage.");
+    assertOplogEntryIsNoop();
+    ASSERT_EQUALS(getModifiedPaths(), "{a.b.c, d}");
 }
 
 TEST_F(RenameNodeTest, ApplyCannotOverwriteImmutablePath) {
@@ -556,10 +557,10 @@ TEST_F(RenameNodeTest, ApplyCannotOverwriteImmutablePath) {
     ASSERT_OK(node.init(update["$rename"]["a"], expCtx));
 
     mutablebson::Document doc(fromjson("{a: 0, b: 1}"));
-    setPathTaken("b");
+    setPathTaken(makeRuntimeUpdatePathForTest("b"));
     addImmutablePath("b");
     ASSERT_THROWS_CODE_AND_WHAT(
-        node.apply(getApplyParams(doc.root()["b"])),
+        node.apply(getApplyParams(doc.root()["b"]), getUpdateNodeApplyParams()),
         AssertionException,
         ErrorCodes::ImmutableField,
         "Performing an update on the path 'b' would modify the immutable field 'b'");

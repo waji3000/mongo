@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,20 +27,25 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include <boost/optional.hpp>
+#include <cstddef>
+#include <string>
 #include <vector>
 
+#include <absl/container/node_hash_set.h>
+
+#include "mongo/base/error_codes.h"
 #include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/json.h"
-#include "mongo/db/pipeline/document.h"
-#include "mongo/db/pipeline/document_comparator.h"
+#include "mongo/bson/util/builder.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/document_value_test_util.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/exec/document_value/value_comparator.h"
 #include "mongo/db/pipeline/document_path_support.h"
-#include "mongo/db/pipeline/document_value_test_util.h"
 #include "mongo/db/pipeline/field_path.h"
-#include "mongo/db/pipeline/value.h"
 #include "mongo/unittest/unittest.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 namespace document_path_support {
@@ -52,8 +56,10 @@ using std::vector;
 const ValueComparator kDefaultValueComparator{};
 
 TEST(VisitAllValuesAtPathTest, NestedObjectWithScalarValue) {
-    auto values = kDefaultValueComparator.makeUnorderedValueSet();
-    auto callback = [&values](const Value& val) { values.insert(val); };
+    auto values = kDefaultValueComparator.makeFlatUnorderedValueSet();
+    auto callback = [&values](const Value& val) {
+        values.insert(val);
+    };
     Document doc{{"a", Document{{"b", 1}}}};
     visitAllValuesAtPath(doc, FieldPath("a.b"), callback);
     ASSERT_EQ(values.size(), 1UL);
@@ -61,26 +67,32 @@ TEST(VisitAllValuesAtPathTest, NestedObjectWithScalarValue) {
 }
 
 TEST(VisitAllValuesAtPathTest, NestedObjectWithEmptyArrayValue) {
-    auto values = kDefaultValueComparator.makeUnorderedValueSet();
-    auto callback = [&values](const Value& val) { values.insert(val); };
+    auto values = kDefaultValueComparator.makeFlatUnorderedValueSet();
+    auto callback = [&values](const Value& val) {
+        values.insert(val);
+    };
     Document doc{{"a", Document{{"b", vector<Value>{}}}}};
     visitAllValuesAtPath(doc, FieldPath("a.b"), callback);
     ASSERT_EQ(values.size(), 0UL);
 }
 
 TEST(VisitAllValuesAtPathTest, NestedObjectWithSingletonArrayValue) {
-    auto values = kDefaultValueComparator.makeUnorderedValueSet();
-    auto callback = [&values](const Value& val) { values.insert(val); };
-    Document doc{{"a", Document{{"b", vector<Value>{Value(1)}}}}};
+    auto values = kDefaultValueComparator.makeFlatUnorderedValueSet();
+    auto callback = [&values](const Value& val) {
+        values.insert(val);
+    };
+    Document doc{{"a", Document{{"b", vector{1}}}}};
     visitAllValuesAtPath(doc, FieldPath("a.b"), callback);
     ASSERT_EQ(values.size(), 1UL);
     ASSERT_EQ(values.count(Value(1)), 1UL);
 }
 
 TEST(VisitAllValuesAtPathTest, NestedObjectWithArrayValue) {
-    auto values = kDefaultValueComparator.makeUnorderedValueSet();
-    auto callback = [&values](const Value& val) { values.insert(val); };
-    Document doc{{"a", Document{{"b", vector<Value>{Value(1), Value(2), Value(3)}}}}};
+    auto values = kDefaultValueComparator.makeFlatUnorderedValueSet();
+    auto callback = [&values](const Value& val) {
+        values.insert(val);
+    };
+    Document doc{{"a", Document{{"b", vector{1, 2, 3}}}}};
     visitAllValuesAtPath(doc, FieldPath("a.b"), callback);
     ASSERT_EQ(values.size(), 3UL);
     ASSERT_EQ(values.count(Value(1)), 1UL);
@@ -89,8 +101,10 @@ TEST(VisitAllValuesAtPathTest, NestedObjectWithArrayValue) {
 }
 
 TEST(VisitAllValuesAtPathTest, ObjectWithArrayOfSubobjectsWithScalarValue) {
-    auto values = kDefaultValueComparator.makeUnorderedValueSet();
-    auto callback = [&values](const Value& val) { values.insert(val); };
+    auto values = kDefaultValueComparator.makeFlatUnorderedValueSet();
+    auto callback = [&values](const Value& val) {
+        values.insert(val);
+    };
     Document doc{
         {"a", vector<Document>{Document{{"b", 1}}, Document{{"b", 2}}, Document{{"b", 3}}}}};
     visitAllValuesAtPath(doc, FieldPath("a.b"), callback);
@@ -101,12 +115,14 @@ TEST(VisitAllValuesAtPathTest, ObjectWithArrayOfSubobjectsWithScalarValue) {
 }
 
 TEST(VisitAllValuesAtPathTest, ObjectWithArrayOfSubobjectsWithArrayValues) {
-    auto values = kDefaultValueComparator.makeUnorderedValueSet();
-    auto callback = [&values](const Value& val) { values.insert(val); };
+    auto values = kDefaultValueComparator.makeFlatUnorderedValueSet();
+    auto callback = [&values](const Value& val) {
+        values.insert(val);
+    };
     Document doc{{"a",
-                  vector<Document>{Document{{"b", vector<Value>{Value(1), Value(2)}}},
-                                   Document{{"b", vector<Value>{Value(2), Value(3)}}},
-                                   Document{{"b", vector<Value>{Value(3), Value(1)}}}}}};
+                  vector<Document>{Document{{"b", vector{1, 2}}},
+                                   Document{{"b", vector{2, 3}}},
+                                   Document{{"b", vector{3, 1}}}}}};
     visitAllValuesAtPath(doc, FieldPath("a.b"), callback);
     ASSERT_EQ(values.size(), 3UL);
     ASSERT_EQ(values.count(Value(1)), 1UL);
@@ -115,16 +131,20 @@ TEST(VisitAllValuesAtPathTest, ObjectWithArrayOfSubobjectsWithArrayValues) {
 }
 
 TEST(VisitAllValuesAtPathTest, ObjectWithTwoDimensionalArrayOfSubobjects) {
-    auto values = kDefaultValueComparator.makeUnorderedValueSet();
-    auto callback = [&values](const Value& val) { values.insert(val); };
+    auto values = kDefaultValueComparator.makeFlatUnorderedValueSet();
+    auto callback = [&values](const Value& val) {
+        values.insert(val);
+    };
     Document doc(fromjson("{a: [[{b: 0}, {b: 1}], [{b: 2}, {b: 3}]]}"));
     visitAllValuesAtPath(doc, FieldPath("a.b"), callback);
     ASSERT_EQ(values.size(), 0UL);
 }
 
 TEST(VisitAllValuesAtPathTest, ObjectWithDiverseStructure) {
-    auto values = kDefaultValueComparator.makeUnorderedValueSet();
-    auto callback = [&values](const Value& val) { values.insert(val); };
+    auto values = kDefaultValueComparator.makeFlatUnorderedValueSet();
+    auto callback = [&values](const Value& val) {
+        values.insert(val);
+    };
     Document doc(
         fromjson("{a: ["
                  "     {b: 0},"
@@ -141,8 +161,10 @@ TEST(VisitAllValuesAtPathTest, ObjectWithDiverseStructure) {
 }
 
 TEST(VisitAllValuesAtPathTest, AcceptsNumericFieldNames) {
-    auto values = kDefaultValueComparator.makeUnorderedValueSet();
-    auto callback = [&values](const Value& val) { values.insert(val); };
+    auto values = kDefaultValueComparator.makeFlatUnorderedValueSet();
+    auto callback = [&values](const Value& val) {
+        values.insert(val);
+    };
     Document doc{{"a", Document{{"0", 1}}}};
     visitAllValuesAtPath(doc, FieldPath("a.0"), callback);
     ASSERT_EQ(values.size(), 1UL);
@@ -150,77 +172,76 @@ TEST(VisitAllValuesAtPathTest, AcceptsNumericFieldNames) {
 }
 
 TEST(VisitAllValuesAtPathTest, UsesNumericFieldNameToExtractElementFromArray) {
-    auto values = kDefaultValueComparator.makeUnorderedValueSet();
-    auto callback = [&values](const Value& val) { values.insert(val); };
-    Document doc{{"a", vector<Value>{Value(1), Value(Document{{"0", 1}})}}};
+    auto values = kDefaultValueComparator.makeFlatUnorderedValueSet();
+    auto callback = [&values](const Value& val) {
+        values.insert(val);
+    };
+    Document doc{{"a", {1, Document{{"0", 1}}}}};
     visitAllValuesAtPath(doc, FieldPath("a.0"), callback);
     ASSERT_EQ(values.size(), 1UL);
     ASSERT_EQ(values.count(Value(1)), 1UL);
 }
 
 TEST(VisitAllValuesAtPathTest, TreatsNegativeIndexAsFieldName) {
-    auto values = kDefaultValueComparator.makeUnorderedValueSet();
-    auto callback = [&values](const Value& val) { values.insert(val); };
-    Document doc{
-        {"a",
-         vector<Value>{
-             Value(0), Value(1), Value(Document{{"-1", "target"_sd}}), Value(Document{{"b", 3}})}}};
+    auto values = kDefaultValueComparator.makeFlatUnorderedValueSet();
+    auto callback = [&values](const Value& val) {
+        values.insert(val);
+    };
+    Document doc{{"a", {0, 1, Document{{"-1", "target"_sd}}, Document{{"b", 3}}}}};
     visitAllValuesAtPath(doc, FieldPath("a.-1"), callback);
     ASSERT_EQ(values.size(), 1UL);
     ASSERT_EQ(values.count(Value("target"_sd)), 1UL);
 }
 
 TEST(VisitAllValuesAtPathTest, ExtractsNoValuesFromOutOfBoundsIndex) {
-    auto values = kDefaultValueComparator.makeUnorderedValueSet();
-    auto callback = [&values](const Value& val) { values.insert(val); };
-    Document doc{
-        {"a", vector<Value>{Value(1), Value(Document{{"b", 2}}), Value(Document{{"10", 3}})}}};
+    auto values = kDefaultValueComparator.makeFlatUnorderedValueSet();
+    auto callback = [&values](const Value& val) {
+        values.insert(val);
+    };
+    Document doc{{"a", {1, Document{{"b", 2}}, Document{{"10", 3}}}}};
     visitAllValuesAtPath(doc, FieldPath("a.10"), callback);
     ASSERT_EQ(values.size(), 0UL);
 }
 
 TEST(VisitAllValuesAtPathTest, DoesNotTreatHexStringAsIndexSpecification) {
-    auto values = kDefaultValueComparator.makeUnorderedValueSet();
-    auto callback = [&values](const Value& val) { values.insert(val); };
-    Document doc{{"a",
-                  vector<Value>{Value(1),
-                                Value(Document{{"0x2", 2}}),
-                                Value(Document{{"NOT THIS ONE", 3}})}}};
+    auto values = kDefaultValueComparator.makeFlatUnorderedValueSet();
+    auto callback = [&values](const Value& val) {
+        values.insert(val);
+    };
+    Document doc{{"a", {1, Document{{"0x2", 2}}, Document{{"NOT THIS ONE", 3}}}}};
     visitAllValuesAtPath(doc, FieldPath("a.0x2"), callback);
     ASSERT_EQ(values.size(), 1UL);
     ASSERT_EQ(values.count(Value(2)), 1UL);
 }
 
 TEST(VisitAllValuesAtPathTest, DoesNotAcceptLeadingPlusAsArrayIndex) {
-    auto values = kDefaultValueComparator.makeUnorderedValueSet();
-    auto callback = [&values](const Value& val) { values.insert(val); };
-    Document doc{{"a",
-                  vector<Value>{
-                      Value(1), Value(Document{{"+2", 2}}), Value(Document{{"NOT THIS ONE", 3}})}}};
+    auto values = kDefaultValueComparator.makeFlatUnorderedValueSet();
+    auto callback = [&values](const Value& val) {
+        values.insert(val);
+    };
+    Document doc{{"a", {1, Document{{"+2", 2}}, Document{{"NOT THIS ONE", 3}}}}};
     visitAllValuesAtPath(doc, FieldPath("a.+2"), callback);
     ASSERT_EQ(values.size(), 1UL);
     ASSERT_EQ(values.count(Value(2)), 1UL);
 }
 
 TEST(VisitAllValuesAtPathTest, DoesNotAcceptTrailingCharactersForArrayIndex) {
-    auto values = kDefaultValueComparator.makeUnorderedValueSet();
-    auto callback = [&values](const Value& val) { values.insert(val); };
-    Document doc{{"a",
-                  vector<Value>{Value(1),
-                                Value(Document{{"2xyz", 2}}),
-                                Value(Document{{"NOT THIS ONE", 3}})}}};
+    auto values = kDefaultValueComparator.makeFlatUnorderedValueSet();
+    auto callback = [&values](const Value& val) {
+        values.insert(val);
+    };
+    Document doc{{"a", {1, Document{{"2xyz", 2}}, Document{{"NOT THIS ONE", 3}}}}};
     visitAllValuesAtPath(doc, FieldPath("a.2xyz"), callback);
     ASSERT_EQ(values.size(), 1UL);
     ASSERT_EQ(values.count(Value(2)), 1UL);
 }
 
 TEST(VisitAllValuesAtPathTest, DoesNotAcceptNonDigitsForArrayIndex) {
-    auto values = kDefaultValueComparator.makeUnorderedValueSet();
-    auto callback = [&values](const Value& val) { values.insert(val); };
-    Document doc{{"a",
-                  vector<Value>{Value(1),
-                                Value(Document{{"2x4", 2}}),
-                                Value(Document{{"NOT THIS ONE", 3}})}}};
+    auto values = kDefaultValueComparator.makeFlatUnorderedValueSet();
+    auto callback = [&values](const Value& val) {
+        values.insert(val);
+    };
+    Document doc{{"a", {1, Document{{"2x4", 2}}, Document{{"NOT THIS ONE", 3}}}}};
     visitAllValuesAtPath(doc, FieldPath("a.2x4"), callback);
     ASSERT_EQ(values.size(), 1UL);
     ASSERT_EQ(values.count(Value(2)), 1UL);
@@ -228,18 +249,21 @@ TEST(VisitAllValuesAtPathTest, DoesNotAcceptNonDigitsForArrayIndex) {
 
 TEST(VisitAllValuesAtPathTest,
      DoesExtractNestedValuesFromWithinArraysTraversedWithPositionalPaths) {
-    auto values = kDefaultValueComparator.makeUnorderedValueSet();
-    auto callback = [&values](const Value& val) { values.insert(val); };
-    Document doc{
-        {"a", vector<Value>{Value(1), Value(Document{{"2", 2}}), Value(Document{{"target", 3}})}}};
+    auto values = kDefaultValueComparator.makeFlatUnorderedValueSet();
+    auto callback = [&values](const Value& val) {
+        values.insert(val);
+    };
+    Document doc{{"a", {1, Document{{"2", 2}}, Document{{"target", 3}}}}};
     visitAllValuesAtPath(doc, FieldPath("a.2.target"), callback);
     ASSERT_EQ(values.size(), 1UL);
     ASSERT_EQ(values.count(Value(3)), 1UL);
 }
 
 TEST(VisitAllValuesAtPathTest, DoesExpandMultiplePositionalPathSpecifications) {
-    auto values = kDefaultValueComparator.makeUnorderedValueSet();
-    auto callback = [&values](const Value& val) { values.insert(val); };
+    auto values = kDefaultValueComparator.makeFlatUnorderedValueSet();
+    auto callback = [&values](const Value& val) {
+        values.insert(val);
+    };
     Document doc(fromjson("{a: [[{b: '(0, 0)'}, {b: '(0, 1)'}], [{b: '(1, 0)'}, {b: '(1, 1)'}]]}"));
     visitAllValuesAtPath(doc, FieldPath("a.1.0.b"), callback);
     ASSERT_EQ(values.size(), 1UL);
@@ -247,8 +271,10 @@ TEST(VisitAllValuesAtPathTest, DoesExpandMultiplePositionalPathSpecifications) {
 }
 
 TEST(VisitAllValuesAtPathTest, DoesAcceptNumericInitialField) {
-    auto values = kDefaultValueComparator.makeUnorderedValueSet();
-    auto callback = [&values](const Value& val) { values.insert(val); };
+    auto values = kDefaultValueComparator.makeFlatUnorderedValueSet();
+    auto callback = [&values](const Value& val) {
+        values.insert(val);
+    };
     Document doc{{"a", 1}, {"0", 2}};
     visitAllValuesAtPath(doc, FieldPath("0"), callback);
     ASSERT_EQ(values.size(), 1UL);
@@ -256,8 +282,10 @@ TEST(VisitAllValuesAtPathTest, DoesAcceptNumericInitialField) {
 }
 
 TEST(VisitAllValuesAtPathTest, DoesExpandArrayFoundAfterPositionalSpecification) {
-    auto values = kDefaultValueComparator.makeUnorderedValueSet();
-    auto callback = [&values](const Value& val) { values.insert(val); };
+    auto values = kDefaultValueComparator.makeFlatUnorderedValueSet();
+    auto callback = [&values](const Value& val) {
+        values.insert(val);
+    };
     Document doc(fromjson("{a: [[{b: '(0, 0)'}, {b: '(0, 1)'}], [{b: '(1, 0)'}, {b: '(1, 1)'}]]}"));
     visitAllValuesAtPath(doc, FieldPath("a.1.b"), callback);
     ASSERT_EQ(values.size(), 2UL);
@@ -266,21 +294,46 @@ TEST(VisitAllValuesAtPathTest, DoesExpandArrayFoundAfterPositionalSpecification)
 }
 
 TEST(VisitAllValuesAtPathTest, DoesNotAddMissingValueToResults) {
-    auto values = kDefaultValueComparator.makeUnorderedValueSet();
-    auto callback = [&values](const Value& val) { values.insert(val); };
+    auto values = kDefaultValueComparator.makeFlatUnorderedValueSet();
+    auto callback = [&values](const Value& val) {
+        values.insert(val);
+    };
     Document doc{{"a", Value()}};
     visitAllValuesAtPath(doc, FieldPath("a"), callback);
     ASSERT_EQ(values.size(), 0UL);
 }
 
 TEST(VisitAllValuesAtPathTest, DoesNotAddMissingValueWithinArrayToResults) {
-    auto values = kDefaultValueComparator.makeUnorderedValueSet();
-    auto callback = [&values](const Value& val) { values.insert(val); };
-    Document doc{{"a", vector<Value>{Value(1), Value(), Value(2)}}};
+    auto values = kDefaultValueComparator.makeFlatUnorderedValueSet();
+    auto callback = [&values](const Value& val) {
+        values.insert(val);
+    };
+    Document doc{{"a", {1, Value(), 2}}};
     visitAllValuesAtPath(doc, FieldPath("a"), callback);
     ASSERT_EQ(values.size(), 2UL);
     ASSERT_EQ(values.count(Value(1)), 1UL);
     ASSERT_EQ(values.count(Value(2)), 1UL);
+}
+
+TEST(VisitAllValuesAtPathTest, StrictNumericFields) {
+    auto values = kDefaultValueComparator.makeFlatUnorderedValueSet();
+    auto callback = [&values](const Value& val) {
+        values.insert(val);
+    };
+    {
+        Document doc(fromjson("{a: [[], [{b: [3]}, {b: {\"00\": 2}}]]}"));
+        visitAllValuesAtPath(doc, FieldPath("a.1.b.00"), callback);
+        // We only find 2.
+        ASSERT_EQ(values.size(), 1UL);
+        ASSERT_EQ(values.count(Value(2)), 1UL);
+    }
+    {
+        // Test a 0-prefixed case other than "00".
+        Document doc(fromjson("{a: [{b: [0, 1]}, {b: {\"01\": 2}}]}"));
+        visitAllValuesAtPath(doc, FieldPath("a.b.01"), callback);
+        ASSERT_EQ(values.size(), 1UL);
+        ASSERT_EQ(values.count(Value(2)), 1UL);
+    }
 }
 
 TEST(ExtractElementAlongNonArrayPathTest, ReturnsMissingIfPathDoesNotExist) {
@@ -305,13 +358,13 @@ TEST(ExtractElementAlongNonArrayPathTest, ReturnsValueIfPathExists) {
 }
 
 TEST(ExtractElementAlongNonArrayPathTest, FailsIfPathTerminatesAtEmptyArray) {
-    Document doc{fromjson("{a: {b: {c: {d: []}}}}}")};
+    Document doc{fromjson("{a: {b: {c: {d: []}}}}")};
     auto result = extractElementAlongNonArrayPath(doc, FieldPath{"a.b.c.d"});
     ASSERT_EQ(result.getStatus(), ErrorCodes::InternalError);
 }
 
 TEST(ExtractElementAlongNonArrayPathTest, FailsIfPathTerminatesAtNonEmptyArray) {
-    Document doc{fromjson("{a: {b: {c: {d: [1, 2, 3]}}}}}")};
+    Document doc{fromjson("{a: {b: {c: {d: [1, 2, 3]}}}}")};
     auto result = extractElementAlongNonArrayPath(doc, FieldPath{"a.b.c.d"});
     ASSERT_EQ(result.getStatus(), ErrorCodes::InternalError);
 }
@@ -368,8 +421,8 @@ TEST(DocumentToBsonWithPathsTest, MissingFieldShouldNotAppearInResult) {
 TEST(DocumentToBsonWithPathsTest, ShouldSerializeNothingIfNothingIsNeeded) {
     Document input(fromjson("{a: 1, b: {c: 1}}"));
     BSONObj expected;
-    ASSERT_BSONOBJ_EQ(
-        expected, document_path_support::documentToBsonWithPaths(input, std::set<std::string>{}));
+    ASSERT_BSONOBJ_EQ(expected,
+                      document_path_support::documentToBsonWithPaths(input, OrderedPathSet{}));
 }
 
 TEST(DocumentToBsonWithPathsTest, ShouldExtractEntireArrayFromPrefixOfDottedField) {
@@ -378,6 +431,26 @@ TEST(DocumentToBsonWithPathsTest, ShouldExtractEntireArrayFromPrefixOfDottedFiel
     ASSERT_BSONOBJ_EQ(expected, document_path_support::documentToBsonWithPaths(input, {"a.b"}));
 }
 
+TEST(DocumentToBsonWithPathsTest, SizeTraits) {
+    constexpr size_t longStringLength = 9 * 1024 * 1024;
+    static_assert(longStringLength <= BSONObjMaxInternalSize &&
+                  2 * longStringLength > BSONObjMaxInternalSize &&
+                  2 * longStringLength <= BufferMaxSize);
+    std::string longString(longStringLength, 'A');
+    MutableDocument md;
+    md.addField("a", Value(longString));
+    md.addField("b", Value(longString));
+    ASSERT_DOES_NOT_THROW(document_path_support::documentToBsonWithPaths(md.peek(), {"a"}));
+    ASSERT_THROWS_CODE(document_path_support::documentToBsonWithPaths(md.peek(), {"a", "b"}),
+                       DBException,
+                       ErrorCodes::BSONObjectTooLarge);
+    ASSERT_THROWS_CODE(document_path_support::documentToBsonWithPaths<BSONObj::DefaultSizeTrait>(
+                           md.peek(), {"a", "b"}),
+                       DBException,
+                       ErrorCodes::BSONObjectTooLarge);
+    ASSERT_DOES_NOT_THROW(document_path_support::documentToBsonWithPaths<BSONObj::LargeSizeTrait>(
+        md.peek(), {"a", "b"}));
+}
 }  // namespace
 }  // namespace document_path_support
 }  // namespace mongo

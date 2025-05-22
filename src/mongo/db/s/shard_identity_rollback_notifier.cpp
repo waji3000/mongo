@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,11 +27,12 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/s/shard_identity_rollback_notifier.h"
+#include <utility>
 
 #include "mongo/db/operation_context.h"
+#include "mongo/db/s/shard_identity_rollback_notifier.h"
+#include "mongo/db/service_context.h"
+#include "mongo/util/decorable.h"
 
 namespace mongo {
 

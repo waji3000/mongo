@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,8 +29,17 @@
 
 #pragma once
 
+#include <memory>
+
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/update/array_culling_node.h"
-#include "mongo/stdx/memory.h"
+#include "mongo/db/update/update_node.h"
+#include "mongo/db/update/update_node_visitor.h"
 
 namespace mongo {
 
@@ -47,10 +55,18 @@ public:
     Status init(BSONElement modExpr, const boost::intrusive_ptr<ExpressionContext>& expCtx) final;
 
     std::unique_ptr<UpdateNode> clone() const final {
-        return stdx::make_unique<PullAllNode>(*this);
+        return std::make_unique<PullAllNode>(*this);
+    }
+
+    void acceptVisitor(UpdateNodeVisitor* visitor) final {
+        visitor->visit(this);
     }
 
 private:
+    StringData operatorName() const final {
+        return "$pullAll";
+    }
+
     /**
      * An implementation of ArrayCullingNode::ElementMatcher whose match() function returns true iff
      * its input element is exactly equal to any element from a set of candidate elements.

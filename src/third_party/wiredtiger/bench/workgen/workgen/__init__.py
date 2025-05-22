@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Public Domain 2014-2018 MongoDB, Inc.
+# Public Domain 2014-present MongoDB, Inc.
 # Public Domain 2008-2014 WiredTiger, Inc.
 #
 # This is free and unencumbered software released into the public domain.
@@ -31,7 +31,7 @@
 #
 import os, sys
 
-# After importing the SWIG-generated file, copy all symbols from from it
+# After importing the SWIG-generated file, copy all symbols from it
 # to this module so they will appear in the workgen namespace.
 me = sys.modules[__name__]
 sys.path.append(os.path.dirname(__file__))  # needed for Python3

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -36,145 +35,67 @@
 
 #include "mongo/platform/atomic_word.h"
 #include "mongo/stdx/mutex.h"
+#include "mongo/util/concurrency/with_lock.h"
+#include "mongo/util/parking_lot.h"
 
 namespace mongo {
 
-/**
- * Notifyable is a slim type meant to allow integration of special kinds of waiters for
- * stdx::condition_variable.  Specifially, the notify() on this type will be called directly from
- * stdx::condition_varibale::notify_(one|all).
- *
- * See Waitable for the stdx::condition_variable integration.
- */
-class Notifyable {
-public:
-    virtual void notify() noexcept = 0;
-
-protected:
-    ~Notifyable() = default;
-};
-
-class Waitable;
-
 namespace stdx {
 
-using condition_variable_any = ::std::condition_variable_any;  // NOLINT
-using cv_status = ::std::cv_status;                            // NOLINT
-using ::std::notify_all_at_thread_exit;                        // NOLINT
+using cv_status = ::std::cv_status;      // NOLINT
+using ::std::notify_all_at_thread_exit;  // NOLINT
 
 /**
- * We wrap std::condition_variable to allow us to register Notifyables which can "wait" on the
- * condvar without actually waiting on the std::condition_variable.  This allows us to possibly do
- * productive work in those types, rather than sleeping in the os.
+ * We wrap std::condition_variable_any to allow us to register Notifiables which can "wait" on the
+ * condvar without actually waiting on the std::condition_variable_any. This allows us to possibly
+ * do productive work in those types, rather than sleeping in the os.
  */
-class condition_variable : private std::condition_variable {  // NOLINT
+class condition_variable : private std::condition_variable_any {  // NOLINT
 public:
-    using std::condition_variable::condition_variable;  // NOLINT
+    using std::condition_variable_any::condition_variable_any;  // NOLINT
+
+    /**
+     * Use this function instead of wait/wait_for/wait_until to wait using `notifiable`.
+     *
+     * Waiting using `notifiable` means that:
+     *  1) `cb` will be called to perform the wait, instead of calling
+     *  std::condition_variable::wait. `cb` should return when `notify` is called on `notifiable`.
+     *  2) The wait may be stopped because this condvar is notified, _or_ because `notifiable` was
+     *  notified for some other reason (i.e. interrupt)
+     *  3) Other work may be performed by the waiting thread before it yields; the logic for
+     *  performing this work is encapsulated inside of `cb`; the only constraint is that it returns
+     *  once notification has been performed on `notifiable`. Note that `notifiable` notificaton is
+     *  a one-time event; once it is notified, all calls to this function will return immediately
+     *  without waiting. See `Notifiable` and `ParkingLot` for more.
+     *
+     *  For example, passing `[baton] () { return baton->run(); }` as `cb` would be suitable when
+     *  `baton` is also passed as `notifiable`, becuase `Baton::run` will return when the baton is
+     *  notified.
+     */
+    template <typename Callback>
+    void waitWithNotifiable(Notifiable& notifiable, Callback&& cb) noexcept {
+        return _parkingLot.parkOne(notifiable, std::forward<Callback>(cb));
+    }
 
     void notify_one() noexcept {
-        if (_notifyableCount.load()) {
-            stdx::lock_guard<stdx::mutex> lk(_mutex);
-
-            if (_notifyNextNotifyable(lk)) {
-                return;
-            }
+        if (!_parkingLot.unparkOne()) {
+            std::condition_variable_any::notify_one();  // NOLINT
         }
-
-        std::condition_variable::notify_one();  // NOLINT
     }
 
     void notify_all() noexcept {
-        if (_notifyableCount.load()) {
-            stdx::lock_guard<stdx::mutex> lk(_mutex);
-
-            while (_notifyNextNotifyable(lk)) {
-            }
-        }
-
-        std::condition_variable::notify_all();  // NOLINT
+        _parkingLot.unparkAll();
+        std::condition_variable_any::notify_all();  // NOLINT
     }
 
-    using std::condition_variable::wait;           // NOLINT
-    using std::condition_variable::wait_for;       // NOLINT
-    using std::condition_variable::wait_until;     // NOLINT
-    using std::condition_variable::native_handle;  // NOLINT
+    using std::condition_variable_any::wait;        // NOLINT
+    using std::condition_variable_any::wait_for;    // NOLINT
+    using std::condition_variable_any::wait_until;  // NOLINT
 
 private:
-    friend class ::mongo::Waitable;
-
-    /**
-     * Runs the callback with the Notifyable registered on the condvar.  This ensures that for the
-     * duration of the callback execution, a notification on the condvar will trigger a notify() to
-     * the Notifyable.
-     *
-     * The scheme here is that list entries are erased from the notification list when notified (so
-     * that they don't eat multiple notify_one's).  We detect that condition by noting that our
-     * Notifyable* has been overwritten with null (in which case we should avoid a double erase).
-     *
-     * The method is private, and accessed via friendship in Waitable.
-     */
-    template <typename Callback>
-    void _runWithNotifyable(Notifyable& notifyable, Callback&& cb) noexcept {
-        static_assert(noexcept(std::forward<Callback>(cb)()),
-                      "Only noexcept functions may be invoked with _runWithNotifyable");
-
-        // We use this local pad to receive notification that we were notified, rather than timing
-        // out organically.
-        //
-        // Note that n must be guarded by _mutex after its insertion in _notifyables (so that we can
-        // detect notification in a thread-safe manner).
-        Notifyable* n = &notifyable;
-
-        auto iter = [&] {
-            stdx::lock_guard<stdx::mutex> localMutex(_mutex);
-            _notifyableCount.addAndFetch(1);
-            return _notifyables.insert(_notifyables.end(), &n);
-        }();
-
-        std::forward<Callback>(cb)();
-
-        stdx::lock_guard<stdx::mutex> localMutex(_mutex);
-        // if n is null, we were notified, and erased in _notifyNextNotifyable
-        if (n) {
-            _notifyableCount.subtractAndFetch(1);
-            _notifyables.erase(iter);
-        }
-    }
-
-    /**
-     * Notifies the next notifyable.
-     *
-     * Returns true if there was a notifyable to be notified.
-     *
-     * Note that as part of notifying, we zero out pointers allocated on the stack by
-     * _runWithNotifyable callers.  This is safe because we hold _mutex while we do so, and our
-     * erasure communicates that those waiters need not clear themselves from the notification list
-     * on wakeup.
-     */
-    bool _notifyNextNotifyable(const stdx::lock_guard<stdx::mutex>&) noexcept {
-        auto iter = _notifyables.begin();
-        if (iter == _notifyables.end()) {
-            return false;
-        }
-
-        _notifyableCount.subtractAndFetch(1);
-
-        (**iter)->notify();
-
-        // null out iter here, so that the notifyable won't remove itself from the list when it
-        // wakes up
-        **iter = nullptr;
-
-        _notifyables.erase(iter);
-
-        return true;
-    }
-
-    AtomicUInt64 _notifyableCount;
-
-    stdx::mutex _mutex;
-    std::list<Notifyable**> _notifyables;
+    ParkingLot _parkingLot;
 };
 
+using condition_variable_any = stdx::condition_variable;
 }  // namespace stdx
 }  // namespace mongo

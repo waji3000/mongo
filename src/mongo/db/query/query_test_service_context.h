@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -31,8 +30,8 @@
 #pragma once
 
 #include "mongo/db/client.h"
-#include "mongo/db/logical_session_id.h"
 #include "mongo/db/service_context.h"
+#include "mongo/util/tick_source_mock.h"
 
 namespace mongo {
 
@@ -43,18 +42,18 @@ namespace mongo {
  */
 class QueryTestServiceContext {
 public:
-    QueryTestServiceContext();
+    QueryTestServiceContext(std::unique_ptr<TickSourceMock<Nanoseconds>> tickSource =
+                                std::unique_ptr<TickSourceMock<Nanoseconds>>());
     ~QueryTestServiceContext();
+
+    ServiceContext* getServiceContext() const;
+
+    Client* getClient() const;
 
     ServiceContext::UniqueOperationContext makeOperationContext();
 
-    ServiceContext::UniqueOperationContext makeOperationContext(LogicalSessionId lsid);
-
-    Client* getClient() const;
-    ServiceContext* getServiceContext();
-
 private:
-    ServiceContext::UniqueServiceContext _service;
+    ServiceContext::UniqueServiceContext _serviceContext;
     ServiceContext::UniqueClient _client;
 };
 

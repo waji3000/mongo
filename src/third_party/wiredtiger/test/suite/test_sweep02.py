@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Public Domain 2014-2018 MongoDB, Inc.
+# Public Domain 2014-present MongoDB, Inc.
 # Public Domain 2008-2014 WiredTiger, Inc.
 #
 # This is free and unencumbered software released into the public domain.
@@ -30,8 +30,7 @@
 # Test configuring and reconfiguring sweep options.
 #
 
-import wiredtiger, wttest
-from wttest import unittest
+import wttest
 
 class test_sweep02(wttest.WiredTigerTestCase):
     base_config = 'create,'
@@ -66,6 +65,3 @@ class test_sweep02(wttest.WiredTigerTestCase):
     def test_config05(self):
         self.conn = self.wiredtiger_open(self.dir, self.base_config + \
             "file_manager=(close_scan_interval=1,close_idle_time=1)")
-
-if __name__ == '__main__':
-    wttest.run()

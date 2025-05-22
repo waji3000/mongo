@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,18 +27,15 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include "mongo/client/index_spec.h"
-
+#include "mongo/base/error_codes.h"
 #include "mongo/client/dbclient_base.h"
-#include "mongo/client/read_preference.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 
 const char IndexSpec::kIndexValText[] = "text";
 const char IndexSpec::kIndexValGeo2D[] = "2d";
-const char IndexSpec::kIndexValGeoHaystack[] = "geoHaystack";
 const char IndexSpec::kIndexValGeo2DSphere[] = "2dsphere";
 const char IndexSpec::kIndexValHashed[] = "hashed";
 
@@ -47,11 +43,10 @@ namespace {
 
 const int kIndexTypeNumbers[] = {IndexSpec::kIndexValAscending, IndexSpec::kIndexValDescending};
 
-const char* const kIndexTypeStrings[] = {NULL,
-                                         NULL,
+const char* const kIndexTypeStrings[] = {nullptr,
+                                         nullptr,
                                          IndexSpec::kIndexValText,
                                          IndexSpec::kIndexValGeo2D,
-                                         IndexSpec::kIndexValGeoHaystack,
                                          IndexSpec::kIndexValGeo2DSphere,
                                          IndexSpec::kIndexValHashed};
 
@@ -62,7 +57,7 @@ const char kDuplicateOption[] = "duplicate option added to index descriptor";
 
 IndexSpec::IndexSpec() : _dynamicName(true) {}
 
-IndexSpec& IndexSpec::addKey(const StringData& field, IndexType type) {
+IndexSpec& IndexSpec::addKey(StringData field, IndexType type) {
     uassert(ErrorCodes::InvalidOptions, kDuplicateKey, !_keys.asTempObj().hasField(field));
     if (type <= kIndexTypeDescending)
         _keys.append(field, kIndexTypeNumbers[type]);
@@ -109,7 +104,7 @@ IndexSpec& IndexSpec::unique(bool value) {
     return *this;
 }
 
-IndexSpec& IndexSpec::name(const StringData& value) {
+IndexSpec& IndexSpec::name(StringData value) {
     _name = value.toString();
     _dynamicName = false;
     return *this;
@@ -149,7 +144,7 @@ IndexSpec& IndexSpec::textWeights(const BSONObj& value) {
     return *this;
 }
 
-IndexSpec& IndexSpec::textDefaultLanguage(const StringData& value) {
+IndexSpec& IndexSpec::textDefaultLanguage(StringData value) {
     uassert(ErrorCodes::InvalidOptions,
             kDuplicateOption,
             !_options.asTempObj().hasField("default_language"));
@@ -157,7 +152,7 @@ IndexSpec& IndexSpec::textDefaultLanguage(const StringData& value) {
     return *this;
 }
 
-IndexSpec& IndexSpec::textLanguageOverride(const StringData& value) {
+IndexSpec& IndexSpec::textLanguageOverride(StringData value) {
     uassert(ErrorCodes::InvalidOptions,
             kDuplicateOption,
             !_options.asTempObj().hasField("language_override"));
@@ -196,13 +191,6 @@ IndexSpec& IndexSpec::geo2DMin(double value) {
 IndexSpec& IndexSpec::geo2DMax(double value) {
     uassert(ErrorCodes::InvalidOptions, kDuplicateOption, !_options.asTempObj().hasField("max"));
     _options.append("max", value);
-    return *this;
-}
-
-IndexSpec& IndexSpec::geoHaystackBucketSize(double value) {
-    uassert(
-        ErrorCodes::InvalidOptions, kDuplicateOption, !_options.asTempObj().hasField("bucketSize"));
-    _options.append("bucketSize", value);
     return *this;
 }
 

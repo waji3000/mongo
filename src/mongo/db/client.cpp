@@ -1,6 +1,3 @@
-// client.cpp
-
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -34,36 +31,60 @@
    to an open socket (or logical connection if pooling on sockets) from a client.
 */
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/client.h"
-
 #include <boost/functional/hash.hpp>
+#include <cstddef>
+#include <cstdint>
+#include <mutex>
 #include <string>
-#include <vector>
 
-#include "mongo/base/status.h"
-#include "mongo/db/lasterror.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/db/client.h"
+#include "mongo/db/cluster_role.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/operation_cpu_timer.h"
 #include "mongo/db/service_context.h"
-#include "mongo/stdx/thread.h"
+#include "mongo/logv2/log_service.h"
+#include "mongo/transport/session.h"
 #include "mongo/util/concurrency/thread_name.h"
-#include "mongo/util/exit.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo {
-
 namespace {
-thread_local ServiceContext::UniqueClient currentClient;
-}  // namespace
 
-void Client::initThread(StringData desc, transport::SessionHandle session) {
-    initThread(desc, getGlobalServiceContext(), std::move(session));
+thread_local ServiceContext::UniqueClient currentClient;
+
+void invariantNoCurrentClient() {
+    invariant(!haveClient(),
+              str::stream() << "Already have client on this thread: "  //
+                            << '"' << Client::getCurrent()->desc() << '"');
 }
 
+int64_t generateSeed(const std::string& desc) {
+    size_t seed = 0;
+    boost::hash_combine(seed, Date_t::now().asInt64());
+    boost::hash_combine(seed, desc);
+    return seed;
+}
+
+bool checkIfRouterClient(const std::shared_ptr<transport::Session>& session) {
+    return session && session->isFromRouterPort();
+}
+
+// In a normal server process, this will be overridden by AuthorizationSessionImpl
+// to examine the active user's privilege set.
+// For UnitTests, this simply fails closed unless explicitly overridden.
+std::function<bool(Client*)> checkAuthForInternalClient = [](Client*) {
+    return false;
+};
+
+}  // namespace
+
 void Client::initThread(StringData desc,
-                        ServiceContext* service,
-                        transport::SessionHandle session) {
-    invariant(!haveClient());
+                        Service* service,
+                        std::shared_ptr<transport::Session> session,
+                        ClientOperationKillableByStepdown killable) {
+    invariantNoCurrentClient();
 
     std::string fullDesc;
     if (session) {
@@ -75,24 +96,48 @@ void Client::initThread(StringData desc,
     setThreadName(fullDesc);
 
     // Create the client obj, attach to thread
-    currentClient = service->makeClient(fullDesc, std::move(session));
+    currentClient = service->makeClient(fullDesc, std::move(session), killable);
+    setLogService(toLogService(service));
 }
 
-namespace {
-int64_t generateSeed(const std::string& desc) {
-    size_t seed = 0;
-    boost::hash_combine(seed, Date_t::now().asInt64());
-    boost::hash_combine(seed, desc);
-    return seed;
+void Client::setCurrent(ServiceContext::UniqueClient client) {
+    invariantNoCurrentClient();
+    setLogService(toLogService(client.get()->getService()));
+    currentClient = std::move(client);
+    if (auto opCtx = currentClient->_opCtx)
+        if (auto timers = OperationCPUTimers::get(opCtx))
+            timers->onThreadAttach();
 }
-}  // namespace
 
-Client::Client(std::string desc, ServiceContext* serviceContext, transport::SessionHandle session)
-    : _serviceContext(serviceContext),
+ServiceContext::UniqueClient Client::releaseCurrent() {
+    invariant(haveClient(), "No client to release");
+    if (auto opCtx = currentClient->_opCtx)
+        if (auto timers = OperationCPUTimers::get(opCtx))
+            timers->onThreadDetach();
+    setLogService(logv2::LogService::unknown);
+    return std::move(currentClient);
+}
+
+
+Client* Client::getCurrent() {
+    return currentClient.get();
+}
+
+Client::Client(std::string desc,
+               Service* service,
+               std::shared_ptr<transport::Session> session,
+               ClientOperationKillableByStepdown killable)
+    : _service(service),
       _session(std::move(session)),
       _desc(std::move(desc)),
       _connectionId(_session ? _session->id() : 0),
-      _prng(generateSeed(_desc)) {}
+      _operationKillable(killable),
+      _prng(generateSeed(_desc)),
+      _isRouterClient(checkIfRouterClient(_session)),
+      _uuid(UUID::gen()),
+      _tags(kPending) {}
+
+Client::~Client() = default;
 
 void Client::reportState(BSONObjBuilder& builder) {
     builder.append("desc", desc());
@@ -110,17 +155,6 @@ ServiceContext::UniqueOperationContext Client::makeOperationContext() {
     return getServiceContext()->makeOperationContext(this);
 }
 
-void Client::setOperationContext(OperationContext* opCtx) {
-    // We can only set the OperationContext once before resetting it.
-    invariant(opCtx != NULL && _opCtx == NULL);
-    _opCtx = opCtx;
-}
-
-void Client::resetOperationContext() {
-    invariant(_opCtx != NULL);
-    _opCtx = NULL;
-}
-
 std::string Client::clientAddress(bool includePort) const {
     if (!hasRemote()) {
         return "";
@@ -129,10 +163,6 @@ std::string Client::clientAddress(bool includePort) const {
         return getRemote().toString();
     }
     return getRemote().host();
-}
-
-Client* Client::getCurrent() {
-    return currentClient.get();
 }
 
 Client& cc() {
@@ -144,29 +174,118 @@ bool haveClient() {
     return static_cast<bool>(currentClient);
 }
 
-ServiceContext::UniqueClient Client::releaseCurrent() {
-    invariant(haveClient());
-    return std::move(currentClient);
+bool isProcessInternalClient(const Client& client) {
+    return client.isInDirectClient() || !client.session();
 }
 
-void Client::setCurrent(ServiceContext::UniqueClient client) {
-    invariant(!haveClient());
-    currentClient = std::move(client);
+/**
+ * User connections are listed active so long as they are associated with an opCtx.
+ * Non-user connections are listed active if they have an opCtx and not waiting on a condvar.
+ */
+bool Client::hasAnyActiveCurrentOp() const {
+    if (!_opCtx)
+        return false;
+    if (isFromUserConnection() || !_opCtx->isWaitingForConditionOrInterrupt())
+        return true;
+    return false;
 }
 
-ThreadClient::ThreadClient(ServiceContext* serviceContext)
-    : ThreadClient(getThreadName(), serviceContext, nullptr) {}
+void Client::setKilled() {
+    ClientLock lk(this);
+    _killed.store(true);
+    if (_opCtx) {
+        getServiceContext()->killOperation(lk, _opCtx, ErrorCodes::ClientMarkedKilled);
+    }
+}
 
 ThreadClient::ThreadClient(StringData desc,
-                           ServiceContext* serviceContext,
-                           transport::SessionHandle session) {
-    invariant(!currentClient);
-    Client::initThread(desc, serviceContext, std::move(session));
+                           Service* service,
+                           std::shared_ptr<transport::Session> session,
+                           Killable killable) {
+    invariantNoCurrentClient();
+    _originalThreadName = getThreadNameRef();
+    Client::initThread(desc, service, std::move(session), killable);
 }
 
 ThreadClient::~ThreadClient() {
     invariant(currentClient);
     currentClient.reset(nullptr);
+    setLogService(logv2::LogService::unknown);
+    setThreadNameRef(std::move(_originalThreadName));
+}
+
+Client* ThreadClient::get() const {
+    return &cc();
+}
+
+AlternativeClientRegion::AlternativeClientRegion(ServiceContext::UniqueClient& clientToUse)
+    : _alternateClient(&clientToUse) {
+    invariant(clientToUse);
+    if (Client::getCurrent()) {
+        _originalClient = Client::releaseCurrent();
+    }
+    Client::setCurrent(std::move(*_alternateClient));
+}
+
+AlternativeClientRegion::~AlternativeClientRegion() {
+    *_alternateClient = Client::releaseCurrent();
+    if (_originalClient) {
+        Client::setCurrent(std::move(_originalClient));
+    }
+}
+
+Client* AlternativeClientRegion::get() const {
+    return &cc();
+}
+
+void Client::setTags(TagMask tagsToSet) {
+    mutateTags([tagsToSet](TagMask originalTags) { return (originalTags | tagsToSet); });
+}
+
+void Client::unsetTags(TagMask tagsToUnset) {
+    mutateTags([tagsToUnset](TagMask originalTags) { return (originalTags & ~tagsToUnset); });
+}
+
+void Client::mutateTags(const std::function<TagMask(TagMask)>& mutateFunc) {
+    TagMask oldValue, newValue;
+    do {
+        oldValue = _tags.load();
+        newValue = mutateFunc(oldValue);
+
+        // Any change to the Client tags automatically clears kPending status.
+        newValue &= ~kPending;
+    } while (!_tags.compareAndSwap(&oldValue, newValue));
+}
+
+Client::TagMask Client::getTags() const {
+    return _tags.load();
+}
+
+int Client::getLocalPort() const {
+    if (_service->role().hasExclusively(ClusterRole::RouterServer) &&
+        serverGlobalParams.routerPort) {
+        if (_opCtx && _opCtx->routedByReplicaSetEndpoint()) {
+            // This is a client connected to the replica set endpoint so return the shard/main port.
+            return serverGlobalParams.port;
+        }
+        return serverGlobalParams.routerPort.value();
+    }
+    return serverGlobalParams.port;
+}
+
+void Client::_setOperationContext(OperationContext* opCtx) {
+    _opCtx = opCtx;
+    if (_session) {
+        _session->setInOperation(opCtx != nullptr);
+    }
+}
+
+bool Client::isInternalClient() {
+    return _isInternalClient && checkAuthForInternalClient(this);
+}
+
+void Client::setCheckAuthForInternalClient(std::function<bool(Client*)> fn) {
+    checkAuthForInternalClient = std::move(fn);
 }
 
 }  // namespace mongo

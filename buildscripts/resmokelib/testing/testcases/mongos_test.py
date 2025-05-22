@@ -1,11 +1,7 @@
 """The unittest.TestCase for mongos --test."""
 
-from __future__ import absolute_import
-
-from . import interface
-from ... import config
-from ... import core
-from ... import utils
+from buildscripts.resmokelib import config, core, logging, utils
+from buildscripts.resmokelib.testing.testcases import interface
 
 
 class MongosTestCase(interface.ProcessTestCase):
@@ -13,14 +9,17 @@ class MongosTestCase(interface.ProcessTestCase):
 
     REGISTERED_NAME = "mongos_test"
 
-    def __init__(self, logger, mongos_options):
+    def __init__(self, logger: logging.Logger, mongos_options: list[dict]):
         """Initialize the mongos test and saves the options."""
 
-        self.mongos_executable = utils.default_if_none(config.MONGOS_EXECUTABLE,
-                                                       config.DEFAULT_MONGOS_EXECUTABLE)
+        assert len(mongos_options) == 1
+
+        self.mongos_executable = utils.default_if_none(
+            config.MONGOS_EXECUTABLE, config.DEFAULT_MONGOS_EXECUTABLE
+        )
         # Use the executable as the test name.
         interface.ProcessTestCase.__init__(self, logger, "mongos test", self.mongos_executable)
-        self.options = mongos_options.copy()
+        self.options = mongos_options[0].copy()
 
     def configure(self, fixture, *args, **kwargs):
         """Ensure the --test option is present in the mongos options."""
@@ -31,5 +30,9 @@ class MongosTestCase(interface.ProcessTestCase):
             self.options["test"] = ""
 
     def _make_process(self):
-        return core.programs.mongos_program(self.logger, executable=self.mongos_executable,
-                                            **self.options)
+        return core.programs.mongos_program(
+            self.logger,
+            self.fixture.job_num,
+            executable=self.mongos_executable,
+            mongos_options=self.options,
+        )[0]

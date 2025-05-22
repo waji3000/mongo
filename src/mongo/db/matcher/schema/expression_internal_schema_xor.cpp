@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,53 +27,24 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/matcher/schema/expression_internal_schema_xor.h"
-
-#include "mongo/bson/bsonmisc.h"
-#include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
 
 namespace mongo {
 constexpr StringData InternalSchemaXorMatchExpression::kName;
 
-bool InternalSchemaXorMatchExpression::matches(const MatchableDocument* doc,
-                                               MatchDetails* details) const {
-    bool found = false;
-    for (size_t i = 0; i < numChildren(); i++) {
-        if (getChild(i)->matches(doc, nullptr)) {
-            if (found) {
-                return false;
-            }
-            found = true;
-        }
-    }
-    return found;
+void InternalSchemaXorMatchExpression::debugString(StringBuilder& debug,
+                                                   int indentationLevel) const {
+    _debugAddSpace(debug, indentationLevel);
+    debug << kName;
+    _debugStringAttachTagInfo(&debug);
+    _debugList(debug, indentationLevel);
 }
 
-bool InternalSchemaXorMatchExpression::matchesSingleElement(const BSONElement& element,
-                                                            MatchDetails* details) const {
-    bool found = false;
-    for (size_t i = 0; i < numChildren(); i++) {
-        if (getChild(i)->matchesSingleElement(element, details)) {
-            if (found) {
-                return false;
-            }
-            found = true;
-        }
-    }
-    return found;
-}
-
-void InternalSchemaXorMatchExpression::debugString(StringBuilder& debug, int level) const {
-    _debugAddSpace(debug, level);
-    debug << kName + "\n";
-    _debugList(debug, level);
-}
-
-void InternalSchemaXorMatchExpression::serialize(BSONObjBuilder* out) const {
+void InternalSchemaXorMatchExpression::serialize(BSONObjBuilder* out,
+                                                 const SerializationOptions& opts,
+                                                 bool includePath) const {
     BSONArrayBuilder arrBob(out->subarrayStart(kName));
-    _listToBSON(&arrBob);
+    _listToBSON(&arrBob, opts, includePath);
 }
 }  //  namespace mongo

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,8 +29,8 @@
 
 #pragma once
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/util/functional.h"
+#include "mongo/util/out_of_line_executor.h"
 
 namespace mongo {
 
@@ -40,19 +39,18 @@ class Status;
 /**
  * Interface for a thread pool.
  */
-class ThreadPoolInterface {
-    MONGO_DISALLOW_COPYING(ThreadPoolInterface);
+class ThreadPoolInterface : public OutOfLineExecutor {
+    ThreadPoolInterface(const ThreadPoolInterface&) = delete;
+    ThreadPoolInterface& operator=(const ThreadPoolInterface&) = delete;
 
 public:
-    using Task = unique_function<void()>;
-
     /**
      * Destroys a thread pool.
      *
      * The destructor may block if join() has not previously been called and returned.
      * It is fatal to destroy the pool while another thread is blocked on join().
      */
-    virtual ~ThreadPoolInterface() = default;
+    ~ThreadPoolInterface() override = default;
 
     /**
      * Starts the thread pool. May be called at most once.
@@ -74,16 +72,6 @@ public:
      * inside the pool.
      */
     virtual void join() = 0;
-
-    /**
-     * Schedules "task" to run in the thread pool.
-     *
-     * Returns OK on success, ShutdownInProgress if shutdown() has already executed.
-     *
-     * It is safe to call this before startup(), but the scheduled task will not execute
-     * until after startup() is called.
-     */
-    virtual Status schedule(Task task) = 0;
 
 protected:
     ThreadPoolInterface() = default;

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,11 +29,6 @@
 
 #pragma once
 
-#include "mongo/base/disallow_copying.h"
-#include "mongo/base/status.h"
-#include "mongo/transport/message_compressor_base.h"
-#include "mongo/util/string_map.h"
-
 #include <array>
 #include <limits>
 #include <map>
@@ -42,12 +36,19 @@
 #include <string>
 #include <vector>
 
+#include "mongo/base/error_extra_info.h"
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/transport/message_compressor_base.h"
+#include "mongo/util/string_map.h"
+
 namespace mongo {
 
 namespace optionenvironment {
 class OptionSection;
 class Environment;
-}  // namespace option environment
+}  // namespace optionenvironment
 
 namespace moe = mongo::optionenvironment;
 
@@ -55,7 +56,8 @@ namespace moe = mongo::optionenvironment;
  * The MessageCompressorRegistry holds the global registrations of compressors for a process.
  */
 class MessageCompressorRegistry {
-    MONGO_DISALLOW_COPYING(MessageCompressorRegistry);
+    MessageCompressorRegistry(const MessageCompressorRegistry&) = delete;
+    MessageCompressorRegistry& operator=(const MessageCompressorRegistry&) = delete;
 
 public:
     MessageCompressorRegistry() = default;
@@ -119,7 +121,6 @@ private:
     std::vector<std::string> _compressorNames;
 };
 
-Status addMessageCompressionOptions(moe::OptionSection* options, bool forShell);
 Status storeMessageCompressionOptions(const std::string& compressors);
 void appendMessageCompressionStats(BSONObjBuilder* b);
 }  // namespace mongo

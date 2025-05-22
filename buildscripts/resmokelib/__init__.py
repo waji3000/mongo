@@ -1,13 +1,27 @@
 """Empty."""
 
-from __future__ import absolute_import
+from buildscripts.resmokelib import (
+    config,
+    errors,
+    logging,
+    parser,
+    reportfile,
+    sighandler,
+    suite_hierarchy,
+    suitesconfig,
+    testing,
+    utils,
+)
 
-from . import config
-from . import errors
-from . import logging
-from . import parser
-from . import reportfile
-from . import sighandler
-from . import suitesconfig
-from . import testing
-from . import utils
+__all__ = [
+    "config",
+    "errors",
+    "logging",
+    "parser",
+    "reportfile",
+    "sighandler",
+    "suitesconfig",
+    "suite_hierarchy",
+    "testing",
+    "utils",
+]

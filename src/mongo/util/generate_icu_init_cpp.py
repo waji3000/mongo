@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 #
 # Copyright (C) 2018-present MongoDB, Inc.
 #
@@ -28,15 +28,21 @@
 # it in the license file.
 
 import optparse
-import os
 import sys
+
 
 def main(argv):
     parser = optparse.OptionParser()
-    parser.add_option('-o', '--output', action='store', dest='output_cpp_file',
-                      help='path to output cpp file')
-    parser.add_option('-i', '--input', action='store', dest='input_data_file',
-                      help='input ICU data file, in common format (.dat)')
+    parser.add_option(
+        "-o", "--output", action="store", dest="output_cpp_file", help="path to output cpp file"
+    )
+    parser.add_option(
+        "-i",
+        "--input",
+        action="store",
+        dest="input_data_file",
+        help="input ICU data file, in common format (.dat)",
+    )
     (options, args) = parser.parse_args(argv)
     if len(args) > 1:
         parser.error("too many arguments")
@@ -46,8 +52,9 @@ def main(argv):
         parser.error("input ICU data file unspecified")
     generate_cpp_file(options.input_data_file, options.output_cpp_file)
 
+
 def generate_cpp_file(data_file_path, cpp_file_path):
-    source_template = '''// AUTO-GENERATED FILE DO NOT EDIT
+    source_template = """// AUTO-GENERATED FILE DO NOT EDIT
 // See generate_icu_init_cpp.py.
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
@@ -78,7 +85,6 @@ def generate_cpp_file(data_file_path, cpp_file_path):
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
 
 #include <unicode/udata.h>
 
@@ -101,20 +107,21 @@ alignas(16) const uint8_t kRawData[] = {%(decimal_encoded_data)s};
 
 }  // namespace
 
-MONGO_INITIALIZER(LoadICUData)(InitializerContext* context) {
+MONGO_INITIALIZER_GENERAL(LoadICUData, (), ("BeginStartupOptionHandling"))(
+        InitializerContext* context) {
     UErrorCode status = U_ZERO_ERROR;
     udata_setCommonData(kRawData, &status);
-    fassert(40088, U_SUCCESS(status));
-    return Status::OK();
+    fassert(40089, U_SUCCESS(status));
 }
 
 }  // namespace mongo
-'''
-    decimal_encoded_data = ''
-    with open(data_file_path, 'rb') as data_file:
-        decimal_encoded_data = ','.join([str(ord(byte)) for byte in data_file.read()])
-    with open(cpp_file_path, 'wb') as cpp_file:
+"""
+    decimal_encoded_data = ""
+    with open(data_file_path, "rb") as data_file:
+        decimal_encoded_data = ",".join([str(byte) for byte in data_file.read()])
+    with open(cpp_file_path, "w") as cpp_file:
         cpp_file.write(source_template % dict(decimal_encoded_data=decimal_encoded_data))
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     main(sys.argv)

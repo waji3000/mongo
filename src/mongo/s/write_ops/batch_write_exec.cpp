@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,62 +27,739 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
 
-#include "mongo/platform/basic.h"
+#include "mongo/s/sharding_feature_flags_gen.h"
+#include "mongo/s/write_ops/batched_command_request.h"
+#include <algorithm>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <cstddef>
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
 
-#include "mongo/s/write_ops/batch_write_exec.h"
+#include <boost/optional/optional.hpp>
 
 #include "mongo/base/error_codes.h"
-#include "mongo/base/owned_pointer_map.h"
 #include "mongo/base/status.h"
-#include "mongo/bson/util/builder.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/client/connection_string.h"
-#include "mongo/client/remote_command_targeter.h"
+#include "mongo/client/read_preference.h"
+#include "mongo/db/error_labels.h"
+#include "mongo/db/feature_flag.h"
+#include "mongo/db/internal_transactions_feature_flag_gen.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/query/write_ops/write_ops_parsers.h"
+#include "mongo/db/server_options.h"
+#include "mongo/db/session/logical_session_id_helpers.h"
+#include "mongo/db/stats/counters.h"
+#include "mongo/db/timeseries/write_ops/timeseries_write_ops_utils.h"
+#include "mongo/db/transaction/transaction_api.h"
+#include "mongo/executor/inline_executor.h"
+#include "mongo/executor/remote_command_response.h"
 #include "mongo/executor/task_executor_pool.h"
-#include "mongo/s/client/shard_registry.h"
+#include "mongo/logv2/log.h"
+#include "mongo/s/async_requests_sender.h"
+#include "mongo/s/cannot_implicitly_create_collection_info.h"
+#include "mongo/s/chunk_manager.h"
+#include "mongo/s/client/num_hosts_targeted_metrics.h"
+#include "mongo/s/client/shard.h"
 #include "mongo/s/grid.h"
+#include "mongo/s/mongos_server_parameters_gen.h"
 #include "mongo/s/multi_statement_transaction_requests_sender.h"
+#include "mongo/s/request_types/cluster_commands_without_shard_key_gen.h"
+#include "mongo/s/stale_exception.h"
 #include "mongo/s/transaction_router.h"
+#include "mongo/s/write_ops/batch_write_exec.h"
 #include "mongo/s/write_ops/batch_write_op.h"
-#include "mongo/s/write_ops/write_error_detail.h"
-#include "mongo/util/log.h"
+#include "mongo/s/write_ops/coordinate_multi_update_util.h"
+#include "mongo/s/write_ops/write_op.h"
+#include "mongo/s/write_ops/write_without_shard_key_util.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/exit.h"
+#include "mongo/util/str.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
+
 
 namespace mongo {
 namespace {
 
 const ReadPreferenceSetting kPrimaryOnlyReadPreference(ReadPreference::PrimaryOnly);
 
-//
-// Map which allows associating ConnectionString hosts with TargetedWriteBatches
-// This is needed since the dispatcher only returns hosts with responses.
-//
-
-// TODO: Unordered map?
-typedef OwnedPointerMap<ShardId, TargetedWriteBatch> OwnedShardBatchMap;
-
-WriteErrorDetail errorFromStatus(const Status& status) {
-    WriteErrorDetail error;
-    error.setStatus(status);
-    return error;
-}
-
-// Helper to note several stale errors from a response
-void noteStaleResponses(const std::vector<ShardError>& staleErrors, NSTargeter* targeter) {
+// Helper to note several stale shard errors from a response
+void noteStaleCollVersionResponses(OperationContext* opCtx,
+                                   const std::vector<ShardError>& staleErrors,
+                                   NSTargeter* targeter) {
     for (const auto& error : staleErrors) {
-        LOG(4) << "Noting stale config response " << error.error.getErrInfo() << " from shard "
-               << error.endpoint.shardName;
-        targeter->noteStaleResponse(
-            error.endpoint,
-            StaleConfigInfo::parseFromCommandError(
-                error.error.isErrInfoSet() ? error.error.getErrInfo() : BSONObj()));
+        LOGV2_DEBUG(22902,
+                    4,
+                    "Noting stale config response",
+                    "shardId"_attr = error.endpoint.shardName,
+                    "status"_attr = redact(error.error.getStatus()));
+
+        auto extraInfo = error.error.getStatus().extraInfo<StaleConfigInfo>();
+        invariant(extraInfo);
+        targeter->noteStaleCollVersionResponse(opCtx, *extraInfo);
     }
 }
 
-// The number of times we'll try to continue a batch op if no progress is being made. This only
-// applies when no writes are occurring and metadata is not changing on reload.
-const int kMaxRoundsWithoutProgress(5);
+// Helper to note several stale db errors from a response
+void noteStaleDbVersionResponses(OperationContext* opCtx,
+                                 const std::vector<ShardError>& staleErrors,
+                                 NSTargeter* targeter) {
+    for (const auto& error : staleErrors) {
+        LOGV2_DEBUG(22903,
+                    4,
+                    "Noting stale database response",
+                    "shardId"_attr = error.endpoint.shardName,
+                    "status"_attr = redact(error.error.getStatus()));
+        auto extraInfo = error.error.getStatus().extraInfo<StaleDbRoutingVersion>();
+        invariant(extraInfo);
+        targeter->noteStaleDbVersionResponse(opCtx, *extraInfo);
+    }
+}
 
+void noteCannotImplicitlyCreateCollectionResponses(OperationContext* opCtx,
+                                                   const std::vector<ShardError>& createErrors,
+                                                   NSTargeter* targeter) {
+    for (const auto& error : createErrors) {
+        LOGV2_DEBUG(8037202,
+                    4,
+                    "Noting cannot implicitly create collection response",
+                    "status"_attr = redact(error.error.getStatus()));
+        auto extraInfo = error.error.getStatus().extraInfo<CannotImplicitlyCreateCollectionInfo>();
+        invariant(extraInfo);
+        targeter->noteCannotImplicitlyCreateCollectionResponse(opCtx, *extraInfo);
+    }
+}
+
+bool hasTransientTransactionError(const BatchedCommandResponse& response) {
+    if (!response.isErrorLabelsSet()) {
+        return false;
+    }
+
+    const auto& errorLabels = response.getErrorLabels();
+    auto iter = std::find_if(errorLabels.begin(), errorLabels.end(), [](const std::string& label) {
+        return label == ErrorLabel::kTransientTransaction;
+    });
+    return iter != errorLabels.end();
+}
+
+/*
+ * Provides the write concern with which child batches have to be internally submitted.
+ */
+boost::optional<WriteConcernOptions> getWriteConcernForChildBatch(OperationContext* opCtx) {
+    // Per-operation write concern is not supported in transactions.
+    if (TransactionRouter::get(opCtx)) {
+        return boost::none;
+    }
+
+    // Retrieve the WC specified by the remote client; in case of "fire and forget" request, the WC
+    // needs to be upgraded to "w: 1" for the sharding protocol to correctly handle internal
+    // writeErrors.
+    auto wc = opCtx->getWriteConcern();
+    if (!wc.requiresWriteAcknowledgement()) {
+        wc.w = 1;
+    }
+
+    return wc;
+}
+
+// Helper to parse all of the childBatches and construct the proper requests to send using the
+// AsyncRequestSender.
+std::vector<AsyncRequestsSender::Request> constructARSRequestsToSend(
+    OperationContext* opCtx,
+    NSTargeter& targeter,
+    TargetedBatchMap& childBatches,
+    TargetedBatchMap& pendingBatches,
+    BatchWriteExecStats* stats,
+    BatchWriteOp& batchOp,
+    boost::optional<bool> allowShardKeyUpdatesWithoutFullShardKeyInQuery) {
+    std::vector<AsyncRequestsSender::Request> requests;
+    const auto wcForChildBatch = getWriteConcernForChildBatch(opCtx);
+    // Get as many batches as we can at once
+    for (auto&& childBatch : childBatches) {
+        auto nextBatch = std::move(childBatch.second);
+
+        // If the batch is nullptr, we sent it previously, so skip
+        if (!nextBatch)
+            continue;
+
+        // If we already have a batch for this shard, wait until the next time
+        const auto& targetShardId = nextBatch->getShardId();
+        if (pendingBatches.count(targetShardId)) {
+            LOGV2_DEBUG(9986808,
+                        4,
+                        "Waiting to send batch to shard as it already has one pending",
+                        "target shard"_attr = targetShardId);
+            continue;
+        }
+
+        stats->noteTargetedShard(targetShardId);
+
+        const auto request = [&] {
+            const auto shardBatchRequest(batchOp.buildBatchRequest(
+                *nextBatch, targeter, allowShardKeyUpdatesWithoutFullShardKeyInQuery));
+
+            BSONObjBuilder requestBuilder;
+            shardBatchRequest.serialize(&requestBuilder);
+            if (wcForChildBatch) {
+                requestBuilder.append(WriteConcernOptions::kWriteConcernField,
+                                      wcForChildBatch->toBSON());
+            }
+
+            logical_session_id_helpers::serializeLsidAndTxnNumber(opCtx, &requestBuilder);
+
+            return requestBuilder.obj();
+        }();
+
+        LOGV2_DEBUG(22905,
+                    4,
+                    "Sending write batch",
+                    "shardId"_attr = targetShardId,
+                    "request"_attr = redact(request));
+
+        requests.emplace_back(targetShardId, request);
+
+        // Indicate we're done by setting the batch to nullptr. We'll only get duplicate
+        // hostEndpoints if we have broadcast and non-broadcast endpoints for the same host,
+        // so this should be pretty efficient without moving stuff around.
+        childBatch.second = nullptr;
+
+        // Recv-side is responsible for cleaning up the nextBatch when used
+        pendingBatches.emplace(targetShardId, std::move(nextBatch));
+    }
+    return requests;
+}
+
+// If the network response is OK then we process the response from the remote shard. The returned
+// boolean dictates if we should abort rest of the batch.
+bool processResponseFromRemote(OperationContext* opCtx,
+                               NSTargeter& targeter,
+                               const ShardId& shardInfo,
+                               const BatchedCommandResponse& batchedCommandResponse,
+                               BatchWriteOp& batchOp,
+                               TargetedWriteBatch* batch,
+                               BatchWriteExecStats* stats) {
+    // Stale routing info errors need to be tracked in order to trigger a refresh of the targeter.
+    // On the other hand, errors caused by the catalog cache being temporarily unavailable (such as
+    // ShardCannotRefreshDueToLocksHeld) are ignored in this context, since no deduction can be made
+    // around possible placement changes.
+    TrackedErrors trackedErrors;
+    trackedErrors.startTracking(ErrorCodes::StaleConfig);
+    trackedErrors.startTracking(ErrorCodes::StaleDbVersion);
+    trackedErrors.startTracking(ErrorCodes::CannotImplicitlyCreateCollection);
+
+    LOGV2_DEBUG(22907,
+                4,
+                "Write results received",
+                "shardInfo"_attr = shardInfo,
+                "status"_attr = redact(batchedCommandResponse.toStatus()));
+
+    // Dispatch was ok, note response
+    batchOp.noteBatchResponse(*batch, batchedCommandResponse, &trackedErrors);
+
+    // If we are in a transaction, we must fail the whole batch on any error.
+    if (TransactionRouter::get(opCtx)) {
+        // Note: this returns a bad status if any part of the batch failed.
+        auto batchStatus = batchedCommandResponse.toStatus();
+        if (!batchStatus.isOK() && batchStatus != ErrorCodes::WouldChangeOwningShard) {
+            auto newStatus = batchStatus.withContext(
+                str::stream() << "Encountered error from " << shardInfo << " during a transaction");
+
+            // Throw when there is a transient transaction error since this
+            // should be a top level error and not just a write error.
+            if (hasTransientTransactionError(batchedCommandResponse)) {
+                uassertStatusOK(newStatus);
+            }
+
+            return true;
+        }
+    }
+
+    // Note if anything was stale
+    auto staleConfigErrors = trackedErrors.getErrors(ErrorCodes::StaleConfig);
+    const auto& staleDbErrors = trackedErrors.getErrors(ErrorCodes::StaleDbVersion);
+    const auto& cannotImplicitlyCreateCollectionErrors =
+        trackedErrors.getErrors(ErrorCodes::CannotImplicitlyCreateCollection);
+
+    if (!staleConfigErrors.empty()) {
+        noteStaleCollVersionResponses(opCtx, staleConfigErrors, &targeter);
+        ++stats->numStaleShardBatches;
+    }
+
+    if (!staleDbErrors.empty()) {
+        noteStaleDbVersionResponses(opCtx, staleDbErrors, &targeter);
+        ++stats->numStaleDbBatches;
+    }
+
+    if (!cannotImplicitlyCreateCollectionErrors.empty()) {
+        noteCannotImplicitlyCreateCollectionResponses(
+            opCtx, cannotImplicitlyCreateCollectionErrors, &targeter);
+    }
+
+    return false;
+}  // processResponseFromRemote
+
+// If the local process experiences an error trying to get the response from remote, process the
+// error. The returned boolean dictates if we should abort the rest of the batch.
+bool processErrorResponseFromLocal(OperationContext* opCtx,
+                                   BatchWriteOp& batchOp,
+                                   TargetedWriteBatch* batch,
+                                   Status responseStatus,
+                                   const WriteConcernErrorDetail* wce,
+                                   const ShardId& shardInfo,
+                                   boost::optional<HostAndPort> shardHostAndPort) {
+    if ((ErrorCodes::isShutdownError(responseStatus) ||
+         responseStatus == ErrorCodes::CallbackCanceled) &&
+        globalInShutdownDeprecated()) {
+        // Throw an error since the mongos itself is shutting down so this should
+        // be a top level error instead of a write error.
+        uassertStatusOK(responseStatus);
+    }
+
+    // Error occurred dispatching, note it
+    const Status status = responseStatus.withContext(
+        str::stream() << "Write results unavailable "
+                      << (shardHostAndPort ? "from "
+                                           : "from failing to target a host in the shard ")
+                      << shardInfo);
+
+    batchOp.noteBatchError(*batch, write_ops::WriteError(0, status), wce);
+
+    LOGV2_DEBUG(22908,
+                4,
+                "Unable to receive write results",
+                "shardInfo"_attr = shardInfo,
+                "error"_attr = redact(status));
+
+    // If we are in a transaction, we must stop immediately (even for unordered).
+    if (TransactionRouter::get(opCtx)) {
+        // Throw when there is a transient transaction error since this should be a
+        // top level error and not just a write error.
+        if (isTransientTransactionError(status.code(), false, false)) {
+            uassertStatusOK(status);
+        }
+
+        return true;
+    }
+
+    return false;
+}
+
+// Iterates through all of the child batches and sends and processes each batch.
+void executeChildBatches(OperationContext* opCtx,
+                         NSTargeter& targeter,
+                         const BatchedCommandRequest& clientRequest,
+                         TargetedBatchMap& childBatches,
+                         BatchWriteExecStats* stats,
+                         BatchWriteOp& batchOp,
+                         bool& abortBatch,
+                         boost::optional<bool> allowShardKeyUpdatesWithoutFullShardKeyInQuery) {
+    const size_t numToSend = childBatches.size();
+    size_t numSent = 0;
+
+    while (numSent != numToSend) {
+        // Collect batches out on the network, mapped by endpoint
+        TargetedBatchMap pendingBatches;
+
+        auto requests = constructARSRequestsToSend(opCtx,
+                                                   targeter,
+                                                   childBatches,
+                                                   pendingBatches,
+                                                   stats,
+                                                   batchOp,
+                                                   allowShardKeyUpdatesWithoutFullShardKeyInQuery);
+        bool isRetryableWriteNotInInternalTxn =
+            opCtx->getTxnNumber() && !TransactionRouter::get(opCtx);
+        // Send the requests.
+        MultiStatementTransactionRequestsSender ars(
+            opCtx,
+            Grid::get(opCtx)->getExecutorPool()->getArbitraryExecutor(),
+            clientRequest.getNS().dbName(),
+            requests,
+            kPrimaryOnlyReadPreference,
+            isRetryableWriteNotInInternalTxn ? Shard::RetryPolicy::kIdempotent
+                                             : Shard::RetryPolicy::kNoRetry);
+        numSent += pendingBatches.size();
+        LOGV2_DEBUG(9986806, 5, "Sent child batches", "numSent"_attr = numSent);
+
+        std::vector<BatchedCommandResponse> batchResponses;
+        batchResponses.reserve(pendingBatches.size());
+        // Receive all of the responses.
+        while (!ars.done()) {
+            // Block until a response is available.
+            auto response = ars.next();
+            // Get the TargetedWriteBatch to find where to put the response
+            dassert(pendingBatches.find(response.shardId) != pendingBatches.end());
+            TargetedWriteBatch* batch = pendingBatches.find(response.shardId)->second.get();
+            const auto shardInfo = response.shardHostAndPort ? response.shardHostAndPort->toString()
+                                                             : batch->getShardId();
+
+            // Then check if we successfully got a response.
+            Status responseStatus = response.swResponse.getStatus();
+            batchResponses.emplace_back();
+            if (responseStatus.isOK()) {
+                std::string errMsg;
+                if (!batchResponses.back().parseBSON(response.swResponse.getValue().data,
+                                                     &errMsg)) {
+                    responseStatus = {ErrorCodes::FailedToParse, errMsg};
+                }
+            }
+
+            if (responseStatus.isOK()) {
+                if ((abortBatch = processResponseFromRemote(opCtx,
+                                                            targeter,
+                                                            shardInfo,
+                                                            batchResponses.back(),
+                                                            batchOp,
+                                                            batch,
+                                                            stats))) {
+                    break;
+                }
+            } else {
+                // The ARS failed to retrieve the response due to some sort of local failure.
+                if ((abortBatch = processErrorResponseFromLocal(opCtx,
+                                                                batchOp,
+                                                                batch,
+                                                                responseStatus,
+                                                                nullptr,
+                                                                shardInfo,
+                                                                response.shardHostAndPort))) {
+                    break;
+                }
+            }
+        }
+        batchOp.handleDeferredResponses(targeter.hasStaleShardResponse());
+        batchOp.handleDeferredWriteConcernErrors();
+    }
+}
+
+// Only processes one write response from the child batches. Currently this is used for the two
+// phase protocol of the singleton writes without shard key and time-series retryable updates.
+void processResponseForOnlyFirstBatch(OperationContext* opCtx,
+                                      NSTargeter& targeter,
+                                      BatchWriteOp& batchOp,
+                                      TargetedBatchMap& childBatches,
+                                      const BatchedCommandResponse& batchedCommandResponse,
+                                      const Status& responseStatus,
+                                      BatchWriteExecStats* stats,
+                                      bool& abortBatch) {
+    // Since we only send the write to a single shard, record the response of the write against the
+    // first TargetedWriteBatch, and record no-ops for the remaining targeted shards. We always
+    // resolve the first batch due to a quirk of this protocol running within an internal
+    // transaction. This is because StaleShardVersion errors are automatically retried within the
+    // internal transaction, and if there happened to be a moveChunk that changes the number of
+    // targetable shards, the two phase protocol would still complete successfully, but the
+    // childBatches here could potentially still only include targetedWrites for the previous subset
+    // of shards before the moveChunk (since the StaleShardVersion error was not made visible here).
+    // It isn't important which TargetedWriteBatch records the write response, just as long as only
+    // one does so that the response on the client is still valid.
+    bool hasRecordedWriteResponseForFirstBatch = false;
+    for (auto&& childBatch : childBatches) {
+        auto nextBatch = std::move(childBatch.second);
+
+        // We expect that each TargetedWriteBatch should only contain 1 write op for each shard.
+        invariant(nextBatch->getWrites().size() == 1);
+
+        if (responseStatus.isOK()) {
+            if (!hasRecordedWriteResponseForFirstBatch) {
+                // Resolve the first child batch with the response of the write or a no-op response
+                // if there was no matching document.
+                // if the remote returned a 'writeConcernError', it will be part of the
+                // 'batchedCommandResponse' and handled here.
+                if ((abortBatch = processResponseFromRemote(opCtx,
+                                                            targeter,
+                                                            nextBatch.get()->getShardId(),
+                                                            batchedCommandResponse,
+                                                            batchOp,
+                                                            nextBatch.get(),
+                                                            stats))) {
+                    break;
+                }
+                hasRecordedWriteResponseForFirstBatch = true;
+            } else {
+                // Explicitly set the status so that debug builds won't invariant when checking the
+                // status.
+                BatchedCommandResponse noopBatchCommandResponse;
+                noopBatchCommandResponse.setStatus(Status::OK());
+                if (auto wce = batchedCommandResponse.getWriteConcernError(); wce != nullptr) {
+                    // Inject 'writeConcernError' from original response, so it won't be lost.
+                    auto wceCopy = std::make_unique<WriteConcernErrorDetail>(*wce);
+                    noopBatchCommandResponse.setWriteConcernError(wceCopy.release());
+                }
+                processResponseFromRemote(opCtx,
+                                          targeter,
+                                          nextBatch->getShardId(),
+                                          noopBatchCommandResponse,
+                                          batchOp,
+                                          nextBatch.get(),
+                                          stats);
+            }
+        } else {
+            // The ARS failed to retrieve the response due to some sort of local failure, or a shard
+            // returned a non-ok response.
+            if ((abortBatch =
+                     processErrorResponseFromLocal(opCtx,
+                                                   batchOp,
+                                                   nextBatch.get(),
+                                                   responseStatus,
+                                                   batchedCommandResponse.getWriteConcernError(),
+                                                   nextBatch->getShardId(),
+                                                   boost::none))) {
+                break;
+            }
+        }
+    }
+}
+
+void executeTwoPhaseWrite(OperationContext* opCtx,
+                          NSTargeter& targeter,
+                          BatchWriteOp& batchOp,
+                          TargetedBatchMap& childBatches,
+                          BatchWriteExecStats* stats,
+                          const BatchedCommandRequest& clientRequest,
+                          bool& abortBatch,
+                          bool allowShardKeyUpdatesWithoutFullShardKeyInQuery) {
+    const auto targetedWriteBatch = [&] {
+        // If there is a targeted write with a sampleId, use that write instead in order to pass the
+        // sampleId to the two phase write protocol. Otherwise, just choose the first targeted
+        // write.
+        for (auto&& [_ /* shardId */, childBatch] : childBatches) {
+            auto nextBatch = childBatch.get();
+
+            // For a write without shard key, we expect each TargetedWriteBatch in childBatches to
+            // contain only one TargetedWrite directed to each shard.
+            tassert(7208400,
+                    "There must be only 1 targeted write in this targeted write batch.",
+                    !nextBatch->getWrites().empty());
+
+            auto targetedWrite = nextBatch->getWrites().begin()->get();
+            if (targetedWrite->sampleId) {
+                return nextBatch;
+            }
+        }
+        return childBatches.begin()->second.get();
+    }();
+
+    auto cmdObj = [&] {
+        const auto shardBatchRequest = batchOp.buildBatchRequest(
+            *targetedWriteBatch, targeter, allowShardKeyUpdatesWithoutFullShardKeyInQuery);
+        BSONObjBuilder requestBuilder;
+        shardBatchRequest.serialize(&requestBuilder);
+        if (const auto wcForChildBatch = getWriteConcernForChildBatch(opCtx)) {
+            requestBuilder.append(WriteConcernOptions::kWriteConcernField,
+                                  wcForChildBatch->toBSON());
+        }
+
+        return requestBuilder.obj();
+    }();
+
+    boost::optional<WriteConcernErrorDetail> wce;
+    auto swRes = write_without_shard_key::runTwoPhaseWriteProtocol(
+        opCtx, targeter.getNS(), std::move(cmdObj), wce);
+
+    Status responseStatus = swRes.getStatus();
+    BatchedCommandResponse batchedCommandResponse;
+
+    // Adds a 'writeConcernError' from the remote shard to the response. Does nothing if the remote
+    // shard did not return a 'writeConcernError'.
+    auto appendWCEToResponse = [&]() {
+        if (wce.has_value()) {
+            auto wceCopy = std::make_unique<WriteConcernErrorDetail>(*wce);
+            batchedCommandResponse.setWriteConcernError(wceCopy.release());
+        }
+    };
+
+    if (swRes.isOK()) {
+        // Explicitly set the status of a no-op if there is no response.
+        if (swRes.getValue().getResponse().isEmpty()) {
+            batchedCommandResponse.setStatus(Status::OK());
+            appendWCEToResponse();
+        } else {
+            // If parsing succeeds, the 'writeConcernError' will be part of 'batchedCommandResponse'
+            // here.
+            std::string errMsg;
+            if (!batchedCommandResponse.parseBSON(swRes.getValue().getResponse(), &errMsg)) {
+                responseStatus = {ErrorCodes::FailedToParse, errMsg};
+            }
+        }
+    } else {
+        // Remote shard returned an error, and the 'batchedCommandResponse' is still empty.
+        // We need to make sure to append any 'writeConcernError' from the shard to the response.
+        appendWCEToResponse();
+    }
+
+    processResponseForOnlyFirstBatch(opCtx,
+                                     targeter,
+                                     batchOp,
+                                     childBatches,
+                                     batchedCommandResponse,
+                                     responseStatus,
+                                     stats,
+                                     abortBatch);
+}
+
+void executeRetryableTimeseriesUpdate(OperationContext* opCtx,
+                                      NSTargeter& targeter,
+                                      BatchWriteOp& batchOp,
+                                      TargetedBatchMap& childBatches,
+                                      BatchWriteExecStats* stats,
+                                      const BatchedCommandRequest& clientRequest,
+                                      bool& abortBatch) {
+    auto getIndex = [](const TargetedWriteBatch& batch) {
+        const auto& writes = batch.getWrites();
+        invariant(writes.size() == 1, std::to_string(writes.size()));
+        return writes.front()->writeOpRef.first;
+    };
+
+    invariant(!childBatches.empty());
+    auto index = getIndex(*childBatches.begin()->second);
+
+    if constexpr (kDebugBuild) {
+        if (childBatches.size() > 1) {
+            // All child batches should be from the same update statement, which means they should
+            // have the same index.
+            for (auto&& [shardId, batch] : childBatches) {
+                invariant(getIndex(*batch) == index);
+            }
+        }
+    }
+
+    auto wholeOp = clientRequest.getUpdateRequest();
+    auto singleUpdateOp = timeseries::write_ops::buildSingleUpdateOp(wholeOp, index);
+    BatchedCommandRequest singleUpdateRequest(singleUpdateOp);
+    const auto stmtId = write_ops::getStmtIdForWriteAt(wholeOp, index);
+
+    auto executor = Grid::get(opCtx)->getExecutorPool()->getFixedExecutor();
+    auto inlineExecutor = std::make_shared<executor::InlineExecutor>();
+    txn_api::SyncTransactionWithRetries txn(
+        opCtx, executor, nullptr /* resourceYielder */, inlineExecutor);
+    BatchedCommandResponse batchedCommandResponse;
+    auto swResult =
+        txn.runNoThrow(opCtx,
+                       [&singleUpdateRequest, &batchedCommandResponse, stmtId](
+                           const txn_api::TransactionClient& txnClient, ExecutorPtr txnExec) {
+                           auto updateResponse =
+                               txnClient.runCRUDOpSync(singleUpdateRequest, {stmtId});
+                           batchedCommandResponse = std::move(updateResponse);
+
+                           return SemiFuture<void>::makeReady();
+                       });
+    Status responseStatus = Status::OK();
+    if (!swResult.isOK()) {
+        responseStatus = swResult.getStatus();
+    } else {
+        if (!swResult.getValue().cmdStatus.isOK()) {
+            responseStatus = swResult.getValue().cmdStatus;
+        }
+        if (auto wcError = swResult.getValue().wcError; !wcError.toStatus().isOK()) {
+            batchedCommandResponse.setWriteConcernError(
+                std::make_unique<WriteConcernErrorDetail>(wcError).release());
+        }
+    }
+
+    processResponseForOnlyFirstBatch(opCtx,
+                                     targeter,
+                                     batchOp,
+                                     childBatches,
+                                     batchedCommandResponse,
+                                     responseStatus,
+                                     stats,
+                                     abortBatch);
+}
+
+void coordinateMultiUpdate(OperationContext* opCtx,
+                           NSTargeter& targeter,
+                           BatchWriteOp& batchOp,
+                           TargetedBatchMap& childBatches,
+                           BatchWriteExecStats* stats,
+                           const BatchedCommandRequest& clientRequest,
+                           bool& abortBatch) {
+    // Each shard in childBatches has the same write batch containing a single
+    // multi write. Regardless of how many shards are targeted here, we only
+    // send a single _shardsvrCoordinateMultiUpdate command to the db primary
+    // shard. The db primary will actually execute the writes via the
+    // MultiUpdateCoordinator and return their results via a field in the
+    // _shardsvrCoordinateMultiUpdate response. This means that we only need to
+    // process the response for the first batch, since it contains the results
+    // for all batches.
+    auto batchWriteResponse = coordinate_multi_update_util::executeCoordinateMultiUpdate(
+        opCtx, batchOp, childBatches, clientRequest);
+
+    processResponseForOnlyFirstBatch(opCtx,
+                                     targeter,
+                                     batchOp,
+                                     childBatches,
+                                     batchWriteResponse,
+                                     batchWriteResponse.getTopLevelStatus(),
+                                     stats,
+                                     abortBatch);
+}
+
+void executeTwoPhaseOrTimeSeriesWriteChildBatches(OperationContext* opCtx,
+                                                  NSTargeter& targeter,
+                                                  BatchWriteOp& batchOp,
+                                                  TargetedBatchMap& childBatches,
+                                                  BatchWriteExecStats* stats,
+                                                  const BatchedCommandRequest& clientRequest,
+                                                  bool& abortBatch,
+                                                  WriteType writeType) {
+    switch (writeType) {
+        case WriteType::WithoutShardKeyOrId: {
+            // If the WriteType is 'WithoutShardKeyOrId', then we have detected an
+            // updateOne/deleteOne request without a shard key or _id. We will use a two phase
+            // protocol to apply the write.
+            tassert(6992000, "Executing write batches with a size of 0", childBatches.size() > 0u);
+
+            auto allowShardKeyUpdatesWithoutFullShardKeyInQuery =
+                opCtx->isRetryableWrite() || opCtx->inMultiDocumentTransaction();
+
+            // If there is only 1 targetable shard, we can skip using the two phase write
+            // protocol.
+            if (childBatches.size() == 1) {
+                executeChildBatches(opCtx,
+                                    targeter,
+                                    clientRequest,
+                                    childBatches,
+                                    stats,
+                                    batchOp,
+                                    abortBatch,
+                                    allowShardKeyUpdatesWithoutFullShardKeyInQuery);
+            } else {
+                // Execute the two phase write protocol for writes that cannot directly target a
+                // shard. If there are any transaction errors, 'abortBatch' will be set.
+                executeTwoPhaseWrite(opCtx,
+                                     targeter,
+                                     batchOp,
+                                     childBatches,
+                                     stats,
+                                     clientRequest,
+                                     abortBatch,
+                                     allowShardKeyUpdatesWithoutFullShardKeyInQuery);
+            }
+            break;
+        }
+        case WriteType::TimeseriesRetryableUpdate:
+            // If the WriteType is 'TimeseriesRetryableUpdate', then we have detected
+            // a retryable time-series update request. We will run it in the internal
+            // transaction api and collect the response.
+            executeRetryableTimeseriesUpdate(
+                opCtx, targeter, batchOp, childBatches, stats, clientRequest, abortBatch);
+            break;
+        case WriteType::MultiWriteBlockingMigrations:
+            coordinateMultiUpdate(
+                opCtx, targeter, batchOp, childBatches, stats, clientRequest, abortBatch);
+            break;
+        default:
+            MONGO_UNREACHABLE
+    }
+}
 }  // namespace
 
 void BatchWriteExec::executeBatch(OperationContext* opCtx,
@@ -91,10 +767,13 @@ void BatchWriteExec::executeBatch(OperationContext* opCtx,
                                   const BatchedCommandRequest& clientRequest,
                                   BatchedCommandResponse* clientResponse,
                                   BatchWriteExecStats* stats) {
-    const auto& nss(clientRequest.getNS());
+    const auto& nss(targeter.getNS());
 
-    LOG(4) << "Starting execution of write batch of size "
-           << static_cast<int>(clientRequest.sizeWriteOps()) << " for " << nss.ns();
+    LOGV2_DEBUG(22904,
+                4,
+                "Starting execution of a write batch",
+                logAttrs(nss),
+                "size"_attr = clientRequest.sizeWriteOps());
 
     BatchWriteOp batchOp(opCtx, clientRequest);
 
@@ -103,8 +782,11 @@ void BatchWriteExec::executeBatch(OperationContext* opCtx,
     int rounds = 0;
     int numCompletedOps = 0;
     int numRoundsWithoutProgress = 0;
+    bool abortBatch = false;
+    int maxRoundsWithoutProgress = gMaxRoundsWithoutProgress.load();
+    Backoff backoff(Seconds(1), Seconds(2));
 
-    while (!batchOp.isFinished()) {
+    while (!batchOp.isFinished() && !abortBatch) {
         //
         // Get child batches to send using the targeter
         //
@@ -128,219 +810,72 @@ void BatchWriteExec::executeBatch(OperationContext* opCtx,
         //    deliver in this case, since for all the client knows we may have gotten the batch
         //    exactly when the metadata changed.
         //
+        LOGV2_DEBUG(9986800,
+                    4,
+                    "Starting attempt at executing write batch",
+                    logAttrs(nss),
+                    "rounds"_attr = rounds,
+                    "numCompletedOps"_attr = numCompletedOps,
+                    "numRoundsWithoutProgress"_attr = numRoundsWithoutProgress);
 
-        OwnedPointerMap<ShardId, TargetedWriteBatch> childBatchesOwned;
-        std::map<ShardId, TargetedWriteBatch*>& childBatches = childBatchesOwned.mutableMap();
+        TargetedBatchMap childBatches;
 
         // If we've already had a targeting error, we've refreshed the metadata once and can
         // record target errors definitively.
         bool recordTargetErrors = refreshedTargeter;
-        Status targetStatus = batchOp.targetBatch(targeter, recordTargetErrors, &childBatches);
-        if (!targetStatus.isOK()) {
+        auto statusWithWriteType = batchOp.targetBatch(targeter, recordTargetErrors, &childBatches);
+        if (!statusWithWriteType.isOK()) {
+            LOGV2_DEBUG(9986801,
+                        4,
+                        "Encountered a targeter error",
+                        "error"_attr = redact(statusWithWriteType.getStatus()),
+                        "will refresh"_attr = !refreshedTargeter);
+
             // Don't do anything until a targeter refresh
             targeter.noteCouldNotTarget();
             refreshedTargeter = true;
-            ++stats->numTargetErrors;
             dassert(childBatches.size() == 0u);
-        }
 
-        //
-        // Send all child batches
-        //
+            if (TransactionRouter::get(opCtx)) {
+                // Throw when there is a transient transaction error since this should be a top
+                // level error and not just a write error.
+                if (isTransientTransactionError(statusWithWriteType.getStatus().code(),
+                                                false /* hasWriteConcernError */,
+                                                false /* isCommitOrAbort */)) {
+                    uassertStatusOK(statusWithWriteType);
+                }
 
-        const size_t numToSend = childBatches.size();
-        size_t numSent = 0;
-
-        while (numSent != numToSend) {
-            // Collect batches out on the network, mapped by endpoint
-            OwnedShardBatchMap ownedPendingBatches;
-            OwnedShardBatchMap::MapType& pendingBatches = ownedPendingBatches.mutableMap();
-
-            //
-            // Construct the requests.
-            //
-
-            std::vector<AsyncRequestsSender::Request> requests;
-
-            // Get as many batches as we can at once
-            for (auto& childBatch : childBatches) {
-                TargetedWriteBatch* const nextBatch = childBatch.second;
-
-                // If the batch is nullptr, we sent it previously, so skip
-                if (!nextBatch)
-                    continue;
-
-                // If we already have a batch for this shard, wait until the next time
-                const auto& targetShardId = nextBatch->getEndpoint().shardName;
-
-                if (pendingBatches.count(targetShardId))
-                    continue;
-
-                stats->noteTargetedShard(targetShardId);
-
-                const auto request = [&] {
-                    const auto shardBatchRequest(batchOp.buildBatchRequest(*nextBatch));
-
-                    BSONObjBuilder requestBuilder;
-                    shardBatchRequest.serialize(&requestBuilder);
-
-                    {
-                        OperationSessionInfo sessionInfo;
-
-                        if (opCtx->getLogicalSessionId()) {
-                            sessionInfo.setSessionId(*opCtx->getLogicalSessionId());
-                        }
-
-                        sessionInfo.setTxnNumber(opCtx->getTxnNumber());
-                        sessionInfo.serialize(&requestBuilder);
-                    }
-
-                    return requestBuilder.obj();
-                }();
-
-                LOG(4) << "Sending write batch to " << targetShardId << ": " << redact(request);
-
-                requests.emplace_back(targetShardId, request);
-
-                // Indicate we're done by setting the batch to nullptr. We'll only get duplicate
-                // hostEndpoints if we have broadcast and non-broadcast endpoints for the same host,
-                // so this should be pretty efficient without moving stuff around.
-                childBatch.second = nullptr;
-
-                // Recv-side is responsible for cleaning up the nextBatch when used
-                pendingBatches.emplace(targetShardId, nextBatch);
+                break;
             }
-
-            bool isRetryableWrite = opCtx->getTxnNumber() && !TransactionRouter::get(opCtx);
-
-            MultiStatementTransactionRequestsSender ars(
-                opCtx,
-                Grid::get(opCtx)->getExecutorPool()->getArbitraryExecutor(),
-                clientRequest.getNS().db().toString(),
-                requests,
-                kPrimaryOnlyReadPreference,
-                isRetryableWrite ? Shard::RetryPolicy::kIdempotent : Shard::RetryPolicy::kNoRetry);
-            numSent += pendingBatches.size();
-
-            //
-            // Receive the responses.
-            //
-
-            while (!ars.done()) {
-                // Block until a response is available.
-                auto response = ars.next();
-
-                // Get the TargetedWriteBatch to find where to put the response
-                dassert(pendingBatches.find(response.shardId) != pendingBatches.end());
-                TargetedWriteBatch* batch = pendingBatches.find(response.shardId)->second;
-
-                // First check if we were able to target a shard host.
-                if (!response.shardHostAndPort) {
-                    invariant(!response.swResponse.isOK());
-
-                    // Record a resolve failure
-                    batchOp.noteBatchError(*batch,
-                                           errorFromStatus(response.swResponse.getStatus()));
-
-                    // TODO: It may be necessary to refresh the cache if stale, or maybe just cancel
-                    // and retarget the batch
-                    LOG(4) << "Unable to send write batch to " << batch->getEndpoint().shardName
-                           << causedBy(response.swResponse.getStatus());
-
-                    // We're done with this batch. Clean up when we can't resolve a host.
-                    auto it = childBatches.find(batch->getEndpoint().shardName);
-                    invariant(it != childBatches.end());
-                    delete it->second;
-                    it->second = nullptr;
-                    continue;
-                }
-
-                const auto shardHost(std::move(*response.shardHostAndPort));
-
-                // Then check if we successfully got a response.
-                Status responseStatus = response.swResponse.getStatus();
-                BatchedCommandResponse batchedCommandResponse;
-                if (responseStatus.isOK()) {
-                    std::string errMsg;
-                    if (!batchedCommandResponse.parseBSON(response.swResponse.getValue().data,
-                                                          &errMsg) ||
-                        !batchedCommandResponse.isValid(&errMsg)) {
-                        responseStatus = {ErrorCodes::FailedToParse, errMsg};
-                    }
-                }
-
-                if (responseStatus.isOK()) {
-                    TrackedErrors trackedErrors;
-                    trackedErrors.startTracking(ErrorCodes::StaleShardVersion);
-                    trackedErrors.startTracking(ErrorCodes::CannotImplicitlyCreateCollection);
-
-                    LOG(4) << "Write results received from " << shardHost.toString() << ": "
-                           << redact(batchedCommandResponse.toString());
-
-                    // If we are in a transaction, we must fail the whole batch on any error.
-                    if (TransactionRouter::get(opCtx)) {
-                        // Note: this returns a bad status if any part of the batch failed.
-                        auto batchStatus = batchedCommandResponse.toStatus();
-                        if (!batchStatus.isOK()) {
-                            batchOp.forgetTargetedBatchesOnTransactionAbortingError();
-                            uassertStatusOK(batchStatus.withContext(
-                                str::stream() << "Encountered error from " << shardHost.toString()
-                                              << " during a transaction"));
-                        }
-                    }
-
-                    // Dispatch was ok, note response
-                    batchOp.noteBatchResponse(*batch, batchedCommandResponse, &trackedErrors);
-
-                    // Note if anything was stale
-                    const auto& staleErrors =
-                        trackedErrors.getErrors(ErrorCodes::StaleShardVersion);
-                    if (!staleErrors.empty()) {
-                        noteStaleResponses(staleErrors, &targeter);
-                        ++stats->numStaleBatches;
-                    }
-
-                    const auto& cannotImplicitlyCreateErrors =
-                        trackedErrors.getErrors(ErrorCodes::CannotImplicitlyCreateCollection);
-                    if (!cannotImplicitlyCreateErrors.empty()) {
-                        // This forces the chunk manager to reload so we can attach the correct
-                        // version on retry and make sure we route to the correct shard.
-                        targeter.noteCouldNotTarget();
-                    }
-
-                    // Remember that we successfully wrote to this shard
-                    // NOTE: This will record lastOps for shards where we actually didn't update
-                    // or delete any documents, which preserves old behavior but is conservative
-                    stats->noteWriteAt(shardHost,
-                                       batchedCommandResponse.isLastOpSet()
-                                           ? batchedCommandResponse.getLastOp()
-                                           : repl::OpTime(),
-                                       batchedCommandResponse.isElectionIdSet()
-                                           ? batchedCommandResponse.getElectionId()
-                                           : OID());
-                } else {
-                    // Error occurred dispatching, note it
-                    const Status status = responseStatus.withContext(
-                        str::stream() << "Write results unavailable from " << shardHost);
-
-                    batchOp.noteBatchError(*batch, errorFromStatus(status));
-
-                    LOG(4) << "Unable to receive write results from " << shardHost
-                           << causedBy(redact(status));
-
-                    // If we are in a transaction, we must fail the whole batch on any error.
-                    if (TransactionRouter::get(opCtx)) {
-                        batchOp.forgetTargetedBatchesOnTransactionAbortingError();
-                        uassertStatusOK(status.withContext(
-                            str::stream() << "Encountered error from " << shardHost.toString()
-                                          << " during a transaction"));
-                    }
-                }
+        } else {
+            if (statusWithWriteType.getValue() == WriteType::Ordinary ||
+                statusWithWriteType.getValue() == WriteType::WithoutShardKeyWithId) {
+                // Tries to execute all of the child batches. If there are any transaction errors,
+                // 'abortBatch' will be set.
+                executeChildBatches(
+                    opCtx,
+                    targeter,
+                    clientRequest,
+                    childBatches,
+                    stats,
+                    batchOp,
+                    abortBatch,
+                    boost::none /* allowShardKeyUpdatesWithoutFullShardKeyInQuery */);
+            } else {
+                executeTwoPhaseOrTimeSeriesWriteChildBatches(opCtx,
+                                                             targeter,
+                                                             batchOp,
+                                                             childBatches,
+                                                             stats,
+                                                             clientRequest,
+                                                             abortBatch,
+                                                             statusWithWriteType.getValue());
             }
         }
 
         ++rounds;
         ++stats->numRounds;
+        LOGV2_DEBUG(9986810, 4, "Completed round", "rounds completed"_attr = rounds);
 
         // If we're done, get out
         if (batchOp.isFinished())
@@ -353,14 +888,35 @@ void BatchWriteExec::executeBatch(OperationContext* opCtx,
         //
 
         bool targeterChanged = false;
-        Status refreshStatus = targeter.refreshIfNeeded(opCtx, &targeterChanged);
+        try {
+            targeterChanged = targeter.createCollectionIfNeeded(opCtx);
+            LOGV2_DEBUG_OPTIONS(4817406,
+                                2,
+                                {logv2::LogComponent::kShardMigrationPerf},
+                                "Starting post-migration commit refresh on the router");
+            targeterChanged |= targeter.refreshIfNeeded(opCtx);
+            LOGV2_DEBUG_OPTIONS(4817407,
+                                2,
+                                {logv2::LogComponent::kShardMigrationPerf},
+                                "Finished post-migration commit refresh on the router");
+        } catch (const ExceptionFor<ErrorCodes::StaleEpoch>& ex) {
+            LOGV2_DEBUG_OPTIONS(4817408,
+                                2,
+                                {logv2::LogComponent::kShardMigrationPerf},
+                                "Finished post-migration commit refresh on the router with error",
+                                "error"_attr = redact(ex));
+            batchOp.abortBatch(write_ops::WriteError(
+                0, ex.toStatus("collection was dropped in the middle of the operation")));
+            break;
+        } catch (const DBException& ex) {
+            LOGV2_DEBUG_OPTIONS(4817409,
+                                2,
+                                {logv2::LogComponent::kShardMigrationPerf},
+                                "Finished post-migration commit refresh on the router with error",
+                                "error"_attr = redact(ex));
 
-        LOG(4) << "executeBatch targeter changed: " << targeterChanged;
-
-        if (!refreshStatus.isOK()) {
-            // It's okay if we can't refresh, we'll just record errors for the ops if
-            // needed.
-            warning() << "could not refresh targeter" << causedBy(refreshStatus.reason());
+            // It's okay if we can't refresh, we'll just record errors for the ops if needed
+            LOGV2_WARNING(22911, "Could not refresh targeter", "error"_attr = redact(ex));
         }
 
         //
@@ -369,55 +925,96 @@ void BatchWriteExec::executeBatch(OperationContext* opCtx,
 
         int currCompletedOps = batchOp.numWriteOpsIn(WriteOpState_Completed);
         if (currCompletedOps == numCompletedOps && !targeterChanged) {
+            LOGV2_DEBUG(9986809,
+                        5,
+                        "No progress made this round",
+                        "num rounds without progress"_attr = numRoundsWithoutProgress);
             ++numRoundsWithoutProgress;
         } else {
             numRoundsWithoutProgress = 0;
         }
         numCompletedOps = currCompletedOps;
 
-        if (numRoundsWithoutProgress > kMaxRoundsWithoutProgress) {
-            batchOp.abortBatch(errorFromStatus(
+        if (numRoundsWithoutProgress > maxRoundsWithoutProgress) {
+            batchOp.abortBatch(write_ops::WriteError(
+                0,
                 {ErrorCodes::NoProgressMade,
                  str::stream() << "no progress was made executing batch write op in "
-                               << clientRequest.getNS().ns()
-                               << " after "
-                               << kMaxRoundsWithoutProgress
-                               << " rounds ("
-                               << numCompletedOps
-                               << " ops completed in "
-                               << rounds
-                               << " rounds total)"}));
+                               << clientRequest.getNS().toStringForErrorMsg() << " after "
+                               << maxRoundsWithoutProgress << " rounds (" << numCompletedOps
+                               << " ops completed in " << rounds << " rounds total)"}));
             break;
+        }
+        if (numRoundsWithoutProgress > 0) {
+            sleepFor(backoff.nextSleep());
         }
     }
 
+    auto nShardsOwningChunks = batchOp.getNShardsOwningChunks();
+    if (nShardsOwningChunks)
+        stats->noteNumShardsOwningChunks(*nShardsOwningChunks);
+
+    stats->noteTargetedCollectionIsSharded(targeter.isTargetedCollectionSharded());
+
     batchOp.buildClientResponse(clientResponse);
 
-    LOG(4) << "Finished execution of write batch"
-           << (clientResponse->isErrDetailsSet() ? " with write errors" : "")
-           << (clientResponse->isErrDetailsSet() && clientResponse->isWriteConcernErrorSet()
-                   ? " and"
-                   : "")
-           << (clientResponse->isWriteConcernErrorSet() ? " with write concern error" : "")
-           << " for " << clientRequest.getNS();
+    LOGV2_DEBUG(22910,
+                4,
+                "Finished execution of write batch",
+                "succeededOrFailed"_attr =
+                    (clientResponse->isErrDetailsSet() ? "failed" : "succeeded"),
+                "wcSucceededOrFailed"_attr =
+                    (clientResponse->isWriteConcernErrorSet() ? "failed" : "succeeded"),
+                logAttrs(clientRequest.getNS()));
 }
 
 void BatchWriteExecStats::noteTargetedShard(const ShardId& shardId) {
     _targetedShards.insert(shardId);
 }
 
-void BatchWriteExecStats::noteWriteAt(const HostAndPort& host,
-                                      repl::OpTime opTime,
-                                      const OID& electionId) {
-    _writeOpTimes[ConnectionString(host)] = HostOpTime(opTime, electionId);
+void BatchWriteExecStats::noteNumShardsOwningChunks(const int nShardsOwningChunks) {
+    _numShardsOwningChunks.emplace(nShardsOwningChunks);
+}
+
+void BatchWriteExecStats::noteTargetedCollectionIsSharded(bool isSharded) {
+    _hasTargetedShardedCollection = isSharded;
 }
 
 const std::set<ShardId>& BatchWriteExecStats::getTargetedShards() const {
     return _targetedShards;
 }
 
-const HostOpTimeMap& BatchWriteExecStats::getWriteOpTimes() const {
-    return _writeOpTimes;
+boost::optional<int> BatchWriteExecStats::getNumShardsOwningChunks() const {
+    return _numShardsOwningChunks;
 }
 
-}  // namespace
+bool BatchWriteExecStats::hasTargetedShardedCollection() const {
+    return _hasTargetedShardedCollection;
+}
+
+void updateHostsTargetedMetrics(OperationContext* opCtx,
+                                BatchedCommandRequest::BatchType batchType,
+                                int nShardsOwningChunks,
+                                int nShardsTargeted,
+                                bool isSharded) {
+    NumHostsTargetedMetrics::QueryType writeType;
+    switch (batchType) {
+        case BatchedCommandRequest::BatchType_Insert:
+            writeType = NumHostsTargetedMetrics::QueryType::kInsertCmd;
+            break;
+        case BatchedCommandRequest::BatchType_Update:
+            writeType = NumHostsTargetedMetrics::QueryType::kUpdateCmd;
+            break;
+        case BatchedCommandRequest::BatchType_Delete:
+            writeType = NumHostsTargetedMetrics::QueryType::kDeleteCmd;
+            break;
+
+            MONGO_UNREACHABLE;
+    }
+
+    auto targetType = NumHostsTargetedMetrics::get(opCtx).parseTargetType(
+        opCtx, nShardsTargeted, nShardsOwningChunks, isSharded);
+    NumHostsTargetedMetrics::get(opCtx).addNumHostsTargeted(writeType, targetType);
+}
+
+}  // namespace mongo

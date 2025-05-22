@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,82 +27,90 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <string>
 
-#include <map>
-
+#include "mongo/base/error_codes.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
-#include "mongo/db/client.h"
+#include "mongo/db/auth/resource_pattern.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/concurrency/lock_manager_defs.h"
-#include "mongo/db/concurrency/lock_state.h"
+#include "mongo/db/commands/lock_info_gen.h"
+#include "mongo/db/concurrency/lock_manager.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/db_raii.h"
+#include "mongo/db/dump_lock_manager_impl.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/profile_settings.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/storage/storage_engine.h"
 
 namespace mongo {
+namespace {
 
-using std::string;
-using std::stringstream;
-
-/**
- * Admin command to display global lock information
- */
-class CmdLockInfo : public BasicCommand {
+class CmdLockInfo : public TypedCommand<CmdLockInfo> {
 public:
+    using Request = LockInfoCommand;
+
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kAlways;
     }
 
-    virtual bool adminOnly() const {
+    bool adminOnly() const override {
         return true;
-    }
-
-    virtual bool supportsWriteConcern(const BSONObj& cmd) const {
-        return false;
     }
 
     std::string help() const override {
         return "show all lock info on the server";
     }
 
-    Status checkAuthForCommand(Client* client,
-                               const std::string& dbname,
-                               const BSONObj& cmdObj) const final {
-        bool isAuthorized = AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
-            ResourcePattern::forClusterResource(), ActionType::serverStatus);
-        return isAuthorized ? Status::OK() : Status(ErrorCodes::Unauthorized, "Unauthorized");
-    }
+    class Invocation final : public MinimalInvocationBase {
+    public:
+        using MinimalInvocationBase::MinimalInvocationBase;
 
-    CmdLockInfo() : BasicCommand("lockInfo") {}
-
-    bool run(OperationContext* opCtx,
-             const string& dbname,
-             const BSONObj& jsobj,
-             BSONObjBuilder& result) {
-        std::map<LockerId, BSONObj> lockToClientMap;
-
-        for (ServiceContext::LockedClientsCursor cursor(opCtx->getClient()->getServiceContext());
-             Client* client = cursor.next();) {
-            invariant(client);
-
-            stdx::lock_guard<Client> lk(*client);
-            const OperationContext* clientOpCtx = client->getOperationContext();
-
-            // Operation context specific information
-            if (clientOpCtx) {
-                BSONObjBuilder infoBuilder;
-                // The client information
-                client->reportState(infoBuilder);
-
-                infoBuilder.append("opid", clientOpCtx->getOpID());
-                LockerId lockerId = clientOpCtx->lockState()->getId();
-                lockToClientMap.insert({lockerId, infoBuilder.obj()});
-            }
+    private:
+        void doCheckAuthorization(OperationContext* opCtx) const override {
+            uassert(ErrorCodes::Unauthorized,
+                    "Unauthorized",
+                    AuthorizationSession::get(opCtx->getClient())
+                        ->isAuthorizedForActionsOnResource(
+                            ResourcePattern::forClusterResource(request().getDbName().tenantId()),
+                            ActionType::serverStatus));
         }
 
-        getGlobalLockManager()->getLockInfoBSON(lockToClientMap, &result);
-        return true;
-    }
-} cmdLockInfo;
-}
+        NamespaceString ns() const override {
+            return NamespaceString(request().getDbName());
+        }
+
+        bool supportsWriteConcern() const override {
+            return false;
+        }
+
+        void run(OperationContext* opCtx, rpc::ReplyBuilderInterface* reply) override {
+            AutoStatsTracker statsTracker(opCtx,
+                                          ns(),
+                                          Top::LockType::NotLocked,
+                                          AutoStatsTracker::LogMode::kUpdateTopAndCurOp,
+                                          DatabaseProfileSettings::get(opCtx->getServiceContext())
+                                              .getDatabaseProfileLevel(request().getDbName()));
+
+            auto lockToClientMap = getLockerIdToClientMap(opCtx->getServiceContext());
+
+            auto lockManager = LockManager::get(opCtx->getServiceContext());
+            auto result = reply->getBodyBuilder();
+            auto lockInfoArr = BSONArrayBuilder(result.subarrayStart("lockInfo"));
+            lockManager->getLockInfoArray(lockToClientMap, false, lockManager, &lockInfoArr);
+            const auto& includeStorageEngineDump = request().getIncludeStorageEngineDump();
+            if (includeStorageEngineDump) {
+                opCtx->getServiceContext()->getStorageEngine()->dump();
+            }
+        }
+    };
+};
+MONGO_REGISTER_COMMAND(CmdLockInfo).forShard();
+
+}  // namespace
+}  // namespace mongo

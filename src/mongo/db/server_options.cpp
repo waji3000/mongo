@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,9 +27,13 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/server_options.h"
+
+#include "mongo/logv2/log.h"
+#include "mongo/util/str.h"
+#include "mongo/util/version/releases.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 namespace mongo {
 
@@ -41,5 +44,17 @@ namespace mongo {
  * sets it via the command line, which would pull in more dependencies.
  */
 ServerGlobalParams serverGlobalParams;
+
+std::string ServerGlobalParams::getPortSettingHelpText() {
+    return str::stream() << "Specify port number - " << serverGlobalParams.port << " by default";
+}
+
+void ServerGlobalParams::FCVSnapshot::logFCVWithContext(StringData context) const {
+    LOGV2_OPTIONS(5853300,
+                  {logv2::LogComponent::kReplication},
+                  "current featureCompatibilityVersion value",
+                  "featureCompatibilityVersion"_attr = multiversion::toString(_version),
+                  "context"_attr = context);
+}
 
 }  // namespace mongo

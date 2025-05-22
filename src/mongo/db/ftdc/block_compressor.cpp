@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,13 +27,13 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/ftdc/block_compressor.h"
-
 #include <zlib.h>
 
-#include "mongo/util/mongoutils/str.h"
+#include <boost/move/utility_core.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/db/ftdc/block_compressor.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -67,9 +66,7 @@ StatusWith<ConstDataRange> BlockCompressor::compress(ConstDataRange source) {
     if (err != Z_STREAM_END) {
         (void)deflateEnd(&stream);
 
-        if (err != Z_OK) {
-            return {ErrorCodes::ZLibError, str::stream() << "deflate failed with " << err};
-        }
+        return {ErrorCodes::ZLibError, str::stream() << "deflate failed with " << err};
     }
 
     err = deflateEnd(&stream);
@@ -77,7 +74,7 @@ StatusWith<ConstDataRange> BlockCompressor::compress(ConstDataRange source) {
         return {ErrorCodes::ZLibError, str::stream() << "deflateEnd failed with " << err};
     }
 
-    return ConstDataRange(reinterpret_cast<char*>(_buffer.data()), stream.total_out);
+    return ConstDataRange(_buffer.data(), stream.total_out);
 }
 
 StatusWith<ConstDataRange> BlockCompressor::uncompress(ConstDataRange source,
@@ -115,7 +112,7 @@ StatusWith<ConstDataRange> BlockCompressor::uncompress(ConstDataRange source,
         return {ErrorCodes::ZLibError, str::stream() << "inflateEnd failed with " << err};
     }
 
-    return ConstDataRange(reinterpret_cast<char*>(_buffer.data()), stream.total_out);
+    return ConstDataRange(_buffer.data(), stream.total_out);
 }
 
 }  // namespace mongo

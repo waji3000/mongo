@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,33 +27,47 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kFTDC
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/ftdc/file_manager.h"
-
-#include <boost/filesystem.hpp>
+#include <algorithm>
+#include <cstdio>
+#include <cstring>
+#include <memory>
 #include <string>
+#include <utility>
 
+#include <boost/filesystem/directory.hpp>
+#include <boost/filesystem/operations.hpp>
+#include <boost/filesystem/path.hpp>
+#include <boost/iterator/iterator_facade.hpp>
+#include <boost/move/utility_core.hpp>
+// IWYU pragma: no_include "boost/system/detail/error_code.hpp"
+
+#include "mongo/base/error_codes.h"
 #include "mongo/base/string_data.h"
 #include "mongo/db/client.h"
 #include "mongo/db/ftdc/config.h"
 #include "mongo/db/ftdc/constants.h"
+#include "mongo/db/ftdc/file_manager.h"
 #include "mongo/db/ftdc/file_reader.h"
-#include "mongo/db/jsobj.h"
-#include "mongo/stdx/memory.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 #include "mongo/util/time_support.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kFTDC
+
 
 namespace mongo {
 
 FTDCFileManager::FTDCFileManager(const FTDCConfig* config,
                                  const boost::filesystem::path& path,
-                                 FTDCCollectorCollection* collection)
-    : _config(config), _writer(_config), _path(path), _rotateCollectors(collection) {}
+                                 FTDCCollectorCollection* collection,
+                                 UseMultiServiceSchema multiServiceSchema)
+    : _config(config),
+      _writer(_config, multiServiceSchema),
+      _path(path),
+      _rotateCollectors(collection),
+      _multiServiceSchema(multiServiceSchema) {}
 
 FTDCFileManager::~FTDCFileManager() {
     close().transitional_ignore();
@@ -64,7 +77,8 @@ StatusWith<std::unique_ptr<FTDCFileManager>> FTDCFileManager::create(
     const FTDCConfig* config,
     const boost::filesystem::path& path,
     FTDCCollectorCollection* collection,
-    Client* client) {
+    Client* client,
+    UseMultiServiceSchema multiServiceSchema) {
     const boost::filesystem::path dir = boost::filesystem::absolute(path);
 
     // We don't expect to ever pass "" to create_directories below, but catch
@@ -77,13 +91,13 @@ StatusWith<std::unique_ptr<FTDCFileManager>> FTDCFileManager::create(
         boost::filesystem::create_directories(dir, ec);
         if (ec) {
             return {ErrorCodes::NonExistentPath,
-                    str::stream() << "\'" << dir.generic_string() << "\' could not be created: "
-                                  << ec.message()};
+                    str::stream() << "\"" << dir.generic_string()
+                                  << "\" could not be created: " << ec.message()};
         }
     }
 
-    auto mgr =
-        std::unique_ptr<FTDCFileManager>(new FTDCFileManager(config, dir, std::move(collection)));
+    auto mgr = std::unique_ptr<FTDCFileManager>(
+        new FTDCFileManager(config, dir, std::move(collection), multiServiceSchema));
 
     // Enumerate the metrics files
     auto files = mgr->scanDirectory();
@@ -92,7 +106,7 @@ StatusWith<std::unique_ptr<FTDCFileManager>> FTDCFileManager::create(
     auto interimDocs = mgr->recoverInterimFile();
 
     // Open the archive file for writing
-    auto swFile = mgr->generateArchiveFileName(path, terseUTCCurrentTime());
+    auto swFile = mgr->generateArchiveFileName(path, terseCurrentTimeForFilename(true));
     if (!swFile.isOK()) {
         return swFile.getStatus();
     }
@@ -103,7 +117,10 @@ StatusWith<std::unique_ptr<FTDCFileManager>> FTDCFileManager::create(
     }
 
     // Rotate as needed after we appended interim data to the archive file
-    mgr->trimDirectory(files);
+    s = mgr->trimDirectory(files);
+    if (!s.isOK()) {
+        return s;
+    }
 
     return {std::move(mgr)};
 }
@@ -118,7 +135,7 @@ std::vector<boost::filesystem::path> FTDCFileManager::scanDirectory() {
 
         std::string str = filename.generic_string();
         if (str.compare(0, strlen(kFTDCArchiveFile), kFTDCArchiveFile) == 0 &&
-            str != kFTDCInterimFile) {
+            str != kFTDCInterimTempFile && str != kFTDCInterimFile) {
             files.emplace_back(_path / filename);
         }
     }
@@ -195,7 +212,7 @@ Status FTDCFileManager::openArchiveFile(
     // collect one-time information
     // This is appened after the file is opened to ensure a user can determine which bson objects
     // where collected from which server instance.
-    auto sample = _rotateCollectors->collect(client);
+    auto sample = _rotateCollectors->collect(client, _multiServiceSchema);
     if (!std::get<0>(sample).isEmpty()) {
         Status s = _writer.writeMetadata(std::get<0>(sample), std::get<1>(sample));
 
@@ -207,22 +224,41 @@ Status FTDCFileManager::openArchiveFile(
     return Status::OK();
 }
 
-void FTDCFileManager::trimDirectory(std::vector<boost::filesystem::path>& files) {
+Status FTDCFileManager::trimDirectory(std::vector<boost::filesystem::path>& files) {
     std::uint64_t maxSize = _config->maxDirectorySizeBytes;
     std::uint64_t size = 0;
 
     dassert(std::is_sorted(files.begin(), files.end()));
 
     for (auto it = files.rbegin(); it != files.rend(); ++it) {
-        std::uint64_t fileSize = boost::filesystem::file_size(*it);
+        boost::system::error_code ec;
+        std::uint64_t fileSize = boost::filesystem::file_size(*it, ec);
+        if (ec) {
+            return {ErrorCodes::NonExistentPath,
+                    str::stream() << "\"" << (*it).generic_string()
+                                  << "\" file size could not be retrieved during trimming: "
+                                  << ec.message()};
+        }
         size += fileSize;
 
         if (size >= maxSize) {
-            LOG(1) << "Cleaning file over full-time diagnostic data capture quota, file: "
-                   << (*it).generic_string() << " with size " << fileSize;
-            boost::filesystem::remove(*it);
+            LOGV2_DEBUG(20628,
+                        1,
+                        "Cleaning file over full-time diagnostic data capture quota",
+                        "fileName"_attr = (*it).generic_string(),
+                        "fileSize"_attr = fileSize);
+
+            boost::filesystem::remove(*it, ec);
+            if (ec) {
+                return {ErrorCodes::NonExistentPath,
+                        str::stream()
+                            << "\"" << (*it).generic_string()
+                            << "\" could not be removed during trimming: " << ec.message()};
+            }
         }
     }
+
+    return Status::OK();
 }
 
 std::vector<std::tuple<FTDCBSONUtil::FTDCType, BSONObj, Date_t>>
@@ -236,7 +272,15 @@ FTDCFileManager::recoverInterimFile() {
         return docs;
     }
 
-    size_t size = boost::filesystem::file_size(interimFile);
+    boost::system::error_code ec;
+    size_t size = boost::filesystem::file_size(interimFile, ec);
+    if (ec) {
+        LOGV2(20629,
+              "Recover interim file failed as the file size could not be checked",
+              "errorMessage"_attr = ec.message());
+        return docs;
+    }
+
     if (size == 0) {
         return docs;
     }
@@ -244,11 +288,10 @@ FTDCFileManager::recoverInterimFile() {
     FTDCFileReader read;
     auto s = read.open(interimFile);
     if (!s.isOK()) {
-        log() << "Unclean full-time diagnostic data capture shutdown detected, found interim file, "
-                 "but failed "
-                 "to open it, some "
-                 "metrics may have been lost. "
-              << s;
+        LOGV2(20630,
+              "Unclean full-time diagnostic data capture shutdown detected, found interim file,  "
+              "but failed to open it, some metrics may have been lost",
+              "error"_attr = s);
 
         // Note: We ignore any actual errors as reading from the interim files is a best-effort
         return docs;
@@ -263,10 +306,10 @@ FTDCFileManager::recoverInterimFile() {
 
     // Warn if the interim file was corrupt or we had an unclean shutdown
     if (!m.isOK() || !docs.empty()) {
-        log() << "Unclean full-time diagnostic data capture shutdown detected, found interim file, "
-                 "some "
-                 "metrics may have been lost. "
-              << m.getStatus();
+        LOGV2(20631,
+              "Unclean full-time diagnostic data capture shutdown detected, found interim file, "
+              "some metrics may have been lost",
+              "error"_attr = m.getStatus());
     }
 
     // Note: We ignore any actual errors as reading from the interim files is a best-effort
@@ -282,14 +325,32 @@ Status FTDCFileManager::rotate(Client* client) {
     auto files = scanDirectory();
 
     // Rotate as needed
-    trimDirectory(files);
+    s = trimDirectory(files);
+    if (!s.isOK()) {
+        return s;
+    }
 
-    auto swFile = generateArchiveFileName(_path, terseUTCCurrentTime());
+    auto swFile = generateArchiveFileName(_path, terseCurrentTimeForFilename(true));
     if (!swFile.isOK()) {
         return swFile.getStatus();
     }
 
     return openArchiveFile(client, swFile.getValue(), {});
+}
+
+Status FTDCFileManager::writePeriodicMetadataSampleAndRotateIfNeeded(Client* client,
+                                                                     const BSONObj& sample,
+                                                                     Date_t date) {
+    auto status = _writer.writePeriodicMetadataSample(sample, date);
+    if (!status.isOK()) {
+        return status;
+    }
+
+    if (_writer.getSize() > _config->maxFileSizeBytes) {
+        return rotate(client);
+    }
+
+    return Status::OK();
 }
 
 Status FTDCFileManager::writeSampleAndRotateIfNeeded(Client* client,

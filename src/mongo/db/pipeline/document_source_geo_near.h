@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,15 +29,38 @@
 
 #pragma once
 
+#include <list>
+#include <memory>
+#include <set>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/matcher/matcher.h"
+#include "mongo/db/pipeline/dependencies.h"
 #include "mongo/db/pipeline/document_source.h"
+#include "mongo/db/pipeline/expression.h"
+#include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/field_path.h"
+#include "mongo/db/pipeline/pipeline.h"
+#include "mongo/db/pipeline/stage_constraints.h"
+#include "mongo/db/pipeline/variables.h"
+#include "mongo/db/query/query_shape/serialization_options.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/intrusive_counter.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
-class DocumentSourceGeoNear : public DocumentSource, public NeedsMergerDocumentSource {
+class DocumentSourceGeoNear : public DocumentSource {
 public:
     static constexpr StringData kKeyFieldName = "key"_sd;
-    static constexpr auto kStageName = "$geoNear";
+    static constexpr StringData kStageName = "$geoNear"_sd;
 
     /**
      * Only exposed for testing.
@@ -47,43 +69,76 @@ public:
         const boost::intrusive_ptr<ExpressionContext>&);
 
     const char* getSourceName() const final {
-        return kStageName;
+        return DocumentSourceGeoNear::kStageName.data();
+    }
+
+    static const Id& id;
+
+    Id getId() const override {
+        return id;
     }
 
     StageConstraints constraints(Pipeline::SplitState pipeState) const final {
-        return {StreamType::kStreaming,
-                PositionRequirement::kFirst,
-                HostTypeRequirement::kAnyShard,
-                DiskUseRequirement::kNoDiskUse,
-                FacetRequirement::kNotAllowed,
-                TransactionRequirement::kAllowed};
+        StageConstraints constraints{StreamType::kStreaming,
+                                     PositionRequirement::kCustom,
+                                     HostTypeRequirement::kAnyShard,
+                                     DiskUseRequirement::kNoDiskUse,
+                                     FacetRequirement::kNotAllowed,
+                                     TransactionRequirement::kAllowed,
+                                     LookupRequirement::kAllowed,
+                                     UnionRequirement::kAllowed};
+        constraints.noFieldModifications = (!includeLocs && !distanceField);
+        return constraints;
+    }
+
+    void validatePipelinePosition(bool alreadyOptimized,
+                                  Pipeline::SourceContainer::const_iterator pos,
+                                  const Pipeline::SourceContainer& container) const final {
+        // This stage must be in the first position in the pipeline after optimization.
+        uassert(40603,
+                str::stream() << getSourceName()
+                              << " was not the first stage in the pipeline after optimization. Is "
+                                 "optimization disabled or inhibited?",
+                !alreadyOptimized || pos == container.cbegin());
     }
 
     /**
      * DocumentSourceGeoNear should always be replaced by a DocumentSourceGeoNearCursor before
      * executing a pipeline, so this method should never be called.
      */
-    GetNextResult getNext() final {
-        MONGO_UNREACHABLE;
+    GetNextResult doGetNext() final {
+        MONGO_UNREACHABLE_TASSERT(9911962);
     }
 
-    Value serialize(boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final;
+    Value serialize(const SerializationOptions& opts = SerializationOptions{}) const final;
+
+    boost::intrusive_ptr<DocumentSource> optimize() final;
 
     static boost::intrusive_ptr<DocumentSource> createFromBson(
         BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& pCtx);
 
+
+    bool hasQuery() const override;
+
     /**
      * A query predicate to apply to the documents in addition to the "near" predicate.
      */
-    BSONObj getQuery() const {
-        return query;
+    BSONObj getQuery() const override {
+        return query ? *query->getQuery() : BSONObj();
+    };
+
+    /**
+     * Set the query predicate to apply to the documents in addition to the "near" predicate.
+     */
+    void setQuery(BSONObj newQuery) {
+        query = std::make_unique<Matcher>(newQuery.getOwned(), pExpCtx);
     };
 
     /**
      * The field in which the computed distance will be stored.
      */
-    FieldPath getDistanceField() const {
-        return *distanceField;
+    boost::optional<FieldPath> getDistanceField() const {
+        return distanceField;
     }
 
     /**
@@ -101,6 +156,13 @@ public:
     }
 
     /**
+     * Set the field over which to apply the "near" predicate.
+     */
+    void setKeyField(const FieldPath& newPath) {
+        keyFieldPath = newPath;
+    }
+
+    /**
      * A scaling factor to apply to the distance, if specified by the user.
      */
     boost::optional<double> getDistanceMultiplier() const {
@@ -108,6 +170,8 @@ public:
     }
 
     DepsTracker::State getDependencies(DepsTracker* deps) const final;
+
+    void addVariableRefs(std::set<Variables::Id>* refs) const final;
 
     /**
      * Returns true if the $geoNear specification requires the geoNear point metadata.
@@ -118,38 +182,44 @@ public:
      * Converts this $geoNear aggregation stage into an equivalent $near or $nearSphere query on
      * 'nearFieldName'.
      */
-    BSONObj asNearQuery(StringData nearFieldName) const;
-
-    /**
-     * This document source is sent as-is to the shards.
-     */
-    boost::intrusive_ptr<DocumentSource> getShardSource() final {
-        return this;
-    }
+    BSONObj asNearQuery(StringData nearFieldName);
 
     /**
      * In a sharded cluster, this becomes a merge sort by distance, from nearest to furthest.
      */
-    MergingLogic mergingLogic() final;
+    boost::optional<DistributedPlanLogic> distributedPlanLogic() final;
 
+protected:
+    Pipeline::SourceContainer::iterator doOptimizeAt(Pipeline::SourceContainer::iterator itr,
+                                                     Pipeline::SourceContainer* container) final;
 
 private:
     explicit DocumentSourceGeoNear(const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
 
     /**
+     * If this stage immediately follows an $_internalUnpackBucket, split it up into several stages
+     * including an explicit $sort.
+     *
+     * Does nothing if not immediately following an $_internalUnpackBucket.
+     */
+    Pipeline::SourceContainer::iterator splitForTimeseries(Pipeline::SourceContainer::iterator itr,
+                                                           Pipeline::SourceContainer* container);
+
+
+    /**
      * Parses the fields in the object 'options', throwing if an error occurs.
      */
-    void parseOptions(BSONObj options);
+    void parseOptions(BSONObj options, const boost::intrusive_ptr<ExpressionContext>& pCtx);
 
     // These fields describe the command to run.
-    // 'coords' and 'distanceField' are required; the rest are optional.
-    BSONObj coords;  // "near" option, but near is a reserved keyword on windows
-    bool coordsIsArray;
-    std::unique_ptr<FieldPath> distanceField;  // Using unique_ptr because FieldPath can't be empty
-    BSONObj query;
+    // 'near' is required; the rest are optional.
+    boost::intrusive_ptr<Expression> _nearGeometry;
+
+    boost::optional<FieldPath> distanceField;
+    std::unique_ptr<Matcher> query;
     bool spherical;
-    boost::optional<double> maxDistance;
-    boost::optional<double> minDistance;
+    boost::intrusive_ptr<Expression> maxDistance;
+    boost::intrusive_ptr<Expression> minDistance;
     boost::optional<double> distanceMultiplier;
     boost::optional<FieldPath> includeLocs;
     boost::optional<FieldPath> keyFieldPath;

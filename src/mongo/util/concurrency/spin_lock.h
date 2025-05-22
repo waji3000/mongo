@@ -1,6 +1,3 @@
-// spin_lock.h
-
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -38,8 +35,9 @@
 #include <atomic>
 #endif
 
-#include "mongo/base/disallow_copying.h"
-#include "mongo/config.h"
+#include <mutex>
+
+#include "mongo/config.h"  // IWYU pragma: keep
 #include "mongo/platform/compiler.h"
 #include "mongo/stdx/mutex.h"
 
@@ -47,7 +45,8 @@ namespace mongo {
 
 #if defined(_WIN32)
 class SpinLock {
-    MONGO_DISALLOW_COPYING(SpinLock);
+    SpinLock(const SpinLock&) = delete;
+    SpinLock& operator=(const SpinLock&) = delete;
 
 public:
     SpinLock() {
@@ -66,6 +65,10 @@ public:
         LeaveCriticalSection(&_cs);
     }
 
+    bool try_lock() {
+        return TryEnterCriticalSection(&_cs);
+    }
+
 private:
     CRITICAL_SECTION _cs;
 };
@@ -74,7 +77,8 @@ private:
 
 #if MONGO_CONFIG_DEBUG_BUILD
 class SpinLock {
-    MONGO_DISALLOW_COPYING(SpinLock);
+    SpinLock(const SpinLock&) = delete;
+    SpinLock& operator=(const SpinLock&) = delete;
 
 public:
     SpinLock() = default;
@@ -87,6 +91,10 @@ public:
         _mutex.unlock();
     }
 
+    bool try_lock() {
+        return _mutex.try_lock();
+    }
+
 private:
     stdx::mutex _mutex;
 };
@@ -94,7 +102,8 @@ private:
 #else
 
 class SpinLock {
-    MONGO_DISALLOW_COPYING(SpinLock);
+    SpinLock(const SpinLock&) = delete;
+    SpinLock& operator=(const SpinLock&) = delete;
 
 public:
     SpinLock() = default;
@@ -107,6 +116,10 @@ public:
         if (MONGO_likely(_tryLock()))
             return;
         _lockSlowPath();
+    }
+
+    bool try_lock() {
+        return _tryLock();
     }
 
 private:

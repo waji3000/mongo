@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,68 +29,76 @@
 
 #pragma once
 
+#include <boost/optional/optional.hpp>
+#include <vector>
+
+#include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/database_holder.h"
-
-#include <set>
-#include <string>
-
-#include "mongo/base/string_data.h"
-#include "mongo/db/namespace_string.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/stdx/mutex.h"
-#include "mongo/util/concurrency/mutex.h"
+#include "mongo/stdx/unordered_map.h"
 #include "mongo/util/string_map.h"
 
 namespace mongo {
 
-class Database;
-class OperationContext;
-
-/**
- * Registry of opened databases.
- */
-class DatabaseHolderImpl : public DatabaseHolder::Impl {
+class DatabaseHolderImpl : public DatabaseHolder {
 public:
     DatabaseHolderImpl() = default;
 
-    /**
-     * Retrieves an already opened database or returns NULL. Must be called with the database
-     * locked in at least IS-mode.
-     */
-    Database* get(OperationContext* opCtx, StringData ns) const override;
+    Database* getDb(OperationContext* opCtx, const DatabaseName& dbName) const override;
 
-    /**
-     * Retrieves a database reference if it is already opened, or opens it if it hasn't been
-     * opened/created yet. Must be called with the database locked in X-mode.
-     *
-     * @param justCreated Returns whether the database was newly created (true) or it already
-     *          existed (false). Can be NULL if this information is not necessary.
-     */
-    Database* openDb(OperationContext* opCtx, StringData ns, bool* justCreated = nullptr) override;
+    bool dbExists(OperationContext* opCtx, const DatabaseName& dbName) const override;
 
-    /**
-     * Closes the specified database. Must be called with the database locked in X-mode.
-     * No background jobs must be in progress on the database when this function is called.
-     */
-    void close(OperationContext* opCtx, StringData ns, const std::string& reason) override;
+    Database* openDb(OperationContext* opCtx,
+                     const DatabaseName& dbName,
+                     bool* justCreated = nullptr) override;
 
-    /**
-     * Closes all opened databases. Must be called with the global lock acquired in X-mode.
-     * Will uassert if any background jobs are running when this function is called.
-     *
-     * @param reason The reason for close.
-     */
-    void closeAll(OperationContext* opCtx, const std::string& reason) override;
+    void dropDb(OperationContext* opCtx, Database* db) override;
 
-    /**
-     * Returns the set of existing database names that differ only in casing.
-     */
-    std::set<std::string> getNamesWithConflictingCasing(StringData name) override;
+    void close(OperationContext* opCtx, const DatabaseName& dbName) override;
+
+    void closeAll(OperationContext* opCtx) override;
+
+    boost::optional<DatabaseName> getNameWithConflictingCasing(const DatabaseName& dbName) override;
+
+    std::vector<DatabaseName> getNames() override;
+
+    // This class is the owner of the Database objects opened by DatabaseHolderImpl. It contains
+    // a DatabaseName -> Database map to locate Database's by name as well as a multimap of used for
+    // efficient search of case insensitive name duplicates. The class keeps both structures
+    // synchronized, and thus, it does not allow write access to the maps individually.
+    class DBsIndex {
+    public:
+        using DBs = stdx::unordered_map<DatabaseName, std::unique_ptr<Database>>;
+
+        const DBs& viewAll() const;
+
+        Database* getOrCreate(const DatabaseName& dbName);
+
+        void erase(const DatabaseName& dbName);
+
+        boost::optional<DatabaseName> getAnyConflictingName(const DatabaseName& dbName) const;
+
+        std::pair<Database*, bool> upsert(const DatabaseName& dbName, std::unique_ptr<Database> db);
+
+    private:
+        using NormalizedDatabaseName = std::string;
+        using NormalizedDBs =
+            std::unordered_multimap<NormalizedDatabaseName, DatabaseName>;  // NOLINT
+
+        DBs _dbs;                      // Use for exact matching
+        NormalizedDBs _normalizedDBs;  // Use to locate DBs with same normalized key
+
+        static NormalizedDatabaseName normalize(const DatabaseName& dbName);
+    };
 
 private:
-    std::set<std::string> _getNamesWithConflictingCasing_inlock(StringData name);
+    boost::optional<DatabaseName> _getNameWithConflictingCasing_inlock(const DatabaseName& dbName);
 
-    typedef StringMap<Database*> DBs;
-    mutable SimpleMutex _m;
-    DBs _dbs;
+    mutable stdx::mutex _m;
+
+    DatabaseHolderImpl::DBsIndex _dbs;
 };
+
 }  // namespace mongo

@@ -1,31 +1,39 @@
 // Test transaction starting with read.
-// @tags: [uses_transactions]
-(function() {
-    "use strict";
+//
+// @tags: [
+//   # The test runs commands that are not allowed with security token: endSession.
+//   not_allowed_with_signed_security_token,
+//   uses_transactions
+// ]
 
-    const dbName = "test";
-    const collName = "start_transaction_with_read";
+import {withTxnAndAutoRetryOnMongos} from "jstests/libs/auto_retry_transaction_in_sharding.js";
 
-    const testDB = db.getSiblingDB(dbName);
-    const coll = testDB[collName];
+const dbName = "test";
+const collName = "start_transaction_with_read";
 
-    testDB.runCommand({drop: collName, writeConcern: {w: "majority"}});
+const testDB = db.getSiblingDB(dbName);
+const coll = testDB[collName];
 
-    testDB.runCommand({create: coll.getName(), writeConcern: {w: "majority"}});
+testDB.runCommand({drop: collName, writeConcern: {w: "majority"}});
+assert.commandWorked(testDB.runCommand({create: collName, writeConcern: {w: "majority"}}));
 
-    const sessionOptions = {causalConsistency: false};
-    const session = testDB.getMongo().startSession(sessionOptions);
-    const sessionDb = session.getDatabase(dbName);
-    const sessionColl = sessionDb[collName];
+const sessionOptions = {
+    causalConsistency: false
+};
+const session = testDB.getMongo().startSession(sessionOptions);
+const sessionDb = session.getDatabase(dbName);
+const sessionColl = sessionDb[collName];
 
-    // Non-transactional write to give something to find.
-    const initialDoc = {_id: "pretransaction1", x: 0};
-    assert.writeOK(sessionColl.insert(initialDoc, {writeConcern: {w: "majority"}}));
+// Non-transactional write to give something to find.
+const initialDoc = {
+    _id: "pretransaction1",
+    x: 0
+};
+assert.commandWorked(sessionColl.insert(initialDoc, {writeConcern: {w: "majority"}}));
 
-    jsTest.log("Start a transaction with a read");
+jsTest.log("Start a transaction with a read");
 
-    session.startTransaction();
-
+withTxnAndAutoRetryOnMongos(session, () => {
     let docs = sessionColl.find({}).toArray();
     assert.sameMembers(docs, [initialDoc]);
 
@@ -40,13 +48,11 @@
 
     // Insert a doc within a transaction.
     assert.commandWorked(sessionColl.insert({_id: "insert-2"}));
+}, {});
 
-    session.commitTransaction();
+// Read with default read concern sees the committed transaction.
+assert.eq({_id: "insert-1"}, coll.findOne({_id: "insert-1"}));
+assert.eq({_id: "insert-2"}, coll.findOne({_id: "insert-2"}));
+assert.eq(initialDoc, coll.findOne(initialDoc));
 
-    // Read with default read concern sees the committed transaction.
-    assert.eq({_id: "insert-1"}, coll.findOne({_id: "insert-1"}));
-    assert.eq({_id: "insert-2"}, coll.findOne({_id: "insert-2"}));
-    assert.eq(initialDoc, coll.findOne(initialDoc));
-
-    session.endSession();
-}());
+session.endSession();

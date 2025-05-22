@@ -1,15 +1,15 @@
-load("jstests/readonly/lib/read_only_test.js");
+import {runReadOnlyTest} from "jstests/readonly/lib/read_only_test.js";
 
 runReadOnlyTest(function() {
-    'use strict';
     return {
         name: 'catalog_ops',
 
         collectionNames: ["foo", "bar", "baz", "garply"],
+        tsCollectionName: "tsColl",
+        tsBucketsCollectionName: "system.buckets.tsColl",
         indexSpecs: [{a: 1}, {a: 1, b: -1}, {a: 1, b: 1, c: -1}],
 
         load: function(writableCollection) {
-
             // Catalog guarantees are neccessarily weaker in sharded systems since mongos is not
             // read-only aware.
             if (TestData.fixture === "sharded")
@@ -23,29 +23,41 @@ runReadOnlyTest(function() {
                 assert.commandWorked(db.runCommand({create: collectionName}));
             }
 
+            // Create also a timeseries collection to validate that listCollections still works.
+            assert.commandWorked(db.createCollection(
+                this.tsCollectionName, {timeseries: {timeField: "time", metaField: "meta"}}));
+
+            this.collectionNames.push(this.tsCollectionName, this.tsBucketsCollectionName);
+
             // Create some indexes so we can verify that listIndexes works in read-only mode.
             for (var indexSpec of this.indexSpecs) {
                 assert.commandWorked(writableCollection.createIndex(indexSpec));
             }
         },
         exec: function(readableCollection) {
-
             // Catalog guarantees are neccessarily weaker in sharded systems since mongos is not
             // read-only aware.
             if (TestData.fixture === "sharded")
                 return;
 
             // Check that we can read our collections out.
-            var db = readableCollection.getDB();
-            var collections = db.getCollectionNames();  // runs listCollections internally.
-            for (var collectionName of this.collectionNames) {
-                assert.contains(collectionName,
-                                collections,
-                                "expected to have a collection '" + collectionName +
-                                    "' in the output of listCollections, which was " +
-                                    tojson(collections));
-            }
-            assert.gte(collections.length, this.collectionNames.length);
+            const db = readableCollection.getDB();
+
+            // Check that listCollections is working and prints collection information with readOnly
+            // true.
+            const collections = db.getCollectionInfos();
+
+            this.collectionNames.forEach(expectedCollectionName => {
+                const outputColl = collections.find(coll => coll.name === expectedCollectionName);
+                assert(outputColl,
+                       "expected collection '" + expectedCollectionName +
+                           "' to be readOnly, but according to listCollections output it isn't. " +
+                           tojson(collections));
+                assert(outputColl.info.readOnly,
+                       "Collection '" + expectedCollectionName +
+                           "' not found in the output of listCollections, which was " +
+                           tojson(collections));
+            });
 
             // Check that create fails.
             assert.commandFailed(db.runCommand({create: "quux"}));
@@ -61,9 +73,9 @@ runReadOnlyTest(function() {
             var actualIndexes = indexes.map((fullSpec) => {
                 return fullSpec.key;
             });
-            var expectedIndexes = Array.concat([{_id: 1}], this.indexSpecs);
+            var expectedIndexes = [{_id: 1}].concat(this.indexSpecs);
 
-            assert.docEq(actualIndexes, expectedIndexes);
+            assert.docEq(expectedIndexes, actualIndexes);
 
             // Check that createIndexes fails.
             assert.commandFailed(

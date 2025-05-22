@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -33,14 +32,18 @@
 #include <iostream>
 #include <yaml-cpp/yaml.h>
 
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/bson/timestamp.h"
 #include "mongo/bson/util/builder.h"
-#include "mongo/db/jsobj.h"
 #include "mongo/util/options_parser/constraints.h"
 
 namespace mongo {
 namespace optionenvironment {
 
-using std::shared_ptr;
 using std::string;
 using std::type_info;
 
@@ -388,7 +391,7 @@ void buildYAMLNode(YAML::Emitter& out, const BSONObj& in, bool isMap = true) {
                 out << elem.Long();
                 break;
             case BSONType::NumberDouble:
-                out << elem.Double();
+                out << YAML::Precision(10) << elem.Double();
                 break;
             case BSONType::String:
                 out << elem.String();

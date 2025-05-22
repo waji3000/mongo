@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -33,41 +32,83 @@
  */
 
 
-#include "mongo/platform/basic.h"
-
 #include <memory>
+#include <utility>
 #include <vector>
 
-#include "mongo/base/owned_pointer_vector.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/client.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/exec/near.h"
+#include "mongo/db/exec/plan_stage.h"
 #include "mongo/db/exec/queued_data_stage.h"
-#include "mongo/db/exec/working_set_common.h"
-#include "mongo/stdx/memory.h"
+#include "mongo/db/exec/working_set.h"
+#include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/query/plan_executor.h"
+#include "mongo/db/query/stage_types.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/storage/snapshot.h"
+#include "mongo/dbtests/dbtests.h"  // IWYU pragma: keep
 #include "mongo/unittest/unittest.h"
+#include "mongo/util/intrusive_counter.h"
 
+namespace mongo {
 namespace {
 
-using namespace mongo;
-using std::shared_ptr;
-using std::unique_ptr;
-using std::vector;
-using stdx::make_unique;
-
-const std::string kTestNamespace = "test.coll";
+const NamespaceString kTestNamespace = NamespaceString::createNamespaceString_forTest("test.coll");
+const BSONObj kTestKeyPattern = BSON("testIndex" << 1);
 
 class QueryStageNearTest : public unittest::Test {
 public:
     void setUp() override {
+        _expCtx = ExpressionContextBuilder{}.opCtx(_opCtx).ns(kTestNamespace).build();
+
         directClient.createCollection(kTestNamespace);
+        ASSERT_OK(dbtests::createIndex(_opCtx, kTestNamespace.ns_forTest(), kTestKeyPattern));
+
+        _autoColl.emplace(_opCtx, kTestNamespace);
+        const auto& coll = _autoColl->getCollection();
+        ASSERT(coll);
+        _mockGeoIndex = coll->getIndexCatalog()->findIndexByKeyPatternAndOptions(
+            _opCtx, kTestKeyPattern, _makeMinimalIndexSpec(kTestKeyPattern));
+        ASSERT(_mockGeoIndex);
+    }
+
+    const CollectionPtr& getCollection() const {
+        return _autoColl->getCollection();
     }
 
 protected:
+    BSONObj _makeMinimalIndexSpec(BSONObj keyPattern) {
+        return BSON(IndexDescriptor::kKeyPatternFieldName
+                    << keyPattern << IndexDescriptor::kIndexVersionFieldName
+                    << IndexDescriptor::getDefaultIndexVersion());
+    }
+
     const ServiceContext::UniqueOperationContext _uniqOpCtx = cc().makeOperationContext();
     OperationContext* const _opCtx = _uniqOpCtx.get();
     DBDirectClient directClient{_opCtx};
+
+    boost::intrusive_ptr<ExpressionContext> _expCtx;
+
+    boost::optional<AutoGetCollectionForReadMaybeLockFree> _autoColl;
+    const IndexDescriptor* _mockGeoIndex;
 };
 
 /**
@@ -77,56 +118,63 @@ protected:
 class MockNearStage final : public NearStage {
 public:
     struct MockInterval {
-        MockInterval(const vector<BSONObj>& data, double min, double max)
+        MockInterval(const std::vector<BSONObj>& data, double min, double max)
             : data(data), min(min), max(max) {}
 
-        vector<BSONObj> data;
+        std::vector<BSONObj> data;
         double min;
         double max;
     };
 
-    MockNearStage(OperationContext* opCtx, WorkingSet* workingSet, const Collection* coll)
-        : NearStage(opCtx, "MOCK_DISTANCE_SEARCH_STAGE", STAGE_UNKNOWN, workingSet, coll),
+    MockNearStage(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                  WorkingSet* workingSet,
+                  const CollectionPtr& coll,
+                  const IndexDescriptor* indexDescriptor)
+        : NearStage(expCtx.get(),
+                    "MOCK_DISTANCE_SEARCH_STAGE",
+                    STAGE_UNKNOWN,
+                    workingSet,
+                    &coll,
+                    indexDescriptor),
           _pos(0) {}
 
-    void addInterval(vector<BSONObj> data, double min, double max) {
-        _intervals.push_back(stdx::make_unique<MockInterval>(data, min, max));
+    void addInterval(std::vector<BSONObj> data, double min, double max) {
+        _intervals.push_back(std::make_unique<MockInterval>(data, min, max));
     }
 
-    virtual StatusWith<CoveredInterval*> nextInterval(OperationContext* opCtx,
-                                                      WorkingSet* workingSet,
-                                                      const Collection* collection) {
+    std::unique_ptr<CoveredInterval> nextInterval(OperationContext* opCtx,
+                                                  WorkingSet* workingSet) final {
         if (_pos == static_cast<int>(_intervals.size()))
-            return StatusWith<CoveredInterval*>(NULL);
+            return nullptr;
 
         const MockInterval& interval = *_intervals[_pos++];
 
         bool lastInterval = _pos == static_cast<int>(_intervals.size());
 
-        auto queuedStage = make_unique<QueuedDataStage>(opCtx, workingSet);
+        auto queuedStage = std::make_unique<QueuedDataStage>(expCtx(), workingSet);
 
         for (unsigned int i = 0; i < interval.data.size(); i++) {
             // Add all documents from the lastInterval into the QueuedDataStage.
             const WorkingSetID id = workingSet->allocate();
             WorkingSetMember* member = workingSet->get(id);
-            member->obj = Snapshotted<BSONObj>(SnapshotId(), interval.data[i]);
+            member->doc = {SnapshotId(), Document{interval.data[i]}};
             workingSet->transitionToOwnedObj(id);
             queuedStage->pushBack(id);
         }
 
         _children.push_back(std::move(queuedStage));
-        return StatusWith<CoveredInterval*>(
-            new CoveredInterval(_children.back().get(), interval.min, interval.max, lastInterval));
+        return std::make_unique<CoveredInterval>(
+            _children.back().get(), interval.min, interval.max, lastInterval);
     }
 
-    StatusWith<double> computeDistance(WorkingSetMember* member) final {
+    double computeDistance(WorkingSetMember* member) final {
         ASSERT(member->hasObj());
-        return StatusWith<double>(member->obj.value()["distance"].numberDouble());
+        return member->doc.value()["distance"].getDouble();
     }
 
-    virtual StageState initialize(OperationContext* opCtx,
-                                  WorkingSet* workingSet,
-                                  WorkingSetID* out) {
+    StageState initialize(OperationContext* opCtx,
+                          WorkingSet* workingSet,
+                          WorkingSetID* out) override {
         return IS_EOF;
     }
 
@@ -135,24 +183,24 @@ private:
     int _pos;
 };
 
-static vector<BSONObj> advanceStage(PlanStage* stage, WorkingSet* workingSet) {
-    vector<BSONObj> results;
+static std::vector<BSONObj> advanceStage(PlanStage* stage, WorkingSet* workingSet) {
+    std::vector<BSONObj> results;
 
     WorkingSetID nextMemberID;
     PlanStage::StageState state = PlanStage::NEED_TIME;
 
     while (PlanStage::NEED_TIME == state) {
         while (PlanStage::ADVANCED == (state = stage->work(&nextMemberID))) {
-            results.push_back(workingSet->get(nextMemberID)->obj.value());
+            results.push_back(workingSet->get(nextMemberID)->doc.value().toBson());
         }
     }
 
     return results;
 }
 
-static void assertAscendingAndValid(const vector<BSONObj>& results) {
+static void assertAscendingAndValid(const std::vector<BSONObj>& results) {
     double lastDistance = -1.0;
-    for (vector<BSONObj>::const_iterator it = results.begin(); it != results.end(); ++it) {
+    for (std::vector<BSONObj>::const_iterator it = results.begin(); it != results.end(); ++it) {
         double distance = (*it)["distance"].numberDouble();
         bool shouldInclude = (*it)["$included"].eoo() || (*it)["$included"].trueValue();
         ASSERT(shouldInclude);
@@ -162,14 +210,10 @@ static void assertAscendingAndValid(const vector<BSONObj>& results) {
 }
 
 TEST_F(QueryStageNearTest, Basic) {
-    vector<BSONObj> mockData;
+    std::vector<BSONObj> mockData;
     WorkingSet workingSet;
 
-    AutoGetCollectionForRead autoColl(_opCtx, NamespaceString{kTestNamespace});
-    auto* coll = autoColl.getCollection();
-    ASSERT(coll);
-
-    MockNearStage nearStage(_opCtx, &workingSet, coll);
+    MockNearStage nearStage(_expCtx.get(), &workingSet, getCollection(), _mockGeoIndex);
 
     // First set of results
     mockData.clear();
@@ -195,20 +239,20 @@ TEST_F(QueryStageNearTest, Basic) {
     mockData.push_back(BSON("distance" << 3.5));  // Not included
     nearStage.addInterval(mockData, 2.0, 3.0);
 
-    vector<BSONObj> results = advanceStage(&nearStage, &workingSet);
+    std::vector<BSONObj> results = advanceStage(&nearStage, &workingSet);
     ASSERT_EQUALS(results.size(), 8u);
     assertAscendingAndValid(results);
 }
 
 TEST_F(QueryStageNearTest, EmptyResults) {
-    vector<BSONObj> mockData;
+    std::vector<BSONObj> mockData;
     WorkingSet workingSet;
 
-    AutoGetCollectionForRead autoColl(_opCtx, NamespaceString{kTestNamespace});
-    auto* coll = autoColl.getCollection();
+    AutoGetCollectionForReadMaybeLockFree autoColl(_opCtx, kTestNamespace);
+    const auto& coll = autoColl.getCollection();
     ASSERT(coll);
 
-    MockNearStage nearStage(_opCtx, &workingSet, coll);
+    MockNearStage nearStage(_expCtx.get(), &workingSet, coll, _mockGeoIndex);
 
     // Empty set of results
     mockData.clear();
@@ -221,8 +265,10 @@ TEST_F(QueryStageNearTest, EmptyResults) {
     mockData.push_back(BSON("distance" << 1.0));
     nearStage.addInterval(mockData, 1.0, 2.0);
 
-    vector<BSONObj> results = advanceStage(&nearStage, &workingSet);
+    std::vector<BSONObj> results = advanceStage(&nearStage, &workingSet);
     ASSERT_EQUALS(results.size(), 3u);
     assertAscendingAndValid(results);
 }
-}
+
+}  // namespace
+}  // namespace mongo

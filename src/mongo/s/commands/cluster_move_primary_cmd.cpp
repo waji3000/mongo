@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,104 +27,116 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#include <memory>
+#include <string>
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/bson/util/bson_extract.h"
-#include "mongo/db/audit.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/client/read_preference.h"
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/auth/resource_pattern.h"
 #include "mongo/db/commands.h"
-#include "mongo/rpc/write_concern_error_detail.h"
-#include "mongo/s/catalog/sharding_catalog_client.h"
-#include "mongo/s/catalog/type_shard.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/generic_argument_util.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/service_context.h"
+#include "mongo/executor/remote_command_response.h"
+#include "mongo/rpc/get_status_from_command_result.h"
+#include "mongo/rpc/op_msg.h"
+#include "mongo/s/async_requests_sender.h"
 #include "mongo/s/catalog_cache.h"
-#include "mongo/s/client/shard_registry.h"
+#include "mongo/s/client/shard.h"
 #include "mongo/s/cluster_commands_helpers.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/move_primary_gen.h"
-#include "mongo/util/log.h"
-#include "mongo/util/scopeguard.h"
+#include "mongo/util/assert_util.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 namespace mongo {
-
-using std::string;
-
 namespace {
 
-class MoveDatabasePrimaryCommand : public BasicCommand {
+class MovePrimaryCommand final : public TypedCommand<MovePrimaryCommand> {
 public:
-    MoveDatabasePrimaryCommand() : BasicCommand("movePrimary", "moveprimary") {}
+    using Request = MovePrimary;
 
-    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
-        return AllowedOnSecondary::kAlways;
-    }
+    MovePrimaryCommand() : TypedCommand(MovePrimary::kCommandName, MovePrimary::kCommandAlias) {}
 
-    virtual bool adminOnly() const {
+    class Invocation final : public InvocationBase {
+    public:
+        using InvocationBase::InvocationBase;
+
+        void typedRun(OperationContext* opCtx) {
+            const auto& dbNss = ns();
+            const auto& toShardId = request().getTo();
+
+            ScopeGuard onBlockExit([&] {
+                // Invalidate the routing table cache entry for this database in order to reload it
+                // at the next access, even if sending the command to the primary shard fails (e.g.,
+                // NetworkError).
+                Grid::get(opCtx)->catalogCache()->purgeDatabase(dbNss.dbName());
+            });
+
+            const auto dbInfo = uassertStatusOK(
+                Grid::get(opCtx)->catalogCache()->getDatabase(opCtx, dbNss.dbName()));
+
+            ShardsvrMovePrimary shardsvrRequest{dbNss.dbName()};
+            shardsvrRequest.setDbName(DatabaseName::kAdmin);
+            shardsvrRequest.getMovePrimaryRequestBase().setTo(toShardId);
+            generic_argument_util::setMajorityWriteConcern(shardsvrRequest,
+                                                           &opCtx->getWriteConcern());
+
+            const auto commandResponse = executeCommandAgainstDatabasePrimaryOnlyAttachingDbVersion(
+                opCtx,
+                DatabaseName::kAdmin,
+                dbInfo,
+                shardsvrRequest.toBSON(),
+                ReadPreferenceSetting{ReadPreference::PrimaryOnly},
+                Shard::RetryPolicy::kIdempotent);
+
+            const auto remoteResponse = uassertStatusOK(commandResponse.swResponse);
+            uassertStatusOK(getStatusFromCommandResult(remoteResponse.data));
+        }
+
+    private:
+        NamespaceString ns() const override {
+            return NamespaceString(request().getCommandParameter());
+        }
+
+        bool supportsWriteConcern() const override {
+            return true;
+        }
+
+        void doCheckAuthorization(OperationContext* opCtx) const override {
+            uassert(
+                ErrorCodes::Unauthorized,
+                "Unauthorized",
+                AuthorizationSession::get(opCtx->getClient())
+                    ->isAuthorizedForActionsOnResource(
+                        ResourcePattern::forDatabaseName(ns().dbName()), ActionType::moveChunk));
+        }
+    };
+
+private:
+    bool adminOnly() const override {
         return true;
     }
 
-    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+    bool skipApiVersionCheck() const override {
         return true;
+    }
+
+    AllowedOnSecondary secondaryAllowed(ServiceContext* context) const override {
+        return AllowedOnSecondary::kNever;
     }
 
     std::string help() const override {
-        return " example: { moveprimary : 'foo' , to : 'localhost:9999' }";
+        return "Reassigns the primary shard holding all un-sharded collections in the database";
     }
-
-    virtual Status checkAuthForCommand(Client* client,
-                                       const std::string& dbname,
-                                       const BSONObj& cmdObj) const {
-        if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
-                ResourcePattern::forDatabaseName(parseNs(dbname, cmdObj)), ActionType::moveChunk)) {
-            return Status(ErrorCodes::Unauthorized, "Unauthorized");
-        }
-
-        return Status::OK();
-    }
-
-    virtual std::string parseNs(const std::string& dbname, const BSONObj& cmdObj) const {
-        const auto nsElt = cmdObj.firstElement();
-        uassert(ErrorCodes::InvalidNamespace,
-                "'movePrimary' must be of type String",
-                nsElt.type() == BSONType::String);
-        return nsElt.str();
-    }
-
-    virtual bool run(OperationContext* opCtx,
-                     const std::string& dbname,
-                     const BSONObj& cmdObj,
-                     BSONObjBuilder& result) {
-
-        auto movePrimaryRequest = MovePrimary::parse(IDLParserErrorContext("MovePrimary"), cmdObj);
-
-        const string db = parseNs("", cmdObj);
-        const NamespaceString nss(db);
-
-        ConfigsvrMovePrimary configMovePrimaryRequest;
-        configMovePrimaryRequest.set_configsvrMovePrimary(nss);
-        configMovePrimaryRequest.setTo(movePrimaryRequest.getTo());
-
-        // Invalidate the routing table cache entry for this database so that we reload the
-        // collection the next time it's accessed, even if we receive a failure, e.g. NetworkError.
-        ON_BLOCK_EXIT([opCtx, db] { Grid::get(opCtx)->catalogCache()->purgeDatabase(db); });
-
-        auto configShard = Grid::get(opCtx)->shardRegistry()->getConfigShard();
-
-        auto cmdResponse = uassertStatusOK(configShard->runCommandWithFixedRetryAttempts(
-            opCtx,
-            ReadPreferenceSetting(ReadPreference::PrimaryOnly),
-            "admin",
-            CommandHelpers::appendMajorityWriteConcern(
-                CommandHelpers::appendPassthroughFields(cmdObj, configMovePrimaryRequest.toBSON())),
-            Shard::RetryPolicy::kIdempotent));
-
-        CommandHelpers::filterCommandReplyForPassthrough(cmdResponse.response, &result);
-        return true;
-    }
-
-} clusterMovePrimaryCmd;
+};
+MONGO_REGISTER_COMMAND(MovePrimaryCommand).forRouter();
 
 }  // namespace
 }  // namespace mongo

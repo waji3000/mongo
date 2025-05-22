@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,9 +29,16 @@
 
 #pragma once
 
+#include <cstdint>
+#include <memory>
+
 #include "mongo/base/clonable_ptr.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/exec/mutable_bson/const_element.h"
+#include "mongo/db/exec/mutable_bson/element.h"
+#include "mongo/db/field_ref.h"
+#include "mongo/db/query/collation/collator_interface.h"
 #include "mongo/db/update/modifier_node.h"
-#include "mongo/stdx/memory.h"
 
 namespace mongo {
 
@@ -46,13 +52,15 @@ namespace mongo {
 class ArrayCullingNode : public ModifierNode {
 public:
     ModifyResult updateExistingElement(mutablebson::Element* element,
-                                       std::shared_ptr<FieldRef> elementPath) const final;
+                                       const FieldRef& elementPath) const final;
 
     void validateUpdate(mutablebson::ConstElement updatedElement,
                         mutablebson::ConstElement leftSibling,
                         mutablebson::ConstElement rightSibling,
                         std::uint32_t recursionLevel,
-                        ModifyResult modifyResult) const final;
+                        ModifyResult modifyResult,
+                        bool validateForStorage,
+                        bool* containsDotsAndDollarsField) const final;
 
     void setCollator(const CollatorInterface* collator) final {
         _matcher->setCollator(collator);
@@ -70,9 +78,20 @@ protected:
         virtual std::unique_ptr<ElementMatcher> clone() const = 0;
         virtual bool match(const mutablebson::ConstElement& element) = 0;
         virtual void setCollator(const CollatorInterface* collator) = 0;
+        /**
+         * Retrieve the value the matcher applies as a single-element BSONObj with an empty string
+         * as the keyname. For example, for the input syntax: { $pull: { votes: { $gte: 6 } } },
+         * this function would return: { "": { $gte: 6 } } in BSON.
+         */
+        virtual BSONObj value() const = 0;
     };
 
     clonable_ptr<ElementMatcher> _matcher;
+
+private:
+    BSONObj operatorValue() const final {
+        return _matcher->value();
+    }
 };
 
 }  // namespace mongo

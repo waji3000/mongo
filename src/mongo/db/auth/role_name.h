@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,18 +29,7 @@
 
 #pragma once
 
-#include <iosfwd>
-#include <memory>
-#include <string>
-#include <vector>
-
-
-#include "mongo/base/disallow_copying.h"
-#include "mongo/base/string_data.h"
-#include "mongo/bson/bsonelement.h"
-#include "mongo/bson/bsonobjbuilder.h"
-#include "mongo/platform/hash_namespace.h"
-#include "mongo/util/assert_util.h"
+#include "mongo/db/auth/auth_name.h"
 
 namespace mongo {
 
@@ -50,173 +38,27 @@ namespace mongo {
  *
  * Consists of a "role name"  part and a "datbase name" part.
  */
-class RoleName {
+class RoleName : public AuthName<RoleName> {
 public:
-    RoleName() : _splitPoint(0) {}
-    RoleName(StringData role, StringData dbname);
+    static constexpr auto kName = "RoleName"_sd;
+    static constexpr auto kFieldName = "role"_sd;
 
-    // Added for IDL support
-    static RoleName parseFromBSON(const BSONElement& elem);
-    void serializeToBSON(StringData fieldName, BSONObjBuilder* bob) const;
-    void serializeToBSON(BSONArrayBuilder* bob) const;
+    using AuthName::AuthName;
 
-    /**
-     * Gets the name of the role excluding the "@dbname" component.
-     */
-    StringData getRole() const {
-        return StringData(_fullName).substr(0, _splitPoint);
-    }
-
-    /**
-     * Gets the database name part of a role name.
-     */
-    StringData getDB() const {
-        return StringData(_fullName).substr(_splitPoint + 1);
-    }
-
-    bool empty() const {
-        return _fullName.empty();
-    }
-
-    /**
-     * Gets the full name of a role as a string, formatted as "role@db".
-     *
-     * Allowed for keys in non-persistent data structures, such as std::map.
-     */
-    const std::string& getFullName() const {
-        return _fullName;
-    }
-
-    /**
-     * Stringifies the object, for logging/debugging.
-     */
-    const std::string& toString() const {
-        return getFullName();
-    }
-
-private:
-    std::string _fullName;  // The full name, stored as a string.  "role@db".
-    size_t _splitPoint;     // The index of the "@" separating the role and db name parts.
-
-    void _serializeToSubObj(BSONObjBuilder* sub) const;
-};
-
-static inline bool operator==(const RoleName& lhs, const RoleName& rhs) {
-    return lhs.getFullName() == rhs.getFullName();
-}
-
-static inline bool operator!=(const RoleName& lhs, const RoleName& rhs) {
-    return lhs.getFullName() != rhs.getFullName();
-}
-
-static inline bool operator<(const RoleName& lhs, const RoleName& rhs) {
-    if (lhs.getDB() == rhs.getDB()) {
-        return lhs.getRole() < rhs.getRole();
-    }
-    return lhs.getDB() < rhs.getDB();
-}
-
-std::ostream& operator<<(std::ostream& os, const RoleName& name);
-
-
-/**
- * Iterator over an unspecified container of RoleName objects.
- */
-class RoleNameIterator {
-public:
-    class Impl {
-        MONGO_DISALLOW_COPYING(Impl);
-
-    public:
-        Impl(){};
-        virtual ~Impl(){};
-        static Impl* clone(Impl* orig) {
-            return orig ? orig->doClone() : NULL;
-        }
-        virtual bool more() const = 0;
-        virtual const RoleName& get() const = 0;
-
-        virtual const RoleName& next() = 0;
-
-    private:
-        virtual Impl* doClone() const = 0;
-    };
-
-    RoleNameIterator() : _impl(nullptr) {}
-    RoleNameIterator(const RoleNameIterator& other) : _impl(Impl::clone(other._impl.get())) {}
-    explicit RoleNameIterator(Impl* impl) : _impl(impl) {}
-
-    RoleNameIterator& operator=(const RoleNameIterator& other) {
-        _impl.reset(Impl::clone(other._impl.get()));
-        return *this;
-    }
-
-    bool more() const {
-        return _impl.get() && _impl->more();
-    }
-    const RoleName& get() const {
-        return _impl->get();
-    }
-
-    const RoleName& next() {
-        return _impl->next();
-    }
-
-    const RoleName& operator*() const {
-        return get();
-    }
-    const RoleName* operator->() const {
-        return &get();
-    }
-
-private:
-    std::unique_ptr<Impl> _impl;
-};
-
-}  // namespace mongo
-
-// Define hash function for RoleNames so they can be keys in stdx::unordered_map
-MONGO_HASH_NAMESPACE_START
-template <>
-struct hash<mongo::RoleName> {
-    size_t operator()(const mongo::RoleName& rname) const {
-        return hash<std::string>()(rname.getFullName());
+    const std::string& getRole() const {
+        return getName();
     }
 };
-MONGO_HASH_NAMESPACE_END
 
-namespace mongo {
-
-template <typename ContainerIterator>
-class RoleNameContainerIteratorImpl : public RoleNameIterator::Impl {
-    MONGO_DISALLOW_COPYING(RoleNameContainerIteratorImpl);
-
-public:
-    RoleNameContainerIteratorImpl(const ContainerIterator& begin, const ContainerIterator& end)
-        : _curr(begin), _end(end) {}
-    virtual ~RoleNameContainerIteratorImpl() {}
-    virtual bool more() const {
-        return _curr != _end;
-    }
-    virtual const RoleName& next() {
-        return *(_curr++);
-    }
-    virtual const RoleName& get() const {
-        return *_curr;
-    }
-    virtual RoleNameIterator::Impl* doClone() const {
-        return new RoleNameContainerIteratorImpl(_curr, _end);
-    }
-
-private:
-    ContainerIterator _curr;
-    ContainerIterator _end;
-};
+using RoleNameIterator = AuthNameIterator<RoleName>;
+template <typename Container>
+using RoleNameContainerIteratorImpl = AuthNameContainerIteratorImpl<Container, RoleName>;
 
 template <typename ContainerIterator>
 RoleNameIterator makeRoleNameIterator(const ContainerIterator& begin,
                                       const ContainerIterator& end) {
-    return RoleNameIterator(new RoleNameContainerIteratorImpl<ContainerIterator>(begin, end));
+    return RoleNameIterator(
+        std::make_unique<RoleNameContainerIteratorImpl<ContainerIterator>>(begin, end));
 }
 
 template <typename Container>

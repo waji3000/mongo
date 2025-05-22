@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,43 +29,45 @@
 
 #include "mongo/db/exec/text_match.h"
 
+#include <memory>
+#include <string>
 #include <vector>
 
-#include "mongo/db/exec/scoped_timer.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/exec/working_set.h"
-#include "mongo/db/exec/working_set_common.h"
-#include "mongo/db/jsobj.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/db/storage/snapshot.h"
 
 namespace mongo {
 
 using std::unique_ptr;
-using std::vector;
-using stdx::make_unique;
 
 const char* TextMatchStage::kStageType = "TEXT_MATCH";
 
-TextMatchStage::TextMatchStage(OperationContext* opCtx,
+TextMatchStage::TextMatchStage(ExpressionContext* expCtx,
                                unique_ptr<PlanStage> child,
-                               const FTSQueryImpl& query,
-                               const FTSSpec& spec,
+                               const TextMatchParams& params,
                                WorkingSet* ws)
-    : PlanStage(kStageType, opCtx), _ftsMatcher(query, spec), _ws(ws) {
+    : PlanStage(kStageType, expCtx), _ftsMatcher(params.query, params.spec), _ws(ws) {
+    _specificStats.indexPrefix = params.indexPrefix;
+    _specificStats.indexName = params.index->indexName();
+    _specificStats.parsedTextQuery = params.query.toBSON();
+    _specificStats.textIndexVersion = params.index->infoObj()["textIndexVersion"].numberInt();
     _children.emplace_back(std::move(child));
 }
 
 TextMatchStage::~TextMatchStage() {}
 
-bool TextMatchStage::isEOF() {
+bool TextMatchStage::isEOF() const {
     return child()->isEOF();
 }
 
 std::unique_ptr<PlanStageStats> TextMatchStage::getStats() {
     _commonStats.isEOF = isEOF();
 
-    unique_ptr<PlanStageStats> ret = make_unique<PlanStageStats>(_commonStats, STAGE_TEXT_MATCH);
-    ret->specific = make_unique<TextMatchStats>(_specificStats);
+    unique_ptr<PlanStageStats> ret =
+        std::make_unique<PlanStageStats>(_commonStats, STAGE_TEXT_MATCH);
+    ret->specific = std::make_unique<TextMatchStats>(_specificStats);
     ret->children.emplace_back(child()->getStats());
 
     return ret;
@@ -89,21 +90,11 @@ PlanStage::StageState TextMatchStage::doWork(WorkingSetID* out) {
         WorkingSetMember* wsm = _ws->get(*out);
 
         // Filter for phrases and negated terms.
-        if (!_ftsMatcher.matches(wsm->obj.value())) {
+        if (!_ftsMatcher.matches(wsm->doc.value().toBson())) {
             _ws->free(*out);
             *out = WorkingSet::INVALID_ID;
             ++_specificStats.docsRejected;
             stageState = PlanStage::NEED_TIME;
-        }
-    } else if (stageState == PlanStage::FAILURE) {
-        // If a stage fails, it may create a status WSM to indicate why it
-        // failed, in which case '*out' is valid.  If ID is invalid, we
-        // create our own error message.
-        if (WorkingSet::INVALID_ID == *out) {
-            str::stream ss;
-            ss << "TEXT_MATCH stage failed to read in results from child";
-            Status status(ErrorCodes::InternalError, ss);
-            *out = WorkingSetCommon::allocateStatusMember(_ws, status);
         }
     }
 

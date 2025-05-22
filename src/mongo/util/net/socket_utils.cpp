@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,21 +27,19 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
-
-#include "mongo/platform/basic.h"
 
 #include "mongo/util/net/socket_utils.h"
 
 #if !defined(_WIN32)
 #include <arpa/inet.h>
-#include <errno.h>
+#include <cerrno>
 #include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/un.h>
 #if defined(__OpenBSD__)
@@ -55,13 +52,17 @@
 #endif
 
 #include "mongo/db/server_options.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/concurrency/value.h"
 #include "mongo/util/errno_util.h"
-#include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/exit_code.h"
 #include "mongo/util/net/sockaddr.h"
 #include "mongo/util/quick_exit.h"
+#include "mongo/util/str.h"
 #include "mongo/util/winutil.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
+
 
 namespace mongo {
 
@@ -69,9 +70,9 @@ namespace mongo {
 const struct WinsockInit {
     WinsockInit() {
         WSADATA d;
-        if (WSAStartup(MAKEWORD(2, 2), &d) != 0) {
-            log() << "ERROR: wsastartup failed " << errnoWithDescription();
-            quickExit(EXIT_NTSERVICE_ERROR);
+        if (int e = WSAStartup(MAKEWORD(2, 2), &d)) {
+            LOGV2(23201, "ERROR: wsastartup failed", "error"_attr = errorMessage(systemError(e)));
+            quickExit(ExitCode::ntServiceError);
         }
     }
 } winsock_init;
@@ -85,108 +86,191 @@ bool IPv6Enabled() {
     return ipv6;
 }
 
+namespace {
+
 #ifdef _WIN32
-#ifdef _UNICODE
-#define X_STR_CONST(str) (L##str)
-#else
-#define X_STR_CONST(str) (str)
-#endif
-const CString kKeepAliveGroup(
-    X_STR_CONST("SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Parameters"));
-const CString kKeepAliveTime(X_STR_CONST("KeepAliveTime"));
-const CString kKeepAliveInterval(X_STR_CONST("KeepAliveInterval"));
-#undef X_STR_CONST
-#endif
+/**
+ * Search the registry for the `key` TCP parameter, a millisecond value.
+ * Returns an empty optional on error or if key is not found.
+ */
+boost::optional<Milliseconds> getTcpMillisKey(const CString& key, logv2::LogSeverity logSeverity) {
+    auto swValOpt = windows::getDWORDRegistryKey(
+        _T("SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Parameters"), key);
+    if (!swValOpt.isOK()) {
+        LOGV2_DEBUG(23203,
+                    logSeverity.toInt(),
+                    "Can't get KeepAlive parameter",
+                    "error"_attr = swValOpt.getStatus());
+        return {};
+    }
+    const auto& oDword = swValOpt.getValue();
+    if (!oDword)
+        return {};
+    return Milliseconds{*oDword};
+}
+
+template <typename In>
+std::error_code windowsSetIoctl(int sock, DWORD controlCode, In&& in) {
+    DWORD outSize = 0;
+    if (WSAIoctl(sock, controlCode, &in, sizeof(in), nullptr, 0, &outSize, nullptr, nullptr))
+        return lastSocketError();
+    return {};
+}
+
+/**
+ * Configure a socket's TCP keepalive behavior. The first keepalive probe is
+ * sent after `idle` with no received packets. Subsequent probes are sent after
+ * each `interval`.
+ */
+std::error_code windowsSetTcpKeepAlive(int sock, Milliseconds idle, Milliseconds interval) {
+    auto uMsec = [](const auto& d) {
+        return u_long(durationCount<Milliseconds>(d));
+    };
+    struct tcp_keepalive keepalive;
+    keepalive.onoff = TRUE;
+    keepalive.keepalivetime = uMsec(idle);
+    keepalive.keepaliveinterval = uMsec(interval);
+    return windowsSetIoctl(sock, SIO_KEEPALIVE_VALS, keepalive);
+}
+
+/**
+ * Configure a TCP socket's keepalive options on Windows.
+ *
+ * On Windows, there has historically been no way to query a socket's TCP
+ * keepalive parameters. We guess from the registry what the settings would be.
+ * If the registry is missing a key, we use the defaults documented at MSDN.
+ *
+ * As of Windows 10, version 1709, the TCP keepalive settings are available as
+ * IPPROTO_TCP options just as on macOS and Linux, and this setup can be much
+ * simpler eventually.
+ */
+void windowsApplyMaxTcpKeepAlive(int sock,
+                                 logv2::LogSeverity logSeverity,
+                                 Milliseconds maxIdle,
+                                 Milliseconds maxInterval) {
+    static constexpr auto defaultIdle = Hours{2};
+    static constexpr auto defaultInterval = Seconds{1};
+    auto idle = getTcpMillisKey(_T("KeepAliveTime"), logSeverity).value_or(defaultIdle);
+    auto interval = getTcpMillisKey(_T("KeepAliveInterval"), logSeverity).value_or(defaultInterval);
+    if (idle > maxIdle || interval > maxInterval) {
+        idle = std::min(idle, maxIdle);
+        interval = std::min(interval, maxInterval);
+        if (auto ec = windowsSetTcpKeepAlive(sock, idle, interval))
+            LOGV2_DEBUG(23204,
+                        logSeverity.toInt(),
+                        "Failed setting keepalive values",
+                        "error"_attr = errorMessage(ec));
+    }
+}
+#endif  // _WIN32
+
+template <typename T>
+void getSocketOption(int sock, int level, int option, T& val) {
+    socklen_t size = sizeof(val);
+    if (getsockopt(sock, level, option, &val, &size))
+        throw std::system_error(lastSocketError());
+}
+
+template <typename T>
+void setSocketOption(int sock, int level, int option, const T& val) {
+    if (setsockopt(sock, level, option, &val, sizeof(val)))
+        throw std::system_error(lastSocketError());
+}
+
+/**
+ * Applies a maximum to a socket option. Gets the specified option from `sock`,
+ * and if its current value is greater than `maxVal`, sets it to `maxVal`.
+ * Failures are logged with `severity`, and if the get operation fails, we do
+ * not attempt the set operation.
+ */
+template <typename T>
+void applyMax(
+    int sock, int level, int optnum, T maxVal, StringData optName, logv2::LogSeverity severity) {
+    T val;
+    try {
+        getSocketOption(sock, level, optnum, val);
+    } catch (const std::system_error& ex) {
+        LOGV2_DEBUG(23205,
+                    severity.toInt(),
+                    "Can't get socket option",
+                    "optname"_attr = optName,
+                    "error"_attr = errorMessage(ex.code()));
+        return;
+    }
+
+    if (val <= maxVal)
+        return;
+
+    try {
+        setSocketOption(sock, level, optnum, maxVal);
+    } catch (const std::system_error& ex) {
+        LOGV2_DEBUG(23206,
+                    severity.toInt(),
+                    "Can't set socket option",
+                    "optname"_attr = optName,
+                    "error"_attr = errorMessage(ex.code()));
+    }
+}
+}  // namespace
 
 void setSocketKeepAliveParams(int sock,
-                              unsigned int maxKeepIdleSecs,
-                              unsigned int maxKeepIntvlSecs) {
-#ifdef _WIN32
-    // Defaults per MSDN when registry key does not exist.
-    // Expressed in seconds here to be consistent with posix,
-    // though Windows uses milliseconds.
-    const DWORD kWindowsKeepAliveTimeSecsDefault = 2 * 60 * 60;
-    const DWORD kWindowsKeepAliveIntervalSecsDefault = 1;
-
-    const auto getKey = [](const CString& key, DWORD default_value) {
-        auto withval = windows::getDWORDRegistryKey(kKeepAliveGroup, key);
-        if (withval.isOK()) {
-            auto val = withval.getValue();
-            // Return seconds
-            return val ? (val.get() / 1000) : default_value;
-        }
-        error() << "can't get KeepAlive parameter: " << withval.getStatus();
-        return default_value;
-    };
-
-    const auto keepIdleSecs = getKey(kKeepAliveTime, kWindowsKeepAliveTimeSecsDefault);
-    const auto keepIntvlSecs = getKey(kKeepAliveInterval, kWindowsKeepAliveIntervalSecsDefault);
-
-    if ((keepIdleSecs > maxKeepIdleSecs) || (keepIntvlSecs > maxKeepIntvlSecs)) {
-        DWORD sent = 0;
-        struct tcp_keepalive keepalive;
-        keepalive.onoff = TRUE;
-        keepalive.keepalivetime = std::min<DWORD>(keepIdleSecs, maxKeepIdleSecs) * 1000;
-        keepalive.keepaliveinterval = std::min<DWORD>(keepIntvlSecs, maxKeepIntvlSecs) * 1000;
-        if (WSAIoctl(sock,
-                     SIO_KEEPALIVE_VALS,
-                     &keepalive,
-                     sizeof(keepalive),
-                     nullptr,
-                     0,
-                     &sent,
-                     nullptr,
-                     nullptr)) {
-            error() << "failed setting keepalive values: " << WSAGetLastError();
-        }
-    }
-#elif defined(__APPLE__) || defined(__linux__)
-    const auto updateSockOpt =
-        [sock](int level, int optnum, unsigned int maxval, StringData optname) {
-            unsigned int optval = 1;
-            socklen_t len = sizeof(optval);
-
-            if (getsockopt(sock, level, optnum, (char*)&optval, &len)) {
-                error() << "can't get " << optname << ": " << errnoWithDescription();
-            }
-
-            if (optval > maxval) {
-                optval = maxval;
-                if (setsockopt(sock, level, optnum, (char*)&optval, sizeof(optval))) {
-                    error() << "can't set " << optname << ": " << errnoWithDescription();
-                }
-            }
-        };
-
-#ifdef __APPLE__
-    updateSockOpt(IPPROTO_TCP, TCP_KEEPALIVE, maxKeepIdleSecs, "TCP_KEEPALIVE");
-#endif
-
-#ifdef __linux__
-#ifdef SOL_TCP
-    const int level = SOL_TCP;
+                              logv2::LogSeverity severity,
+                              Seconds maxIdle,
+                              Seconds maxInterval) {
+#if defined(_WIN32)
+    // Windows implementation is funky enough to get its own forwarded function.
+    // More modern Windows versions (i.e. >1709) would support the `applyMax`
+    // steps, and we'll be able to get rid of this special case eventually.
+    windowsApplyMaxTcpKeepAlive(sock, severity, maxIdle, maxInterval);
+#else  // _WIN32
+#if defined(__APPLE__)
+    int idleOpt = TCP_KEEPALIVE;
 #else
-    const int level = SOL_SOCKET;
+    int idleOpt = TCP_KEEPIDLE;
 #endif
-    updateSockOpt(level, TCP_KEEPIDLE, maxKeepIdleSecs, "TCP_KEEPIDLE");
-    updateSockOpt(level, TCP_KEEPINTVL, maxKeepIntvlSecs, "TCP_KEEPINTVL");
-#endif
-
-#endif
+    auto iSec = [](const auto& d) -> int {
+        return durationCount<Seconds>(d);
+    };
+    applyMax(sock, IPPROTO_TCP, idleOpt, iSec(maxIdle), "TCP_KEEPIDLE", severity);
+    applyMax(sock, IPPROTO_TCP, TCP_KEEPINTVL, iSec(maxInterval), "TCP_KEEPINTVL", severity);
+#endif  // _WIN32
 }
 
-std::string makeUnixSockPath(int port) {
-    return mongoutils::str::stream() << serverGlobalParams.socket << "/mongodb-" << port << ".sock";
+std::string makeUnixSockPath(int port, StringData label) {
+    str::stream stream;
+    stream << serverGlobalParams.socket << "/mongodb-";
+    if (!label.empty()) {
+        stream << label << "-";
+    }
+    return stream << port << ".sock";
 }
+
+#ifndef _WIN32
+void setUnixDomainSocketPermissions(const std::string& path, int permissions) {
+    if (::chmod(path.c_str(), permissions) == -1) {
+        auto ec = lastPosixError();
+        LOGV2_ERROR(23026,
+                    "Failed to chmod socket file",
+                    "path"_attr = path.c_str(),
+                    "error"_attr = errorMessage(ec));
+        fassertFailedNoTrace(40487);
+    }
+}
+#endif
 
 // If an ip address is passed in, just return that.  If a hostname is passed
 // in, look up its ip and return that.  Returns "" on failure.
 std::string hostbyname(const char* hostname) {
-    SockAddr sockAddr(hostname, 0, IPv6Enabled() ? AF_UNSPEC : AF_INET);
-    if (!sockAddr.isValid() || sockAddr.getAddr() == "0.0.0.0")
+    try {
+        auto addr = SockAddr::create(hostname, 0, IPv6Enabled() ? AF_UNSPEC : AF_INET).getAddr();
+        if (addr == "0.0.0.0") {
+            return "";
+        }
+
+        return addr;
+    } catch (const DBException&) {
         return "";
-    else
-        return sockAddr.getAddr();
+    }
 }
 
 //  --- my --
@@ -197,7 +281,8 @@ std::string getHostName() {
     char buf[256];
     int ec = gethostname(buf, 127);
     if (ec || *buf == 0) {
-        log() << "can't get this server's hostname " << errnoWithDescription();
+        auto ec = lastSocketError();
+        LOGV2(23202, "Can't get this server's hostname", "error"_attr = errorMessage(ec));
         return "";
     }
     return buf;
@@ -213,14 +298,13 @@ std::string getHostNameCached() {
     return temp;
 }
 
-std::string getHostNameCachedAndPort() {
-    return str::stream() << getHostNameCached() << ':' << serverGlobalParams.port;
+std::string prettyHostNameAndPort(int port) {
+    return str::stream() << getHostNameCached() << ':' << port;
 }
 
-std::string prettyHostName() {
-    return (serverGlobalParams.port == ServerGlobalParams::DefaultDBPort
-                ? getHostNameCached()
-                : getHostNameCachedAndPort());
+std::string prettyHostName(int port) {
+    return port == ServerGlobalParams::DefaultDBPort ? getHostNameCached()
+                                                     : prettyHostNameAndPort(port);
 }
 
 }  // namespace mongo

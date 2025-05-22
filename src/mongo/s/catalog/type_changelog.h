@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,10 +29,17 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
 #include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
 #include <string>
 
-#include "mongo/db/jsobj.h"
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bson_field.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/version_context.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
@@ -52,8 +58,12 @@ public:
     static const BSONField<std::string> clientAddr;
     static const BSONField<Date_t> time;
     static const BSONField<std::string> what;
+    static const BSONField<BSONObj> versionContext;
     static const BSONField<std::string> ns;
     static const BSONField<BSONObj> details;
+
+    // Name of the chunks collection in the config server.
+    static const NamespaceString ConfigNS;
 
     /**
      * Returns the BSON representation of the entry.
@@ -65,12 +75,6 @@ public:
      * Also does validation of the contents.
      */
     static StatusWith<ChangeLogType> fromBSON(const BSONObj& source);
-
-    /**
-     * Returns OK if all fields have been set. Otherwise, returns NoSuchKey
-     * and information about the first field that is missing.
-     */
-    Status validate() const;
 
     /**
      * Returns a std::string representation of the current internal state.
@@ -107,10 +111,15 @@ public:
     }
     void setWhat(const std::string& what);
 
-    const std::string& getNS() const {
+    boost::optional<VersionContext> getVersionContext() const {
+        return _versionContext;
+    }
+    void setVersionContext(const VersionContext& vCtx);
+
+    const NamespaceString& getNS() const {
         return _ns.get();
     }
-    void setNS(const std::string& ns);
+    void setNS(const NamespaceString& ns);
 
     const BSONObj& getDetails() const {
         return _details.get();
@@ -120,21 +129,23 @@ public:
 private:
     // Convention: (M)andatory, (O)ptional, (S)pecial rule.
 
-    // (M)  id for this change "<hostname>-<current_time>-<increment>"
+    // (M) id for this change "<hostname>-<current_time>-<increment>"
     boost::optional<std::string> _changeId;
-    // (M)  hostname of server that we are making the change on.
+    // (M) hostname of server that we are making the change on.
     boost::optional<std::string> _server;
     // (O) id of shard making the change, or "config" for configSvrs
     boost::optional<std::string> _shard;
-    // (M)  hostname:port of the client that made this change
+    // (M) hostname:port of the client that made this change
     boost::optional<std::string> _clientAddr;
-    // (M)  time this change was made
+    // (M) time this change was made
     boost::optional<Date_t> _time;
-    // (M)  description of the change
+    // (M) description of the change
     boost::optional<std::string> _what;
+    // (O) versionContext under which the change was made
+    boost::optional<VersionContext> _versionContext;
     // (O) database or collection this change applies to
-    boost::optional<std::string> _ns;
-    // (M)  A BSONObj containing extra information about some operations
+    boost::optional<NamespaceString> _ns;
+    // (M) A BSONObj containing extra information about some operations
     boost::optional<BSONObj> _details;
 };
 

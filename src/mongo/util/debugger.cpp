@@ -1,6 +1,3 @@
-// debug_util.cpp
-
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,23 +27,18 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/util/debugger.h"
-
+#include <csignal>
+#include <cstdio>
 #include <cstdlib>
+#include <iostream>
 #include <mutex>
 
-#if defined(USE_GDBSERVER)
-#include <cstdio>
+#include "mongo/config.h"  // IWYU pragma: keep
+#include "mongo/util/debugger.h"
+
+#if defined(MONGO_CONFIG_HAVE_HEADER_UNISTD_H)
 #include <unistd.h>
 #endif
-
-#ifndef _WIN32
-#include <signal.h>
-#endif
-
-#include "mongo/util/debug_util.h"
 
 #ifndef _WIN32
 namespace {
@@ -79,16 +71,17 @@ void breakpoint() {
 #endif
 }
 
-#if defined(USE_GDBSERVER)
-
-/* Magic gdb trampoline
- * Do not call directly! call setupSIGTRAPforGDB()
+/* Magic debugging trampoline
+ * Do not call directly! call setupSIGTRAPforDebugger()
  * Assumptions:
- *  1) gdbserver is on your path
+ *  1) the debugging server binary is on your path
  *  2) You have run "handle SIGSTOP noprint" in gdb
  *  3) serverGlobalParams.port + 2000 is free
  */
-void launchGDB(int) {
+namespace {
+#ifndef _WIN32
+template <typename Exec>
+void launchDebugger(Exec debugger) {
     // Don't come back here
     signal(SIGTRAP, SIG_IGN);
 
@@ -98,8 +91,10 @@ void launchGDB(int) {
         std::abort();
 
     char msg[128];
-    int msgRet = snprintf(
-        msg, sizeof(msg), "\n\n\t**** Launching gdbserver (use lsof to find port) ****\n\n");
+    int msgRet = snprintf(msg,
+                          sizeof(msg),
+                          "\n\n\t**** Launching debugging server (ensure binary is in PATH, use "
+                          "lsof to find port) ****\n\n");
     if (!(msgRet >= 0 && size_t(msgRet) < sizeof(msg)))
         std::abort();
 
@@ -108,21 +103,67 @@ void launchGDB(int) {
 
     if (fork() == 0) {
         // child
-        execlp("gdbserver", "gdbserver", "--attach", ":0", pidToDebug, nullptr);
+        debugger(pidToDebug);
         perror(nullptr);
         _exit(1);
     } else {
         // parent
-        raise(SIGSTOP);  // pause all threads until gdb connects and continues
-        raise(SIGTRAP);  // break inside gdbserver
+        raise(SIGSTOP);  // pause all threads until debugger connects and continues
+        raise(SIGTRAP);  // break inside server
     }
 }
 
-void setupSIGTRAPforGDB() {
-    if (!(signal(SIGTRAP, launchGDB) != SIG_ERR))
-        std::abort();
+#if defined(USE_GDBSERVER)
+
+extern "C" void execCallback(int) {
+    launchDebugger([](char* pidToDebug) {
+        execlp("gdbserver", "gdbserver", "--attach", ":0", pidToDebug, nullptr);
+    });
 }
+
+#elif defined(USE_LLDB_SERVER)
+
+extern "C" void execCallback(int) {
+    launchDebugger([](char* pidToDebug) {
+#ifdef __linux__
+        execlp("lldb-server", "lldb-server", "g", "--attach", pidToDebug, "*:12345", nullptr);
 #else
-void setupSIGTRAPforGDB() {}
+        execlp("debugserver", "debugserver", "*:12345", "--attach", pidToDebug, nullptr);
+#endif
+    });
+}
+
+#endif
+
+}  // namespace
+
+void setupSIGTRAPforDebugger() {
+#if defined(USE_GDBSERVER) || defined(USE_LLDB_SERVER)
+    if (signal(SIGTRAP, execCallback) == SIG_ERR) {
+        std::abort();
+    }
+#endif
 #endif
 }
+
+/**
+ * If the environment variable "MONGODB_WAIT_FOR_DEBUGGER" is set, then raise SIGSTOP signal
+ *
+ * A SIGSTOP cannot be caught, blocked or ignored by a process. The SIGSTOP will freeze the process.
+ * This gives the debugger time to start, attach and then resume the process.
+ */
+void waitForDebugger() {
+#if WAIT_FOR_DEBUGGER
+#ifndef _WIN32
+    if (getenv("MONGODB_WAIT_FOR_DEBUGGER")) {
+        std::cout << "WAITING FOR DEBUGGER TO ATTACH (pid: " << getpid() << ")..................."
+                  << std::endl;
+        raise(SIGSTOP);  // pause all threads until debugger connects and continues
+    }
+#else
+#error "Wait for debugger is not supported on Windows"
+#endif
+
+#endif
+}
+}  // namespace mongo

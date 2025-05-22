@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Public Domain 2014-2018 MongoDB, Inc.
+# Public Domain 2014-present MongoDB, Inc.
 # Public Domain 2008-2014 WiredTiger, Inc.
 #
 # This is free and unencumbered software released into the public domain.
@@ -30,7 +30,7 @@
 # Transactions: commits and rollbacks
 #
 
-import fnmatch, os, shutil, time
+import fnmatch, os, time
 from suite_subprocess import suite_subprocess
 from wtscenario import make_scenarios
 import wttest
@@ -39,7 +39,7 @@ class test_txn05(wttest.WiredTigerTestCase, suite_subprocess):
     logmax = "100K"
     tablename = 'test_txn05'
     uri = 'table:' + tablename
-    archive_list = ['true', 'false']
+    remove_list = ['true', 'false']
     sync_list = [
         '(method=dsync,enabled)',
         '(method=fsync,enabled)',
@@ -70,8 +70,8 @@ class test_txn05(wttest.WiredTigerTestCase, suite_subprocess):
         # deterministic manner.
         txn_sync = self.sync_list[
             self.scenario_number % len(self.sync_list)]
-        # Set archive false on the home directory.
-        return 'log=(archive=false,enabled,file_max=%s),' % self.logmax + \
+        # Set remove=false on the home directory.
+        return 'log=(enabled,file_max=%s,remove=false),' % self.logmax + \
             'transaction_sync="%s",' % txn_sync
 
     # Check that a cursor (optionally started in a new transaction), sees the
@@ -82,7 +82,7 @@ class test_txn05(wttest.WiredTigerTestCase, suite_subprocess):
         c = session.open_cursor(self.uri, None)
         actual = dict((k, v) for k, v in c if v != 0)
         # Search for the expected items as well as iterating
-        for k, v in expected.iteritems():
+        for k, v in expected.items():
             self.assertEqual(c[k], v)
         c.close()
         if txn_config:
@@ -117,16 +117,15 @@ class test_txn05(wttest.WiredTigerTestCase, suite_subprocess):
         self.backup(self.backup_dir)
         #
         # Open and close the backup connection a few times to force
-        # repeated recovery and log archiving even if later recoveries
+        # repeated recovery and log removal even if later recoveries
         # are essentially no-ops. Confirm that the backup contains
         # the committed operations after recovery.
         #
-        # Cycle through the different archive values in a
-        # deterministic manner.
-        self.archive = self.archive_list[
-            self.scenario_number % len(self.archive_list)]
+        # Cycle through the different remove values in a deterministic manner.
+        self.remove = self.remove_list[
+            self.scenario_number % len(self.remove_list)]
         backup_conn_params = \
-            'log=(enabled,file_max=%s,archive=%s)' % (self.logmax, self.archive)
+            'log=(enabled,file_max=%s,remove=%s)' % (self.logmax, self.remove)
         orig_logs = fnmatch.filter(os.listdir(self.backup_dir), "*gerLog*")
         endcount = 2
         count = 0
@@ -137,7 +136,7 @@ class test_txn05(wttest.WiredTigerTestCase, suite_subprocess):
                  session = backup_conn.open_session()
             finally:
                 self.check(session, None, committed)
-                # Sleep long enough so that the archive thread is guaranteed
+                # Sleep long enough so that the removal thread is guaranteed
                 # to run before we close the connection.
                 time.sleep(1.0)
                 if count == 0:
@@ -147,17 +146,17 @@ class test_txn05(wttest.WiredTigerTestCase, suite_subprocess):
             count += 1
         #
         # Check logs after repeated openings. The first log should
-        # have been archived if configured. Subsequent openings would not
-        # archive because no checkpoint is written due to no modifications.
+        # have been removed if configured. Subsequent openings would not
+        # be removed because no checkpoint is written due to no modifications.
         #
         cur_logs = fnmatch.filter(os.listdir(self.backup_dir), "*gerLog*")
         for o in orig_logs:
             # Creating the backup was effectively an unclean shutdown so
-            # even after sleeping, we should never archive log files
+            # even after sleeping, we should never remove log files
             # because a checkpoint has not run.  Later opens and runs of
-            # recovery will detect a clean shutdown and allow archiving.
+            # recovery will detect a clean shutdown and allow removal.
             self.assertEqual(True, o in first_logs)
-            if self.archive == 'true':
+            if self.remove == 'true':
                 self.assertEqual(False, o in cur_logs)
             else:
                 self.assertEqual(True, o in cur_logs)
@@ -237,8 +236,5 @@ class test_txn05(wttest.WiredTigerTestCase, suite_subprocess):
 
         # Check the log state after the entire op completes
         # and run recovery.
-        if self.scenario_number % (len(test_txn05.scenarios) / 100 + 1) == 0:
+        if self.scenario_number % (len(test_txn05.scenarios) // 100 + 1) == 0:
             self.check_log(committed)
-
-if __name__ == '__main__':
-    wttest.run()

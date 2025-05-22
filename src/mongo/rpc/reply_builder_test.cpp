@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,17 +27,31 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <boost/move/utility_core.hpp>
+#include <memory>
+#include <string>
+#include <utility>
 
-#include "mongo/bson/util/builder.h"
-#include "mongo/db/jsobj.h"
-#include "mongo/db/json.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/base/error_extra_info.h"
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/json.h"
+#include "mongo/bson/oid.h"
+#include "mongo/bson/timestamp.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/rpc/legacy_reply.h"
 #include "mongo/rpc/legacy_reply_builder.h"
+#include "mongo/rpc/message.h"
+#include "mongo/rpc/op_msg.h"
 #include "mongo/rpc/op_msg_rpc_impls.h"
-#include "mongo/unittest/death_test.h"
+#include "mongo/rpc/reply_builder_interface.h"
+#include "mongo/stdx/type_traits.h"
 #include "mongo/unittest/unittest.h"
+#include "mongo/util/assert_util.h"
 
 namespace {
 
@@ -98,11 +111,10 @@ BSONObj buildCommand() {
     commandReplyBob.append("ok", 1.0);
     BSONObjBuilder cursorBuilder;
     BSONArrayBuilder a(cursorBuilder.subarrayStart("firstBatch"));
-    a.append(BSON("Foo"
-                  << "Bar"));
+    a.append(BSON("Foo" << "Bar"));
     a.done();
 
-    cursorBuilder.appendIntOrLL("id", 1);
+    cursorBuilder.appendNumber("id", 1);
     cursorBuilder.append("ns", "test.$cmd.blah");
     commandReplyBob.append("cursor", cursorBuilder.done());
     return commandReplyBob.obj();
@@ -152,6 +164,9 @@ TEST(OpMsgReplyBuilder, CommandError) {
     replyBuilder.setCommandReply(status, extraObj);
     replyBuilder.getBodyBuilder().appendElements(metadata);
     auto msg = replyBuilder.done();
+    msg.header().setId(124);
+    msg.header().setResponseToMsgId(123);
+    OpMsg::appendChecksum(&msg);
 
     rpc::OpMsgReply parsed(&msg);
 
@@ -164,6 +179,22 @@ TEST(OpMsgReplyBuilder, CommandError) {
     ASSERT_BSONOBJ_EQ(parsed.getCommandReply(), body);
 }
 
+TEST(OpMsgReplyBuilder, MessageOverBSONSizeLimit) {
+    rpc::OpMsgReplyBuilder r;
+    std::string bigStr(1024 * 1024 * 16, 'a');
+
+    {
+        // 'builder' is an unowned BSONObjBuilder and thus does none of its own size checking,
+        // allowing us to grow the OpMsgReplyBuilder past the bson object size limit.
+        auto builder = r.getBodyBuilder();
+        for (auto i = 0; i < 2; i++) {
+            builder.append("field" + std::to_string(i), bigStr);
+        }
+    }
+
+    ASSERT_THROWS_CODE(r.done(), DBException, ErrorCodes::BSONObjectTooLarge);
+}
+
 template <typename T>
 void testRoundTrip(rpc::ReplyBuilderInterface& replyBuilder, bool unifiedBodyAndMetadata) {
     auto metadata = buildMetadata();
@@ -173,7 +204,9 @@ void testRoundTrip(rpc::ReplyBuilderInterface& replyBuilder, bool unifiedBodyAnd
     replyBuilder.getBodyBuilder().appendElements(metadata);
 
     auto msg = replyBuilder.done();
-
+    msg.header().setId(124);
+    msg.header().setResponseToMsgId(123);
+    OpMsg::appendChecksum(&msg);
     T parsed(&msg);
 
     if (unifiedBodyAndMetadata) {
@@ -198,7 +231,10 @@ void testErrors(rpc::ReplyBuilderInterface& replyBuilder) {
     replyBuilder.setCommandReply(status);
     replyBuilder.getBodyBuilder().appendElements(buildMetadata());
 
-    const auto msg = replyBuilder.done();
+    auto msg = replyBuilder.done();
+    msg.header().setId(124);
+    msg.header().setResponseToMsgId(123);
+    OpMsg::appendChecksum(&msg);
 
     T parsed(&msg);
     const Status result = getStatusFromCommandResult(parsed.getCommandReply());

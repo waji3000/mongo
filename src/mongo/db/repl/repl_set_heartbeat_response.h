@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -32,9 +31,15 @@
 
 #include <string>
 
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/timestamp.h"
 #include "mongo/db/repl/member_state.h"
 #include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/repl_set_config.h"
+#include "mongo/util/net/hostandport.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
@@ -52,7 +57,6 @@ class ReplSetHeartbeatResponse {
 public:
     /**
      * Initializes this ReplSetHeartbeatResponse from the contents of "doc".
-     * "term" is only used to complete a V0 OpTime (which is really a Timestamp).
      */
     Status initialize(const BSONObj& doc, long long term);
 
@@ -69,7 +73,7 @@ public:
     /**
      * Returns toBSON().toString()
      */
-    const std::string toString() const {
+    std::string toString() const {
         return toBSON().toString();
     }
 
@@ -90,6 +94,12 @@ public:
     int getConfigVersion() const {
         return _configVersion;
     }
+    int getConfigTerm() const {
+        return _configTerm;
+    }
+    ConfigVersionAndTerm getConfigVersionAndTerm() const {
+        return ConfigVersionAndTerm(_configVersion, _configTerm);
+    }
     bool hasConfig() const {
         return _configSet;
     }
@@ -105,16 +115,27 @@ public:
         return _appliedOpTimeSet;
     }
     OpTime getAppliedOpTime() const;
+    OpTimeAndWallTime getAppliedOpTimeAndWallTime() const;
+    bool hasWrittenOpTime() const {
+        return _writtenOpTimeSet;
+    }
+    OpTime getWrittenOpTime() const;
+    OpTimeAndWallTime getWrittenOpTimeAndWallTime() const;
     bool hasDurableOpTime() const {
         return _durableOpTimeSet;
     }
     OpTime getDurableOpTime() const;
+    OpTimeAndWallTime getDurableOpTimeAndWallTime() const;
+    bool hasIsElectable() const {
+        return _electableSet;
+    }
+    bool isElectable() const;
 
     /**
      * Sets _setName to "name".
      */
-    void setSetName(std::string name) {
-        _setName = name;
+    void setSetName(StringData name) {
+        _setName = name.toString();
     }
 
     /**
@@ -148,6 +169,13 @@ public:
     }
 
     /**
+     * Sets _configTerm to "configTerm".
+     */
+    void setConfigTerm(int configTerm) {
+        _configTerm = configTerm;
+    }
+
+    /**
      * Initializes _config with "config".
      */
     void setConfig(const ReplSetConfig& config) {
@@ -159,16 +187,32 @@ public:
         _primaryIdSet = true;
         _primaryId = primaryId;
     }
-    void setAppliedOpTime(OpTime time) {
+    void setAppliedOpTimeAndWallTime(OpTimeAndWallTime time) {
         _appliedOpTimeSet = true;
-        _appliedOpTime = time;
+        _appliedOpTime = time.opTime;
+        _appliedWallTime = time.wallTime;
     }
-    void setDurableOpTime(OpTime time) {
+    void setWrittenOpTimeAndWallTime(OpTimeAndWallTime time) {
+        _writtenOpTimeSet = true;
+        _writtenOpTime = time.opTime;
+        _writtenWallTime = time.wallTime;
+    }
+    void setDurableOpTimeAndWallTime(OpTimeAndWallTime time) {
         _durableOpTimeSet = true;
-        _durableOpTime = time;
+        _durableOpTime = time.opTime;
+        _durableWallTime = time.wallTime;
+    }
+    void unsetDurableOpTimeAndWallTime() {
+        _durableOpTimeSet = false;
+        _durableOpTime = OpTime();
+        _durableWallTime = Date_t();
     }
     void setTerm(long long term) {
         _term = term;
+    }
+    void setElectable(bool electable) {
+        _electableSet = true;
+        _electable = electable;
     }
 
 private:
@@ -177,14 +221,21 @@ private:
 
     bool _appliedOpTimeSet = false;
     OpTime _appliedOpTime;
+    Date_t _appliedWallTime;
+
+    bool _writtenOpTimeSet = false;
+    OpTime _writtenOpTime;
+    Date_t _writtenWallTime;
 
     bool _durableOpTimeSet = false;
     OpTime _durableOpTime;
+    Date_t _durableWallTime;
 
     bool _stateSet = false;
     MemberState _state;
 
     int _configVersion = -1;
+    int _configTerm = OpTime::kUninitializedTerm;
     std::string _setName;
     HostAndPort _syncingTo;
 
@@ -194,6 +245,9 @@ private:
     bool _primaryIdSet = false;
     long long _primaryId = -1;
     long long _term = -1;
+
+    bool _electableSet = false;
+    bool _electable = false;
 };
 
 }  // namespace repl

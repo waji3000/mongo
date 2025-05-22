@@ -1,6 +1,7 @@
-load('jstests/libs/discover_topology.js');
+import {DiscoverTopology, Topology} from "jstests/libs/discover_topology.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
-var FSMShardingTest = class {
+export var FSMShardingTest = class {
     constructor(connStr) {
         /**
          * `topology` has the following format:
@@ -58,10 +59,23 @@ var FSMShardingTest = class {
             let shardTopology = topology.shards[shardName];
             let shard;
             if (shardTopology.type === Topology.kReplicaSet) {
-                const shard_rst = new ReplSetTest(shardTopology.nodes[0]);
+                var shard_rst;
+                if (shardTopology.primary) {
+                    shard_rst = new ReplSetTest(shardTopology.primary);
+                } else {
+                    assert(shardTopology.nodes[0]);
+                    shard_rst = new ReplSetTest(shardTopology.nodes[0]);
+                }
+                // TODO(SERVER-98556): Debug statements turned on temporarily for BF diagnosability.
+                shard_rst.asCluster(conn, function() {
+                    for (const node of shard_rst.nodes) {
+                        assert.commandWorked(node.adminCommand(
+                            {"setParameter": 1, logComponentVerbosity: {test: {verbosity: 1}}}));
+                    }
+                });
                 this._shard_rsts.push(shard_rst);
 
-                shard = new Mongo(shard_rst.getURL());
+                shard = new Mongo(shard_rst.getURL(), undefined, {gRPC: false});
                 shard.name = shard_rst.getURL();
             } else {
                 shard = new Mongo(shardTopology.mongod);
@@ -112,15 +126,13 @@ var FSMShardingTest = class {
      * Public Functions.
      */
 
-    shardColl(coll, shardKey) {
+    shardColl(coll, shardKey, unique) {
         assert.commandWorked(this.s(0).adminCommand({
             enableSharding: coll.getDB().toString(),
         }));
 
-        assert.commandWorked(this.s(0).adminCommand({
-            shardCollection: coll.toString(),
-            key: shardKey,
-        }));
+        assert.commandWorked(this.s(0).adminCommand(
+            {shardCollection: coll.toString(), key: shardKey, unique: unique || false}));
     }
 
     /*

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,30 +27,45 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
-
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/storage/storage_engine_init.h"
 
+#include <exception>
 #include <map>
+#include <string>
+#include <utility>
 
-#include "mongo/base/init.h"
+#include <boost/filesystem/path.hpp>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/init.h"  // IWYU pragma: keep
+#include "mongo/bson/bsonelement.h"
 #include "mongo/bson/bsonobjbuilder.h"
-#include "mongo/db/concurrency/lock_state.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/db/exec/scoped_timer.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/storage/control/storage_control.h"
+#include "mongo/db/storage/recovery_unit.h"
+#include "mongo/db/storage/recovery_unit_noop.h"
+#include "mongo/db/storage/storage_engine_change_context.h"
 #include "mongo/db/storage/storage_engine_lock_file.h"
 #include "mongo/db/storage/storage_engine_metadata.h"
 #include "mongo/db/storage/storage_options.h"
+#include "mongo/db/storage/storage_parameters_gen.h"
 #include "mongo/db/storage/storage_repair_observer.h"
-#include "mongo/db/unclean_shutdown.h"
-#include "mongo/stdx/memory.h"
+#include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/db/transaction_resources.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/decorable.h"
+#include "mongo/util/scopeguard.h"
+#include "mongo/util/str.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 namespace mongo {
-
 namespace {
 /**
  * Creates the lock file used to prevent concurrent processes from accessing the data files,
@@ -60,46 +74,41 @@ namespace {
 void createLockFile(ServiceContext* service);
 }  // namespace
 
-extern bool _supportsDocLocking;
+StorageEngine::LastShutdownState initializeStorageEngine(
+    OperationContext* opCtx,
+    const StorageEngineInitFlags initFlags,
+    bool isReplSet,
+    bool shouldRecoverFromOplogAsStandalone,
+    bool inStandaloneMode,
+    BSONObjBuilder* startupTimeElapsedBuilder) {
+    ServiceContext* service = opCtx->getServiceContext();
 
-void initializeStorageEngine(ServiceContext* service, const StorageEngineInitFlags initFlags) {
     // This should be set once.
-    invariant(!service->getStorageEngine());
+    if ((initFlags & StorageEngineInitFlags::kForRestart) == StorageEngineInitFlags{})
+        invariant(!service->getStorageEngine());
 
-    if (0 == (initFlags & StorageEngineInitFlags::kAllowNoLockFile)) {
+    if ((initFlags & StorageEngineInitFlags::kAllowNoLockFile) == StorageEngineInitFlags{}) {
+        SectionScopedTimer scopedTimer(service->getFastClockSource(),
+                                       TimedSectionId::createLockFile,
+                                       startupTimeElapsedBuilder);
         createLockFile(service);
     }
 
     const std::string dbpath = storageGlobalParams.dbpath;
 
-    if (!storageGlobalParams.readOnly) {
-        StorageRepairObserver::set(service, std::make_unique<StorageRepairObserver>(dbpath));
-        auto repairObserver = StorageRepairObserver::get(service);
+    StorageRepairObserver::set(service, std::make_unique<StorageRepairObserver>(dbpath));
+    auto repairObserver = StorageRepairObserver::get(service);
 
-        if (storageGlobalParams.repair) {
-            repairObserver->onRepairStarted();
-        } else if (repairObserver->isIncomplete()) {
-            severe()
-                << "An incomplete repair has been detected! This is likely because a repair "
-                   "operation unexpectedly failed before completing. MongoDB will not start up "
-                   "again without --repair.";
-            fassertFailedNoTrace(50922);
-        }
+    if (storageGlobalParams.repair) {
+        repairObserver->onRepairStarted();
+    } else if (repairObserver->isIncomplete()) {
+        LOGV2_FATAL_NOTRACE(50922,
+                            "An incomplete repair has been detected! This is likely because a "
+                            "repair operation unexpectedly failed before completing. MongoDB will "
+                            "not start up again without --repair.");
     }
 
     if (auto existingStorageEngine = StorageEngineMetadata::getStorageEngineForPath(dbpath)) {
-        if (*existingStorageEngine == "mmapv1" ||
-            (storageGlobalParams.engineSetByUser && storageGlobalParams.engine == "mmapv1")) {
-            log() << startupWarningsLog;
-            log() << "** WARNING: Support for MMAPV1 storage engine has been deprecated and will be"
-                  << startupWarningsLog;
-            log() << "**          removed in version 4.2. Please plan to migrate to the wiredTiger"
-                  << startupWarningsLog;
-            log() << "**          storage engine." << startupWarningsLog;
-            log() << "**          See http://dochub.mongodb.org/core/deprecated-mmapv1";
-            log() << startupWarningsLog;
-        }
-
         if (storageGlobalParams.engineSetByUser) {
             // Verify that the name of the user-supplied storage engine matches the contents of
             // the metadata file.
@@ -107,42 +116,22 @@ void initializeStorageEngine(ServiceContext* service, const StorageEngineInitFla
                 getFactoryForStorageEngine(service, storageGlobalParams.engine);
             if (factory) {
                 uassert(28662,
-                        str::stream() << "Cannot start server. Detected data files in " << dbpath
-                                      << " created by"
-                                      << " the '"
-                                      << *existingStorageEngine
-                                      << "' storage engine, but the"
-                                      << " specified storage engine was '"
-                                      << factory->getCanonicalName()
-                                      << "'.",
+                        str::stream()
+                            << "Cannot start server. Detected data files in " << dbpath
+                            << " created by"
+                            << " the '" << *existingStorageEngine << "' storage engine, but the"
+                            << " specified storage engine was '" << factory->getCanonicalName()
+                            << "'.",
                         factory->getCanonicalName() == *existingStorageEngine);
             }
         } else {
             // Otherwise set the active storage engine as the contents of the metadata file.
-            log() << "Detected data files in " << dbpath << " created by the '"
-                  << *existingStorageEngine << "' storage engine, so setting the active"
-                  << " storage engine to '" << *existingStorageEngine << "'.";
+            LOGV2(22270,
+                  "Storage engine to use detected by data files",
+                  "dbpath"_attr = boost::filesystem::path(dbpath).generic_string(),
+                  "storageEngine"_attr = *existingStorageEngine);
             storageGlobalParams.engine = *existingStorageEngine;
         }
-    } else if (!storageGlobalParams.engineSetByUser) {
-        // Ensure the default storage engine is available with this build of mongod.
-        uassert(28663,
-                str::stream()
-                    << "Cannot start server. The default storage engine '"
-                    << storageGlobalParams.engine
-                    << "' is not available with this build of mongod. Please specify a different"
-                    << " storage engine explicitly, e.g. --storageEngine=mmapv1.",
-                isRegisteredStorageEngine(service, storageGlobalParams.engine));
-    } else if (storageGlobalParams.engineSetByUser && storageGlobalParams.engine == "mmapv1") {
-        log() << startupWarningsLog;
-        log() << "** WARNING: You have explicitly specified 'MMAPV1' storage engine in your"
-              << startupWarningsLog;
-        log() << "**          config file or as a command line option.  Support for the MMAPV1"
-              << startupWarningsLog;
-        log() << "**          storage engine has been deprecated and will be removed in"
-              << startupWarningsLog;
-        log() << "**          version 4.2. See http://dochub.mongodb.org/core/deprecated-mmapv1";
-        log() << startupWarningsLog;
     }
 
     const StorageEngine::Factory* factory =
@@ -153,30 +142,35 @@ void initializeStorageEngine(ServiceContext* service, const StorageEngineInitFla
                           << storageGlobalParams.engine,
             factory);
 
-    if (storageGlobalParams.readOnly) {
+    if (storageGlobalParams.queryableBackupMode) {
         uassert(34368,
-                str::stream()
-                    << "Server was started in read-only mode, but the configured storage engine, "
-                    << storageGlobalParams.engine
-                    << ", does not support read-only operation",
-                factory->supportsReadOnly());
+                str::stream() << "Server was started in queryable backup mode, but the configured "
+                              << "storage engine, " << storageGlobalParams.engine
+                              << ", does not support queryable backup mode",
+                factory->supportsQueryableBackupMode());
     }
 
-    std::unique_ptr<StorageEngineMetadata> metadata = StorageEngineMetadata::forPath(dbpath);
-
-    if (storageGlobalParams.readOnly) {
-        uassert(34415,
-                "Server was started in read-only mode, but the storage metadata file was not"
-                " found.",
-                metadata.get());
+    std::unique_ptr<StorageEngineMetadata> metadata;
+    if ((initFlags & StorageEngineInitFlags::kSkipMetadataFile) == StorageEngineInitFlags{}) {
+        SectionScopedTimer scopedTimer(service->getFastClockSource(),
+                                       TimedSectionId::getStorageEngineMetadata,
+                                       startupTimeElapsedBuilder);
+        metadata = StorageEngineMetadata::forPath(dbpath);
     }
 
     // Validate options in metadata against current startup options.
     if (metadata.get()) {
+        SectionScopedTimer scopedTimer(service->getFastClockSource(),
+                                       TimedSectionId::validateMetadata,
+                                       startupTimeElapsedBuilder);
         uassertStatusOK(factory->validateMetadata(*metadata, storageGlobalParams));
     }
 
-    ScopeGuard guard = MakeGuard([&] {
+    // This should be set once during startup.
+    if ((initFlags & StorageEngineInitFlags::kForRestart) == StorageEngineInitFlags{}) {
+    }
+
+    ScopeGuard guard([&] {
         auto& lockFile = StorageEngineLockFile::get(service);
         if (lockFile) {
             lockFile->close();
@@ -184,35 +178,94 @@ void initializeStorageEngine(ServiceContext* service, const StorageEngineInitFla
     });
 
     auto& lockFile = StorageEngineLockFile::get(service);
-    service->setStorageEngine(std::unique_ptr<StorageEngine>(
-        factory->create(storageGlobalParams, lockFile ? &*lockFile : nullptr)));
-    service->getStorageEngine()->finishInit();
+    {
+        SectionScopedTimer scopedTimer(service->getFastClockSource(),
+                                       TimedSectionId::createStorageEngine,
+                                       startupTimeElapsedBuilder);
+        if ((initFlags & StorageEngineInitFlags::kForRestart) == StorageEngineInitFlags{}) {
+            auto storageEngine =
+                std::unique_ptr<StorageEngine>(factory->create(opCtx,
+                                                               storageGlobalParams,
+                                                               lockFile ? &*lockFile : nullptr,
+                                                               isReplSet,
+                                                               shouldRecoverFromOplogAsStandalone,
+                                                               inStandaloneMode));
+            service->setStorageEngine(std::move(storageEngine));
+        } else {
+            auto storageEngineChangeContext = StorageEngineChangeContext::get(service);
+            auto lk = storageEngineChangeContext->killOpsForStorageEngineChange(service);
+            auto storageEngine =
+                std::unique_ptr<StorageEngine>(factory->create(opCtx,
+                                                               storageGlobalParams,
+                                                               lockFile ? &*lockFile : nullptr,
+                                                               isReplSet,
+                                                               shouldRecoverFromOplogAsStandalone,
+                                                               inStandaloneMode));
+            storageEngineChangeContext->changeStorageEngine(
+                service, std::move(lk), std::move(storageEngine));
+        }
+    }
 
     if (lockFile) {
+        SectionScopedTimer scopedTimer(
+            service->getFastClockSource(), TimedSectionId::writePID, startupTimeElapsedBuilder);
         uassertStatusOK(lockFile->writePid());
     }
 
     // Write a new metadata file if it is not present.
-    if (!metadata.get()) {
-        invariant(!storageGlobalParams.readOnly);
+    if (!metadata.get() &&
+        (initFlags & StorageEngineInitFlags::kSkipMetadataFile) == StorageEngineInitFlags{}) {
+        SectionScopedTimer scopedTimer(service->getFastClockSource(),
+                                       TimedSectionId::writeNewMetadata,
+                                       startupTimeElapsedBuilder);
         metadata.reset(new StorageEngineMetadata(storageGlobalParams.dbpath));
         metadata->setStorageEngine(factory->getCanonicalName().toString());
         metadata->setStorageEngineOptions(factory->createMetadataOptions(storageGlobalParams));
         uassertStatusOK(metadata->write());
     }
 
-    guard.Dismiss();
+    guard.dismiss();
 
-    _supportsDocLocking = service->getStorageEngine()->supportsDocLocking();
+    if (lockFile && lockFile->createdByUncleanShutdown()) {
+        return StorageEngine::LastShutdownState::kUnclean;
+    } else {
+        return StorageEngine::LastShutdownState::kClean;
+    }
 }
 
 void shutdownGlobalStorageEngineCleanly(ServiceContext* service) {
-    invariant(service->getStorageEngine());
-    service->getStorageEngine()->cleanShutdown();
+    auto storageEngine = service->getStorageEngine();
+    invariant(storageEngine);
+    storageEngine->cleanShutdown(service);
     auto& lockFile = StorageEngineLockFile::get(service);
     if (lockFile) {
         lockFile->clearPidAndUnlock();
+        lockFile = boost::none;
     }
+}
+
+StorageEngine::LastShutdownState reinitializeStorageEngine(
+    OperationContext* opCtx,
+    StorageEngineInitFlags initFlags,
+    bool isReplSet,
+    bool shouldRecoverFromOplogAsStandalone,
+    bool inStandaloneMode,
+    std::function<void()> changeConfigurationCallback) {
+    auto service = opCtx->getServiceContext();
+    shard_role_details::getRecoveryUnit(opCtx)->abandonSnapshot();
+    shutdownGlobalStorageEngineCleanly(service);
+    shard_role_details::setRecoveryUnit(opCtx,
+                                        std::make_unique<RecoveryUnitNoop>(),
+                                        WriteUnitOfWork::RecoveryUnitState::kNotInUnitOfWork);
+    changeConfigurationCallback();
+    auto lastShutdownState =
+        initializeStorageEngine(opCtx,
+                                initFlags | StorageEngineInitFlags::kForRestart,
+                                isReplSet,
+                                shouldRecoverFromOplogAsStandalone,
+                                inStandaloneMode);
+    StorageControl::startStorageControls(service);
+    return lastShutdownState;
 }
 
 namespace {
@@ -224,27 +277,21 @@ void createLockFile(ServiceContext* service) {
     } catch (const std::exception& ex) {
         uassert(28596,
                 str::stream() << "Unable to determine status of lock file in the data directory "
-                              << storageGlobalParams.dbpath
-                              << ": "
-                              << ex.what(),
+                              << storageGlobalParams.dbpath << ": " << ex.what(),
                 false);
     }
     const bool wasUnclean = lockFile->createdByUncleanShutdown();
     const auto openStatus = lockFile->open();
-    if (storageGlobalParams.readOnly && openStatus == ErrorCodes::IllegalOperation) {
+    if (openStatus == ErrorCodes::IllegalOperation) {
         lockFile = boost::none;
     } else {
         uassertStatusOK(openStatus);
     }
 
     if (wasUnclean) {
-        if (storageGlobalParams.readOnly) {
-            severe() << "Attempted to open dbpath in readOnly mode, but the server was "
-                        "previously not shut down cleanly.";
-            fassertFailedNoTrace(34416);
-        }
-        warning() << "Detected unclean shutdown - " << lockFile->getFilespec() << " is not empty.";
-        startingAfterUncleanShutdown(service) = true;
+        LOGV2_WARNING(22271,
+                      "Detected unclean shutdown - Lock file is not empty",
+                      "lockFile"_attr = lockFile->getFilespec());
     }
 }
 
@@ -284,7 +331,7 @@ StorageEngine::Factory* getFactoryForStorageEngine(ServiceContext* service, Stri
 Status validateStorageOptions(
     ServiceContext* service,
     const BSONObj& storageEngineOptions,
-    stdx::function<Status(const StorageEngine::Factory* const, const BSONObj&)> validateFunc) {
+    std::function<Status(const StorageEngine::Factory* const, const BSONObj&)> validateFunc) {
 
     BSONObjIterator storageIt(storageEngineOptions);
     while (storageIt.more()) {
@@ -310,55 +357,13 @@ Status validateStorageOptions(
     return Status::OK();
 }
 
-namespace {
-BSONArray storageEngineList(ServiceContext* service) {
-    if (!service)
-        return BSONArray();
-
-    BSONArrayBuilder engineArrayBuilder;
-
-    for (const auto& nameAndFactory : storageFactories(service)) {
-        engineArrayBuilder.append(nameAndFactory.first);
-    }
-
-    return engineArrayBuilder.arr();
-}
-}  // namespace
-
-void appendStorageEngineList(ServiceContext* service, BSONObjBuilder* result) {
-    result->append("storageEngines", storageEngineList(service));
+std::vector<StringData> getStorageEngineNames(ServiceContext* svcCtx) {
+    const auto& factories = storageFactories(svcCtx);
+    std::vector<StringData> ret;
+    std::transform(factories.begin(), factories.end(), std::back_inserter(ret), [](auto& it) {
+        return StringData(it.first);
+    });
+    return ret;
 }
 
-namespace {
-
-class StorageClientObserver final : public ServiceContext::ClientObserver {
-public:
-    void onCreateClient(Client* client) override{};
-    void onDestroyClient(Client* client) override{};
-    void onCreateOperationContext(OperationContext* opCtx) {
-        auto service = opCtx->getServiceContext();
-        auto storageEngine = service->getStorageEngine();
-        // NOTE(schwerin): The following uassert would be more desirable than the early return when
-        // no storage engine is set, but to achieve that we would have to ensure that this file was
-        // never linked into a test binary that didn't actually need/use the storage engine.
-        //
-        // uassert(<some code>,
-        //         "Must instantiate storage engine before creating OperationContext",
-        //         storageEngine);
-        if (!storageEngine) {
-            return;
-        }
-        opCtx->setLockState(stdx::make_unique<LockerImpl>());
-        opCtx->setRecoveryUnit(std::unique_ptr<RecoveryUnit>(storageEngine->newRecoveryUnit()),
-                               WriteUnitOfWork::RecoveryUnitState::kNotInUnitOfWork);
-    }
-    void onDestroyOperationContext(OperationContext* opCtx) {}
-};
-
-ServiceContext::ConstructorActionRegisterer registerStorageClientObserverConstructor{
-    "RegisterStorageClientObserverConstructor", [](ServiceContext* service) {
-        service->registerClientObserver(std::make_unique<StorageClientObserver>());
-    }};
-
-}  // namespace
 }  // namespace mongo

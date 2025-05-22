@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,89 +27,310 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <boost/container/small_vector.hpp>
+// IWYU pragma: no_include "boost/intrusive/detail/iterator.hpp"
+// IWYU pragma: no_include "boost/move/detail/iterator_to_raw_pointer.hpp"
+#include <boost/move/utility_core.hpp>
+#include <memory>
+#include <utility>
 
-#include "mongo/db/query/internal_plans.h"
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
 
-#include "mongo/db/catalog/database.h"
-#include "mongo/db/client.h"
+#include "mongo/base/status_with.h"
+#include "mongo/db/catalog/clustered_collection_util.h"
+#include "mongo/db/catalog/index_catalog_entry.h"
+#include "mongo/db/exec/batched_delete_stage.h"
 #include "mongo/db/exec/collection_scan.h"
-#include "mongo/db/exec/delete.h"
-#include "mongo/db/exec/eof.h"
 #include "mongo/db/exec/fetch.h"
 #include "mongo/db/exec/idhack.h"
 #include "mongo/db/exec/index_scan.h"
-#include "mongo/db/exec/update.h"
+#include "mongo/db/exec/limit.h"
+#include "mongo/db/exec/multi_iterator.h"
+#include "mongo/db/exec/update_stage.h"
+#include "mongo/db/exec/upsert_stage.h"
 #include "mongo/db/query/get_executor.h"
-#include "mongo/stdx/memory.h"
+#include "mongo/db/query/internal_plans.h"
+#include "mongo/db/query/plan_executor_factory.h"
+#include "mongo/db/query/write_ops/update_request.h"
+#include "mongo/db/record_id_helpers.h"
+#include "mongo/db/storage/record_store.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
-std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> InternalPlanner::collectionScan(
-    OperationContext* opCtx,
-    StringData ns,
-    Collection* collection,
-    PlanExecutor::YieldPolicy yieldPolicy,
-    const Direction direction,
-    const RecordId startLoc) {
-    std::unique_ptr<WorkingSet> ws = stdx::make_unique<WorkingSet>();
+namespace {
+CollectionScanParams::ScanBoundInclusion getScanBoundInclusion(BoundInclusion indexBoundInclusion) {
+    switch (indexBoundInclusion) {
+        case BoundInclusion::kExcludeBothStartAndEndKeys:
+            return CollectionScanParams::ScanBoundInclusion::kExcludeBothStartAndEndRecords;
+        case BoundInclusion::kIncludeStartKeyOnly:
+            return CollectionScanParams::ScanBoundInclusion::kIncludeStartRecordOnly;
+        case BoundInclusion::kIncludeEndKeyOnly:
+            return CollectionScanParams::ScanBoundInclusion::kIncludeEndRecordOnly;
+        case BoundInclusion::kIncludeBothStartAndEndKeys:
+            return CollectionScanParams::ScanBoundInclusion::kIncludeBothStartAndEndRecords;
+        default:
+            MONGO_UNREACHABLE;
+    }
+}
 
-    if (NULL == collection) {
-        auto eof = stdx::make_unique<EOFStage>(opCtx);
-        // Takes ownership of 'ws' and 'eof'.
-        auto statusWithPlanExecutor = PlanExecutor::make(
-            opCtx, std::move(ws), std::move(eof), NamespaceString(ns), yieldPolicy);
-        invariant(statusWithPlanExecutor.isOK());
-        return std::move(statusWithPlanExecutor.getValue());
+// Construct collection scan params for a scan over the collection's cluster key. Callers must
+// confirm the collection's cluster key matches the keyPattern.
+CollectionScanParams convertIndexScanParamsToCollScanParams(
+    OperationContext* opCtx,
+    const CollectionPtr* coll,
+    const BSONObj& keyPattern,
+    const BSONObj& startKey,
+    const BSONObj& endKey,
+    BoundInclusion boundInclusion,
+    const InternalPlanner::Direction direction) {
+    const auto& collection = *coll;
+
+    dassert(collection->isClustered() &&
+            clustered_util::matchesClusterKey(keyPattern, collection->getClusteredInfo()));
+    invariant(collection->getDefaultCollator() == nullptr);
+
+    boost::optional<RecordIdBound> startRecord, endRecord;
+    if (!startKey.isEmpty()) {
+        startRecord = RecordIdBound(record_id_helpers::keyForElem(startKey.firstElement()));
+    }
+    if (!endKey.isEmpty()) {
+        endRecord = RecordIdBound(record_id_helpers::keyForElem(endKey.firstElement()));
     }
 
-    invariant(ns == collection->ns().ns());
+    // For a forward scan, the startKey is the minRecord. For a backward scan, it is the maxRecord.
+    auto minRecord = (direction == InternalPlanner::FORWARD) ? startRecord : endRecord;
+    auto maxRecord = (direction == InternalPlanner::FORWARD) ? endRecord : startRecord;
 
-    auto cs = _collectionScan(opCtx, ws.get(), collection, direction, startLoc);
+    if (minRecord && maxRecord) {
+        // Regardless of direction, the minRecord should always be less than the maxRecord
+        dassert(minRecord->recordId() < maxRecord->recordId(),
+                str::stream() << "Expected the minRecord " << minRecord
+                              << " to be less than the maxRecord " << maxRecord
+                              << " on a bounded collection scan. Original startKey and endKey for "
+                                 "index scan ["
+                              << startKey << ", " << endKey << "]. Is FORWARD? "
+                              << (direction == InternalPlanner::FORWARD));
+    }
+
+    CollectionScanParams params;
+    params.minRecord = minRecord;
+    params.maxRecord = maxRecord;
+
+    if (InternalPlanner::FORWARD == direction) {
+        params.direction = CollectionScanParams::FORWARD;
+    } else {
+        params.direction = CollectionScanParams::BACKWARD;
+    }
+    params.boundInclusion = getScanBoundInclusion(boundInclusion);
+    return params;
+}
+
+CollectionScanParams createCollectionScanParams(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    WorkingSet* ws,
+    const CollectionPtr* coll,
+    InternalPlanner::Direction direction,
+    const boost::optional<RecordId>& resumeAfterRecordId,
+    boost::optional<RecordIdBound> minRecord,
+    boost::optional<RecordIdBound> maxRecord,
+    CollectionScanParams::ScanBoundInclusion boundInclusion,
+    bool shouldReturnEofOnFilterMismatch) {
+    const auto& collection = *coll;
+    invariant(collection);
+
+    CollectionScanParams params;
+    params.shouldWaitForOplogVisibility =
+        shouldWaitForOplogVisibility(expCtx->getOperationContext(), collection, false);
+
+    if (resumeAfterRecordId) {
+        params.resumeScanPoint =
+            ResumeScanPoint{*resumeAfterRecordId, false /* tolerateKeyNotFound */};
+    }
+
+    params.minRecord = std::move(minRecord);
+    params.maxRecord = std::move(maxRecord);
+    if (InternalPlanner::FORWARD == direction) {
+        params.direction = CollectionScanParams::FORWARD;
+    } else {
+        params.direction = CollectionScanParams::BACKWARD;
+    }
+    params.boundInclusion = boundInclusion;
+    params.shouldReturnEofOnFilterMismatch = shouldReturnEofOnFilterMismatch;
+    return params;
+}
+}  // namespace
+
+std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> InternalPlanner::sampleCollection(
+    OperationContext* opCtx,
+    VariantCollectionPtrOrAcquisition collection,
+    PlanYieldPolicy::YieldPolicy yieldPolicy,
+    boost::optional<int64_t> numSamples) {
+    const auto& collectionPtr = collection.getCollectionPtr();
+    invariant(collectionPtr);
+
+    std::unique_ptr<WorkingSet> ws = std::make_unique<WorkingSet>();
+    auto expCtx = ExpressionContextBuilder{}.opCtx(opCtx).ns(collectionPtr->ns()).build();
+
+    auto rsRandCursor = collectionPtr->getRecordStore()->getRandomCursor(opCtx);
+    std::unique_ptr<PlanStage> root =
+        std::make_unique<MultiIteratorStage>(expCtx.get(), ws.get(), collection);
+    static_cast<MultiIteratorStage*>(root.get())->addIterator(std::move(rsRandCursor));
+
+    if (numSamples) {
+        auto samples = *numSamples;
+        invariant(samples >= 0,
+                  "Number of samples must be >= 0, otherwise LimitStage it will never end");
+        root = std::make_unique<LimitStage>(expCtx.get(), samples, ws.get(), std::move(root));
+    }
+
+    auto statusWithPlanExecutor = plan_executor_factory::make(
+        expCtx, std::move(ws), std::move(root), collection, yieldPolicy, false);
+
+    invariant(statusWithPlanExecutor.getStatus());
+    return std::move(statusWithPlanExecutor.getValue());
+}
+
+std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> InternalPlanner::collectionScan(
+    OperationContext* opCtx,
+    VariantCollectionPtrOrAcquisition collection,
+    PlanYieldPolicy::YieldPolicy yieldPolicy,
+    const Direction direction,
+    const boost::optional<RecordId>& resumeAfterRecordId,
+    boost::optional<RecordIdBound> minRecord,
+    boost::optional<RecordIdBound> maxRecord,
+    CollectionScanParams::ScanBoundInclusion boundInclusion,
+    bool shouldReturnEofOnFilterMismatch) {
+    const auto& collectionPtr = collection.getCollectionPtr();
+    invariant(collectionPtr);
+
+    std::unique_ptr<WorkingSet> ws = std::make_unique<WorkingSet>();
+
+    auto expCtx = ExpressionContextBuilder{}.opCtx(opCtx).ns(collectionPtr->ns()).build();
+    auto collScanParams = createCollectionScanParams(expCtx,
+                                                     ws.get(),
+                                                     &collectionPtr,
+                                                     direction,
+                                                     resumeAfterRecordId,
+                                                     std::move(minRecord),
+                                                     std::move(maxRecord),
+                                                     boundInclusion,
+                                                     shouldReturnEofOnFilterMismatch);
+
+    auto cs = _collectionScan(expCtx, ws.get(), &collectionPtr, collScanParams);
 
     // Takes ownership of 'ws' and 'cs'.
     auto statusWithPlanExecutor =
-        PlanExecutor::make(opCtx, std::move(ws), std::move(cs), collection, yieldPolicy);
-    invariant(statusWithPlanExecutor.isOK());
+        plan_executor_factory::make(expCtx,
+                                    std::move(ws),
+                                    std::move(cs),
+                                    collection,
+                                    yieldPolicy,
+                                    false /* whether owned BSON must be returned */);
+    invariant(statusWithPlanExecutor.getStatus());
+    return std::move(statusWithPlanExecutor.getValue());
+}
+
+std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> InternalPlanner::collectionScan(
+    OperationContext* opCtx,
+    const CollectionPtr* coll,
+    const CollectionScanParams& params,
+    PlanYieldPolicy::YieldPolicy yieldPolicy) {
+    const auto& collection = *coll;
+    invariant(collection);
+
+    std::unique_ptr<WorkingSet> ws = std::make_unique<WorkingSet>();
+
+    auto expCtx = ExpressionContextBuilder{}.opCtx(opCtx).ns(collection->ns()).build();
+    auto cs = _collectionScan(expCtx, ws.get(), &collection, params);
+
+    // Takes ownership of 'ws' and 'cs'.
+    auto statusWithPlanExecutor =
+        plan_executor_factory::make(expCtx,
+                                    std::move(ws),
+                                    std::move(cs),
+                                    &collection,
+                                    yieldPolicy,
+                                    false /* whether owned BSON must be returned */);
+    invariant(statusWithPlanExecutor.getStatus());
     return std::move(statusWithPlanExecutor.getValue());
 }
 
 std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> InternalPlanner::deleteWithCollectionScan(
     OperationContext* opCtx,
-    Collection* collection,
-    const DeleteStageParams& params,
-    PlanExecutor::YieldPolicy yieldPolicy,
+    CollectionAcquisition coll,
+    std::unique_ptr<DeleteStageParams> params,
+    PlanYieldPolicy::YieldPolicy yieldPolicy,
     Direction direction,
-    const RecordId& startLoc) {
-    invariant(collection);
-    auto ws = stdx::make_unique<WorkingSet>();
+    boost::optional<RecordIdBound> minRecord,
+    boost::optional<RecordIdBound> maxRecord,
+    CollectionScanParams::ScanBoundInclusion boundInclusion,
+    std::unique_ptr<BatchedDeleteStageParams> batchedDeleteParams,
+    const MatchExpression* filter,
+    bool shouldReturnEofOnFilterMismatch) {
+    const auto& collectionPtr = coll.getCollectionPtr();
+    invariant(collectionPtr);
+    if (shouldReturnEofOnFilterMismatch) {
+        tassert(7010801,
+                "MatchExpression filter must be provided when 'shouldReturnEofOnFilterMismatch' is "
+                "set to true ",
+                filter);
+    }
 
-    auto root = _collectionScan(opCtx, ws.get(), collection, direction, startLoc);
+    auto ws = std::make_unique<WorkingSet>();
+    auto expCtx = ExpressionContextBuilder{}.opCtx(opCtx).ns(collectionPtr->ns()).build();
 
-    root = stdx::make_unique<DeleteStage>(opCtx, params, ws.get(), collection, root.release());
+    if (collectionPtr->isCapped()) {
+        expCtx->setIsCappedDelete();
+    }
 
-    auto executor =
-        PlanExecutor::make(opCtx, std::move(ws), std::move(root), collection, yieldPolicy);
+    auto collScanParams = createCollectionScanParams(expCtx,
+                                                     ws.get(),
+                                                     &collectionPtr,
+                                                     direction,
+                                                     boost::none /* resumeAfterId */,
+                                                     std::move(minRecord),
+                                                     std::move(maxRecord),
+                                                     boundInclusion,
+                                                     shouldReturnEofOnFilterMismatch);
+
+    auto root = _collectionScan(expCtx, ws.get(), &collectionPtr, collScanParams, filter);
+
+    root = _createAppropriateDeleteStage(
+        expCtx, coll, std::move(params), std::move(batchedDeleteParams), ws.get(), root.release());
+
+
+    auto executor = plan_executor_factory::make(expCtx,
+                                                std::move(ws),
+                                                std::move(root),
+                                                coll,
+                                                yieldPolicy,
+                                                false /* whether owned BSON must be returned */
+    );
     invariant(executor.getStatus());
     return std::move(executor.getValue());
 }
 
-
 std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> InternalPlanner::indexScan(
     OperationContext* opCtx,
-    const Collection* collection,
+    const CollectionPtr* coll,
     const IndexDescriptor* descriptor,
     const BSONObj& startKey,
     const BSONObj& endKey,
     BoundInclusion boundInclusion,
-    PlanExecutor::YieldPolicy yieldPolicy,
+    PlanYieldPolicy::YieldPolicy yieldPolicy,
     Direction direction,
     int options) {
-    auto ws = stdx::make_unique<WorkingSet>();
+    const auto& collection = *coll;
+    auto ws = std::make_unique<WorkingSet>();
+    auto expCtx = ExpressionContextBuilder{}.opCtx(opCtx).ns(collection->ns()).build();
 
-    std::unique_ptr<PlanStage> root = _indexScan(opCtx,
+    std::unique_ptr<PlanStage> root = _indexScan(expCtx,
                                                  ws.get(),
-                                                 collection,
+                                                 &collection,
                                                  descriptor,
                                                  startKey,
                                                  endKey,
@@ -118,28 +338,37 @@ std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> InternalPlanner::indexScan(
                                                  direction,
                                                  options);
 
-    auto executor =
-        PlanExecutor::make(opCtx, std::move(ws), std::move(root), collection, yieldPolicy);
+    auto executor = plan_executor_factory::make(expCtx,
+                                                std::move(ws),
+                                                std::move(root),
+                                                &collection,
+                                                yieldPolicy,
+                                                false /* whether owned BSON must be returned */
+    );
     invariant(executor.getStatus());
     return std::move(executor.getValue());
 }
 
 std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> InternalPlanner::deleteWithIndexScan(
     OperationContext* opCtx,
-    Collection* collection,
-    const DeleteStageParams& params,
+    CollectionAcquisition coll,
+    std::unique_ptr<DeleteStageParams> params,
     const IndexDescriptor* descriptor,
     const BSONObj& startKey,
     const BSONObj& endKey,
     BoundInclusion boundInclusion,
-    PlanExecutor::YieldPolicy yieldPolicy,
-    Direction direction) {
-    invariant(collection);
-    auto ws = stdx::make_unique<WorkingSet>();
+    PlanYieldPolicy::YieldPolicy yieldPolicy,
+    Direction direction,
+    std::unique_ptr<BatchedDeleteStageParams> batchedDeleteParams) {
+    const auto& collectionPtr = coll.getCollectionPtr();
+    invariant(collectionPtr);
+    auto ws = std::make_unique<WorkingSet>();
 
-    std::unique_ptr<PlanStage> root = _indexScan(opCtx,
+    auto expCtx = ExpressionContextBuilder{}.opCtx(opCtx).ns(collectionPtr->ns()).build();
+
+    std::unique_ptr<PlanStage> root = _indexScan(expCtx,
                                                  ws.get(),
-                                                 collection,
+                                                 &collectionPtr,
                                                  descriptor,
                                                  startKey,
                                                  endKey,
@@ -147,82 +376,194 @@ std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> InternalPlanner::deleteWith
                                                  direction,
                                                  InternalPlanner::IXSCAN_FETCH);
 
-    root = stdx::make_unique<DeleteStage>(opCtx, params, ws.get(), collection, root.release());
+    root = _createAppropriateDeleteStage(
+        expCtx, coll, std::move(params), std::move(batchedDeleteParams), ws.get(), root.release());
 
-    auto executor =
-        PlanExecutor::make(opCtx, std::move(ws), std::move(root), collection, yieldPolicy);
+
+    auto executor = plan_executor_factory::make(expCtx,
+                                                std::move(ws),
+                                                std::move(root),
+                                                coll,
+                                                yieldPolicy,
+                                                false /* whether owned BSON must be returned */
+    );
+    invariant(executor.getStatus());
+    return std::move(executor.getValue());
+}
+
+std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> InternalPlanner::shardKeyIndexScan(
+    OperationContext* opCtx,
+    const CollectionPtr* collection,
+    const ShardKeyIndex& shardKeyIdx,
+    const BSONObj& startKey,
+    const BSONObj& endKey,
+    BoundInclusion boundInclusion,
+    PlanYieldPolicy::YieldPolicy yieldPolicy,
+    Direction direction,
+    int options) {
+    if (shardKeyIdx.descriptor() != nullptr) {
+        return indexScan(opCtx,
+                         collection,
+                         shardKeyIdx.descriptor(),
+                         startKey,
+                         endKey,
+                         boundInclusion,
+                         yieldPolicy,
+                         direction,
+                         options);
+    }
+    // Do a clustered collection scan.
+    auto params = convertIndexScanParamsToCollScanParams(
+        opCtx, collection, shardKeyIdx.keyPattern(), startKey, endKey, boundInclusion, direction);
+    return collectionScan(opCtx, collection, params, yieldPolicy);
+}
+
+std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> InternalPlanner::deleteWithShardKeyIndexScan(
+    OperationContext* opCtx,
+    CollectionAcquisition coll,
+    std::unique_ptr<DeleteStageParams> params,
+    const ShardKeyIndex& shardKeyIdx,
+    const BSONObj& startKey,
+    const BSONObj& endKey,
+    BoundInclusion boundInclusion,
+    PlanYieldPolicy::YieldPolicy yieldPolicy,
+    std::unique_ptr<BatchedDeleteStageParams> batchedDeleteParams,
+    Direction direction) {
+    if (shardKeyIdx.descriptor()) {
+        return deleteWithIndexScan(opCtx,
+                                   coll,
+                                   std::move(params),
+                                   shardKeyIdx.descriptor(),
+                                   startKey,
+                                   endKey,
+                                   boundInclusion,
+                                   yieldPolicy,
+                                   direction,
+                                   std::move(batchedDeleteParams));
+    }
+    auto collectionScanParams = convertIndexScanParamsToCollScanParams(opCtx,
+                                                                       &coll.getCollectionPtr(),
+                                                                       shardKeyIdx.keyPattern(),
+                                                                       startKey,
+                                                                       endKey,
+                                                                       boundInclusion,
+                                                                       direction);
+
+    const auto& collectionPtr = coll.getCollectionPtr();
+    invariant(collectionPtr);
+
+    std::unique_ptr<WorkingSet> ws = std::make_unique<WorkingSet>();
+
+    auto expCtx = ExpressionContextBuilder{}.opCtx(opCtx).ns(collectionPtr->ns()).build();
+
+    auto root = _collectionScan(expCtx, ws.get(), &collectionPtr, collectionScanParams);
+
+    root = _createAppropriateDeleteStage(
+        expCtx, coll, std::move(params), std::move(batchedDeleteParams), ws.get(), root.release());
+
+    auto executor = plan_executor_factory::make(expCtx,
+                                                std::move(ws),
+                                                std::move(root),
+                                                coll,
+                                                yieldPolicy,
+                                                false /* whether owned BSON must be returned */
+    );
     invariant(executor.getStatus());
     return std::move(executor.getValue());
 }
 
 std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> InternalPlanner::updateWithIdHack(
     OperationContext* opCtx,
-    Collection* collection,
+    CollectionAcquisition collection,
     const UpdateStageParams& params,
     const IndexDescriptor* descriptor,
     const BSONObj& key,
-    PlanExecutor::YieldPolicy yieldPolicy) {
-    invariant(collection);
-    auto ws = stdx::make_unique<WorkingSet>();
+    PlanYieldPolicy::YieldPolicy yieldPolicy) {
+    const auto& collectionPtr = collection.getCollectionPtr();
+    invariant(collectionPtr);
+    auto ws = std::make_unique<WorkingSet>();
 
-    auto idHackStage = stdx::make_unique<IDHackStage>(opCtx, collection, key, ws.get(), descriptor);
-    auto root =
-        stdx::make_unique<UpdateStage>(opCtx, params, ws.get(), collection, idHackStage.release());
+    auto expCtx = ExpressionContextBuilder{}.opCtx(opCtx).ns(collectionPtr->ns()).build();
 
-    auto executor =
-        PlanExecutor::make(opCtx, std::move(ws), std::move(root), collection, yieldPolicy);
+    auto idHackStage =
+        std::make_unique<IDHackStage>(expCtx.get(), key, ws.get(), collection, descriptor);
+
+    const bool isUpsert = params.request->isUpsert();
+    auto root = (isUpsert ? std::make_unique<UpsertStage>(
+                                expCtx.get(), params, ws.get(), collection, idHackStage.release())
+                          : std::make_unique<UpdateStage>(
+                                expCtx.get(), params, ws.get(), collection, idHackStage.release()));
+
+    auto executor = plan_executor_factory::make(expCtx,
+                                                std::move(ws),
+                                                std::move(root),
+                                                collection,
+                                                yieldPolicy,
+                                                false /* whether owned BSON must be returned */);
+
     invariant(executor.getStatus());
     return std::move(executor.getValue());
 }
 
-std::unique_ptr<PlanStage> InternalPlanner::_collectionScan(OperationContext* opCtx,
-                                                            WorkingSet* ws,
-                                                            const Collection* collection,
-                                                            Direction direction,
-                                                            const RecordId& startLoc) {
+std::unique_ptr<PlanStage> InternalPlanner::_collectionScan(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    WorkingSet* ws,
+    const CollectionPtr* coll,
+    const CollectionScanParams& params,
+    const MatchExpression* filter) {
+
+    const auto& collection = *coll;
     invariant(collection);
 
-    CollectionScanParams params;
-    params.start = startLoc;
-    params.shouldWaitForOplogVisibility = shouldWaitForOplogVisibility(opCtx, collection, false);
-
-    if (FORWARD == direction) {
-        params.direction = CollectionScanParams::FORWARD;
-    } else {
-        params.direction = CollectionScanParams::BACKWARD;
-    }
-
-    return stdx::make_unique<CollectionScan>(opCtx, collection, params, ws, nullptr);
+    return std::make_unique<CollectionScan>(expCtx.get(), coll, params, ws, filter);
 }
 
-std::unique_ptr<PlanStage> InternalPlanner::_indexScan(OperationContext* opCtx,
-                                                       WorkingSet* ws,
-                                                       const Collection* collection,
-                                                       const IndexDescriptor* descriptor,
-                                                       const BSONObj& startKey,
-                                                       const BSONObj& endKey,
-                                                       BoundInclusion boundInclusion,
-                                                       Direction direction,
-                                                       int options) {
+std::unique_ptr<PlanStage> InternalPlanner::_indexScan(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    WorkingSet* ws,
+    const CollectionPtr* coll,
+    const IndexDescriptor* descriptor,
+    const BSONObj& startKey,
+    const BSONObj& endKey,
+    BoundInclusion boundInclusion,
+    Direction direction,
+    int options) {
+    const auto& collection = *coll;
     invariant(collection);
     invariant(descriptor);
 
-    IndexScanParams params(opCtx, *descriptor);
+    IndexScanParams params(expCtx->getOperationContext(), collection, descriptor);
     params.direction = direction;
     params.bounds.isSimpleRange = true;
     params.bounds.startKey = startKey;
     params.bounds.endKey = endKey;
     params.bounds.boundInclusion = boundInclusion;
-    params.shouldDedup = descriptor->isMultikey(opCtx);
+    params.shouldDedup =
+        descriptor->getEntry()->isMultikey(expCtx->getOperationContext(), collection);
 
     std::unique_ptr<PlanStage> root =
-        stdx::make_unique<IndexScan>(opCtx, std::move(params), ws, nullptr);
+        std::make_unique<IndexScan>(expCtx.get(), coll, std::move(params), ws, nullptr);
 
     if (InternalPlanner::IXSCAN_FETCH & options) {
-        root = stdx::make_unique<FetchStage>(opCtx, ws, root.release(), nullptr, collection);
+        root = std::make_unique<FetchStage>(expCtx.get(), ws, std::move(root), nullptr, coll);
     }
 
     return root;
+}
+
+std::unique_ptr<PlanStage> InternalPlanner::_createAppropriateDeleteStage(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    CollectionAcquisition coll,
+    std::unique_ptr<DeleteStageParams> params,
+    std::unique_ptr<BatchedDeleteStageParams> batchedDeleteParams,
+    WorkingSet* ws,
+    PlanStage* child) {
+    if (batchedDeleteParams) {
+        return std::make_unique<BatchedDeleteStage>(
+            expCtx.get(), std::move(params), std::move(batchedDeleteParams), ws, coll, child);
+    } else {
+        return std::make_unique<DeleteStage>(expCtx.get(), std::move(params), ws, coll, child);
+    }
 }
 
 }  // namespace mongo

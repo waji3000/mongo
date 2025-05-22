@@ -2,19 +2,9 @@
  * @tags: [requires_sharding]
  */
 
-(function() {
-    'use strict';
+import {runAllRoleManagementCommandsTests} from "jstests/auth/role_management_commands_lib.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
-    load('jstests/auth/role_management_commands_lib.js');
-
-    // TODO: Remove 'shardAsReplicaSet: false' when SERVER-32672 is fixed.
-    var st = new ShardingTest({
-        shards: 2,
-        config: 3,
-        keyFile: 'jstests/libs/key1',
-        useHostname: false,
-        other: {shardAsReplicaSet: false}
-    });
-    runAllRoleManagementCommandsTests(st.s, {w: 'majority', wtimeout: 60 * 1000});
-    st.stop();
-})();
+var st = new ShardingTest({shards: 2, config: 3, keyFile: 'jstests/libs/key1', useHostname: false});
+runAllRoleManagementCommandsTests(st.s, {w: 'majority', wtimeout: 60 * 1000});
+st.stop();

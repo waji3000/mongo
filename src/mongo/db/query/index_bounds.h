@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,10 +29,12 @@
 
 #pragma once
 
+#include <cstddef>
 #include <string>
 #include <vector>
 
-#include "mongo/db/jsobj.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/db/query/interval.h"
 #include "mongo/db/storage/index_entry_comparison.h"
 
@@ -59,7 +60,11 @@ struct OrderedIntervalList {
     std::string name;
 
     bool isValidFor(int expectedOrientation) const;
-    std::string toString() const;
+    /**
+     * Generates a debug string for an interval. If 'hasNonSimpleCollation' is true, then string
+     * bounds are hex-encoded.
+     */
+    std::string toString(bool hasNonSimpleCollation) const;
 
     /**
      * Complements the OIL. Used by the index bounds builder in order
@@ -85,6 +90,34 @@ struct OrderedIntervalList {
     OrderedIntervalList reverseClone() const;
 
     Interval::Direction computeDirection() const;
+
+    /**
+     * Returns true if this OIL represents a single [MinKey, MaxKey] bound.
+     */
+    bool isMinToMax() const;
+
+    /**
+     * Returns true if this OIL represents a single [MaxKey, MinKey] bound.
+     */
+    bool isMaxToMin() const;
+
+    /**
+     * Returns true if this OIL represents a point predicate: [N, N].
+     *
+     * These predicates are interesting because if you have an index on {a:1, b:1},
+     * and a point predicate on 'a', then the index provides a sort on {b: 1}.
+     */
+    bool isPoint() const;
+
+    /**
+     * Returns true if this OIL contains only point intervals (such as [N, N]).
+     */
+    bool containsOnlyPointIntervals() const;
+
+    /**
+     * Returns true is this OIL overlaps the type bracket containing objects.
+     */
+    bool boundsOverlapObjectTypeBracket() const;
 };
 
 /**
@@ -113,7 +146,11 @@ struct IndexBounds {
     std::string getFieldName(size_t i) const;
     size_t getNumIntervals(size_t i) const;
     Interval getInterval(size_t i, size_t j) const;
-    std::string toString() const;
+    /**
+     * Generates a debug string displaying the index bounds. If 'hasNonSimpleCollation' is true,
+     * then string bounds are hex-encoded.
+     */
+    std::string toString(bool hasNonSimpleCollation) const;
 
     bool operator==(const IndexBounds& other) const;
     bool operator!=(const IndexBounds& other) const;
@@ -150,8 +187,11 @@ struct IndexBounds {
      *
      * Ex.
      *  {a: ["[1, 1]", "(3, 10)"], b: ["[Infinity, 10)"] }
+     *
+     * If the index bounds are associated with a collation ('hasNonSimpleCollation'), then we will
+     * hex-encode the collation keys.
      */
-    BSONObj toBSON() const;
+    BSONObj toBSON(bool hasNonSimpleCollation) const;
 
     /**
      * Return a copy of the index bounds, but with each of the OILs going in the ascending
@@ -165,12 +205,22 @@ struct IndexBounds {
      */
     IndexBounds reverse() const;
 
+    /**
+     * Returns whether these index bounds represent being unbounded.
+     */
+    bool isUnbounded() const;
+
     // TODO: we use this for max/min scan.  Consider migrating that.
     bool isSimpleRange;
     BSONObj startKey;
     BSONObj endKey;
     BoundInclusion boundInclusion;
 };
+
+class IndexBoundsChecker;
+namespace sbe::size_estimator {
+size_t estimate(const IndexBoundsChecker&);
+}  // namespace sbe::size_estimator
 
 /**
  * A helper used by IndexScan to navigate an index.
@@ -238,6 +288,19 @@ public:
     KeyState checkKey(const BSONObj& currentKey, IndexSeekPoint* query);
 
     /**
+     * The function is same as above `checkKey` plus returning the end key position when the last
+     * field of the index is a range interval.
+     *
+     * The end key will be set to empty if KeyState is not VALID or the last field is not a range
+     * interval.
+     */
+    KeyState checkKeyWithEndPosition(const BSONObj& currentKey,
+                                     IndexSeekPoint* query,
+                                     key_string::Builder& endKey,
+                                     Ordering ord,
+                                     bool forward);
+
+    /**
      * Relative position of a key to an interval.
      * Exposed for testing only.
      */
@@ -262,7 +325,7 @@ public:
      */
     static Location findIntervalForField(const BSONElement& elt,
                                          const OrderedIntervalList& oil,
-                                         const int expectedDirection,
+                                         int expectedDirection,
                                          size_t* newIntervalIndex);
 
 private:
@@ -295,6 +358,10 @@ private:
 
     // Direction of scan * direction of indexing.
     std::vector<int> _expectedDirection;
+
+    std::vector<BSONElement> _keyValues;
+
+    friend size_t sbe::size_estimator::estimate(const IndexBoundsChecker&);
 };
 
 }  // namespace mongo

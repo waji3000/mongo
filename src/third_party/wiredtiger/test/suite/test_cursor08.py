@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Public Domain 2014-2018 MongoDB, Inc.
+# Public Domain 2014-present MongoDB, Inc.
 # Public Domain 2008-2014 WiredTiger, Inc.
 #
 # This is free and unencumbered software released into the public domain.
@@ -30,9 +30,7 @@
 # Log cursors with compression
 #
 
-import fnmatch, os, shutil, run, time
 from suite_subprocess import suite_subprocess
-from wiredtiger import stat, WiredTigerError
 from wtscenario import make_scenarios
 import wttest
 
@@ -55,8 +53,8 @@ class test_cursor08(wttest.WiredTigerTestCase, suite_subprocess):
     scenarios = make_scenarios(reopens, compress)
     # Load the compression extension, and enable it for logging.
     def conn_config(self):
-        return 'log=(archive=false,enabled,file_max=%s,' % self.logmax + \
-            'compressor=%s),' % self.compress + \
+        return 'log=(enabled,file_max=%s,' % self.logmax + \
+            'compressor=%s,remove=false),' % self.compress + \
             'transaction_sync="(method=dsync,enabled)"'
 
     def conn_extensions(self, extlist):
@@ -70,7 +68,7 @@ class test_cursor08(wttest.WiredTigerTestCase, suite_subprocess):
         c = self.session.open_cursor(self.uri, None)
 
         # A binary value.
-        value = u'\u0001\u0002abcd\u0003\u0004'
+        value = '\u0001\u0002abcd\u0003\u0004'
 
         self.session.begin_transaction()
         for k in range(self.nkeys):
@@ -89,13 +87,10 @@ class test_cursor08(wttest.WiredTigerTestCase, suite_subprocess):
             keys = c.get_key()
             # txnid, rectype, optype, fileid, logrec_key, logrec_value
             values = c.get_value()
-            try:
-                if value in str(values[5]):   # logrec_value
+            # We are only looking for log records that have a key/value
+            # pair.
+            if values[4] != b'':
+                if value.encode() in values[5]:     # logrec_value
                     count += 1
-            except:
-                pass
         c.close()
         self.assertEqual(count, self.nkeys)
-
-if __name__ == '__main__':
-    wttest.run()

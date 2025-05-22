@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,310 +27,635 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <boost/cstdint.hpp>
+#include <boost/optional.hpp>
+#include <boost/smart_ptr.hpp>
+#include <iterator>
+#include <list>
+#include <tuple>
 
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/db/commands/test_commands_enabled.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/document_metadata_fields.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/exec/document_value/value_comparator.h"
+#include "mongo/db/pipeline/document_source_limit.h"
 #include "mongo/db/pipeline/document_source_sort.h"
-
-#include "mongo/db/jsobj.h"
-#include "mongo/db/pipeline/document.h"
-#include "mongo/db/pipeline/document_path_support.h"
-#include "mongo/db/pipeline/document_source_skip.h"
-#include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/field_path.h"
 #include "mongo/db/pipeline/lite_parsed_document_source.h"
-#include "mongo/db/pipeline/value.h"
-#include "mongo/db/query/collation/collation_index_key.h"
-#include "mongo/s/query/document_source_merge_cursors.h"
+#include "mongo/db/pipeline/skip_and_limit.h"
+#include "mongo/db/query/allowed_contexts.h"
+#include "mongo/db/query/explain_options.h"
+#include "mongo/db/query/query_knobs_gen.h"
+#include "mongo/db/query/query_shape/serialization_options.h"
+#include "mongo/db/sorter/sorter_template_defs.h"
+#include "mongo/platform/compiler.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/intrusive_counter.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
-using boost::intrusive_ptr;
-using std::make_pair;
-using std::string;
-using std::unique_ptr;
-using std::vector;
-
 namespace {
+struct BoundMakerMin {
+    const long long offset;  // Offset in millis
 
-Value missingToNull(Value maybeMissing) {
-    return maybeMissing.missing() ? Value(BSONNULL) : maybeMissing;
+    DocumentSourceSort::SortableDate operator()(DocumentSourceSort::SortableDate key,
+                                                const Document& doc) const {
+        return {Date_t::fromMillisSinceEpoch(
+            doc.metadata().getTimeseriesBucketMinTime().toMillisSinceEpoch() + offset)};
+    }
+
+    Document serialize(const SerializationOptions& opts) const {
+        // Convert from millis to seconds.
+        return Document{{{"base"_sd, DocumentSourceSort::kMin},
+                         {DocumentSourceSort::kOffset, opts.serializeLiteral(offset / 1000)}}};
+    }
+};
+
+struct BoundMakerMax {
+    const long long offset;
+
+    DocumentSourceSort::SortableDate operator()(DocumentSourceSort::SortableDate key,
+                                                const Document& doc) const {
+        return {Date_t::fromMillisSinceEpoch(
+            doc.metadata().getTimeseriesBucketMaxTime().toMillisSinceEpoch() + offset)};
+    }
+
+    Document serialize(const SerializationOptions& opts) const {
+        // Convert from millis to seconds.
+        return Document{{{"base"_sd, DocumentSourceSort::kMax},
+                         {DocumentSourceSort::kOffset, opts.serializeLiteral(offset / 1000)}}};
+    }
+};
+struct CompAsc {
+    int operator()(DocumentSourceSort::SortableDate x, DocumentSourceSort::SortableDate y) const {
+        // compare(x, y) op 0 means x op y, for any comparator 'op'.
+        if (x.date.toMillisSinceEpoch() < y.date.toMillisSinceEpoch())
+            return -1;
+        if (x.date.toMillisSinceEpoch() > y.date.toMillisSinceEpoch())
+            return 1;
+        return 0;
+    }
+};
+struct CompDesc {
+    int operator()(DocumentSourceSort::SortableDate x, DocumentSourceSort::SortableDate y) const {
+        // compare(x, y) op 0 means x op y, for any comparator 'op'.
+        if (x.date.toMillisSinceEpoch() > y.date.toMillisSinceEpoch())
+            return -1;
+        if (x.date.toMillisSinceEpoch() < y.date.toMillisSinceEpoch())
+            return 1;
+        return 0;
+    }
+};
+
+[[noreturn]] void throwCannotHandleControlEvent() {
+    tasserted(10358905, "Sort does not support control events");
 }
 
-/**
- * Converts a Value representing an in-memory sort key to a BSONObj representing a serialized sort
- * key. If 'sortPatternSize' is 1, returns a BSON object with 'value' as it's only value - and an
- * empty field name. Otherwise asserts that 'value' is an array of length 'sortPatternSize', and
- * returns a BSONObj with one field for each value in the array, each field using the empty field
- * name.
- */
-BSONObj serializeSortKey(size_t sortPatternSize, Value value) {
-    // Missing values don't serialize correctly in this format, so use nulls instead, since they are
-    // considered equivalent with woCompare().
-    if (sortPatternSize == 1) {
-        return BSON("" << missingToNull(value));
-    }
-    invariant(value.isArray());
-    invariant(value.getArrayLength() == sortPatternSize);
-    BSONObjBuilder bb;
-    for (auto&& val : value.getArray()) {
-        bb << "" << missingToNull(val);
-    }
-    return bb.obj();
-}
-
-/**
- * Converts a BSONObj representing a serialized sort key into a Value, which we use for in-memory
- * comparisons. BSONObj {'': 1, '': [2, 3]} becomes Value [1, [2, 3]].
- */
-Value deserializeSortKey(size_t sortPatternSize, BSONObj bsonSortKey) {
-    vector<Value> keys;
-    keys.reserve(sortPatternSize);
-    for (auto&& elt : bsonSortKey) {
-        keys.push_back(Value{elt});
-    }
-    invariant(keys.size() == sortPatternSize);
-    if (sortPatternSize == 1) {
-        // As a special case for a sort on a single field, we do not put the keys into an array.
-        return keys[0];
-    }
-    return Value{std::move(keys)};
-}
-
-/**
- * Generates a new file name on each call using a static, atomic and monotonically increasing
- * number.
- *
- * Each user of the Sorter must implement this function to ensure that all temporary files that the
- * Sorter instances produce are uniquely identified using a unique file name extension with separate
- * atomic variable. This is necessary because the sorter.cpp code is separately included in multiple
- * places, rather than compiled in one place and linked, and so cannot provide a globally unique ID.
- */
-std::string nextFileName() {
-    static AtomicUInt32 documentSourceSortFileCounter;
-    return "extsort-doc-source-sort." +
-        std::to_string(documentSourceSortFileCounter.fetchAndAdd(1));
-}
-
+using TimeSorterAscMin =
+    BoundedSorter<DocumentSourceSort::SortableDate, Document, CompAsc, BoundMakerMin>;
+using TimeSorterAscMax =
+    BoundedSorter<DocumentSourceSort::SortableDate, Document, CompAsc, BoundMakerMax>;
+using TimeSorterDescMin =
+    BoundedSorter<DocumentSourceSort::SortableDate, Document, CompDesc, BoundMakerMin>;
+using TimeSorterDescMax =
+    BoundedSorter<DocumentSourceSort::SortableDate, Document, CompDesc, BoundMakerMax>;
 }  // namespace
 
-constexpr StringData DocumentSourceSort::kStageName;
+const DocumentSourceSort::SortStageOptions DocumentSourceSort::kDefaultOptions = {};
 
-DocumentSourceSort::DocumentSourceSort(const intrusive_ptr<ExpressionContext>& pExpCtx)
-    : DocumentSource(pExpCtx) {}
+DocumentSourceSort::DocumentSourceSort(const boost::intrusive_ptr<ExpressionContext>& pExpCtx,
+                                       const SortPattern& sortOrder,
+                                       DocumentSourceSort::SortStageOptions options)
+    : DocumentSource(kStageName, pExpCtx),
+      _sortExecutor({sortOrder,
+                     options.limit,
+                     options.maxMemoryUsageBytes.value_or(
+                         internalQueryMaxBlockingSortMemoryUsageBytes.load()),
+                     pExpCtx->getTempDir(),
+                     pExpCtx->getAllowDiskUse()}),
+      // The SortKeyGenerator expects the expressions to be serialized in order to detect a sort
+      // by a metadata field.
+      _sortKeyGen({sortOrder, pExpCtx->getCollator()}),
+      _outputSortKeyMetadata(options.outputSortKeyMetadata) {
+    uassert(15976,
+            "$sort stage must have at least one sort key",
+            !_sortExecutor->sortPattern().empty());
+}
 
 REGISTER_DOCUMENT_SOURCE(sort,
                          LiteParsedDocumentSourceDefault::parse,
-                         DocumentSourceSort::createFromBson);
+                         DocumentSourceSort::createFromBson,
+                         AllowedWithApiStrict::kAlways);
 
-DocumentSource::GetNextResult DocumentSourceSort::getNext() {
-    pExpCtx->checkForInterrupt();
+ALLOCATE_DOCUMENT_SOURCE_ID(sort, DocumentSourceSort::id)
+
+REGISTER_DOCUMENT_SOURCE_CONDITIONALLY(_internalBoundedSort,
+                                       LiteParsedDocumentSourceDefault::parse,
+                                       DocumentSourceSort::parseBoundedSort,
+                                       ::mongo::getTestCommandsEnabled()
+                                           ? AllowedWithApiStrict::kNeverInVersion1
+                                           : AllowedWithApiStrict::kInternal,
+                                       ::mongo::getTestCommandsEnabled()
+                                           ? AllowedWithClientType::kAny
+                                           : AllowedWithClientType::kInternal,
+                                       nullptr,  // featureFlag
+                                       true);
+
+DocumentSource::GetNextResult::ReturnStatus DocumentSourceSort::timeSorterPeek() {
+    if (_timeSorterNextDoc) {
+        return GetNextResult::ReturnStatus::kAdvanced;
+    }
+    if (_timeSorterInputEOF) {
+        return GetNextResult::ReturnStatus::kEOF;
+    }
+
+    auto next = pSource->getNext();
+    auto status = next.getStatus();
+    switch (status) {
+        case GetNextResult::ReturnStatus::kAdvanced: {
+            _timeSorterNextDoc = next.getDocument();
+            return status;
+        }
+        case GetNextResult::ReturnStatus::kAdvancedControlDocument: {
+            throwCannotHandleControlEvent();
+        }
+        case GetNextResult::ReturnStatus::kEOF:
+            _timeSorterInputEOF = true;
+            return status;
+        case GetNextResult::ReturnStatus::kPauseExecution:
+            return status;
+    }
+    MONGO_UNREACHABLE_TASSERT(6434800);
+}
+
+Document DocumentSourceSort::timeSorterGetNext() {
+    tassert(6434801,
+            "timeSorterGetNext() is only valid after timeSorterPeek() returns isAdvanced()",
+            _timeSorterNextDoc);
+    auto result = std::move(*_timeSorterNextDoc);
+    _timeSorterNextDoc.reset();
+    return result;
+}
+
+DocumentSource::GetNextResult::ReturnStatus DocumentSourceSort::timeSorterPeekSamePartition() {
+    auto status = timeSorterPeek();
+    switch (status) {
+        case GetNextResult::ReturnStatus::kEOF:
+        case GetNextResult::ReturnStatus::kPauseExecution:
+            return status;
+        case GetNextResult::ReturnStatus::kAdvanced:
+            break;
+        case GetNextResult::ReturnStatus::kAdvancedControlDocument: {
+            throwCannotHandleControlEvent();
+        }
+    }
+
+    if (!_timeSorterPartitionKeyGen) {
+        // No partition key means everything is in the same partition.
+        return GetNextResult::ReturnStatus::kAdvanced;
+    } else {
+        auto prevPartition = std::move(_timeSorterCurrentPartition);
+        _timeSorterCurrentPartition =
+            _timeSorterPartitionKeyGen->computeSortKeyFromDocument(*_timeSorterNextDoc);
+
+        if (!prevPartition) {
+            // No previous partition means there is no constraint.
+            return GetNextResult::ReturnStatus::kAdvanced;
+        } else if (pExpCtx->getValueComparator().evaluate(*_timeSorterCurrentPartition ==
+                                                          *prevPartition)) {
+            // Next is in the same partition.
+            return GetNextResult::ReturnStatus::kAdvanced;
+        } else {
+            // Next is in a new partition: pretend we don't have a next document.
+            return GetNextResult::ReturnStatus::kEOF;
+        }
+    }
+}
+
+DocumentSource::GetNextResult DocumentSourceSort::doGetNext() {
+    if (_timeSorter) {
+        // If the _timeSorter is exhausted but we have more input, it must be because we just
+        // finished a partition. Restart the _timeSorter to make it ready for the next partition.
+        if (_timeSorter->getState() == TimeSorterInterface::State::kDone &&
+            timeSorterPeek() == GetNextResult::ReturnStatus::kAdvanced) {
+            updateTimeSorterStats();
+            _timeSorter->restart();
+            _timeSorterCurrentPartition.reset();
+        }
+
+        // Only pull input as necessary to get _timeSorter to have a result.
+        while (_timeSorter->getState() == TimeSorterInterface::State::kWait) {
+            auto status = timeSorterPeekSamePartition();
+            switch (status) {
+                case GetNextResult::ReturnStatus::kPauseExecution: {
+                    return GetNextResult::makePauseExecution();
+                }
+                case GetNextResult::ReturnStatus::kEOF: {
+                    // We've reached the end of the current partition. Tell _timeSorter there will
+                    // be no more input. In response, its state will never be kWait again unless we
+                    // restart it, so we can proceed to drain all the documents currently held by
+                    // the sorter.
+                    _timeSorter->done();
+                    tassert(
+                        6434802,
+                        "DocumentSourceSort::_timeSorter waiting for input that will not arrive",
+                        _timeSorter->getState() != TimeSorterInterface::State::kWait);
+                    continue;
+                }
+                case GetNextResult::ReturnStatus::kAdvanced: {
+                    auto [time, doc] = extractTime(timeSorterGetNext());
+
+                    _timeSorter->add({time}, doc);
+                    continue;
+                }
+                case GetNextResult::ReturnStatus::kAdvancedControlDocument: {
+                    throwCannotHandleControlEvent();
+                }
+            }
+        }
+
+        if (_timeSorter->getState() == TimeSorterInterface::State::kDone) {
+            updateTimeSorterStats();
+            return GetNextResult::makeEOF();
+        }
+
+        return _timeSorter->next().second;
+    }
 
     if (!_populated) {
-        const auto populationResult = populate();
+        auto populationResult = populate();
+        if (MONGO_unlikely(populationResult.isAdvancedControlDocument())) {
+            throwCannotHandleControlEvent();
+        }
         if (populationResult.isPaused()) {
             return populationResult;
         }
         invariant(populationResult.isEOF());
     }
 
-    if (!_output || !_output->more()) {
-        dispose();
+    if (!_sortExecutor->hasNext()) {
         return GetNextResult::makeEOF();
     }
 
-    return _output->next().second;
+    return GetNextResult{_sortExecutor->getNext().second};
 }
 
-void DocumentSourceSort::serializeToArray(
-    std::vector<Value>& array, boost::optional<ExplainOptions::Verbosity> explain) const {
-    if (explain) {  // always one Value for combined $sort + $limit
-        array.push_back(
-            Value(DOC(kStageName << DOC(
-                          "sortKey" << sortKeyPattern(SortKeySerialization::kForExplain) << "limit"
-                                    << (_limitSrc ? Value(_limitSrc->getLimit()) : Value())))));
-    } else {  // one Value for $sort and maybe a Value for $limit
-        MutableDocument inner(sortKeyPattern(SortKeySerialization::kForPipelineSerialization));
-        array.push_back(Value(DOC(kStageName << inner.freeze())));
+void DocumentSourceSort::serializeForBoundedSort(std::vector<Value>& array,
+                                                 const SerializationOptions& opts) const {
+    tassert(9028700, "_timeSorter is nullptr", _timeSorter);
+    tassert(
+        6369900, "$_internalBoundedSort should not absorb a $limit", !_sortExecutor->hasLimit());
 
-        if (_limitSrc) {
-            _limitSrc->serializeToArray(array);
+    // {$_internalBoundedSort: {sortKey, bound}}
+    auto sortKey = _sortExecutor->sortPattern().serialize(
+        SortPattern::SortKeySerialization::kForPipelineSerialization, opts);
+
+    MutableDocument mutDoc{Document{{
+        {"$_internalBoundedSort"_sd,
+         Document{
+             {{"sortKey"_sd, std::move(sortKey)},
+              {"bound"_sd, _timeSorter->serializeBound(opts)},
+              {"limit"_sd, opts.serializeLiteral(static_cast<long long>(_timeSorter->limit()))}}}},
+    }}};
+
+    if (opts.verbosity >= ExplainOptions::Verbosity::kExecStats) {
+        mutDoc["totalDataSizeSortedBytesEstimate"] =
+            opts.serializeLiteral(static_cast<long long>(_timeSorter->stats().bytesSorted()));
+        mutDoc["usedDisk"] = opts.serializeLiteral(_timeSorter->stats().spilledRanges() > 0);
+        mutDoc["spills"] =
+            opts.serializeLiteral(static_cast<long long>(_timeSorter->stats().spilledRanges()));
+        mutDoc["spilledDataStorageSize"] =
+            opts.serializeLiteral(static_cast<long long>(_sortExecutor->spilledDataStorageSize()));
+    }
+
+    array.push_back(Value{mutDoc.freeze()});
+}
+
+void DocumentSourceSort::serializeForCloning(std::vector<Value>& array,
+                                             const SerializationOptions& opts) const {
+    MutableDocument mutDoc(_sortExecutor->sortPattern().serialize(
+        SortPattern::SortKeySerialization::kForPipelineSerialization, opts));
+    if (_sortExecutor->hasLimit()) {
+        mutDoc[kInternalLimit] =
+            opts.serializeLiteral(static_cast<long long>(_sortExecutor->getLimit()));
+    }
+    if (_outputSortKeyMetadata) {
+        mutDoc[kInternalOutputSortKey] = Value(_outputSortKeyMetadata);
+    }
+    array.push_back(Value(DOC(kStageName << mutDoc.freeze())));
+}
+
+void DocumentSourceSort::serializeWithVerbosity(std::vector<Value>& array,
+                                                const SerializationOptions& opts) const {
+    tassert(9028701, "SerializationOptions do not specify verbosity", opts.verbosity);
+
+    uint64_t limit = _sortExecutor->getLimit();
+    MutableDocument mutDoc(
+        DOC(kStageName << DOC(
+                "sortKey"
+                << _sortExecutor->sortPattern().serialize(
+                       SortPattern::SortKeySerialization::kForExplain, opts)
+                // Only output 'limit' and 'outputSortKeyMetadata' if they're true, mostly to
+                // preserve conciseness for the simple cases without loss of information. It
+                // also prevents the need to update some tests and potentially saves some
+                // downstream changes work if there are similar tests elsewhere.
+                << "limit"
+                << (_sortExecutor->hasLimit() ? opts.serializeLiteral(static_cast<long long>(limit))
+                                              : Value())
+                << "outputSortKeyMetadata" << (_outputSortKeyMetadata ? Value(true) : Value()))));
+
+    if (opts.verbosity >= ExplainOptions::Verbosity::kExecStats) {
+        auto& stats = _sortExecutor->stats();
+
+        mutDoc["totalDataSizeSortedBytesEstimate"] =
+            opts.serializeLiteral(static_cast<long long>(stats.totalDataSizeBytes));
+        mutDoc["usedDisk"] = opts.serializeLiteral(stats.spillingStats.getSpills() > 0);
+        mutDoc["spills"] =
+            opts.serializeLiteral(static_cast<long long>(stats.spillingStats.getSpills()));
+        mutDoc["spilledDataStorageSize"] =
+            opts.serializeLiteral(static_cast<long long>(_sortExecutor->spilledDataStorageSize()));
+    }
+    array.push_back(Value(mutDoc.freeze()));
+}
+
+void DocumentSourceSort::serializeToArray(std::vector<Value>& array,
+                                          const SerializationOptions& opts) const {
+    if (_timeSorter) {
+        serializeForBoundedSort(array, opts);
+    } else if (opts.isSerializingForExplain()) {
+        serializeWithVerbosity(array, opts);
+    } else if (opts.serializeForCloning) {
+        serializeForCloning(array, opts);
+    } else {
+        MutableDocument mutDoc(_sortExecutor->sortPattern().serialize(
+            SortPattern::SortKeySerialization::kForPipelineSerialization, opts));
+        if (_outputSortKeyMetadata) {
+            mutDoc[kInternalOutputSortKey] = Value(_outputSortKeyMetadata);
+        }
+        array.push_back(Value(DOC(kStageName << mutDoc.freeze())));
+        if (_sortExecutor->hasLimit()) {
+            auto limitSrc = DocumentSourceLimit::create(pExpCtx, _sortExecutor->getLimit());
+            limitSrc->serializeToArray(array, opts);
         }
     }
 }
 
-void DocumentSourceSort::doDispose() {
-    _output.reset();
-}
-
-long long DocumentSourceSort::getLimit() const {
-    return _limitSrc ? _limitSrc->getLimit() : -1;
-}
-
-Document DocumentSourceSort::sortKeyPattern(SortKeySerialization serializationMode) const {
-    MutableDocument keyObj;
-    const size_t n = _sortPattern.size();
-    for (size_t i = 0; i < n; ++i) {
-        if (_sortPattern[i].fieldPath) {
-            // Append a named integer based on whether the sort is ascending/descending.
-            keyObj.setField(_sortPattern[i].fieldPath->fullPath(),
-                            Value(_sortPattern[i].isAscending ? 1 : -1));
-        } else {
-            // Sorting by an expression, use a made up field name.
-            auto computedFieldName = string(str::stream() << "$computed" << i);
-            switch (serializationMode) {
-                case SortKeySerialization::kForExplain:
-                case SortKeySerialization::kForPipelineSerialization: {
-                    const bool isExplain = (serializationMode == SortKeySerialization::kForExplain);
-                    keyObj[computedFieldName] = _sortPattern[i].expression->serialize(isExplain);
-                    break;
-                }
-                case SortKeySerialization::kForSortKeyMerging: {
-                    // We need to be able to tell which direction the sort is. Expression sorts are
-                    // always descending.
-                    keyObj[computedFieldName] = Value(-1);
-                    break;
-                }
-            }
-        }
-    }
-    return keyObj.freeze();
+boost::optional<long long> DocumentSourceSort::getLimit() const {
+    return _sortExecutor->hasLimit() ? boost::optional<long long>{_sortExecutor->getLimit()}
+                                     : boost::none;
 }
 
 Pipeline::SourceContainer::iterator DocumentSourceSort::doOptimizeAt(
     Pipeline::SourceContainer::iterator itr, Pipeline::SourceContainer* container) {
     invariant(*itr == this);
 
-    auto sortItr = std::next(itr);
-    long long skipSum = 0;
-    while (sortItr != container->end()) {
-        auto nextStage = (*sortItr).get();
-
-        if (auto nextSkip = dynamic_cast<DocumentSourceSkip*>(nextStage)) {
-            skipSum += nextSkip->getSkip();
-            ++sortItr;
-        } else if (auto nextLimit = dynamic_cast<DocumentSourceLimit*>(nextStage)) {
-            nextLimit->setLimit(nextLimit->getLimit() + skipSum);
-            setLimitSrc(nextLimit);
-            container->erase(sortItr);
-            sortItr = std::next(itr);
-            skipSum = 0;
-        } else if (!nextStage->constraints().canSwapWithLimitAndSample) {
-            return std::next(itr);
-        } else {
-            ++sortItr;
-        }
+    if (_timeSorter) {
+        // Do not absorb a limit, or combine with other sort stages.
+        return std::next(itr);
     }
 
-    return std::next(itr);
+    auto stageItr = std::next(itr);
+    auto limit = extractLimitForPushdown(stageItr, container);
+    if (limit)
+        _sortExecutor->setLimit(*limit);
+
+    auto nextStage = std::next(itr);
+    if (nextStage == container->end()) {
+        return container->end();
+    }
+
+    limit = getLimit();
+
+    // Since $sort is not guaranteed to be stable, we can blindly remove the first $sort only when
+    // there's no limit on the current sort.
+    if (auto nextSort = dynamic_cast<DocumentSourceSort*>((*nextStage).get())) {
+        // Ensure that we don't accidentally erase the request to output the sort key metadata.
+        nextSort->_outputSortKeyMetadata |= _outputSortKeyMetadata;
+        if (!limit) {
+            container->erase(itr);
+            return nextStage;
+        } else {
+            // If there's a limit between two adjacent sorts with the same key pattern it's safe to
+            // merge the two sorts and take the minimum of the limits.
+            if (dynamic_cast<DocumentSourceSort*>((*itr).get())->getSortKeyPattern() ==
+                nextSort->getSortKeyPattern()) {
+                // When coalescing subsequent $sort stages, the existing/lower limit is retained in
+                // 'setLimit'.
+                nextSort->_sortExecutor->setLimit(*limit);
+                container->erase(itr);
+            }
+        }
+    }
+    return nextStage;
 }
 
 DepsTracker::State DocumentSourceSort::getDependencies(DepsTracker* deps) const {
-    for (auto&& keyPart : _sortPattern) {
-        if (keyPart.expression) {
-            keyPart.expression->addDependencies(deps);
-        } else {
-            deps->fields.insert(keyPart.fieldPath->fullPath());
-        }
-    }
-    if (pExpCtx->needsMerge) {
-        // Include the sort key if we will merge several sorted streams later.
-        deps->setNeedsMetadata(DepsTracker::MetadataType::SORT_KEY, true);
+    _sortExecutor->sortPattern().addDependencies(deps);
+
+    if (_requiredMetadata.any()) {
+        deps->setNeedsMetadata(_requiredMetadata);
     }
 
     return DepsTracker::State::SEE_NEXT;
 }
 
-
-intrusive_ptr<DocumentSource> DocumentSourceSort::createFromBson(
-    BSONElement elem, const intrusive_ptr<ExpressionContext>& pExpCtx) {
-    uassert(15973, "the $sort key specification must be an object", elem.type() == Object);
-    return create(pExpCtx, elem.embeddedObject());
+void DocumentSourceSort::addVariableRefs(std::set<Variables::Id>* refs) const {
+    // It's impossible for $sort or the find command's sort to refer to a variable.
 }
 
-intrusive_ptr<DocumentSourceSort> DocumentSourceSort::create(
-    const intrusive_ptr<ExpressionContext>& pExpCtx,
-    BSONObj sortOrder,
-    long long limit,
-    boost::optional<uint64_t> maxMemoryUsageBytes) {
-    intrusive_ptr<DocumentSourceSort> pSort(new DocumentSourceSort(pExpCtx));
-    pSort->_maxMemoryUsageBytes = maxMemoryUsageBytes
-        ? *maxMemoryUsageBytes
-        : internalDocumentSourceSortMaxBlockingSortBytes.load();
-    pSort->_rawSort = sortOrder.getOwned();
+boost::intrusive_ptr<DocumentSource> DocumentSourceSort::createFromBson(
+    BSONElement spec, const boost::intrusive_ptr<ExpressionContext>& pExpCtx) {
+    uassert(15973, "the $sort key specification must be an object", spec.type() == Object);
 
-    for (auto&& keyField : sortOrder) {
-        auto fieldName = keyField.fieldNameStringData();
+    auto specObj = spec.Obj();
+    // Reconstruct the sort order without these internal fields.
+    BSONObjBuilder sortOrder;
 
-        SortPatternPart patternPart;
-
-        if (keyField.type() == Object) {
-            BSONObj metaDoc = keyField.Obj();
-            // this restriction is due to needing to figure out sort direction
-            uassert(17312,
-                    "$meta is the only expression supported by $sort right now",
-                    metaDoc.firstElement().fieldNameStringData() == "$meta");
-
-            uassert(ErrorCodes::FailedToParse,
-                    "Cannot have additional keys in a $meta sort specification",
-                    metaDoc.nFields() == 1);
-
-            VariablesParseState vps = pExpCtx->variablesParseState;
-            patternPart.expression = ExpressionMeta::parse(pExpCtx, metaDoc.firstElement(), vps);
-
-            // If sorting by textScore, sort highest scores first. If sorting by randVal, order
-            // doesn't matter, so just always use descending.
-            patternPart.isAscending = false;
-
-            pSort->_sortPattern.push_back(std::move(patternPart));
-            continue;
+    auto options = kDefaultOptions;
+    for (auto&& elem : specObj) {
+        if (elem.fieldNameStringData() == kInternalLimit) {
+            const auto limitStatus = elem.parseIntegerElementToNonNegativeLong();
+            uassert(9028702,
+                    str::stream() << "invalid $_internalLimit value: "
+                                  << limitStatus.getStatus().reason(),
+                    limitStatus.isOK());
+            options.limit = limitStatus.getValue();
+        } else if (elem.fieldNameStringData() == kInternalOutputSortKey) {
+            options.outputSortKeyMetadata = elem.Bool();
+        } else {
+            sortOrder.append(elem);
         }
-
-        uassert(15974,
-                "$sort key ordering must be specified using a number or {$meta: 'textScore'}",
-                keyField.isNumber());
-
-        int sortOrder = keyField.numberInt();
-
-        uassert(15975,
-                "$sort key ordering must be 1 (for ascending) or -1 (for descending)",
-                ((sortOrder == 1) || (sortOrder == -1)));
-
-        patternPart.fieldPath = FieldPath{fieldName};
-        patternPart.isAscending = (sortOrder > 0);
-        pSort->_paths.insert(patternPart.fieldPath->fullPath());
-        pSort->_sortPattern.push_back(std::move(patternPart));
     }
-
-    uassert(15976, "$sort stage must have at least one sort key", !pSort->_sortPattern.empty());
-
-    pSort->_sortKeyGen = SortKeyGenerator{
-        // The SortKeyGenerator expects the expressions to be serialized in order to detect a sort
-        // by a metadata field.
-        pSort->sortKeyPattern(SortKeySerialization::kForPipelineSerialization).toBson(),
-        pExpCtx->getCollator()};
-
-    if (limit > 0) {
-        pSort->setLimitSrc(DocumentSourceLimit::create(pExpCtx, limit));
-    }
-
-    return pSort;
+    return create(pExpCtx, {sortOrder.obj(), pExpCtx}, std::move(options));
 }
 
-SortOptions DocumentSourceSort::makeSortOptions() const {
-    /* make sure we've got a sort key */
-    verify(_sortPattern.size());
+boost::intrusive_ptr<DocumentSourceSort> DocumentSourceSort::create(
+    const boost::intrusive_ptr<ExpressionContext>& pExpCtx,
+    const SortPattern& sortOrder,
+    SortStageOptions options) {
+    return make_intrusive<DocumentSourceSort>(pExpCtx, sortOrder, std::move(options));
+}
+
+boost::intrusive_ptr<DocumentSourceSort> DocumentSourceSort::createBoundedSort(
+    SortPattern pat,
+    StringData boundBase,
+    long long boundOffset,
+    boost::optional<long long> limit,
+    const boost::intrusive_ptr<ExpressionContext>& expCtx) {
+
+    auto ds = DocumentSourceSort::create(expCtx, pat);
 
     SortOptions opts;
-    if (_limitSrc)
-        opts.limit = _limitSrc->getLimit();
-
-    opts.maxMemoryUsageBytes = _maxMemoryUsageBytes;
-    if (pExpCtx->allowDiskUse && !pExpCtx->inMongos) {
+    opts.maxMemoryUsageBytes = internalQueryMaxBlockingSortMemoryUsageBytes.load();
+    if (expCtx->getAllowDiskUse()) {
         opts.extSortAllowed = true;
-        opts.tempDir = pExpCtx->tempDir;
+        opts.tempDir = expCtx->getTempDir();
+        opts.sorterFileStats = ds->getSorterFileStats();
     }
 
-    return opts;
+    if (limit) {
+        opts.Limit(limit.value());
+    }
+
+    if (boundBase == kMin) {
+        if (pat.back().isAscending) {
+            ds->_timeSorter.reset(
+                new TimeSorterAscMin{opts, CompAsc{}, BoundMakerMin{boundOffset}});
+        } else {
+            ds->_timeSorter.reset(
+                new TimeSorterDescMin{opts, CompDesc{}, BoundMakerMin{boundOffset}});
+        }
+        ds->_requiredMetadata.set(DocumentMetadataFields::MetaType::kTimeseriesBucketMinTime);
+    } else if (boundBase == kMax) {
+        if (pat.back().isAscending) {
+            ds->_timeSorter.reset(
+                new TimeSorterAscMax{opts, CompAsc{}, BoundMakerMax{boundOffset}});
+        } else {
+            ds->_timeSorter.reset(
+                new TimeSorterDescMax{opts, CompDesc{}, BoundMakerMax{boundOffset}});
+        }
+        ds->_requiredMetadata.set(DocumentMetadataFields::MetaType::kTimeseriesBucketMaxTime);
+    } else {
+        MONGO_UNREACHABLE;
+    }
+
+    if (pat.size() > 1) {
+        SortPattern partitionKey =
+            std::vector<SortPattern::SortPatternPart>(pat.begin(), pat.end() - 1);
+        ds->_timeSorterPartitionKeyGen =
+            SortKeyGenerator{std::move(partitionKey), expCtx->getCollator()};
+    }
+
+    ds->_timeSorterStats = ds->_sortExecutor->stats();
+
+    return ds;
+}
+
+boost::intrusive_ptr<DocumentSourceSort> DocumentSourceSort::parseBoundedSort(
+    BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& expCtx) {
+    uassert(6369905,
+            "the $_internalBoundedSort key specification must be an object",
+            elem.type() == Object);
+    BSONObj args = elem.embeddedObject();
+
+    BSONElement key = args["sortKey"];
+    uassert(6369904, "$_internalBoundedSort sortKey must be an object", key.type() == Object);
+
+    // Empty sort pattern is not allowed for the bounded sort.
+    uassert(6900501,
+            "$_internalBoundedSort stage must have at least one sort key",
+            !key.embeddedObject().isEmpty());
+    SortPattern pat{key.embeddedObject(), expCtx};
+
+    {
+        const auto& timePart = pat.back();
+        uassert(6369901,
+                "$_internalBoundedSort doesn't support an expression in the time field (the last "
+                "component of sortKey)",
+                timePart.expression == nullptr);
+        uassert(6369907,
+                "$_internalBoundedSort doesn't support dotted field names in the time field (the "
+                "last component of sortKey)",
+                timePart.fieldPath->getPathLength() == 1);
+    }
+
+    BSONElement bound = args["bound"];
+    uassert(
+        6460200, "$_internalBoundedSort bound must be an object", bound && bound.type() == Object);
+
+    BSONElement boundOffsetElem = bound.Obj()[DocumentSourceSort::kOffset];
+    long long boundOffset = 0;
+    if (boundOffsetElem && boundOffsetElem.isNumber()) {
+        boundOffset = uassertStatusOK(boundOffsetElem.parseIntegerElementToLong()) *
+            1000;  // convert to millis
+    }
+
+    BSONElement boundBaseElem = bound.Obj()["base"];
+    uassert(6460201,
+            "$_internalBoundedSort bound.base must be a string",
+            boundBaseElem && boundBaseElem.type() == String);
+    StringData boundBase = boundBaseElem.valueStringData();
+    uassert(6460202,
+            str::stream() << "$_internalBoundedSort bound.base must be '" << kMin << "' or '"
+                          << kMax << "'",
+            boundBase == kMin || boundBase == kMax);
+
+    auto ds = DocumentSourceSort::create(expCtx, pat);
+
+    SortOptions opts;
+    opts.MaxMemoryUsageBytes(internalQueryMaxBlockingSortMemoryUsageBytes.load());
+    if (expCtx->getAllowDiskUse()) {
+        opts.ExtSortAllowed(true);
+        opts.TempDir(expCtx->getTempDir());
+        opts.FileStats(ds->getSorterFileStats());
+    }
+    if (BSONElement limitElem = args["limit"]) {
+        uassert(6588100,
+                "$_internalBoundedSort limit must be a non-negative number if specified",
+                limitElem.isNumber() && limitElem.numberLong() >= 0);
+        opts.Limit(limitElem.numberLong());
+    }
+
+    if (boundBase == kMin) {
+        if (pat.back().isAscending) {
+            ds->_timeSorter.reset(
+                new TimeSorterAscMin{opts, CompAsc{}, BoundMakerMin{boundOffset}});
+        } else {
+            ds->_timeSorter.reset(
+                new TimeSorterDescMin{opts, CompDesc{}, BoundMakerMin{boundOffset}});
+        }
+        ds->_requiredMetadata.set(DocumentMetadataFields::MetaType::kTimeseriesBucketMinTime);
+    } else if (boundBase == kMax) {
+        if (pat.back().isAscending) {
+            ds->_timeSorter.reset(
+                new TimeSorterAscMax{opts, CompAsc{}, BoundMakerMax{boundOffset}});
+        } else {
+            ds->_timeSorter.reset(
+                new TimeSorterDescMax{opts, CompDesc{}, BoundMakerMax{boundOffset}});
+        }
+        ds->_requiredMetadata.set(DocumentMetadataFields::MetaType::kTimeseriesBucketMaxTime);
+    } else {
+        MONGO_UNREACHABLE;
+    }
+
+    if (pat.size() > 1) {
+        SortPattern partitionKey =
+            std::vector<SortPattern::SortPatternPart>(pat.begin(), pat.end() - 1);
+        ds->_timeSorterPartitionKeyGen =
+            SortKeyGenerator{std::move(partitionKey), expCtx->getCollator()};
+    }
+
+    return ds;
 }
 
 DocumentSource::GetNextResult DocumentSourceSort::populate() {
@@ -347,9 +671,6 @@ DocumentSource::GetNextResult DocumentSourceSort::populate() {
 
 void DocumentSourceSort::loadDocument(Document&& doc) {
     invariant(!_populated);
-    if (!_sorter) {
-        _sorter.reset(MySorter::make(makeSortOptions(), Comparator(*this)));
-    }
 
     Value sortKey;
     Document docForSorter;
@@ -357,194 +678,106 @@ void DocumentSourceSort::loadDocument(Document&& doc) {
     // already computed the sort key we'd have split the pipeline there, would be merging presorted
     // documents, and wouldn't use this method.
     std::tie(sortKey, docForSorter) = extractSortKey(std::move(doc));
-    _sorter->add(sortKey, docForSorter);
+    _sortExecutor->add(sortKey, docForSorter);
 }
 
 void DocumentSourceSort::loadingDone() {
-    if (!_sorter) {
-        _sorter.reset(MySorter::make(makeSortOptions(), Comparator(*this)));
-    }
-    _output.reset(_sorter->done());
-    _usedDisk = _sorter->usedDisk() || _usedDisk;
-    _sorter.reset();
+    _sortExecutor->loadingDone();
     _populated = true;
 }
 
 bool DocumentSourceSort::usedDisk() {
-    return _usedDisk;
-}
-
-Value DocumentSourceSort::getCollationComparisonKey(const Value& val) const {
-    const auto collator = pExpCtx->getCollator();
-
-    // If the collation is the simple collation, the value itself is the comparison key.
-    if (!collator) {
-        return val;
-    }
-
-    // If 'val' is not a collatable type, there's no need to do any work.
-    if (!CollationIndexKey::isCollatableType(val.getType())) {
-        return val;
-    }
-
-    // If 'val' is a string, directly use the collator to obtain a comparison key.
-    if (val.getType() == BSONType::String) {
-        auto compKey = collator->getComparisonKey(val.getString());
-        return Value(compKey.getKeyData());
-    }
-
-    // Otherwise, for non-string collatable types, take the slow path and round-trip the value
-    // through BSON.
-    BSONObjBuilder input;
-    val.addToBsonObj(&input, ""_sd);
-
-    BSONObjBuilder output;
-    CollationIndexKey::collationAwareIndexKeyAppend(input.obj().firstElement(), collator, &output);
-    return Value(output.obj().firstElement());
-}
-
-StatusWith<Value> DocumentSourceSort::extractKeyPart(const Document& doc,
-                                                     const SortPatternPart& patternPart) const {
-    Value plainKey;
-    if (patternPart.fieldPath) {
-        invariant(!patternPart.expression);
-        auto key =
-            document_path_support::extractElementAlongNonArrayPath(doc, *patternPart.fieldPath);
-        if (!key.isOK()) {
-            return key;
-        }
-        plainKey = key.getValue();
-    } else {
-        invariant(patternPart.expression);
-        plainKey = patternPart.expression->evaluate(doc);
-    }
-
-    return getCollationComparisonKey(plainKey);
-}
-
-StatusWith<Value> DocumentSourceSort::extractKeyFast(const Document& doc) const {
-    if (_sortPattern.size() == 1u) {
-        return extractKeyPart(doc, _sortPattern[0]);
-    }
-
-    vector<Value> keys;
-    keys.reserve(_sortPattern.size());
-    for (auto&& keyPart : _sortPattern) {
-        auto extractedKey = extractKeyPart(doc, keyPart);
-        if (!extractedKey.isOK()) {
-            // We can't use the fast path, so bail out.
-            return extractedKey;
-        }
-
-        keys.push_back(std::move(extractedKey.getValue()));
-    }
-    return Value{std::move(keys)};
-}
-
-BSONObj DocumentSourceSort::extractKeyWithArray(const Document& doc) const {
-    SortKeyGenerator::Metadata metadata;
-    if (doc.hasTextScore()) {
-        metadata.textScore = doc.getTextScore();
-    }
-    if (doc.hasRandMetaField()) {
-        metadata.randVal = doc.getRandMetaField();
-    }
-
-    // Convert the Document to a BSONObj, but only do the conversion for the paths we actually need.
-    // Then run the result through the SortKeyGenerator to obtain the final sort key.
-    auto bsonDoc = document_path_support::documentToBsonWithPaths(doc, _paths);
-    return uassertStatusOK(_sortKeyGen->getSortKey(std::move(bsonDoc), &metadata));
+    return isBoundedSortStage() ? _timeSorter->stats().spilledRanges() > 0
+                                : _sortExecutor->wasDiskUsed();
 }
 
 std::pair<Value, Document> DocumentSourceSort::extractSortKey(Document&& doc) const {
-    boost::optional<BSONObj> serializedSortKey;  // Only populated if we need to merge with other
-                                                 // sorted results later. Serialized in the standard
-                                                 // BSON sort key format with empty field names,
-                                                 // e.g. {'': 1, '': [2, 3]}.
+    Value sortKey = _sortKeyGen->computeSortKeyFromDocument(doc);
 
-    Value inMemorySortKey;  // The Value we will use for comparisons within the sorter.
+    if (shouldSetSortKeyMetadata()) {
+        // If this sort stage is part of a merged pipeline, make sure that each Document's sort key
+        // gets saved with its metadata.
+        MutableDocument toBeSorted(std::move(doc));
+        toBeSorted.metadata().setSortKey(sortKey, _sortKeyGen->isSingleElementKey());
 
-    auto fastKey = extractKeyFast(doc);
-    if (fastKey.isOK()) {
-        inMemorySortKey = std::move(fastKey.getValue());
-        if (pExpCtx->needsMerge) {
-            serializedSortKey = serializeSortKey(_sortPattern.size(), inMemorySortKey);
-        }
+        return std::make_pair(std::move(sortKey), toBeSorted.freeze());
     } else {
-        // We have to do it the slow way - through the sort key generator. This will generate a BSON
-        // sort key, which is an object with empty field names. We then need to convert this BSON
-        // representation into the corresponding array of keys as a Value. BSONObj {'': 1, '': [2,
-        // 3]} becomes Value [1, [2, 3]].
-        serializedSortKey = extractKeyWithArray(doc);
-        inMemorySortKey = deserializeSortKey(_sortPattern.size(), *serializedSortKey);
+        return std::make_pair(std::move(sortKey), std::move(doc));
     }
-
-    MutableDocument toBeSorted(std::move(doc));
-    if (pExpCtx->needsMerge) {
-        // We need to be merged, so will have to be serialized. Save the sort key here to avoid
-        // re-computing it during the merge.
-        invariant(serializedSortKey);
-        toBeSorted.setSortKeyMetaField(*serializedSortKey);
-    }
-    return {inMemorySortKey, toBeSorted.freeze()};
 }
 
-int DocumentSourceSort::compare(const Value& lhs, const Value& rhs) const {
-    // DocumentSourceSort::populate() has already guaranteed that the sort key is non-empty.
-    // However, the tricky part is deciding what to do if none of the sort keys are present. In that
-    // case, consider the document "less".
-    //
-    // Note that 'comparator' must use binary comparisons here, as both 'lhs' and 'rhs' are
-    // collation comparison keys.
-    ValueComparator comparator;
-    const size_t n = _sortPattern.size();
-    if (n == 1) {  // simple fast case
-        if (_sortPattern[0].isAscending)
-            return comparator.compare(lhs, rhs);
-        else
-            return -comparator.compare(lhs, rhs);
+std::pair<Date_t, Document> DocumentSourceSort::extractTime(Document&& doc) const {
+    const auto& fullPath = _sortExecutor->sortPattern().back().fieldPath->fullPath();
+    auto time = doc.getField(StringData{fullPath});
+    uassert(6369909, "$_internalBoundedSort only handles Date values", time.getType() == Date);
+    auto date = time.getDate();
+
+    if (shouldSetSortKeyMetadata()) {
+        // If this sort stage is part of a merged pipeline, make sure that each Document's sort key
+        // gets saved with its metadata.
+        Value sortKey = _sortKeyGen->computeSortKeyFromDocument(doc);
+        MutableDocument toBeSorted(std::move(doc));
+        toBeSorted.metadata().setSortKey(sortKey, _sortKeyGen->isSingleElementKey());
+
+        return std::make_pair(date, toBeSorted.freeze());
     }
 
-    // compound sort
-    for (size_t i = 0; i < n; i++) {
-        int cmp = comparator.compare(lhs[i], rhs[i]);
-        if (cmp) {
-            /* if necessary, adjust the return value by the key ordering */
-            if (!_sortPattern[i].isAscending)
-                cmp = -cmp;
+    return std::make_pair(date, std::move(doc));
+}
 
-            return cmp;
-        }
+boost::optional<DocumentSource::DistributedPlanLogic> DocumentSourceSort::distributedPlanLogic() {
+    uassert(6369906,
+            "$_internalBoundedSort cannot be the first stage on the merger, because it requires "
+            "almost-sorted input, which the shardsPart of a pipeline can't provide",
+            !_timeSorter);
+
+    DistributedPlanLogic split;
+    split.shardsStage = this;
+    split.mergeSortPattern = _sortExecutor->sortPattern()
+                                 .serialize(SortPattern::SortKeySerialization::kForSortKeyMerging)
+                                 .toBson();
+    if (auto limit = getLimit()) {
+        split.mergingStages = {DocumentSourceLimit::create(pExpCtx, *limit)};
     }
-
-    /*
-      If we got here, everything matched (or didn't exist), so we'll
-      consider the documents equal for purposes of this sort.
-    */
-    return 0;
+    return split;
 }
 
-intrusive_ptr<DocumentSource> DocumentSourceSort::getShardSource() {
-    return this;
-}
-
-NeedsMergerDocumentSource::MergingLogic DocumentSourceSort::mergingLogic() {
-    return {_limitSrc ? DocumentSourceLimit::create(pExpCtx, _limitSrc->getLimit()) : nullptr,
-            sortKeyPattern(SortKeySerialization::kForSortKeyMerging).toBson()};
-}
-
-bool DocumentSourceSort::canRunInParallelBeforeOut(
-    const std::set<std::string>& nameOfShardKeyFieldsUponEntryToStage) const {
+bool DocumentSourceSort::canRunInParallelBeforeWriteStage(
+    const OrderedPathSet& nameOfShardKeyFieldsUponEntryToStage) const {
     // This is an interesting special case. If there are no further stages which require merging the
     // streams into one, a $sort should not require it. This is only the case because the sort order
-    // doesn't matter for a pipeline ending with a $out stage. We may encounter it here as an
+    // doesn't matter for a pipeline ending with a write stage. We may encounter it here as an
     // intermediate stage before a final $group with a $sort, which would make sense. Should we
     // extend our analysis to detect if an exchange is appropriate in a general pipeline, a $sort
     // would generally require merging the streams before producing output.
     return false;
 }
 
-}  // namespace mongo
+void DocumentSourceSort::doForceSpill() {
+    if (_sortExecutor) {
+        _sortExecutor->forceSpill();
+    }
+    if (_timeSorter) {
+        _timeSorter->forceSpill();
+    }
+}
 
-#include "mongo/db/sorter/sorter.cpp"
-// Explicit instantiation unneeded since we aren't exposing Sorter outside of this file.
+void DocumentSourceSort::updateTimeSorterStats() {
+    tassert(10321900,
+            "Called updateTimeSorterStats() on a non-bounded sort stage",
+            isBoundedSortStage());
+    _timeSorterStats.totalDataSizeBytes = _timeSorter->stats().bytesSorted();
+    _timeSorterStats.memoryUsageBytes = _timeSorter->stats().memUsage();
+    _timeSorterStats.keysSorted = _timeSorter->stats().numSorted();
+    auto sorterFileStats = getSorterFileStats();
+    if (sorterFileStats) {
+        _timeSorterStats.spillingStats.setSpills(_timeSorter->stats().spilledRanges());
+        _timeSorterStats.spillingStats.setSpilledRecords(
+            _timeSorter->stats().spilledKeyValuePairs());
+        _timeSorterStats.spillingStats.setSpilledBytes(sorterFileStats->bytesSpilledUncompressed());
+        _timeSorterStats.spillingStats.updateSpilledDataStorageSize(
+            sorterFileStats->bytesSpilled());
+    }
+}
+
+}  // namespace mongo

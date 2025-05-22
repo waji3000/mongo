@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -33,7 +32,7 @@
 #include <string>
 #include <vector>
 
-#include "mongo/db/jsobj.h"
+#include "mongo/bson/bsonobj.h"
 
 namespace mongo {
 
@@ -47,4 +46,4 @@ void censorArgsVector(std::vector<std::string>* args);
 void censorBSONObj(BSONObj* params);
 
 }  // namespace cmdline_utils
-}
+}  // namespace mongo

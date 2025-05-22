@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,24 +27,24 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
 
-#include "mongo/platform/basic.h"
+// IWYU pragma: no_include "cxxabi.h"
+#include <mutex>
+#include <utility>
 
-#include "mongo/db/repl/task_runner.h"
-
-#include <memory>
-
+#include "mongo/base/error_codes.h"
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/client.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/repl/task_runner.h"
 #include "mongo/db/service_context.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/concurrency/thread_name.h"
-#include "mongo/util/destructor_guard.h"
-#include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
+
 
 namespace mongo {
 namespace repl {
@@ -66,7 +65,9 @@ TaskRunner::NextAction runSingleTask(const TaskRunner::Task& task,
     try {
         return task(opCtx, status);
     } catch (...) {
-        log() << "Unhandled exception in task runner: " << redact(exceptionToStatus());
+        LOGV2(21777,
+              "Unhandled exception in task runner",
+              "error"_attr = redact(exceptionToStatus()));
     }
     return TaskRunner::NextAction::kCancel;
 }
@@ -75,7 +76,9 @@ TaskRunner::NextAction runSingleTask(const TaskRunner::Task& task,
 
 // static
 TaskRunner::Task TaskRunner::makeCancelTask() {
-    return [](OperationContext* opCtx, const Status& status) { return NextAction::kCancel; };
+    return [](OperationContext* opCtx, const Status& status) {
+        return NextAction::kCancel;
+    };
 }
 
 TaskRunner::TaskRunner(ThreadPool* threadPool)
@@ -84,7 +87,12 @@ TaskRunner::TaskRunner(ThreadPool* threadPool)
 }
 
 TaskRunner::~TaskRunner() {
-    DESTRUCTOR_GUARD(cancel(); join(););
+    try {
+        cancel();
+        join();
+    } catch (...) {
+        reportFailedDestructor(MONGO_SOURCE_LOCATION());
+    }
 }
 
 std::string TaskRunner::getDiagnosticString() const {
@@ -114,7 +122,10 @@ void TaskRunner::schedule(Task task) {
         return;
     }
 
-    invariant(_threadPool->schedule([this] { _runTasks(); }));
+    _threadPool->schedule([this](auto status) {
+        invariant(status);
+        _runTasks();
+    });
 
     _active = true;
     _cancelRequested = false;
@@ -135,20 +146,16 @@ void TaskRunner::_runTasks() {
     // We initialize cc() because ServiceContextMongoD::_newOpCtx() expects cc() to be equal to the
     // client used to create the operation context.
     Client* client = &cc();
-    if (AuthorizationManager::get(client->getServiceContext())->isAuthEnabled()) {
+    if (AuthorizationManager::get(client->getService())->isAuthEnabled()) {
         AuthorizationSession::get(client)->grantInternalAuthorization();
     }
-    ServiceContext::UniqueOperationContext opCtx;
 
     while (Task task = _waitForNextTask()) {
-        if (!opCtx) {
-            opCtx = client->makeOperationContext();
-        }
+        NextAction nextAction;
 
-        NextAction nextAction = runSingleTask(task, opCtx.get(), Status::OK());
-
-        if (nextAction != NextAction::kKeepOperationContext) {
-            opCtx.reset();
+        {
+            auto opCtx = client->makeOperationContext();
+            nextAction = runSingleTask(task, opCtx.get(), Status::OK());
         }
 
         if (nextAction == NextAction::kCancel) {
@@ -159,12 +166,11 @@ void TaskRunner::_runTasks() {
             nextAction == NextAction::kInvalid) {
             stdx::lock_guard<stdx::mutex> lk(_mutex);
             if (_tasks.empty()) {
-                _finishRunTasks_inlock();
+                _finishRunTasks(lk);
                 return;
             }
         }
     }
-    opCtx.reset();
 
     std::list<Task> tasks;
     UniqueLock lk{_mutex};
@@ -174,22 +180,21 @@ void TaskRunner::_runTasks() {
         lk.unlock();
         // Cancel remaining tasks with a CallbackCanceled status.
         for (auto&& task : tasks) {
-            runSingleTask(std::move(task),
+            runSingleTask(task,
                           nullptr,
                           Status(ErrorCodes::CallbackCanceled,
                                  "this task has been canceled by a previously invoked task"));
         }
         tasks.clear();
-
     };
     cancelTasks();
 
     lk.lock();
-    _finishRunTasks_inlock();
+    _finishRunTasks(lk);
     cancelTasks();
 }
 
-void TaskRunner::_finishRunTasks_inlock() {
+void TaskRunner::_finishRunTasks(WithLock lk) {
     _active = false;
     _cancelRequested = false;
     _condition.notify_all();

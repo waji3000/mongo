@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,9 +27,14 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <boost/none.hpp>
+#include <mutex>
+
+#include <boost/optional/optional.hpp>
 
 #include "mongo/db/repl/replication_consistency_markers_mock.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/uuid.h"
 
 namespace mongo {
 namespace repl {
@@ -64,22 +68,8 @@ void ReplicationConsistencyMarkersMock::clearInitialSyncFlag(OperationContext* o
     _initialSyncFlag = false;
 }
 
-OpTime ReplicationConsistencyMarkersMock::getMinValid(OperationContext* opCtx) const {
-    stdx::lock_guard<stdx::mutex> lock(_minValidBoundariesMutex);
-    return _minValid;
-}
-
-void ReplicationConsistencyMarkersMock::setMinValid(OperationContext* opCtx,
-                                                    const OpTime& minValid) {
-    stdx::lock_guard<stdx::mutex> lock(_minValidBoundariesMutex);
-    _minValid = minValid;
-}
-
-void ReplicationConsistencyMarkersMock::setMinValidToAtLeast(OperationContext* opCtx,
-                                                             const OpTime& minValid) {
-    stdx::lock_guard<stdx::mutex> lock(_minValidBoundariesMutex);
-    _minValid = std::max(_minValid, minValid);
-}
+void ReplicationConsistencyMarkersMock::ensureFastCountOnOplogTruncateAfterPoint(
+    OperationContext* opCtx) {}
 
 void ReplicationConsistencyMarkersMock::setOplogTruncateAfterPoint(OperationContext* opCtx,
                                                                    const Timestamp& timestamp) {
@@ -93,14 +83,31 @@ Timestamp ReplicationConsistencyMarkersMock::getOplogTruncateAfterPoint(
     return _oplogTruncateAfterPoint;
 }
 
+void ReplicationConsistencyMarkersMock::startUsingOplogTruncateAfterPointForPrimary() {}
+
+void ReplicationConsistencyMarkersMock::stopUsingOplogTruncateAfterPointForPrimary() {}
+
+bool ReplicationConsistencyMarkersMock::isOplogTruncateAfterPointBeingUsedForPrimary() const {
+    return true;
+}
+
+void ReplicationConsistencyMarkersMock::setOplogTruncateAfterPointToTopOfOplog(
+    OperationContext* opCtx) {};
+
+boost::optional<OpTimeAndWallTime>
+ReplicationConsistencyMarkersMock::refreshOplogTruncateAfterPointIfPrimary(
+    OperationContext* opCtx) {
+    return boost::none;
+}
+
 void ReplicationConsistencyMarkersMock::setAppliedThrough(OperationContext* opCtx,
                                                           const OpTime& optime) {
+    invariant(!optime.isNull());
     stdx::lock_guard<stdx::mutex> lock(_minValidBoundariesMutex);
     _appliedThrough = optime;
 }
 
-void ReplicationConsistencyMarkersMock::clearAppliedThrough(OperationContext* opCtx,
-                                                            const Timestamp& writeTimestamp) {
+void ReplicationConsistencyMarkersMock::clearAppliedThrough(OperationContext* opCtx) {
     stdx::lock_guard<stdx::mutex> lock(_minValidBoundariesMutex);
     _appliedThrough = {};
 }
@@ -112,6 +119,20 @@ OpTime ReplicationConsistencyMarkersMock::getAppliedThrough(OperationContext* op
 
 Status ReplicationConsistencyMarkersMock::createInternalCollections(OperationContext* opCtx) {
     return Status::OK();
+}
+
+void ReplicationConsistencyMarkersMock::setInitialSyncIdIfNotSet(OperationContext* opCtx) {
+    if (_initialSyncId.isEmpty()) {
+        _initialSyncId = UUID::gen().toBSON();
+    }
+}
+
+void ReplicationConsistencyMarkersMock::clearInitialSyncId(OperationContext* opCtx) {
+    _initialSyncId = BSONObj();
+}
+
+BSONObj ReplicationConsistencyMarkersMock::getInitialSyncId(OperationContext* opCtx) {
+    return _initialSyncId;
 }
 
 }  // namespace repl

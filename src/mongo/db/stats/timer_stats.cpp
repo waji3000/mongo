@@ -1,6 +1,3 @@
-// timer_stats.cpp
-
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -31,6 +28,8 @@
  */
 
 #include "mongo/db/stats/timer_stats.h"
+
+#include "mongo/bson/bsonobjbuilder.h"
 
 namespace mongo {
 
@@ -72,4 +71,4 @@ BSONObj TimerStats::getReport() const {
     b.appendNumber("totalMillis", t);
     return b.obj();
 }
-}
+}  // namespace mongo

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -29,75 +28,83 @@
  */
 
 #include <string>
+#include <utility>
 #include <vector>
 
+#include <boost/move/utility_core.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
 #include "mongo/base/string_data.h"
+#include "mongo/unittest/stringify.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/assert_util.h"
 
+namespace mongo {
 namespace {
 
-using mongo::makeStatusWith;
-using mongo::StatusWith;
+TEST(StatusWith, MakeCtad) {
+    auto validate = [](auto&& arg) {
+        auto sw = StatusWith(arg);
+        ASSERT_TRUE(sw.isOK());
+        ASSERT_TRUE(uassertStatusOK(sw) == arg);
+        using Arg = std::decay_t<decltype(arg)>;
+        return std::is_same_v<decltype(sw), StatusWith<Arg>>;
+    };
+    ASSERT_TRUE(validate(3));
+    ASSERT_TRUE(validate(false));
+    ASSERT_TRUE(validate(123.45));
+    ASSERT_TRUE(validate(std::string("foo")));
+    ASSERT_TRUE(validate(std::vector<int>()));
+    ASSERT_TRUE(validate(std::vector<int>({1, 2, 3})));
+}
 
-TEST(StatusWith, makeStatusWith) {
-    using mongo::StringData;
+/** Check uassertStatusOK with various reference types */
+TEST(StatusWith, UassertStatusOKReferenceTypes) {
+    auto sd = "barbaz"_sd;
+    auto sw = StatusWith(sd);
 
-    auto s1 = makeStatusWith<int>(3);
-    ASSERT_TRUE(s1.isOK());
-    ASSERT_EQUALS(uassertStatusOK(s1), 3);
+    const StatusWith<StringData>& cref = sw;
+    ASSERT_EQUALS(uassertStatusOK(cref), sd);
 
-    auto s2 = makeStatusWith<std::vector<int>>();
-    ASSERT_TRUE(s2.isOK());
-    ASSERT_EQUALS(uassertStatusOK(s2).size(), 0u);
+    StatusWith<StringData>& ncref = sw;
+    ASSERT_EQUALS(uassertStatusOK(ncref), sd);
 
-    std::vector<int> i = {1, 2, 3};
-    auto s3 = makeStatusWith<std::vector<int>>(i.begin(), i.end());
-    ASSERT_TRUE(s3.isOK());
-    ASSERT_EQUALS(uassertStatusOK(s3).size(), 3u);
-
-    auto s4 = makeStatusWith<std::string>("foo");
-
-    ASSERT_TRUE(s4.isOK());
-    ASSERT_EQUALS(uassertStatusOK(s4), std::string{"foo"});
-    const char* foo = "barbaz";
-    auto s5 = makeStatusWith<StringData>(foo, std::size_t{6});
-    ASSERT_TRUE(s5.isOK());
-
-    // make sure CV qualifiers trigger correct overload
-    const StatusWith<StringData>& s6 = s5;
-    ASSERT_EQUALS(uassertStatusOK(s6), foo);
-    StatusWith<StringData>& s7 = s5;
-    ASSERT_EQUALS(uassertStatusOK(s7), foo);
-    ASSERT_EQUALS(uassertStatusOK(std::move(s5)), foo);
-
-    // Check that we use T(...) and not T{...}
-    // ASSERT_EQUALS requires an ostream overload for vector<int>
-    ASSERT_TRUE(makeStatusWith<std::vector<int>>(1, 2) == std::vector<int>{2});
+    StatusWith<StringData>&& rref = std::move(sw);
+    ASSERT_EQUALS(uassertStatusOK(std::move(rref)), sd);
 }
 
 TEST(StatusWith, nonDefaultConstructible) {
     class NoDefault {
-        NoDefault() = delete;
-
     public:
-        NoDefault(int x) : _x{x} {};
-        int _x{0};
+        NoDefault() = delete;
+        NoDefault(int x) : x{x} {}
+        int x;
     };
 
-    auto swND = makeStatusWith<NoDefault>(1);
-    ASSERT_TRUE(swND.getValue()._x = 1);
+    auto swND = StatusWith(NoDefault(1));
+    ASSERT_EQ(swND.getValue().x, 1);
 
-    auto swNDerror = StatusWith<NoDefault>(mongo::ErrorCodes::BadValue, "foo");
+    auto swNDerror = StatusWith<NoDefault>(ErrorCodes::BadValue, "foo");
     ASSERT_FALSE(swNDerror.isOK());
 }
 
 TEST(StatusWith, ignoreTest) {
-    auto function = []() -> StatusWith<bool> { return false; };
+    // A compile-only test
+    [] {
+        return StatusWith(false);
+    }()
+        .getStatus()
+        .ignore();
+}
 
-    // Compile only test:
-    function().getStatus().ignore();
+TEST(StatusWith, AssertionFormat) {
+    Status failed(ErrorCodes::CallbackCanceled, "foo");
+    ASSERT_EQ(unittest::stringify::invoke(StatusWith<StringData>(failed)),
+              unittest::stringify::invoke(failed));
+    ASSERT_EQ(unittest::stringify::invoke(StatusWith<StringData>("foo")), "foo");
 }
 
 }  // namespace
+}  // namespace mongo

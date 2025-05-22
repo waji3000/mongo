@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,14 +27,20 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include "mongo/rpc/reply_builder_interface.h"
 
+#include <memory>
 #include <utility>
 
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/error_extra_info.h"
 #include "mongo/base/status_with.h"
-#include "mongo/db/jsobj.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/db/basic_types_gen.h"
+#include "mongo/db/commands/test_commands_enabled.h"
+#include "mongo/idl/idl_parser.h"
 
 namespace mongo {
 namespace rpc {
@@ -74,6 +79,21 @@ BSONObj augmentReplyWithStatus(const Status& status, BSONObj reply) {
         extraInfo->serialize(&bob);
     }
 
+    // Ensure the error reply satisfies the IDL-defined requirements.
+    // Only validate error reply in test mode so that we don't expose users to errors if we
+    // construct an invalid error reply.
+    if (getTestCommandsEnabled()) {
+        try {
+            ErrorReply::parse(IDLParserContext("augmentReplyWithStatus"), bob.asTempObj());
+        } catch (const DBException&) {
+            invariant(false,
+                      "invalid error-response to a command constructed in "
+                      "rpc::augmentReplyWithStatus. All erroring command responses "
+                      "must comply with the format specified by the IDL-defined struct ErrorReply, "
+                      "defined in idl/basic_types.idl");
+        }
+    }
+
     return bob.obj();
 }
 
@@ -88,6 +108,20 @@ ReplyBuilderInterface& ReplyBuilderInterface::setCommandReply(Status nonOKStatus
                                                               BSONObj extraErrorInfo) {
     invariant(!nonOKStatus.isOK());
     return setRawCommandReply(augmentReplyWithStatus(nonOKStatus, std::move(extraErrorInfo)));
+}
+
+bool ReplyBuilderInterface::shouldRunAgainForExhaust() const {
+    return _shouldRunAgainForExhaust;
+}
+
+
+boost::optional<BSONObj> ReplyBuilderInterface::getNextInvocation() const {
+    return _nextInvocation;
+}
+
+void ReplyBuilderInterface::setNextInvocation(boost::optional<BSONObj> nextInvocation) {
+    _shouldRunAgainForExhaust = true;
+    _nextInvocation = nextInvocation;
 }
 
 }  // namespace rpc

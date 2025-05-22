@@ -1,6 +1,3 @@
-// winutil.cpp
-
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -32,7 +29,6 @@
 
 #if defined(_WIN32)
 
-#include "mongo/platform/basic.h"
 
 #include "mongo/util/winutil.h"
 

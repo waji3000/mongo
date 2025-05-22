@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,30 +27,36 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <deque>
 
-#include "mongo/db/pipeline/tee_buffer.h"
+#include <boost/smart_ptr/intrusive_ptr.hpp>
 
-#include "mongo/db/pipeline/document.h"
+#include "mongo/base/string_data.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/document_value_test_util.h"
+#include "mongo/db/pipeline/aggregation_context_fixture.h"
 #include "mongo/db/pipeline/document_source_mock.h"
-#include "mongo/db/pipeline/document_value_test_util.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/tee_buffer.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/assert_util.h"
 
 namespace mongo {
 namespace {
 
-TEST(TeeBufferTest, ShouldRequireAtLeastOneConsumer) {
+using TeeBufferTest = AggregationContextFixture;
+
+TEST_F(TeeBufferTest, ShouldRequireAtLeastOneConsumer) {
     ASSERT_THROWS_CODE(TeeBuffer::create(0), AssertionException, 40309);
 }
 
-TEST(TeeBufferTest, ShouldRequirePositiveBatchSize) {
+TEST_F(TeeBufferTest, ShouldRequirePositiveBatchSize) {
     ASSERT_THROWS_CODE(TeeBuffer::create(1, 0), AssertionException, 40310);
     ASSERT_THROWS_CODE(TeeBuffer::create(1, -2), AssertionException, 40310);
 }
 
-TEST(TeeBufferTest, ShouldBeExhaustedIfInputIsExhausted) {
-    auto mock = DocumentSourceMock::create();
+TEST_F(TeeBufferTest, ShouldBeExhaustedIfInputIsExhausted) {
+    auto mock = DocumentSourceMock::createForTest(getExpCtx());
     auto teeBuffer = TeeBuffer::create(1);
     teeBuffer->setSource(mock.get());
 
@@ -60,9 +65,9 @@ TEST(TeeBufferTest, ShouldBeExhaustedIfInputIsExhausted) {
     ASSERT(teeBuffer->getNext(0).isEOF());
 }
 
-TEST(TeeBufferTest, ShouldProvideAllResultsWithoutPauseIfTheyFitInOneBatch) {
+TEST_F(TeeBufferTest, ShouldProvideAllResultsWithoutPauseIfTheyFitInOneBatch) {
     std::deque<DocumentSource::GetNextResult> inputs{Document{{"a", 1}}, Document{{"a", 2}}};
-    auto mock = DocumentSourceMock::create(inputs);
+    auto mock = DocumentSourceMock::createForTest(inputs, getExpCtx());
     auto teeBuffer = TeeBuffer::create(1);
     teeBuffer->setSource(mock.get());
 
@@ -78,9 +83,9 @@ TEST(TeeBufferTest, ShouldProvideAllResultsWithoutPauseIfTheyFitInOneBatch) {
     ASSERT_TRUE(teeBuffer->getNext(0).isEOF());
 }
 
-TEST(TeeBufferTest, ShouldProvideAllResultsWithoutPauseIfOnlyOneConsumer) {
+TEST_F(TeeBufferTest, ShouldProvideAllResultsWithoutPauseIfOnlyOneConsumer) {
     std::deque<DocumentSource::GetNextResult> inputs{Document{{"a", 1}}, Document{{"a", 2}}};
-    auto mock = DocumentSourceMock::create(inputs);
+    auto mock = DocumentSourceMock::createForTest(inputs, getExpCtx());
 
     const size_t bufferBytes = 1;  // Both docs won't fit in a single batch.
     auto teeBuffer = TeeBuffer::create(1, bufferBytes);
@@ -98,9 +103,9 @@ TEST(TeeBufferTest, ShouldProvideAllResultsWithoutPauseIfOnlyOneConsumer) {
     ASSERT_TRUE(teeBuffer->getNext(0).isEOF());
 }
 
-TEST(TeeBufferTest, ShouldTellConsumerToPauseIfItFinishesBatchBeforeOtherConsumers) {
+TEST_F(TeeBufferTest, ShouldTellConsumerToPauseIfItFinishesBatchBeforeOtherConsumers) {
     std::deque<DocumentSource::GetNextResult> inputs{Document{{"a", 1}}, Document{{"a", 2}}};
-    auto mock = DocumentSourceMock::create(inputs);
+    auto mock = DocumentSourceMock::createForTest(inputs, getExpCtx());
 
     const size_t nConsumers = 2;
     const size_t bufferBytes = 1;  // Both docs won't fit in a single batch.
@@ -141,9 +146,9 @@ TEST(TeeBufferTest, ShouldTellConsumerToPauseIfItFinishesBatchBeforeOtherConsume
     ASSERT_TRUE(teeBuffer->getNext(1).isEOF());
 }
 
-TEST(TeeBufferTest, ShouldAllowOtherConsumersToAdvanceOnceTrailingConsumerIsDisposed) {
+TEST_F(TeeBufferTest, ShouldAllowOtherConsumersToAdvanceOnceTrailingConsumerIsDisposed) {
     std::deque<DocumentSource::GetNextResult> inputs{Document{{"a", 1}}, Document{{"a", 2}}};
-    auto mock = DocumentSourceMock::create(inputs);
+    auto mock = DocumentSourceMock::createForTest(inputs, getExpCtx());
 
     const size_t nConsumers = 2;
     const size_t bufferBytes = 1;  // Both docs won't fit in a single batch.

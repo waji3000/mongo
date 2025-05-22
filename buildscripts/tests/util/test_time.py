@@ -1,12 +1,8 @@
 """Unit test for the util.time module."""
 
-from __future__ import absolute_import
-
 import unittest
 
-import util.time as time_utils
-
-#pylint: disable=missing-docstring
+from buildscripts.util import time as time_utils
 
 
 class Ns2SecTest(unittest.TestCase):

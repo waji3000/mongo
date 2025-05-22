@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,10 +27,10 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
+#include <memory>
 #include <system_error>
 
+#include "mongo/base/string_data.h"
 #include "mongo/base/system_error.h"
 #include "mongo/unittest/unittest.h"
 

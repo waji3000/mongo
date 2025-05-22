@@ -1,6 +1,5 @@
-"""Extension to the unittest package to support buildlogger and parallel test execution."""
+"""Extension to the unittest package to support different loggers and parallel test execution."""
 
-from __future__ import absolute_import
+from buildscripts.resmokelib.testing import executor, suite
 
-from . import executor
-from . import suite
+__all__ = ["executor", "suite"]

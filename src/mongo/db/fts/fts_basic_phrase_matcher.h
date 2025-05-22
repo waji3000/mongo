@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,7 +29,8 @@
 
 #pragma once
 
-#include "mongo/base/disallow_copying.h"
+#include <string>
+
 #include "mongo/db/fts/fts_phrase_matcher.h"
 
 namespace mongo {
@@ -42,7 +42,8 @@ namespace fts {
  * operations are inherently diacritic sensitive.
  */
 class BasicFTSPhraseMatcher final : public FTSPhraseMatcher {
-    MONGO_DISALLOW_COPYING(BasicFTSPhraseMatcher);
+    BasicFTSPhraseMatcher(const BasicFTSPhraseMatcher&) = delete;
+    BasicFTSPhraseMatcher& operator=(const BasicFTSPhraseMatcher&) = delete;
 
 public:
     BasicFTSPhraseMatcher() = default;

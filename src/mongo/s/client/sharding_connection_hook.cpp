@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,66 +27,69 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
-
-#include "mongo/platform/basic.h"
-
-#include "mongo/s/client/sharding_connection_hook.h"
 
 #include <string>
+#include <utility>
 
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/util/bson_extract.h"
-#include "mongo/client/authenticate.h"
-#include "mongo/db/client.h"
+#include "mongo/client/connection_string.h"
+#include "mongo/client/internal_auth.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/logv2/log.h"
 #include "mongo/rpc/get_status_from_command_result.h"
-#include "mongo/s/client/version_manager.h"
-#include "mongo/util/log.h"
+#include "mongo/s/client/sharding_connection_hook.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
+
 
 namespace mongo {
 
 using std::string;
 
-ShardingConnectionHook::ShardingConnectionHook(bool shardedConnections,
-                                               std::unique_ptr<rpc::EgressMetadataHook> egressHook)
-    : _shardedConnections(shardedConnections), _egressHook(std::move(egressHook)) {}
+ShardingConnectionHook::ShardingConnectionHook(std::unique_ptr<rpc::EgressMetadataHook> egressHook)
+    : _egressHook(std::move(egressHook)) {}
 
 void ShardingConnectionHook::onCreate(DBClientBase* conn) {
-    if (conn->type() == ConnectionString::INVALID) {
+    if (conn->type() == ConnectionString::ConnectionType::kInvalid) {
         uasserted(ErrorCodes::BadValue, str::stream() << "Unrecognized connection string.");
     }
 
     // Authenticate as the first thing we do
     // NOTE: Replica set authentication allows authentication against *any* online host
     if (auth::isInternalAuthSet()) {
-        LOG(2) << "calling onCreate auth for " << conn->toString();
-
-        uassertStatusOKWithContext(conn->authenticateInternalUser(),
-                                   str::stream() << "can't authenticate to server "
-                                                 << conn->getServerAddress());
+        LOGV2_DEBUG(22722, 2, "Calling onCreate auth", "connectionString"_attr = conn->toString());
+        try {
+            conn->authenticateInternalUser();
+        } catch (DBException& e) {
+            e.addContext(str::stream()
+                         << "can't authenticate to server " << conn->getServerAddress());
+            throw;
+        }
     }
 
-    // Delegate the metadata hook logic to the egress hook; use lambdas to pass the arguments in
-    // the order expected by the egress hook.
-    if (_shardedConnections) {
-        conn->setReplyMetadataReader(
-            [this](OperationContext* opCtx, const BSONObj& metadataObj, StringData target) {
-                return _egressHook->readReplyMetadata(opCtx, target, metadataObj);
-            });
-    }
     conn->setRequestMetadataWriter([this](OperationContext* opCtx, BSONObjBuilder* metadataBob) {
         return _egressHook->writeRequestMetadata(opCtx, metadataBob);
     });
 
 
-    if (conn->type() == ConnectionString::MASTER) {
-        BSONObj isMasterResponse;
-        if (!conn->runCommand("admin", BSON("ismaster" << 1), isMasterResponse)) {
-            uassertStatusOK(getStatusFromCommandResult(isMasterResponse));
+    if (conn->type() == ConnectionString::ConnectionType::kStandalone) {
+        BSONObj helloResponse;
+        if (!conn->runCommand(DatabaseName::kAdmin, BSON("hello" << 1), helloResponse)) {
+            uassertStatusOK(getStatusFromCommandResult(helloResponse));
         }
 
         long long configServerModeNumber;
         Status status =
-            bsonExtractIntegerField(isMasterResponse, "configsvr", &configServerModeNumber);
+            bsonExtractIntegerField(helloResponse, "configsvr", &configServerModeNumber);
 
         if (status == ErrorCodes::NoSuchKey) {
             // This isn't a config server we're talking to.
@@ -100,20 +102,12 @@ void ShardingConnectionHook::onCreate(DBClientBase* conn) {
         uassert(28785,
                 str::stream() << "Unrecognized configsvr mode number: " << configServerModeNumber
                               << ". Range of known configsvr mode numbers is: ["
-                              << minKnownConfigServerMode
-                              << ", "
-                              << maxKnownConfigServerMode
+                              << minKnownConfigServerMode << ", " << maxKnownConfigServerMode
                               << "]",
                 configServerModeNumber >= minKnownConfigServerMode &&
                     configServerModeNumber <= maxKnownConfigServerMode);
 
         uassertStatusOK(status);
-    }
-}
-
-void ShardingConnectionHook::onDestroy(DBClientBase* conn) {
-    if (_shardedConnections && versionManager.isVersionableCB(conn)) {
-        versionManager.resetShardVersionCB(conn);
     }
 }
 

@@ -1,6 +1,3 @@
-// wiredtiger_server_status.h
-
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -32,7 +29,10 @@
 
 #pragma once
 
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/db/commands/server_status.h"
+#include "mongo/db/operation_context.h"
 
 namespace mongo {
 
@@ -43,13 +43,12 @@ class WiredTigerKVEngine;
  */
 class WiredTigerServerStatusSection : public ServerStatusSection {
 public:
-    WiredTigerServerStatusSection(WiredTigerKVEngine* engine);
-    virtual bool includeByDefault() const;
-    virtual BSONObj generateSection(OperationContext* opCtx,
-                                    const BSONElement& configElement) const;
+    static constexpr StringData kServerStatusSectionName = "wiredTiger"_sd;
 
-private:
-    WiredTigerKVEngine* _engine;
+    using ServerStatusSection::ServerStatusSection;
+    bool includeByDefault() const override;
+    BSONObj generateSection(OperationContext* opCtx,
+                            const BSONElement& configElement) const override;
 };
 
 }  // namespace mongo

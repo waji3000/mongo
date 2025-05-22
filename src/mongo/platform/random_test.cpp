@@ -1,6 +1,3 @@
-// random_test.cpp
-
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,12 +27,23 @@
  *    it in the license file.
  */
 
+
+#include <cmath>
 #include <set>
+#include <string>
 #include <vector>
 
-#include "mongo/platform/random.h"
+#include <fmt/format.h>
 
+#include "mongo/base/string_data.h"
+#include "mongo/logv2/log.h"
+#include "mongo/platform/random.h"
 #include "mongo/unittest/unittest.h"
+#include "mongo/util/debug_util.h"
+#include "mongo/util/str.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
+
 
 namespace mongo {
 
@@ -137,13 +145,13 @@ TEST(RandomTest, NextCanonicalDistinctValues) {
 }
 
 /**
- * Test that nextCanonicalDouble() always returns values between 0 and 1.
+ * Test that nextCanonicalDouble() is at least very likely to return values in [0,1).
  */
 TEST(RandomTest, NextCanonicalWithinRange) {
     PseudoRandom prng(10);
-    for (int i = 0; i < 100; i++) {
+    for (size_t i = 0; i < 1'000'000; ++i) {
         double next = prng.nextCanonicalDouble();
-        ASSERT_LTE(0.0, next);
+        ASSERT_GTE(next, 0.0);
         ASSERT_LT(next, 1.0);
     }
 }
@@ -214,12 +222,49 @@ TEST(RandomTest, NextInt64InRange) {
     }
 }
 
-TEST(RandomTest, Secure1) {
-    auto a = SecureRandom::create();
-    auto b = SecureRandom::create();
-
-    for (int i = 0; i < 100; i++) {
-        ASSERT_NOT_EQUALS(a->nextInt64(), b->nextInt64());
+/**
+ * Test uniformity of nextInt32(max)
+ */
+TEST(RandomTest, NextInt32Uniformity) {
+    PseudoRandom prng(10);
+    /* Break the range into sections. */
+    /* Check that all sections get roughly equal # of hits */
+    constexpr int32_t kMax = (int32_t{3} << 29) - 1;
+    constexpr size_t kBuckets = 64;
+    constexpr size_t kNIter = 1'000'000;
+    constexpr double mu = static_cast<double>(kNIter) / kBuckets;
+    constexpr double muSqInv = 1. / (mu * mu);
+    std::vector<size_t> hist(kBuckets);
+    for (size_t i = 0; i < kNIter; ++i) {
+        auto next = prng.nextInt32(kMax);
+        ASSERT_GTE(next, 0);
+        ASSERT_LTE(next, kMax);
+        ++hist[static_cast<double>(next) * static_cast<double>(kBuckets) / (kMax + 1)];
+    }
+    if (kDebugBuild) {
+        for (size_t i = 0; i < hist.size(); ++i) {
+            double dev = std::pow(std::pow((hist[i] - mu) / mu, 2), .5);
+            LOGV2(22611,
+                  "Histogram",
+                  "hist"_attr = fmt::format("  [{:4}] count:{:4}, dev:{:6f}, {}",
+                                            i,
+                                            hist[i],
+                                            dev,
+                                            std::string(hist[i] / 256, '*')));
+        }
+    }
+    for (size_t i = 0; i < hist.size(); ++i) {
+        double dev = std::pow(std::pow(hist[i] - mu, 2) * muSqInv, .5);
+        ASSERT_LT(dev, 0.1) << fmt::format("hist[{}]={}, mu={}", i, hist[i], mu);
     }
 }
+
+TEST(RandomTest, Secure1) {
+    auto a = SecureRandom();
+    auto b = SecureRandom();
+
+    for (int i = 0; i < 100; i++) {
+        ASSERT_NOT_EQUALS(a.nextInt64(), b.nextInt64());
+    }
 }
+}  // namespace mongo

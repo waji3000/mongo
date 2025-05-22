@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,7 +27,17 @@
  *    it in the license file.
  */
 
+#include <iosfwd>
+
 namespace mongo {
-// print mongos version info
-void printShardingVersionInfo(bool out);
+
+/**
+ * Outputs the version of MongoS as part of server startup.
+ * Goes to `os` if nonnull, else to LOGV2.
+ *
+ * NOTE: Outputs the version of MongoS to `os` (as part of the --version option),
+ * which reports different data than if `os` is null!
+ */
+void logMongosVersionInfo(std::ostream* os);
+
 }  // namespace mongo

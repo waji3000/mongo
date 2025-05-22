@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,104 +27,119 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
 
-#include "mongo/platform/basic.h"
+#include <set>
+#include <string>
+#include <utility>
 
-#include "mongo/db/dbhelpers.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
 
-#include <boost/filesystem/operations.hpp>
-#include <fstream>
-
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/catalog/clustered_collection_util.h"
+#include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/collection_catalog.h"
+#include "mongo/db/catalog/collection_operation_source.h"
+#include "mongo/db/catalog/index_catalog.h"
+#include "mongo/db/catalog/index_catalog_entry.h"
+#include "mongo/db/catalog_raii.h"
+#include "mongo/db/collection_crud/collection_write_path.h"
+#include "mongo/db/curop.h"
 #include "mongo/db/db_raii.h"
-#include "mongo/db/exec/working_set_common.h"
-#include "mongo/db/index/btree_access_method.h"
-#include "mongo/db/json.h"
-#include "mongo/db/keypattern.h"
+#include "mongo/db/dbhelpers.h"
+#include "mongo/db/index/index_access_method.h"
+#include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/matcher/expression_parser.h"
 #include "mongo/db/matcher/extensions_callback_real.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/op_observer.h"
-#include "mongo/db/ops/delete.h"
-#include "mongo/db/ops/update.h"
-#include "mongo/db/ops/update_request.h"
-#include "mongo/db/ops/update_result.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/query/canonical_query.h"
+#include "mongo/db/query/find_command.h"
 #include "mongo/db/query/get_executor.h"
+#include "mongo/db/query/index_bounds_builder.h"
 #include "mongo/db/query/internal_plans.h"
-#include "mongo/db/query/query_planner.h"
-#include "mongo/db/repl/repl_client_info.h"
-#include "mongo/db/repl/replication_coordinator.h"
-#include "mongo/db/service_context.h"
-#include "mongo/db/storage/data_protector.h"
-#include "mongo/db/storage/encryption_hooks.h"
-#include "mongo/db/storage/storage_options.h"
-#include "mongo/db/write_concern.h"
-#include "mongo/db/write_concern_options.h"
-#include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
-#include "mongo/util/scopeguard.h"
+#include "mongo/db/query/plan_executor.h"
+#include "mongo/db/query/plan_yield_policy.h"
+#include "mongo/db/query/write_ops/delete.h"
+#include "mongo/db/query/write_ops/update.h"
+#include "mongo/db/query/write_ops/update_request.h"
+#include "mongo/db/query/write_ops/write_ops_parsers.h"
+#include "mongo/db/record_id_helpers.h"
+#include "mongo/db/repl/oplog.h"
+#include "mongo/db/shard_role.h"
+#include "mongo/db/storage/snapshot.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/intrusive_counter.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
+
 
 namespace mongo {
 
-using std::unique_ptr;
-using std::ios_base;
-using std::ofstream;
-using std::set;
 using std::string;
-using std::stringstream;
+using std::unique_ptr;
 
-/* fetch a single object from collection ns that matches query
-   set your db SavedContext first
-*/
 bool Helpers::findOne(OperationContext* opCtx,
-                      Collection* collection,
+                      const CollectionPtr& collection,
                       const BSONObj& query,
-                      BSONObj& result,
-                      bool requireIndex) {
-    RecordId loc = findOne(opCtx, collection, query, requireIndex);
+                      BSONObj& result) {
+    RecordId loc = findOne(opCtx, collection, query);
     if (loc.isNull())
         return false;
     result = collection->docFor(opCtx, loc).value();
     return true;
 }
 
+BSONObj Helpers::findOneForTesting(OperationContext* opCtx,
+                                   const CollectionPtr& collection,
+                                   const BSONObj& query,
+                                   const bool invariantOnError) {
+    BSONObj ret;
+    bool found = findOne(opCtx, collection, query, ret);
+    if (invariantOnError) {
+        invariant(found);
+    }
+
+    return ret.getOwned();
+}
+
+
 /* fetch a single object from collection ns that matches query
    set your db SavedContext first
 */
 RecordId Helpers::findOne(OperationContext* opCtx,
-                          Collection* collection,
-                          const BSONObj& query,
-                          bool requireIndex) {
+                          const CollectionPtr& collection,
+                          const BSONObj& query) {
     if (!collection)
         return RecordId();
 
-    auto qr = stdx::make_unique<QueryRequest>(collection->ns());
-    qr->setFilter(query);
-    return findOne(opCtx, collection, std::move(qr), requireIndex);
+    auto findCommand = std::make_unique<FindCommandRequest>(collection->ns());
+    findCommand->setFilter(query);
+    return findOne(opCtx, collection, std::move(findCommand));
 }
 
 RecordId Helpers::findOne(OperationContext* opCtx,
-                          Collection* collection,
-                          std::unique_ptr<QueryRequest> qr,
-                          bool requireIndex) {
+                          const CollectionPtr& collection,
+                          std::unique_ptr<FindCommandRequest> findCommand) {
     if (!collection)
         return RecordId();
 
-    const ExtensionsCallbackReal extensionsCallback(opCtx, &collection->ns());
+    auto cq = std::make_unique<CanonicalQuery>(CanonicalQueryParams{
+        .expCtx = ExpressionContextBuilder{}.fromRequest(opCtx, *findCommand).build(),
+        .parsedFind = ParsedFindCommandParams{
+            .findCommand = std::move(findCommand),
+            .extensionsCallback = ExtensionsCallbackReal(opCtx, &collection->ns()),
+            .allowedFeatures = MatchExpressionParser::kAllowAllSpecialFeatures}});
+    cq->setForceGenerateRecordId(true);
 
-    const boost::intrusive_ptr<ExpressionContext> expCtx;
-    auto statusWithCQ =
-        CanonicalQuery::canonicalize(opCtx,
-                                     std::move(qr),
-                                     expCtx,
-                                     extensionsCallback,
-                                     MatchExpressionParser::kAllowAllSpecialFeatures);
-
-    massertStatusOK(statusWithCQ.getStatus());
-    unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
-
-    size_t options = requireIndex ? QueryPlannerParams::NO_TABLE_SCAN : QueryPlannerParams::DEFAULT;
-    auto exec = uassertStatusOK(
-        getExecutor(opCtx, collection, std::move(cq), PlanExecutor::NO_YIELD, options));
+    auto exec = uassertStatusOK(getExecutorFind(opCtx,
+                                                MultipleCollectionAccessor{collection},
+                                                std::move(cq),
+                                                PlanYieldPolicy::YieldPolicy::INTERRUPT_ONLY));
 
     PlanExecutor::ExecState state;
     BSONObj obj;
@@ -133,60 +147,94 @@ RecordId Helpers::findOne(OperationContext* opCtx,
     if (PlanExecutor::ADVANCED == (state = exec->getNext(&obj, &loc))) {
         return loc;
     }
-    massert(34427,
-            "Plan executor error: " + WorkingSetCommon::toStatusString(obj),
-            PlanExecutor::IS_EOF == state);
     return RecordId();
 }
 
 bool Helpers::findById(OperationContext* opCtx,
-                       Database* database,
-                       StringData ns,
+                       const NamespaceString& nss,
                        BSONObj query,
-                       BSONObj& result,
-                       bool* nsFound,
-                       bool* indexFound) {
-    invariant(database);
-
-    Collection* collection = database->getCollection(opCtx, ns);
+                       BSONObj& result) {
+    auto collCatalog = CollectionCatalog::get(opCtx);
+    const Collection* collection = collCatalog->lookupCollectionByNamespace(opCtx, nss);
     if (!collection) {
         return false;
     }
 
-    if (nsFound)
-        *nsFound = true;
-
-    IndexCatalog* catalog = collection->getIndexCatalog();
+    const IndexCatalog* catalog = collection->getIndexCatalog();
     const IndexDescriptor* desc = catalog->findIdIndex(opCtx);
 
-    if (!desc)
-        return false;
+    if (!desc) {
+        if (clustered_util::isClusteredOnId(collection->getClusteredInfo())) {
+            Snapshotted<BSONObj> doc;
+            if (collection->findDoc(opCtx,
+                                    record_id_helpers::keyForObj(IndexBoundsBuilder::objFromElement(
+                                        query["_id"], collection->getDefaultCollator())),
+                                    &doc)) {
+                result = std::move(doc.value());
+                return true;
+            }
+        }
 
-    if (indexFound)
-        *indexFound = 1;
-
-    RecordId loc = catalog->getIndex(desc)->findSingle(opCtx, query["_id"].wrap());
-    if (loc.isNull())
         return false;
-    result = collection->docFor(opCtx, loc).value();
+    }
+
+    const IndexCatalogEntry* entry = catalog->getEntry(desc);
+    // TODO(SERVER-103399): Investigate usage validity of CollectionPtr::CollectionPtr_UNSAFE
+    auto recordId = entry->accessMethod()->asSortedData()->findSingle(
+        opCtx, CollectionPtr::CollectionPtr_UNSAFE(collection), entry, query["_id"].wrap());
+    if (recordId.isNull())
+        return false;
+    result = collection->docFor(opCtx, recordId).value();
     return true;
 }
 
 RecordId Helpers::findById(OperationContext* opCtx,
-                           Collection* collection,
+                           const CollectionPtr& collection,
                            const BSONObj& idquery) {
-    verify(collection);
-    IndexCatalog* catalog = collection->getIndexCatalog();
+    MONGO_verify(collection);
+    const IndexCatalog* catalog = collection->getIndexCatalog();
     const IndexDescriptor* desc = catalog->findIdIndex(opCtx);
+    if (!desc && clustered_util::isClusteredOnId(collection->getClusteredInfo())) {
+        // There is no explicit IndexDescriptor for _id on a collection clustered by _id. However,
+        // the RecordId can be constructed directly from the input.
+        return record_id_helpers::keyForObj(
+            IndexBoundsBuilder::objFromElement(idquery["_id"], collection->getDefaultCollator()));
+    }
+
     uassert(13430, "no _id index", desc);
-    return catalog->getIndex(desc)->findSingle(opCtx, idquery["_id"].wrap());
+    const IndexCatalogEntry* entry = catalog->getEntry(desc);
+    return entry->accessMethod()->asSortedData()->findSingle(
+        opCtx, collection, entry, idquery["_id"].wrap());
 }
 
-bool Helpers::getSingleton(OperationContext* opCtx, const char* ns, BSONObj& result) {
-    AutoGetCollectionForReadCommand ctx(opCtx, NamespaceString(ns));
-    auto exec =
-        InternalPlanner::collectionScan(opCtx, ns, ctx.getCollection(), PlanExecutor::NO_YIELD);
-    PlanExecutor::ExecState state = exec->getNext(&result, NULL);
+// Acquires necessary locks to read the collection with the given namespace. If this is an oplog
+// read, use AutoGetOplogFastPath for simplified locking.
+const CollectionPtr& getCollectionForRead(
+    OperationContext* opCtx,
+    const NamespaceString& ns,
+    boost::optional<AutoGetCollectionForReadCommand>& autoColl,
+    boost::optional<AutoGetOplogFastPath>& autoOplog) {
+    if (ns.isOplog()) {
+        // Simplify locking rules for oplog collection.
+        autoOplog.emplace(opCtx, OplogAccessMode::kRead);
+        return autoOplog->getCollection();
+    } else {
+        autoColl.emplace(opCtx, NamespaceString(ns));
+        return autoColl->getCollection();
+    }
+}
+
+bool Helpers::getSingleton(OperationContext* opCtx, const NamespaceString& nss, BSONObj& result) {
+    boost::optional<AutoGetCollectionForReadCommand> autoColl;
+    boost::optional<AutoGetOplogFastPath> autoOplog;
+    const auto& collection = getCollectionForRead(opCtx, nss, autoColl, autoOplog);
+    if (!collection) {
+        return false;
+    }
+
+    auto exec = InternalPlanner::collectionScan(
+        opCtx, &collection, PlanYieldPolicy::YieldPolicy::INTERRUPT_ONLY);
+    PlanExecutor::ExecState state = exec->getNext(&result, nullptr);
 
     CurOp::get(opCtx)->done();
 
@@ -201,11 +249,19 @@ bool Helpers::getSingleton(OperationContext* opCtx, const char* ns, BSONObj& res
     return false;
 }
 
-bool Helpers::getLast(OperationContext* opCtx, const char* ns, BSONObj& result) {
-    AutoGetCollectionForReadCommand autoColl(opCtx, NamespaceString(ns));
-    auto exec = InternalPlanner::collectionScan(
-        opCtx, ns, autoColl.getCollection(), PlanExecutor::NO_YIELD, InternalPlanner::BACKWARD);
-    PlanExecutor::ExecState state = exec->getNext(&result, NULL);
+bool Helpers::getLast(OperationContext* opCtx, const NamespaceString& nss, BSONObj& result) {
+    boost::optional<AutoGetCollectionForReadCommand> autoColl;
+    boost::optional<AutoGetOplogFastPath> autoOplog;
+    const auto& collection = getCollectionForRead(opCtx, nss, autoColl, autoOplog);
+    if (!collection) {
+        return false;
+    }
+
+    auto exec = InternalPlanner::collectionScan(opCtx,
+                                                &collection,
+                                                PlanYieldPolicy::YieldPolicy::INTERRUPT_ONLY,
+                                                InternalPlanner::BACKWARD);
+    PlanExecutor::ExecState state = exec->getNext(&result, nullptr);
 
     // Non-yielding collection scans from InternalPlanner will never error.
     invariant(PlanExecutor::ADVANCED == state || PlanExecutor::IS_EOF == state);
@@ -218,44 +274,85 @@ bool Helpers::getLast(OperationContext* opCtx, const char* ns, BSONObj& result) 
     return false;
 }
 
-void Helpers::upsert(OperationContext* opCtx,
-                     const string& ns,
-                     const BSONObj& o,
-                     bool fromMigrate) {
+UpdateResult Helpers::upsert(OperationContext* opCtx,
+                             CollectionAcquisition& coll,
+                             const BSONObj& o,
+                             bool fromMigrate) {
     BSONElement e = o["_id"];
-    verify(e.type());
+    MONGO_verify(e.type());
     BSONObj id = e.wrap();
-
-    OldClientContext context(opCtx, ns);
-
-    const NamespaceString requestNs(ns);
-    UpdateRequest request(requestNs);
-
-    request.setQuery(id);
-    request.setUpdates(o);
-    request.setUpsert();
-    request.setFromMigration(fromMigrate);
-
-    update(opCtx, context.db(), request);
+    return upsert(opCtx, coll, id, o, fromMigrate);
 }
 
-void Helpers::putSingleton(OperationContext* opCtx, const char* ns, BSONObj obj) {
-    OldClientContext context(opCtx, ns);
+UpdateResult Helpers::upsert(OperationContext* opCtx,
+                             CollectionAcquisition& coll,
+                             const BSONObj& filter,
+                             const BSONObj& updateMod,
+                             bool fromMigrate) {
+    OldClientContext context(opCtx, coll.nss());
 
-    const NamespaceString requestNs(ns);
-    UpdateRequest request(requestNs);
+    auto request = UpdateRequest();
+    request.setNamespaceString(coll.nss());
 
-    request.setUpdates(obj);
+    request.setQuery(filter);
+    request.setUpdateModification(write_ops::UpdateModification::parseFromClassicUpdate(updateMod));
+    request.setUpsert();
+    if (fromMigrate) {
+        request.setSource(OperationSource::kFromMigrate);
+        request.setBypassEmptyTsReplacement(true);
+    }
+    request.setYieldPolicy(PlanYieldPolicy::YieldPolicy::INTERRUPT_ONLY);
+
+    return ::mongo::update(opCtx, coll, request);
+}
+
+void Helpers::update(OperationContext* opCtx,
+                     CollectionAcquisition& coll,
+                     const BSONObj& filter,
+                     const BSONObj& updateMod,
+                     bool fromMigrate) {
+    OldClientContext context(opCtx, coll.nss());
+
+    auto request = UpdateRequest();
+    request.setNamespaceString(coll.nss());
+
+    request.setQuery(filter);
+    request.setUpdateModification(write_ops::UpdateModification::parseFromClassicUpdate(updateMod));
+    if (fromMigrate) {
+        request.setSource(OperationSource::kFromMigrate);
+        request.setBypassEmptyTsReplacement(true);
+    }
+    request.setYieldPolicy(PlanYieldPolicy::YieldPolicy::INTERRUPT_ONLY);
+
+    ::mongo::update(opCtx, coll, request);
+}
+
+Status Helpers::insert(OperationContext* opCtx,
+                       const CollectionAcquisition& coll,
+                       const BSONObj& doc) {
+    OldClientContext context(opCtx, coll.nss());
+    return collection_internal::insertDocument(
+        opCtx, coll.getCollectionPtr(), InsertStatement{doc}, &CurOp::get(opCtx)->debug());
+}
+
+void Helpers::putSingleton(OperationContext* opCtx, CollectionAcquisition& coll, BSONObj obj) {
+    OldClientContext context(opCtx, coll.nss());
+
+    auto request = UpdateRequest();
+    request.setNamespaceString(coll.nss());
+
+    request.setUpdateModification(write_ops::UpdateModification::parseFromClassicUpdate(obj));
+    request.setYieldPolicy(PlanYieldPolicy::YieldPolicy::INTERRUPT_ONLY);
     request.setUpsert();
 
-    update(opCtx, context.db(), request);
+    ::mongo::update(opCtx, coll, request);
 
     CurOp::get(opCtx)->done();
 }
 
 BSONObj Helpers::toKeyFormat(const BSONObj& o) {
     BSONObjBuilder keyObj(o.objsize());
-    BSONForEach(e, o) {
+    for (auto&& e : o) {
         keyObj.appendAs(e, "");
     }
     return keyObj.obj();
@@ -263,136 +360,55 @@ BSONObj Helpers::toKeyFormat(const BSONObj& o) {
 
 BSONObj Helpers::inferKeyPattern(const BSONObj& o) {
     BSONObjBuilder kpBuilder;
-    BSONForEach(e, o) {
+    for (auto&& e : o) {
         kpBuilder.append(e.fieldName(), 1);
     }
     return kpBuilder.obj();
 }
 
-void Helpers::emptyCollection(OperationContext* opCtx, const NamespaceString& nss) {
-    OldClientContext context(opCtx, nss.ns());
+void Helpers::emptyCollection(OperationContext* opCtx, const CollectionAcquisition& coll) {
+    OldClientContext context(opCtx, coll.nss());
     repl::UnreplicatedWritesBlock uwb(opCtx);
-    Collection* collection = context.db() ? context.db()->getCollection(opCtx, nss) : nullptr;
-    deleteObjects(opCtx, collection, nss, BSONObj(), false);
+    deleteObjects(opCtx, coll, BSONObj(), false);
 }
 
-Helpers::RemoveSaver::RemoveSaver(const string& a, const string& b, const string& why) {
-    static int NUM = 0;
-
-    _root = storageGlobalParams.dbpath;
-    if (a.size())
-        _root /= a;
-    if (b.size())
-        _root /= b;
-    verify(a.size() || b.size());
-
-    _file = _root;
-
-    stringstream ss;
-    ss << why << "." << terseCurrentTime(false) << "." << NUM++ << ".bson";
-    _file /= ss.str();
-
-    auto encryptionHooks = EncryptionHooks::get(getGlobalServiceContext());
-    if (encryptionHooks->enabled()) {
-        _protector = encryptionHooks->getDataProtector();
-        _file += encryptionHooks->getProtectedPathSuffix();
+bool Helpers::findByIdAndNoopUpdate(OperationContext* opCtx,
+                                    const CollectionPtr& collection,
+                                    const BSONObj& idQuery,
+                                    BSONObj& result) {
+    auto recordId = Helpers::findById(opCtx, collection, idQuery);
+    if (recordId.isNull()) {
+        return false;
     }
+
+    Snapshotted<BSONObj> snapshottedDoc;
+    auto foundDoc = collection->findDoc(opCtx, recordId, &snapshottedDoc);
+    if (!foundDoc) {
+        return false;
+    }
+
+    result = snapshottedDoc.value();
+
+    // Use an UnreplicatedWritesBlock to avoid generating an oplog entry for this no-op update.
+    // The update is being used to generated write conflicts and isn't modifying the data itself, so
+    // secondaries don't need to know about it. Also set CollectionUpdateArgs::update to an empty
+    // BSONObj because that's a second way OpObserverImpl::onUpdate() detects and ignores no-op
+    // updates.
+    repl::UnreplicatedWritesBlock uwb(opCtx);
+    CollectionUpdateArgs args(snapshottedDoc.value());
+    args.criteria = idQuery;
+    args.update = BSONObj();
+    collection_internal::updateDocument(opCtx,
+                                        collection,
+                                        recordId,
+                                        snapshottedDoc,
+                                        result,
+                                        collection_internal::kUpdateNoIndexes,
+                                        nullptr /* indexesAffected */,
+                                        nullptr /* opDebug */,
+                                        &args);
+
+    return true;
 }
-
-Helpers::RemoveSaver::~RemoveSaver() {
-    if (_protector && _out) {
-        auto encryptionHooks = EncryptionHooks::get(getGlobalServiceContext());
-        invariant(encryptionHooks->enabled());
-
-        size_t protectedSizeMax = encryptionHooks->additionalBytesForProtectedBuffer();
-        std::unique_ptr<uint8_t[]> protectedBuffer(new uint8_t[protectedSizeMax]);
-
-        size_t resultLen;
-        Status status = _protector->finalize(protectedBuffer.get(), protectedSizeMax, &resultLen);
-        if (!status.isOK()) {
-            severe() << "Unable to finalize DataProtector while closing RemoveSaver: "
-                     << redact(status);
-            fassertFailed(34350);
-        }
-
-        _out->write(reinterpret_cast<const char*>(protectedBuffer.get()), resultLen);
-        if (_out->fail()) {
-            severe() << "Couldn't write finalized DataProtector data to: " << _file.string()
-                     << " for remove saving: " << redact(errnoWithDescription());
-            fassertFailed(34351);
-        }
-
-        protectedBuffer.reset(new uint8_t[protectedSizeMax]);
-        status = _protector->finalizeTag(protectedBuffer.get(), protectedSizeMax, &resultLen);
-        if (!status.isOK()) {
-            severe() << "Unable to get finalizeTag from DataProtector while closing RemoveSaver: "
-                     << redact(status);
-            fassertFailed(34352);
-        }
-        if (resultLen != _protector->getNumberOfBytesReservedForTag()) {
-            severe() << "Attempted to write tag of size " << resultLen
-                     << " when DataProtector only reserved "
-                     << _protector->getNumberOfBytesReservedForTag() << " bytes";
-            fassertFailed(34353);
-        }
-        _out->seekp(0);
-        _out->write(reinterpret_cast<const char*>(protectedBuffer.get()), resultLen);
-        if (_out->fail()) {
-            severe() << "Couldn't write finalizeTag from DataProtector to: " << _file.string()
-                     << " for remove saving: " << redact(errnoWithDescription());
-            fassertFailed(34354);
-        }
-    }
-}
-
-Status Helpers::RemoveSaver::goingToDelete(const BSONObj& o) {
-    if (!_out) {
-        // We don't expect to ever pass "" to create_directories below, but catch
-        // this anyway as per SERVER-26412.
-        invariant(!_root.empty());
-        boost::filesystem::create_directories(_root);
-        _out.reset(new ofstream(_file.string().c_str(), ios_base::out | ios_base::binary));
-        if (_out->fail()) {
-            string msg = str::stream() << "couldn't create file: " << _file.string()
-                                       << " for remove saving: " << redact(errnoWithDescription());
-            error() << msg;
-            _out.reset();
-            _out = 0;
-            return Status(ErrorCodes::FileNotOpen, msg);
-        }
-    }
-
-    const uint8_t* data = reinterpret_cast<const uint8_t*>(o.objdata());
-    size_t dataSize = o.objsize();
-
-    std::unique_ptr<uint8_t[]> protectedBuffer;
-    if (_protector) {
-        auto encryptionHooks = EncryptionHooks::get(getGlobalServiceContext());
-        invariant(encryptionHooks->enabled());
-
-        size_t protectedSizeMax = dataSize + encryptionHooks->additionalBytesForProtectedBuffer();
-        protectedBuffer.reset(new uint8_t[protectedSizeMax]);
-
-        size_t resultLen;
-        Status status = _protector->protect(
-            data, dataSize, protectedBuffer.get(), protectedSizeMax, &resultLen);
-        if (!status.isOK()) {
-            return status;
-        }
-
-        data = protectedBuffer.get();
-        dataSize = resultLen;
-    }
-
-    _out->write(reinterpret_cast<const char*>(data), dataSize);
-    if (_out->fail()) {
-        string msg = str::stream() << "couldn't write document to file: " << _file.string()
-                                   << " for remove saving: " << redact(errnoWithDescription());
-        error() << msg;
-        return Status(ErrorCodes::OperationFailed, msg);
-    }
-    return Status::OK();
-}
-
 
 }  // namespace mongo

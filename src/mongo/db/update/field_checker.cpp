@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -32,11 +31,10 @@
 
 #include "mongo/base/error_codes.h"
 #include "mongo/db/field_ref.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
-using mongoutils::str::stream;
 
 namespace fieldchecker {
 
@@ -52,24 +50,22 @@ Status isUpdatable(const FieldRef& field) {
 
         if (part.empty()) {
             return Status(ErrorCodes::EmptyFieldName,
-                          mongoutils::str::stream()
-                              << "The update path '"
-                              << field.dottedField()
-                              << "' contains an empty field name, which is not allowed.");
+                          str::stream() << "The update path '" << field.dottedField()
+                                        << "' contains an empty field name, which is not allowed.");
         }
     }
 
     return Status::OK();
 }
 
-bool isPositionalElement(const StringData& field) {
+bool isPositionalElement(StringData field) {
     return field.size() == 1 && field[0] == '$';
 }
 
 bool isPositional(const FieldRef& fieldRef, size_t* pos, size_t* count) {
     // 'count' is optional.
     size_t dummy;
-    if (count == NULL) {
+    if (count == nullptr) {
         count = &dummy;
     }
 
@@ -86,7 +82,7 @@ bool isPositional(const FieldRef& fieldRef, size_t* pos, size_t* count) {
     return *count > 0;
 }
 
-bool isArrayFilterIdentifier(const StringData& field) {
+bool isArrayFilterIdentifier(StringData field) {
     return field.size() >= 3 && field[0] == '$' && field[1] == '[' &&
         field[field.size() - 1] == ']';
 }

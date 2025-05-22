@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,7 +29,25 @@
 
 #pragma once
 
+#include <boost/optional.hpp>
+#include <functional>
+#include <iosfwd>
+#include <typeinfo>
+#include <vector>
+
+#include "mongo/platform/compiler.h"
+#include "mongo/util/dynamic_catch.h"
+
 namespace mongo {
+/**
+ * Sets the appropriate state to enable/disable diagnostic logging based on `newVal`.
+ */
+void setDiagnosticLoggingInSignalHandlers(bool newVal);
+
+/**
+ * Restores the default signal handlers and ends the process.
+ */
+void endProcessWithSignal(int signalNum);
 
 /**
  * Sets up handlers for synchronous events, like segv, abort, terminate and malloc-failure.
@@ -50,12 +67,93 @@ void setupSynchronousSignalHandlers();
  *     mongoMalloc
  *     mongoRealloc
  */
-void reportOutOfMemoryErrorAndExit();
+MONGO_COMPILER_NORETURN void reportOutOfMemoryErrorAndExit();
 
 /**
  * Clears the signal mask for the process. This is called from forkServer and to setup
  * the unit tests. On Windows, this is a noop.
  */
 void clearSignalMask();
+
+#if defined(__linux__) || defined(__APPLE__)
+#define MONGO_STACKTRACE_HAS_SIGNAL
+#endif
+
+#if defined(MONGO_STACKTRACE_HAS_SIGNAL)
+/**
+ * Returns the signal used to initiate all-thread stack traces.
+ */
+int stackTraceSignal();
+#endif
+
+/**
+ * Returns the signal used for stress-testing of EINTR resilience.
+ */
+int interruptResilienceTestingSignal();
+
+/**
+ * Analyzes the active exception, describing it to an ostream.
+ * Consults a dynamic registry of exception handlers.
+ * See `util/dynamic_catch.h`.
+ */
+class ActiveExceptionWitness {
+public:
+    /** Default constructor creates handlers for some basic exception types. */
+    ActiveExceptionWitness();
+
+    /**
+     * Called at startup to teach our std::terminate handler how to print a
+     * diagnostic for decoupled types of exceptions (e.g. in third_party, in
+     * layers above base, or outside of the server codebase).
+     *
+     * This is not thread-safe, call at startup before multithreading. The
+     * probes are evaluated in order so that later entries here will supersede
+     * earlier entries and match more tightly in the catch hierarchy.
+     */
+    template <typename Ex>
+    void addHandler(std::function<void(const Ex&, std::ostream&)> handler) {
+        _configurators.push_back([=](CatchAndDescribe& dc) {
+            dc.addCatch<Ex>([=](const Ex& ex, std::ostream& os) {
+                handler(ex, os);
+                _exceptionTypeBlurb(typeid(ex), os);
+            });
+        });
+    }
+
+    /**
+     * Writes a description of the active exception to `os`, using built-in
+     * exception probes, augmented by any configured exception probes given by calls to
+     * `addHandler`.
+     *
+     * Called by our std::terminate handler when it detects an active
+     * exception. The active exception is probably related to why the process
+     * is terminating, but not necessarily. Consult a dynamic registry of
+     * exception types to diagnose the active exception.
+     */
+    void describe(std::ostream& os);
+
+private:
+    /**
+     * A DynamicCatch that provides handlers with an std::ostream& into which
+     * to describe the exception they've caught.
+     */
+    using CatchAndDescribe = DynamicCatch<std::ostream&>;
+
+    static void _exceptionTypeBlurb(const std::type_info& ex, std::ostream& os);
+
+    std::vector<std::function<void(CatchAndDescribe&)>> _configurators;
+};
+
+/** The singleton ActiveExceptionWitness. */
+ActiveExceptionWitness& globalActiveExceptionWitness();
+
+std::string describeActiveException();
+
+/**
+ * Returns a `shared_ptr` that will have sole ownership of a `MallocFreeOStreamGuard`. The passed in
+ * signal number is used to end the process if the deadlock mitigation is triggered.
+ */
+std::shared_ptr<void> makeMallocFreeOStreamGuard_forTest(int sig);
+void setMallocFreeOStreamGuardDeadlockCallback_forTest(std::function<void(int)> cb);
 
 }  // namespace mongo

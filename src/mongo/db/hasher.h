@@ -1,9 +1,3 @@
-/* hasher.h
- *
- * Defines a simple hash function class
- */
-
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -35,15 +29,22 @@
 
 #pragma once
 
-#include "mongo/base/disallow_copying.h"
+/**
+ * Defines a simple hash function class
+ */
+
+
+#include <cstdint>
+
 #include "mongo/bson/bsonelement.h"
 
 namespace mongo {
 
-typedef int HashSeed;
+typedef int32_t HashSeed;
 
 class BSONElementHasher {
-    MONGO_DISALLOW_COPYING(BSONElementHasher);
+    BSONElementHasher(const BSONElementHasher&) = delete;
+    BSONElementHasher& operator=(const BSONElementHasher&) = delete;
 
 public:
     /* The hash function we use can be given a seed, to effectively randomize it
@@ -53,7 +54,7 @@ public:
      * WARNING: do not change the hash see value. Hash-based sharding clusters will
      * expect that value to be zero.
      */
-    static const int DEFAULT_HASH_SEED = 0;
+    static constexpr HashSeed const DEFAULT_HASH_SEED = 0;
 
     /* This computes a 64-bit hash of the value part of BSONElement "e",
      * preceded by the seed "seed".  Squashes element (and any sub-elements)
@@ -72,4 +73,4 @@ public:
 private:
     BSONElementHasher();
 };
-}
+}  // namespace mongo

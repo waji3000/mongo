@@ -2,12 +2,13 @@ test_kind: js_test
 
 selector:
   roots:
-  - jstestfuzz/out/*.js
+    - jstestfuzz/out/*.js
 
 executor:
   archive:
     hooks:
       - CheckReplDBHash
+      - CheckMetadataConsistencyInBackground
       - ValidateCollections
   config:
     shell_options:
@@ -15,30 +16,45 @@ executor:
         TestData:
           # Other fuzzers test commands against sharded clusters with logical session ids.
           disableImplicitSessions: true
-      readMode: commands
+      crashOnInvalidBSONError: ""
+      objcheck: ""
   hooks:
-  - class: CheckReplDBHash
-    shell_options:
-      global_vars:
-        TestData:
-          skipValidationOnInvalidViewDefinitions: true
-  - class: ValidateCollections
-    shell_options:
-      global_vars:
-        TestData:
-          skipValidationOnInvalidViewDefinitions: true
-          forceValidationWithFeatureCompatibilityVersion: "4.2"
+    - class: FuzzerRestoreSettings
+    - class: RunQueryStats
+      allow_feature_not_supported: true
+    - class: CheckReplDBHash
+      shell_options:
+        global_vars:
+          TestData:
+            skipValidationOnInvalidViewDefinitions: true
+    - class: CheckMetadataConsistencyInBackground
+    - class: ValidateCollections
+      shell_options:
+        global_vars:
+          TestData:
+            skipValidationOnInvalidViewDefinitions: true
+    - class: CheckRoutingTableConsistency
+      shell_options:
+        global_vars:
+          TestData:
+            mayForgeReshardingTempCollections: true
   fixture:
     class: ShardedClusterFixture
     mongos_options:
       set_parameters:
         enableTestCommands: 1
-      verbose: ''
+        internalQueryStatsRateLimit: -1
+        internalQueryStatsErrorsAreCommandFatal: true
+      verbose: ""
     mongod_options:
       set_parameters:
         disableLogicalSessionCacheRefresh: false
         enableTestCommands: 1
-        numInitialSyncAttempts: 1
+        transactionLifetimeLimitSeconds: 1
         writePeriodicNoops: 1
-      verbose: ''
+        internalQueryStatsRateLimit: -1
+        internalQueryStatsErrorsAreCommandFatal: true
+        notablescan: false
+      verbose: ""
+    num_rs_nodes_per_shard: 1
     num_shards: 2

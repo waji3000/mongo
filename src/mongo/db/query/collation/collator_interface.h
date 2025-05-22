@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,13 +29,15 @@
 
 #pragma once
 
+#include <cstddef>
 #include <memory>
 #include <string>
+#include <utility>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/string_data.h"
-#include "mongo/base/string_data_comparator_interface.h"
+#include "mongo/base/string_data_comparator.h"
 #include "mongo/bson/bsonobj_comparator_interface.h"
+#include "mongo/db/basic_types_gen.h"
 #include "mongo/db/query/collation/collation_spec.h"
 
 namespace mongo {
@@ -49,8 +50,14 @@ namespace mongo {
  *
  * Does not throw exceptions.
  */
-class CollatorInterface : public StringData::ComparatorInterface {
-    MONGO_DISALLOW_COPYING(CollatorInterface);
+
+class CollatorInterface;
+
+constexpr CollatorInterface* kSimpleCollator = nullptr;
+
+class CollatorInterface : public StringDataComparator {
+    CollatorInterface(const CollatorInterface&) = delete;
+    CollatorInterface& operator=(const CollatorInterface&) = delete;
 
 public:
     /**
@@ -90,18 +97,19 @@ public:
     /**
      * Constructs a CollatorInterface capable of computing the collation described by 'spec'.
      */
-    CollatorInterface(CollationSpec spec) : _spec(std::move(spec)) {}
+    CollatorInterface(Collation spec) : _spec(std::move(spec)) {}
 
-    virtual ~CollatorInterface() {}
+    ~CollatorInterface() override {}
 
     virtual std::unique_ptr<CollatorInterface> clone() const = 0;
+    virtual std::shared_ptr<CollatorInterface> cloneShared() const = 0;
 
     /**
      * Returns a number < 0 if 'left' is less than 'right' with respect to the collation, a number >
      * 0 if 'left' is greater than 'right' w.r.t. the collation, and 0 if 'left' and 'right' are
      * equal w.r.t. the collation.
      */
-    virtual int compare(StringData left, StringData right) const = 0;
+    int compare(StringData left, StringData right) const override = 0;
 
     /**
      * Hashes the string such that strings which are equal under this collation also have equal
@@ -114,6 +122,12 @@ public:
      * comments for details.
      */
     virtual ComparisonKey getComparisonKey(StringData stringData) const = 0;
+
+    /**
+     * Returns the comparison key string for 'stringData', according to this collation. See
+     * ComparisonKey's comments for details.
+     */
+    std::string getComparisonString(StringData stringData) const;
 
     /**
      * Returns whether this collation has the same matching and sorting semantics as 'other'.
@@ -131,33 +145,39 @@ public:
     }
 
     /**
-     * Returns a reference to the CollationSpec.
+     * Returns a reference to the Collation.
      */
-    const CollationSpec& getSpec() const {
+    const Collation& getSpec() const {
         return _spec;
     }
 
     /**
-     * Returns true if lhs and rhs are both nullptr, or if they point to equivalent collators.
+     * Returns true if lhs and rhs are both the simple collator (nullptr), or if they point to
+     * equivalent collators.
      */
     static bool collatorsMatch(const CollatorInterface* lhs, const CollatorInterface* rhs) {
-        if (lhs == nullptr && rhs == nullptr) {
+        if (isSimpleCollator(lhs) && isSimpleCollator(rhs)) {
             return true;
         }
-        if (lhs == nullptr || rhs == nullptr) {
+        if (isSimpleCollator(lhs) || isSimpleCollator(rhs)) {
             return false;
         }
         return (*lhs == *rhs);
     }
 
     /**
-     * Returns a clone of 'collator'. If 'collator' is nullptr, returns the null collator.
+     * Returns a clone of 'collator'.
+     * If 'collator' is the simple collator (nullptr), returns it again.
      */
     static std::unique_ptr<CollatorInterface> cloneCollator(const CollatorInterface* collator) {
-        if (!collator) {
-            return {nullptr};
+        if (isSimpleCollator(collator)) {
+            return std::unique_ptr<CollatorInterface>{kSimpleCollator};
         }
         return collator->clone();
+    }
+
+    static bool isSimpleCollator(const CollatorInterface* collator) {
+        return collator == kSimpleCollator;
     }
 
 protected:
@@ -166,7 +186,7 @@ protected:
     }
 
 private:
-    const CollationSpec _spec;
+    const Collation _spec;
 };
 
 }  // namespace mongo

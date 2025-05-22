@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -29,17 +28,15 @@
  */
 
 #include <boost/filesystem.hpp>
+#include <boost/filesystem/path.hpp>
 #include <vector>
 
-#include "mongo/db/jsobj.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/db/service_context_test_fixture.h"
 
 namespace mongo {
 
-class FTDCTest : public ServiceContextTest {
-public:
-    FTDCTest();
-};
+class FTDCTest : public ClockSourceMockServiceContextTest {};
 
 /**
  * Validation mode for tests, strict by default
@@ -62,7 +59,7 @@ enum class FTDCValidationMode {
  *
  * Unit Test ASSERTs if there is mismatch.
  */
-void ValidateDocumentList(const boost::filesystem::path& p,
+void ValidateDocumentList(const boost::filesystem::path& path,
                           const std::vector<BSONObj>& docs,
                           FTDCValidationMode mode);
 
@@ -74,6 +71,18 @@ void ValidateDocumentList(const boost::filesystem::path& p,
 void ValidateDocumentList(const std::vector<BSONObj>& docs1,
                           const std::vector<BSONObj>& docs2,
                           FTDCValidationMode mode);
+
+/**
+ * Validate the documents in a file matches the documents in the specified vectors, which
+ * are sorted by type.
+ *
+ * Unit Test ASSERTs if there is mismatch.
+ */
+void ValidateDocumentListByType(const std::vector<boost::filesystem::path>& paths,
+                                const std::vector<BSONObj>& expectedOnRotateMetadata,
+                                const std::vector<BSONObj>& expectedMetrics,
+                                const std::vector<BSONObj>& expectedPeriodicMetadata,
+                                FTDCValidationMode mode);
 
 /**
  * Delete a file if it exists.

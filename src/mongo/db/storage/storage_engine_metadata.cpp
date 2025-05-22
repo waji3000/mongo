@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,43 +27,53 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/storage/storage_engine_metadata.h"
-
-#include <boost/filesystem.hpp>
-#include <boost/optional.hpp>
-#include <cstdio>
-#include <fstream>
-#include <limits>
-#include <ostream>
+#include <boost/filesystem/operations.hpp>
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <cerrno>
+#include <exception>
+#include <fstream>  // IWYU pragma: keep
+#include <system_error>
 #include <vector>
 
 #ifdef __linux__  // Only needed by flushDirectory for Linux
 #include <boost/filesystem/path.hpp>
 #include <fcntl.h>
-#include <sys/stat.h>
-#include <sys/types.h>
 #endif
 
+#include "mongo/base/data_range.h"
 #include "mongo/base/data_type_validated.h"
-#include "mongo/db/bson/dotted_path_support.h"
-#include "mongo/db/jsobj.h"
-#include "mongo/rpc/object_check.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/bson/dotted_path/dotted_path_support.h"
+#include "mongo/config.h"  // IWYU pragma: keep
+#include "mongo/db/storage/storage_engine_metadata.h"
+#include "mongo/logv2/log.h"
+#include "mongo/rpc/object_check.h"  // IWYU pragma: keep
 #include "mongo/util/assert_util.h"
+#include "mongo/util/errno_util.h"
 #include "mongo/util/file.h"
-#include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
+
+#if defined(MONGO_CONFIG_HAVE_HEADER_UNISTD_H)
+#include <unistd.h>
+#endif
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
+
 
 namespace mongo {
-
-namespace dps = ::mongo::dotted_path_support;
 
 namespace {
 
 const std::string kMetadataBasename = "storage.bson";
+
+}  // namespace
 
 bool fsyncFile(boost::filesystem::path path) {
     invariant(path.has_filename());
@@ -77,8 +86,6 @@ bool fsyncFile(boost::filesystem::path path) {
     return true;
 }
 
-}  // namespace
-
 // static
 std::unique_ptr<StorageEngineMetadata> StorageEngineMetadata::forPath(const std::string& dbpath) {
     std::unique_ptr<StorageEngineMetadata> metadata;
@@ -86,8 +93,8 @@ std::unique_ptr<StorageEngineMetadata> StorageEngineMetadata::forPath(const std:
         metadata.reset(new StorageEngineMetadata(dbpath));
         Status status = metadata->read();
         if (!status.isOK()) {
-            error() << "Unable to read the storage engine metadata file: " << status;
-            fassertFailedNoTrace(28661);
+            LOGV2_FATAL_NOTRACE(
+                28661, "Unable to read the storage engine metadata file", "error"_attr = status);
         }
     }
     return metadata;
@@ -143,13 +150,13 @@ Status StorageEngineMetadata::read() {
     boost::uintmax_t fileSize = boost::filesystem::file_size(metadataPath);
     if (fileSize == 0) {
         return Status(ErrorCodes::InvalidPath,
-                      str::stream() << "Metadata file " << metadataPath.string()
-                                    << " cannot be empty.");
+                      str::stream()
+                          << "Metadata file " << metadataPath.string() << " cannot be empty.");
     }
     if (fileSize == static_cast<boost::uintmax_t>(-1)) {
         return Status(ErrorCodes::InvalidPath,
-                      str::stream() << "Unable to determine size of metadata file "
-                                    << metadataPath.string());
+                      str::stream()
+                          << "Unable to determine size of metadata file " << metadataPath.string());
     }
 
     std::vector<char> buffer(fileSize);
@@ -157,27 +164,25 @@ Status StorageEngineMetadata::read() {
         std::ifstream ifs(metadataPath.c_str(), std::ios_base::in | std::ios_base::binary);
         if (!ifs) {
             return Status(ErrorCodes::FileNotOpen,
-                          str::stream() << "Failed to read metadata from "
-                                        << metadataPath.string());
+                          str::stream()
+                              << "Failed to read metadata from " << metadataPath.string());
         }
 
         // Read BSON from file
         ifs.read(&buffer[0], buffer.size());
         if (!ifs) {
             return Status(ErrorCodes::FileStreamFailed,
-                          str::stream() << "Unable to read BSON data from "
-                                        << metadataPath.string());
+                          str::stream()
+                              << "Unable to read BSON data from " << metadataPath.string());
         }
     } catch (const std::exception& ex) {
         return Status(ErrorCodes::FileStreamFailed,
                       str::stream() << "Unexpected error reading BSON data from "
-                                    << metadataPath.string()
-                                    << ": "
-                                    << ex.what());
+                                    << metadataPath.string() << ": " << ex.what());
     }
 
     ConstDataRange cdr(&buffer[0], buffer.size());
-    auto swObj = cdr.read<Validated<BSONObj>>();
+    auto swObj = cdr.readNoThrow<Validated<BSONObj>>();
     if (!swObj.isOK()) {
         return swObj.getStatus();
     }
@@ -185,7 +190,8 @@ Status StorageEngineMetadata::read() {
     BSONObj obj = swObj.getValue();
 
     // Validate 'storage.engine' field.
-    BSONElement storageEngineElement = dps::extractElementAtPath(obj, "storage.engine");
+    BSONElement storageEngineElement =
+        ::mongo::bson::extractElementAtDottedPath(obj, "storage.engine");
     if (storageEngineElement.type() != mongo::String) {
         return Status(ErrorCodes::FailedToParse,
                       str::stream() << "The 'storage.engine' field in metadata must be a string: "
@@ -201,12 +207,13 @@ Status StorageEngineMetadata::read() {
     _storageEngine = storageEngine;
 
     // Read storage engine options generated by storage engine factory from startup options.
-    BSONElement storageEngineOptionsElement = dps::extractElementAtPath(obj, "storage.options");
+    BSONElement storageEngineOptionsElement =
+        ::mongo::bson::extractElementAtDottedPath(obj, "storage.options");
     if (!storageEngineOptionsElement.eoo()) {
         if (!storageEngineOptionsElement.isABSONObj()) {
             return Status(ErrorCodes::FailedToParse,
                           str::stream()
-                              << "The 'storage.options' field in metadata must be a string: "
+                              << "The 'storage.options' field in metadata must be an object: "
                               << storageEngineOptionsElement.toString());
         }
         setStorageEngineOptions(storageEngineOptionsElement.Obj());
@@ -221,39 +228,42 @@ void flushMyDirectory(const boost::filesystem::path& file) {
     // if called without a fully qualified path it asserts; that makes mongoperf fail.
     // so make a warning. need a better solution longer term.
     // massert(13652, str::stream() << "Couldn't find parent dir for file: " << file.string(),);
-    if (!file.has_branch_path()) {
-        log() << "warning flushMyDirectory couldn't find parent dir for file: " << file.string();
+    if (!file.has_parent_path()) {
+        LOGV2(22283,
+              "flushMyDirectory couldn't find parent dir for file",
+              "file"_attr = file.generic_string());
         return;
     }
 
 
-    boost::filesystem::path dir = file.branch_path();  // parent_path in new boosts
+    boost::filesystem::path dir = file.parent_path();
 
-    LOG(1) << "flushing directory " << dir.string();
+    LOGV2_DEBUG(22284, 1, "flushing directory {dir_string}", "dir_string"_attr = dir.string());
 
     int fd = ::open(dir.string().c_str(), O_RDONLY);  // DO NOT THROW OR ASSERT BEFORE CLOSING
-    massert(13650,
-            str::stream() << "Couldn't open directory '" << dir.string() << "' for flushing: "
-                          << errnoWithDescription(),
-            fd >= 0);
+    if (fd < 0) {
+        auto ec = lastPosixError();
+        msgasserted(13650,
+                    str::stream() << "Couldn't open directory '" << dir.string()
+                                  << "' for flushing: " << errorMessage(ec));
+    }
     if (fsync(fd) != 0) {
-        int e = errno;
-        if (e == EINVAL) {  // indicates filesystem does not support synchronization
+        auto ec = lastPosixError();
+        if (ec == posixError(EINVAL)) {  // indicates filesystem does not support synchronization
             if (!_warnedAboutFilesystem) {
-                log() << "\tWARNING: This file system is not supported. For further information"
-                      << " see:" << startupWarningsLog;
-                log() << "\t\t\thttp://dochub.mongodb.org/core/unsupported-filesystems"
-                      << startupWarningsLog;
-                log() << "\t\tPlease notify MongoDB, Inc. if an unlisted filesystem generated "
-                      << "this warning." << startupWarningsLog;
+                LOGV2_OPTIONS(
+                    22285,
+                    {logv2::LogTag::kStartupWarnings},
+                    "This file system is not supported. For further information see: "
+                    "http://dochub.mongodb.org/core/unsupported-filesystems Please notify MongoDB, "
+                    "Inc. if an unlisted filesystem generated this warning");
                 _warnedAboutFilesystem = true;
             }
         } else {
             close(fd);
-            massert(13651,
-                    str::stream() << "Couldn't fsync directory '" << dir.string() << "': "
-                                  << errnoWithDescription(e),
-                    false);
+            msgasserted(13651,
+                        str::stream() << "Couldn't fsync directory '" << dir.string()
+                                      << "': " << errorMessage(ec));
         }
     }
     close(fd);
@@ -271,21 +281,20 @@ Status StorageEngineMetadata::write() const {
     {
         std::ofstream ofs(metadataTempPath.c_str(), std::ios_base::out | std::ios_base::binary);
         if (!ofs) {
-            return Status(
-                ErrorCodes::FileNotOpen,
-                str::stream() << "Failed to write metadata to " << metadataTempPath.string() << ": "
-                              << errnoWithDescription());
+            auto ec = lastSystemError();
+            return Status(ErrorCodes::FileNotOpen,
+                          str::stream() << "Failed to write metadata to "
+                                        << metadataTempPath.string() << ": " << errorMessage(ec));
         }
 
         BSONObj obj = BSON(
             "storage" << BSON("engine" << _storageEngine << "options" << _storageEngineOptions));
         ofs.write(obj.objdata(), obj.objsize());
         if (!ofs) {
+            auto ec = lastSystemError();
             return Status(ErrorCodes::OperationFailed,
                           str::stream() << "Failed to write BSON data to "
-                                        << metadataTempPath.string()
-                                        << ": "
-                                        << errnoWithDescription());
+                                        << metadataTempPath.string() << ": " << errorMessage(ec));
         }
     }
 
@@ -305,11 +314,8 @@ Status StorageEngineMetadata::write() const {
     } catch (const std::exception& ex) {
         return Status(ErrorCodes::FileRenameFailed,
                       str::stream() << "Unexpected error while renaming temporary metadata file "
-                                    << metadataTempPath.string()
-                                    << " to "
-                                    << metadataPath.string()
-                                    << ": "
-                                    << ex.what());
+                                    << metadataTempPath.string() << " to " << metadataPath.string()
+                                    << ": " << ex.what());
     }
 
     return Status::OK();
@@ -325,21 +331,16 @@ Status StorageEngineMetadata::validateStorageEngineOption<bool>(
                 ErrorCodes::InvalidOptions,
                 str::stream()
                     << "Requested option conflicts with the current storage engine option for "
-                    << fieldName
-                    << "; you requested "
-                    << (expectedValue ? "true" : "false")
+                    << fieldName << "; you requested " << (expectedValue ? "true" : "false")
                     << " but the current server storage is implicitly set to "
-                    << (*defaultValue ? "true" : "false")
-                    << " and cannot be changed");
+                    << (*defaultValue ? "true" : "false") << " and cannot be changed");
         }
         return Status::OK();
     }
     if (!element.isBoolean()) {
         return Status(ErrorCodes::FailedToParse,
                       str::stream() << "Expected boolean field " << fieldName << " but got "
-                                    << typeName(element.type())
-                                    << " instead: "
-                                    << element);
+                                    << typeName(element.type()) << " instead: " << element);
     }
     if (element.boolean() == expectedValue) {
         return Status::OK();
@@ -347,12 +348,9 @@ Status StorageEngineMetadata::validateStorageEngineOption<bool>(
     return Status(
         ErrorCodes::InvalidOptions,
         str::stream() << "Requested option conflicts with current storage engine option for "
-                      << fieldName
-                      << "; you requested "
-                      << (expectedValue ? "true" : "false")
+                      << fieldName << "; you requested " << (expectedValue ? "true" : "false")
                       << " but the current server storage is already set to "
-                      << (element.boolean() ? "true" : "false")
-                      << " and cannot be changed");
+                      << (element.boolean() ? "true" : "false") << " and cannot be changed");
 }
 
 }  // namespace mongo

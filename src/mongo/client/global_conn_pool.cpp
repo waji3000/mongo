@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,50 +27,26 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <string>
 
+#include "mongo/base/init.h"  // IWYU pragma: keep
+#include "mongo/base/initializer.h"
 #include "mongo/client/global_conn_pool.h"
-
-#include "mongo/base/init.h"
-#include "mongo/db/server_parameters.h"
+#include "mongo/client/global_conn_pool_gen.h"
 
 namespace mongo {
 namespace {
 
-// Maximum connections per host the connection pool should store
-int maxConnsPerHost(200);
-ExportedServerParameter<int, ServerParameterType::kStartupOnly>  //
-    maxConnsPerHostParameter(ServerParameterSet::getGlobal(),
-                             "connPoolMaxConnsPerHost",
-                             &maxConnsPerHost);
-
-// Maximum in-use connections per host in the global connection pool
-int maxInUseConnsPerHost(std::numeric_limits<int>::max());
-ExportedServerParameter<int, ServerParameterType::kStartupOnly>  //
-    maxInUseConnsPerHostParameter(ServerParameterSet::getGlobal(),
-                                  "connPoolMaxInUseConnsPerHost",
-                                  &maxInUseConnsPerHost);
-
-// Amount of time, in minutes, to keep idle connections in the global connection pool
-int globalConnPoolIdleTimeout(std::numeric_limits<int>::max());
-ExportedServerParameter<int, ServerParameterType::kStartupOnly>  //
-    globalConnPoolIdleTimeoutParameter(ServerParameterSet::getGlobal(),
-                                       "globalConnPoolIdleTimeoutMinutes",
-                                       &globalConnPoolIdleTimeout);
-
-MONGO_INITIALIZER(InitializeGlobalConnectionPool)(InitializerContext* context) {
+MONGO_INITIALIZER_WITH_PREREQUISITES(InitializeGlobalConnectionPool, ("EndStartupOptionStorage"))
+(InitializerContext* context) {
     globalConnPool.setName("connection pool");
     globalConnPool.setMaxPoolSize(maxConnsPerHost);
     globalConnPool.setMaxInUse(maxInUseConnsPerHost);
     globalConnPool.setIdleTimeout(globalConnPoolIdleTimeout);
-
-    return Status::OK();
 }
 
 }  // namespace
 
 DBConnectionPool globalConnPool;
-
-ReplicaSetMonitorManager globalRSMonitorManager;
 
 }  // namespace mongo

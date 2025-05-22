@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,185 +29,215 @@
 
 #pragma once
 
-#include <vector>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <cstdint>
+#include <functional>
+#include <memory>
+#include <string>
 
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/db/catalog/index_catalog.h"
-
 #include "mongo/db/catalog/index_catalog_entry.h"
-#include "mongo/db/index/index_build_interceptor.h"
+#include "mongo/db/index/index_access_method.h"
+#include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/index/multikey_paths.h"
-#include "mongo/db/jsobj.h"
+#include "mongo/db/index_builds/index_build_interceptor.h"
+#include "mongo/db/index_builds/resumable_index_builds_gen.h"
+#include "mongo/db/matcher/expression.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/record_id.h"
+#include "mongo/db/repl/oplog.h"
 #include "mongo/db/server_options.h"
+#include "mongo/db/storage/key_string/key_string.h"
 #include "mongo/db/storage/record_store.h"
+#include "mongo/db/update/document_diff_calculator.h"
 
 namespace mongo {
 
 class Client;
 class Collection;
-
+class CollectionPtr;
 class IndexDescriptor;
-class IndexAccessMethod;
 struct InsertDeleteOptions;
 
 /**
- * how many: 1 per Collection.
- * lifecycle: attached to a Collection.
+ * Special kind of 'IndexCatalogEntryContainer' just for the "ready" indexes maintained by
+ * 'IndexCatalogImpl'. The purpose of this class is to allow for fast access to the ready _id index.
+ */
+class ReadyIndexCatalogEntryContainer : public IndexCatalogEntryContainer {
+public:
+    std::shared_ptr<const IndexCatalogEntry> release(const IndexDescriptor* desc) override {
+        if (auto released = IndexCatalogEntryContainer::release(desc)) {
+            // Some operations can drop the _id index, such as collection truncation or re-indexing.
+            if (desc->isIdIndex()) {
+                _cachedIdIndex = nullptr;
+            }
+            return released;
+        }
+        return nullptr;
+    }
+
+    void add(std::shared_ptr<const IndexCatalogEntry>&& entry) override {
+        if (entry->descriptor()->isIdIndex()) {
+            _cachedIdIndex = entry->descriptor();
+        }
+        IndexCatalogEntryContainer::add(std::move(entry));
+    }
+
+    const IndexDescriptor* getIdIndex() const {
+        return _cachedIdIndex;
+    }
+
+private:
+    // Pointer to the ready _id index, if it exists. Should be kept in sync with _entries.
+    const IndexDescriptor* _cachedIdIndex{nullptr};
+};
+
+/**
+ * IndexCatalogImpl is stored as a member of CollectionImpl. When the Collection is cloned this is
+ * cloned with it by making shallow copies of the contained IndexCatalogEntry. The IndexCatalogEntry
+ * instances are shared across multiple Collection instances.
  */
 class IndexCatalogImpl : public IndexCatalog {
 public:
-    explicit IndexCatalogImpl(Collection* collection, int maxNumIndexesAllowed);
-    ~IndexCatalogImpl() override;
-
-    // must be called before used
-    Status init(OperationContext* opCtx) override;
-
-    bool ok() const override;
-
-    // ---- accessors -----
-
-    bool haveAnyIndexes() const override;
-    int numIndexesTotal(OperationContext* opCtx) const override;
-    int numIndexesReady(OperationContext* opCtx) const override;
-    int numIndexesInProgress(OperationContext* opCtx) const {
-        return numIndexesTotal(opCtx) - numIndexesReady(opCtx);
-    }
+    /**
+     * Maximum number of indexes that can be present for any given collection at any given time.
+     */
+    static constexpr int kMaxNumIndexesAllowed = 64;
 
     /**
-     * this is in "alive" until the Collection goes away
-     * in which case everything from this tree has to go away.
+     * Creates a cloned IndexCatalogImpl. Will make shallow copies of IndexCatalogEntryContainers so
+     * the IndexCatalogEntry will be shared across IndexCatalogImpl instances'
      */
+    std::unique_ptr<IndexCatalog> clone() const override;
+
+    void init(OperationContext* opCtx,
+              Collection* collection,
+              bool isPointInTimeRead = false) override;
+
+    bool haveAnyIndexes() const override;
+
+    bool haveAnyIndexesInProgress() const override;
+
+    int numIndexesTotal() const override;
+
+    int numIndexesReady() const override;
+
+    int numIndexesInProgress() const override;
 
     bool haveIdIndex(OperationContext* opCtx) const override;
 
-    /**
-     * Returns the spec for the id index to create by default for this collection.
-     */
-    BSONObj getDefaultIdIndexSpec() const override;
+    BSONObj getDefaultIdIndexSpec(const CollectionPtr& collection) const override;
 
-    IndexDescriptor* findIdIndex(OperationContext* opCtx) const override;
+    const IndexDescriptor* findIdIndex(OperationContext* opCtx) const override;
 
-    /**
-     * Find index by name.  The index name uniquely identifies an index.
-     *
-     * @return null if cannot find
-     */
-    IndexDescriptor* findIndexByName(OperationContext* opCtx,
-                                     StringData name,
-                                     bool includeUnfinishedIndexes = false) const override;
+    const IndexDescriptor* findIndexByName(
+        OperationContext* opCtx,
+        StringData name,
+        InclusionPolicy inclusionPolicy = InclusionPolicy::kReady) const override;
 
-    /**
-     * Find index by matching key pattern and collation spec.  The key pattern and collation spec
-     * uniquely identify an index.
-     *
-     * Collation is specified as a normalized collation spec as returned by
-     * CollationInterface::getSpec.  An empty object indicates the simple collation.
-     *
-     * @return null if cannot find index, otherwise the index with a matching key pattern and
-     * collation.
-     */
-    IndexDescriptor* findIndexByKeyPatternAndCollationSpec(
+    const IndexDescriptor* findIndexByKeyPatternAndOptions(
         OperationContext* opCtx,
         const BSONObj& key,
-        const BSONObj& collationSpec,
-        bool includeUnfinishedIndexes = false) const override;
+        const BSONObj& indexSpec,
+        InclusionPolicy inclusionPolicy = InclusionPolicy::kReady) const override;
 
-    /**
-     * Find indexes with a matching key pattern, putting them into the vector 'matches'.  The key
-     * pattern alone does not uniquely identify an index.
-     *
-     * Consider using 'findIndexByName' if expecting to match one index.
-     */
     void findIndexesByKeyPattern(OperationContext* opCtx,
                                  const BSONObj& key,
-                                 bool includeUnfinishedIndexes,
-                                 std::vector<IndexDescriptor*>* matches) const override;
-
-    /**
-     * Returns an index suitable for shard key range scans.
-     *
-     * This index:
-     * - must be prefixed by 'shardKey', and
-     * - must not be a partial index.
-     * - must have the simple collation.
-     *
-     * If the parameter 'requireSingleKey' is true, then this index additionally must not be
-     * multi-key.
-     *
-     * If no such index exists, returns NULL.
-     */
-    IndexDescriptor* findShardKeyPrefixedIndex(OperationContext* opCtx,
-                                               const BSONObj& shardKey,
-                                               bool requireSingleKey) const override;
+                                 InclusionPolicy inclusionPolicy,
+                                 std::vector<const IndexDescriptor*>* matches) const override;
 
     void findIndexByType(OperationContext* opCtx,
                          const std::string& type,
-                         std::vector<IndexDescriptor*>& matches,
-                         bool includeUnfinishedIndexes = false) const override;
+                         std::vector<const IndexDescriptor*>& matches,
+                         InclusionPolicy inclusionPolicy = InclusionPolicy::kReady) const override;
 
+    const IndexDescriptor* findIndexByIdent(
+        OperationContext* opCtx,
+        StringData ident,
+        InclusionPolicy inclusionPolicy = InclusionPolicy::kReady) const override;
 
-    /**
-     * Reload the index definition for 'oldDesc' from the CollectionCatalogEntry.  'oldDesc'
-     * must be a ready index that is already registered with the index catalog.  Returns an
-     * unowned pointer to the descriptor for the new index definition.
-     *
-     * Use this method to notify the IndexCatalog that the spec for this index has changed.
-     *
-     * It is invalid to dereference 'oldDesc' after calling this method.  This method broadcasts
-     * an invalidateAll() on the cursor manager to notify other users of the IndexCatalog that
-     * this descriptor is now invalid.
-     */
     const IndexDescriptor* refreshEntry(OperationContext* opCtx,
-                                        const IndexDescriptor* oldDesc) override;
+                                        Collection* collection,
+                                        const IndexDescriptor* oldDesc,
+                                        CreateIndexEntryFlags flags) override;
 
-    // never returns NULL
     const IndexCatalogEntry* getEntry(const IndexDescriptor* desc) const override;
 
-    IndexAccessMethod* getIndex(const IndexDescriptor* desc) override;
-    const IndexAccessMethod* getIndex(const IndexDescriptor* desc) const override;
+    IndexCatalogEntry* getWritableEntryByName(
+        OperationContext* opCtx,
+        StringData name,
+        InclusionPolicy inclusionPolicy = InclusionPolicy::kReady) override;
 
-    /**
-     * Returns a not-ok Status if there are any unfinished index builds. No new indexes should
-     * be built when in this state.
-     */
-    Status checkUnfinished() const override;
+    IndexCatalogEntry* getWritableEntryByKeyPatternAndOptions(
+        OperationContext* opCtx,
+        const BSONObj& key,
+        const BSONObj& indexSpec,
+        InclusionPolicy inclusionPolicy = InclusionPolicy::kReady) override;
+
+    std::shared_ptr<const IndexCatalogEntry> getEntryShared(const IndexDescriptor*) const override;
+
+    std::vector<std::shared_ptr<const IndexCatalogEntry>> getAllReadyEntriesShared() const override;
 
     using IndexIterator = IndexCatalog::IndexIterator;
-    std::unique_ptr<IndexIterator> getIndexIterator(
-        OperationContext* const opCtx, const bool includeUnfinishedIndexes) const override;
+    std::unique_ptr<IndexIterator> getIndexIterator(OperationContext* opCtx,
+                                                    InclusionPolicy inclusionPolicy) const override;
 
-    // ---- index set modifiers ------
+    IndexCatalogEntry* createIndexEntry(OperationContext* opCtx,
+                                        Collection* collection,
+                                        IndexDescriptor&& descriptor,
+                                        CreateIndexEntryFlags flags) override;
 
-    /**
-     * Call this only on an empty collection from inside a WriteUnitOfWork. Index creation on an
-     * empty collection can be rolled back as part of a larger WUOW. Returns the full specification
-     * of the created index, as it is stored in this index catalog.
-     */
     StatusWith<BSONObj> createIndexOnEmptyCollection(OperationContext* opCtx,
+                                                     Collection* collection,
                                                      BSONObj spec) override;
 
-    StatusWith<BSONObj> prepareSpecForCreate(OperationContext* opCtx,
-                                             const BSONObj& original) const override;
+    StatusWith<BSONObj> prepareSpecForCreate(
+        OperationContext* opCtx,
+        const CollectionPtr& collection,
+        const BSONObj& original,
+        const boost::optional<ResumeIndexInfo>& resumeInfo = boost::none) const override;
 
-    /**
-     * Drops all indexes in the index catalog, optionally dropping the id index depending on the
-     * 'includingIdIndex' parameter value. If the 'droppedIndexes' parameter is not null,
-     * it is filled with the names and index info of the dropped indexes.
-     */
+    std::vector<BSONObj> removeExistingIndexes(OperationContext* opCtx,
+                                               const CollectionPtr& collection,
+                                               const std::vector<BSONObj>& indexSpecsToBuild,
+                                               bool removeIndexBuildsToo) const override;
+
+    std::vector<BSONObj> removeExistingIndexesNoChecks(
+        OperationContext* opCtx,
+        const CollectionPtr& collection,
+        const std::vector<BSONObj>& indexSpecsToBuild,
+        IndexCatalog::RemoveExistingIndexesFlags flags) const override;
+
+    void dropIndexes(OperationContext* opCtx,
+                     Collection* collection,
+                     std::function<bool(const IndexDescriptor*)> matchFn,
+                     std::function<void(const IndexDescriptor*)> onDropFn) override;
+
     void dropAllIndexes(OperationContext* opCtx,
+                        Collection* collection,
                         bool includingIdIndex,
-                        stdx::function<void(const IndexDescriptor*)> onDropFn) override;
-    void dropAllIndexes(OperationContext* opCtx, bool includingIdIndex) override;
+                        std::function<void(const IndexDescriptor*)> onDropFn) override;
 
-    Status dropIndex(OperationContext* opCtx, IndexDescriptor* desc) override;
+    Status resetUnfinishedIndexForRecovery(OperationContext* opCtx,
+                                           Collection* collection,
+                                           IndexCatalogEntry* entry) override;
 
-    /**
-     * will drop all incompleted indexes and return specs
-     * after this, the indexes can be rebuilt
-     */
-    std::vector<BSONObj> getAndClearUnfinishedIndexes(OperationContext* opCtx) override;
+    Status dropUnfinishedIndex(OperationContext* opCtx,
+                               Collection* collection,
+                               IndexCatalogEntry* entry) override;
 
+    Status dropIndexEntry(OperationContext* opCtx,
+                          Collection* collection,
+                          IndexCatalogEntry* entry) override;
+
+    void deleteIndexFromDisk(OperationContext* opCtx,
+                             Collection* collection,
+                             const std::string& indexName) override;
 
     struct IndexKillCriteria {
         std::string ns;
@@ -216,131 +245,67 @@ public:
         BSONObj key;
     };
 
-    // ---- modify single index
+    void setMultikeyPaths(OperationContext* opCtx,
+                          const CollectionPtr& coll,
+                          const IndexDescriptor* desc,
+                          const KeyStringSet& multikeyMetadataKeys,
+                          const MultikeyPaths& multikeyPaths) const override;
 
-    /**
-     * Returns true if the index 'idx' is multikey, and returns false otherwise.
-     */
-    bool isMultikey(OperationContext* opCtx, const IndexDescriptor* idx) override;
-
-    /**
-     * Returns the path components that cause the index 'idx' to be multikey if the index supports
-     * path-level multikey tracking, and returns an empty vector if path-level multikey tracking
-     * isn't supported.
-     *
-     * If the index supports path-level multikey tracking but isn't multikey, then this function
-     * returns a vector with size equal to the number of elements in the index key pattern where
-     * each element in the vector is an empty set.
-     */
-    MultikeyPaths getMultikeyPaths(OperationContext* opCtx, const IndexDescriptor* idx) override;
-
-    // --- these probably become private?
-
-    class IndexBuildBlock : public IndexCatalog::IndexBuildBlockInterface {
-        MONGO_DISALLOW_COPYING(IndexBuildBlock);
-
-    public:
-        IndexBuildBlock(OperationContext* opCtx,
-                        Collection* collection,
-                        IndexCatalogImpl* catalog,
-                        const BSONObj& spec);
-
-        ~IndexBuildBlock();
-
-        /**
-         * Must be called from within a `WriteUnitOfWork`
-         */
-        Status init();
-
-        /**
-         * Must be called from within a `WriteUnitOfWork`
-         */
-        void success();
-
-        /**
-         * index build failed, clean up meta data
-         *
-         * Must be called from within a `WriteUnitOfWork`
-         */
-        void fail();
-
-        IndexCatalogEntry* getEntry() {
-            return _entry;
-        }
-
-        const std::string& getIndexName() const {
-            return _indexName;
-        }
-
-        const BSONObj& getSpec() const {
-            return _spec;
-        }
-
-    private:
-        Collection* const _collection;
-        IndexCatalogImpl* const _catalog;
-        const std::string _ns;
-
-        BSONObj _spec;
-
-        std::string _indexName;
-        std::string _indexNamespace;
-
-        IndexCatalogEntry* _entry;
-
-        OperationContext* _opCtx;
-        std::unique_ptr<IndexBuildInterceptor> _indexBuildInterceptor;
-    };
-
-    // ----- data modifiers ------
-
-    /**
-     * When 'keysInsertedOut' is not null, it will be set to the number of index keys inserted by
-     * this operation.
-     *
-     * This method may throw.
-     */
     Status indexRecords(OperationContext* opCtx,
+                        const CollectionPtr& coll,
                         const std::vector<BsonRecord>& bsonRecords,
-                        int64_t* keysInsertedOut) override;
+                        int64_t* keysInsertedOut) const override;
 
-    /**
-     * When 'keysDeletedOut' is not null, it will be set to the number of index keys removed by
-     * this operation.
-     */
+    Status updateRecord(OperationContext* opCtx,
+                        const CollectionPtr& coll,
+                        const BSONObj& oldDoc,
+                        const BSONObj& newDoc,
+                        const BSONObj* opDiff,
+                        const RecordId& recordId,
+                        int64_t* keysInsertedOut,
+                        int64_t* keysDeletedOut) const override;
+
     void unindexRecord(OperationContext* opCtx,
+                       const CollectionPtr& collection,
                        const BSONObj& obj,
                        const RecordId& loc,
                        bool noWarn,
-                       int64_t* keysDeletedOut) override;
+                       int64_t* keysDeletedOut,
+                       CheckRecordId checkRecordId = CheckRecordId::Off) const override;
+
+    StatusWith<int64_t> compactIndexes(OperationContext* opCtx,
+                                       const CompactOptions& options) const override;
 
     inline std::string getAccessMethodName(const BSONObj& keyPattern) override {
         return _getAccessMethodName(keyPattern);
     }
 
-    std::unique_ptr<IndexCatalog::IndexBuildBlockInterface> createIndexBuildBlock(
-        OperationContext* opCtx, const BSONObj& spec) override;
-
     std::string::size_type getLongestIndexNameLength(OperationContext* opCtx) const override;
-
-    // public static helpers
 
     BSONObj fixIndexKey(const BSONObj& key) const override;
 
-    /**
-     * Fills out 'options' in order to indicate whether to allow dups or relax
-     * index constraints, as needed by replication.
-     */
     void prepareInsertDeleteOptions(OperationContext* opCtx,
+                                    const NamespaceString&,
                                     const IndexDescriptor* desc,
                                     InsertDeleteOptions* options) const override;
 
-    void setNs(NamespaceString ns) override;
+    void indexBuildSuccess(OperationContext* opCtx,
+                           Collection* coll,
+                           IndexCatalogEntry* index) override;
 
-    void indexBuildSuccess(OperationContext* opCtx, IndexCatalogEntry* index) override;
+    /**
+     * Returns a status indicating whether 'expression' is valid for use in a partial index
+     * partialFilterExpression.
+     */
+    static Status checkValidFilterExpressions(const MatchExpression* expression);
 
 private:
     static const BSONObj _idObj;  // { _id : 1 }
+
+    /**
+     * Rebuilds internal data structures for which indexes need to be updated upon write operations.
+     */
+    void _rebuildIndexUpdateIdentifier();
 
     /**
      * In addition to IndexNames::findPluginName, validates that it is a known index type.
@@ -350,69 +315,130 @@ private:
      */
     std::string _getAccessMethodName(const BSONObj& keyPattern) const;
 
-    void _checkMagic() const;
-
     Status _indexFilteredRecords(OperationContext* opCtx,
-                                 IndexCatalogEntry* index,
+                                 const CollectionPtr& coll,
+                                 const IndexCatalogEntry* index,
                                  const std::vector<BsonRecord>& bsonRecords,
-                                 int64_t* keysInsertedOut);
+                                 int64_t* keysInsertedOut) const;
 
     Status _indexRecords(OperationContext* opCtx,
-                         IndexCatalogEntry* index,
+                         const CollectionPtr& coll,
+                         const IndexCatalogEntry* index,
                          const std::vector<BsonRecord>& bsonRecords,
-                         int64_t* keysInsertedOut);
+                         int64_t* keysInsertedOut) const;
 
-    Status _unindexRecord(OperationContext* opCtx,
-                          IndexCatalogEntry* index,
-                          const BSONObj& obj,
-                          const RecordId& loc,
-                          bool logIfError,
-                          int64_t* keysDeletedOut);
+    Status _updateRecord(OperationContext* opCtx,
+                         const CollectionPtr& coll,
+                         const IndexCatalogEntry* index,
+                         const BSONObj& oldDoc,
+                         const BSONObj& newDoc,
+                         const RecordId& recordId,
+                         int64_t* keysInsertedOut,
+                         int64_t* keysDeletedOut) const;
+
+    void _unindexRecord(OperationContext* opCtx,
+                        const CollectionPtr& collection,
+                        const IndexCatalogEntry* entry,
+                        const BSONObj& obj,
+                        const RecordId& loc,
+                        bool logIfError,
+                        int64_t* keysDeletedOut,
+                        CheckRecordId checkRecordId = CheckRecordId::Off) const;
 
     /**
-     * this does no sanity checks
+     * Helper to remove the index from disk.
+     * The index should be removed from the in-memory catalog beforehand.
      */
-    Status _dropIndex(OperationContext* opCtx, IndexCatalogEntry* entry);
-
-    // just does disk hanges
-    // doesn't change memory state, etc...
     void _deleteIndexFromDisk(OperationContext* opCtx,
+                              Collection* collection,
                               const std::string& indexName,
-                              const std::string& indexNamespace);
+                              std::shared_ptr<IndexCatalogEntry> entry);
 
-    // descriptor ownership passes to _setupInMemoryStructures
-    // initFromDisk: Avoids registering a change to undo this operation when set to true.
-    //               You must set this flag if calling this function outside of a UnitOfWork.
-    // isReadyIndex: The index will be directly available for query usage without needing to
-    //               complete the IndexBuildBlock process.
-    IndexCatalogEntry* _setupInMemoryStructures(OperationContext* opCtx,
-                                                std::unique_ptr<IndexDescriptor> descriptor,
-                                                bool initFromDisk,
-                                                bool isReadyIndex);
-
-    // Apply a set of transformations to the user-provided index object 'spec' to make it
-    // conform to the standard for insertion.  This function adds the 'v' field if it didn't
-    // exist, removes the '_id' field if it exists, applies plugin-level transformations if
-    // appropriate, etc.
+    /**
+     * Applies a set of transformations to the user-provided index object 'spec' to make it
+     * conform to the standard for insertion.  Removes the '_id' field if it exists, applies
+     * plugin-level transformations if appropriate, etc.
+     */
     StatusWith<BSONObj> _fixIndexSpec(OperationContext* opCtx,
-                                      Collection* collection,
+                                      const CollectionPtr& collection,
                                       const BSONObj& spec) const;
 
-    Status _isSpecOk(OperationContext* opCtx, const BSONObj& spec) const;
+    Status _isSpecOk(OperationContext* opCtx,
+                     const CollectionPtr& collection,
+                     const BSONObj& spec) const;
 
-    Status _doesSpecConflictWithExisting(OperationContext* opCtx, const BSONObj& spec) const;
+    /**
+     * Validates the 'original' index specification, alters any legacy fields and does plugin-level
+     * transformations for text and geo indexes. Returns a clean spec ready to be built, or an
+     * error.
+     */
+    StatusWith<BSONObj> _validateAndFixIndexSpec(OperationContext* opCtx,
+                                                 const CollectionPtr& collection,
+                                                 const BSONObj& original) const;
 
-    int _magic;
-    Collection* const _collection;
-    const int _maxNumIndexesAllowed;
+    /**
+     * Checks whether there are any spec conflicts with existing ready indexes or in-progress index
+     * builds. Also checks whether any limits set on this server would be exceeded by building the
+     * index. 'includeUnfinishedIndexes' dictates whether in-progress index builds are checked for
+     * conflicts, along with ready indexes.
+     *
+     * Returns IndexAlreadyExists for both ready and in-progress index builds. Can also return other
+     * errors.
+     */
+    Status _doesSpecConflictWithExisting(
+        OperationContext* opCtx,
+        const CollectionPtr& collection,
+        const BSONObj& spec,
+        InclusionPolicy inclusionPolicy,
+        const std::map<StringData, std::set<IndexType>>* allowedFieldNames = nullptr) const;
 
-    IndexCatalogEntryContainer _readyIndexes;
+    /**
+     * Returns true if the replica set member's config has {buildIndexes:false} set, which means
+     * we are not allowed to build non-_id indexes on this server, AND this index spec is for a
+     * non-_id index.
+     */
+    Status _isNonIDIndexAndNotAllowedToBuild(OperationContext* opCtx, const BSONObj& spec) const;
+
+    void _logInternalState(OperationContext* opCtx,
+                           const CollectionPtr& collection,
+                           long long numIndexesInCollectionCatalogEntry,
+                           const std::vector<std::string>& indexNamesToDrop);
+
+    /**
+     * Returns a writable IndexCatalogEntry copy that will be returned by current and future calls
+     * to this function. Any previous IndexCatalogEntry/IndexDescriptor pointers that were returned
+     * may be invalidated.
+     */
+    IndexCatalogEntry* _getWritableEntry(const IndexDescriptor* descriptor);
+
+    /**
+     * List of indexes that are "ready" in the sense that they are functional and in sync with the
+     * underlying collection's documents. Whenever this container is modified, it is required to
+     * rebuild the data in '_indexUpdateIdentifier'.
+     */
+    ReadyIndexCatalogEntryContainer _readyIndexes;
+
+    /**
+     * List of indexes that are currently being built. Not in sync with the underlying collection's
+     * documents (yet). Whenever this container is modified, it is required to rebuild the data in
+     * '_indexUpdateIdentifier'.
+     * Indexes that are completely built will be moved from '_buildingIndexes' to '_readyIndexes'
+     * eventually.
+     */
     IndexCatalogEntryContainer _buildingIndexes;
 
-    // These are the index specs of indexes that were "leftover".
-    // "Leftover" means they were unfinished when a mongod shut down.
-    // Certain operations are prohibited until someone fixes.
-    // Retrieve by calling getAndClearUnfinishedIndexes().
-    std::vector<BSONObj> _unfinishedIndexes;
+    /**
+     * List of frozen indexes. These indexes are "disabled" and will not be updated upon new data
+     * modifications.
+     */
+    IndexCatalogEntryContainer _frozenIndexes;
+
+    /**
+     * A helper object containing aggregate information about which indexes will be affected by
+     * updates to specific fields. This object needs to be kept in sync with the data contained in
+     * '_readyIndexes' and '_buildingIndexes', by means of calling '_rebuildIndexUpdateIdentifier()'
+     * when one of them gets changed.
+     */
+    boost::optional<doc_diff::IndexUpdateIdentifier> _indexUpdateIdentifier;
 };
 }  // namespace mongo

@@ -1,11 +1,9 @@
-load("jstests/libs/parallelTester.js");
+import {Thread} from "jstests/libs/parallelTester.js";
 
 /**
  * Implements a kill session test helper
  */
-var _kill_sessions_api_module = (function() {
-    "use strict";
-
+export var _kill_sessions_api_module = (function() {
     var KillSessionsTestHelper = {};
 
     function isdbgrid(client) {
@@ -41,7 +39,7 @@ var _kill_sessions_api_module = (function() {
     Fixture.prototype.kill = function(db, command) {
         var result = this._clientToKillVia.getDB(db).runCommand(command);
         if (!result.ok) {
-            print(tojson(result));
+            jsTest.log.info({result});
         }
         assert(result.ok);
     };
@@ -49,7 +47,7 @@ var _kill_sessions_api_module = (function() {
     Fixture.prototype.assertKillFailed = function(db, command) {
         var result = this._clientToKillVia.getDB(db).runCommand(command);
         if (result.ok) {
-            print(tojson(result), tojson(command));
+            jsTest.log.info({result, command});
         }
         assert(!result.ok);
     };
@@ -119,7 +117,7 @@ var _kill_sessions_api_module = (function() {
         // hosts.  We identify particular ops by secs sleeping.
         this.visit(function(client) {
             let admin = client.getDB("admin");
-            admin.getMongo().setSlaveOk();
+            admin.getMongo().setSecondaryOk();
 
             assert.soon(function() {
                 let inProgressOps = admin.aggregate([{$currentOp: {'allUsers': true}}]);
@@ -132,7 +130,7 @@ var _kill_sessions_api_module = (function() {
                 }
 
                 return false;
-            }, "never started sleep", 30000, 1);
+            }, "never started sleep with 'secs' " + id, 30000, 1);
         });
 
         return new HangingOpHandle(thread, lsid);
@@ -182,11 +180,12 @@ var _kill_sessions_api_module = (function() {
     Fixture.prototype.assertNoSessionsInCursors = function() {
         this.visit(function(client) {
             var db = client.getDB("admin");
-            db.setSlaveOk();
-            var cursors =
-                db.aggregate([{"$currentOp": {"idleCursors": true, "allUsers": true}}]).toArray();
-            cursors.forEach(function(cursor) {
-                assert(!cursor.lsid);
+            db.setSecondaryOk();
+            assert.soon(() => {
+                let cursors = db.aggregate([
+                                    {"$currentOp": {"idleCursors": true, "allUsers": true}}
+                                ]).toArray();
+                return cursors.every(cursor => !cursor.lsid);
             });
         });
     };
@@ -203,7 +202,7 @@ var _kill_sessions_api_module = (function() {
             });
 
             var db = client.getDB("admin");
-            db.setSlaveOk();
+            db.setSecondaryOk();
             var cursors = db.aggregate([
                                 {"$currentOp": {"idleCursors": true, "allUsers": true}},
                                 {"$match": {type: "idleCursor"}}
@@ -226,8 +225,14 @@ var _kill_sessions_api_module = (function() {
         });
     };
 
-    function CursorHandle(session) {
+    Fixture.prototype.assertCursorKillLogMessages = function(cursorHandles) {
+        cursorHandles.forEach(
+            cursorHandle => cursorHandle.assertCursorKillLogMessages(this._clientsToVerifyVia));
+    };
+
+    function CursorHandle(session, cursors) {
         this._session = session;
+        this._cursors = cursors;
     }
 
     CursorHandle.prototype.getLsid = function() {
@@ -236,6 +241,19 @@ var _kill_sessions_api_module = (function() {
 
     CursorHandle.prototype.join = function() {
         this._session.endSession();
+    };
+
+    CursorHandle.prototype.assertCursorKillLogMessages = function(hostsToCheck) {
+        for (let hostToCheck of hostsToCheck) {
+            if (hostToCheck.host in this._cursors) {
+                assert(checkLog.checkContainsOnceJsonStringMatch(
+                           hostToCheck,
+                           20528,
+                           'cursorId',
+                           this._cursors[hostToCheck.host].exactValueString),
+                       "cursor kill was not logged by " + hostToCheck.host);
+            }
+        }
     };
 
     /**
@@ -260,20 +278,27 @@ var _kill_sessions_api_module = (function() {
             "$readPreference": {
                 mode: "primaryPreferred",
             },
+            readConcern: {},
+            writeConcern: {w: 1},
         };
 
+        var cursors = {};
         var result;
         if (this._clientToExecuteViaIsdbgrid) {
             result = db.runCommand({multicast: cmd});
+            for (let host of Object.keys(result.hosts)) {
+                cursors[host] = result.hosts[host].data.cursor.id;
+            }
         } else {
             result = db.runCommand(cmd);
+            cursors[db.getMongo().host] = result.cursor.id;
         }
         if (!result.ok) {
-            print(tojson(result));
+            jsTest.log.info({result});
         }
         assert(result.ok);
 
-        return new CursorHandle(session);
+        return new CursorHandle(session, cursors);
     };
 
     /**
@@ -312,6 +337,7 @@ var _kill_sessions_api_module = (function() {
                 fixture.assertSessionsInCursors([handle], []);
                 fixture.kill("admin", obj);
                 fixture.assertNoSessionsInCursors();
+                fixture.assertCursorKillLogMessages([handle]);
                 handle.join();
             },
 
@@ -322,6 +348,7 @@ var _kill_sessions_api_module = (function() {
                 fixture.assertSessionsInCursors([handle1, handle2], []);
                 fixture.kill("admin", obj);
                 fixture.assertNoSessionsInCursors();
+                fixture.assertCursorKillLogMessages([handle1, handle2]);
                 handle1.join();
                 handle2.join();
             },
@@ -371,6 +398,7 @@ var _kill_sessions_api_module = (function() {
                     fixture.kill("admin", obj);
                 }
                 fixture.assertSessionsInCursors([handle3], [handle1, handle2]);
+                fixture.assertCursorKillLogMessages([handle1, handle2]);
                 handle1.join();
                 handle2.join();
 
@@ -380,6 +408,7 @@ var _kill_sessions_api_module = (function() {
                     fixture.kill("admin", obj);
                 }
                 fixture.assertNoSessionsInCursors();
+                fixture.assertCursorKillLogMessages([handle3]);
                 handle3.join();
             },
         ];
@@ -403,41 +432,40 @@ var _kill_sessions_api_module = (function() {
     });
 
     [[
-       // Verifies that we can killSessions by lsid
-       "killSessions",
-       function(x) {
-           if (!x.uid) {
-               return {
-                   id: x.id,
-                   uid: computeSHA256Block(""),
-               };
-           } else {
-               return x;
-           }
-       }
+        // Verifies that we can killSessions by lsid
+        "killSessions",
+        function(x) {
+            if (!x.uid) {
+                return {
+                    id: x.id,
+                    uid: computeSHA256Block(""),
+                };
+            } else {
+                return x;
+            }
+        }
     ],
      [
-       // Verifies that we can kill by pattern by lsid
-       "killAllSessionsByPattern",
-       function(x) {
-           if (!x.uid) {
-               return {
-                   lsid: {
-                       id: x.id,
-                       uid: computeSHA256Block(""),
-                   }
-               };
-           } else {
-               return {lsid: x};
-           }
-       }
+         // Verifies that we can kill by pattern by lsid
+         "killAllSessionsByPattern",
+         function(x) {
+             if (!x.uid) {
+                 return {
+                     lsid: {
+                         id: x.id,
+                         uid: computeSHA256Block(""),
+                     }
+                 };
+             } else {
+                 return {lsid: x};
+             }
+         }
      ]].forEach(function(cmd) {
         noAuth = noAuth.concat(makeNoAuthArgKill.apply({}, cmd));
     });
 
     KillSessionsTestHelper.runNoAuth = function(
         clientToExecuteVia, clientToKillVia, clientsToVerifyVia) {
-
         var fixture = new Fixture(clientToExecuteVia, clientToKillVia, clientsToVerifyVia);
 
         for (var i = 0; i < noAuth.length; ++i) {
@@ -527,6 +555,7 @@ var _kill_sessions_api_module = (function() {
                     fixture.kill("admin", obj);
                 }
                 fixture.assertSessionsInCursors([handle3], [handle1, handle2]);
+                fixture.assertCursorKillLogMessages([handle1, handle2]);
                 handle1.join();
                 handle2.join();
 
@@ -536,6 +565,7 @@ var _kill_sessions_api_module = (function() {
                     fixture.kill("admin", obj);
                 }
                 fixture.assertNoSessionsInCursors();
+                fixture.assertCursorKillLogMessages([handle3]);
                 handle3.join();
             },
         ];
@@ -564,102 +594,102 @@ var _kill_sessions_api_module = (function() {
 
     // Tests for makeAuthNoArgKill
     [[
-       // We can kill our own sessions
-       "killSessions",
-       "simple",
-       "simple",
+        // We can kill our own sessions
+        "killSessions",
+        "simple",
+        "simple",
     ],
      [
-       // We can kill all sessions
-       "killAllSessions",
-       "simple",
-       "killAny",
+         // We can kill all sessions
+         "killAllSessions",
+         "simple",
+         "killAny",
      ],
      [
-       // We can kill all sessions by pattern
-       "killAllSessionsByPattern",
-       "simple",
-       "killAny",
+         // We can kill all sessions by pattern
+         "killAllSessionsByPattern",
+         "simple",
+         "killAny",
      ]].forEach(function(cmd) {
         auth = auth.concat(makeAuthNoArgKill.apply({}, cmd));
     });
 
     // Tests for makeAuthArgKill
     [[
-       // We can kill our own sessions by id (spoofing our own id)
-       "killSessions",
-       "simple",
-       "simple",
-       "killAny",
-       function() {
-           return function(x) {
-               if (!x.uid) {
-                   return {
-                       id: x.id,
-                       uid: computeSHA256Block("simple@admin"),
-                   };
-               } else {
-                   return x;
-               }
-           };
-       }
+        // We can kill our own sessions by id (spoofing our own id)
+        "killSessions",
+        "simple",
+        "simple",
+        "killAny",
+        function() {
+            return function(x) {
+                if (!x.uid) {
+                    return {
+                        id: x.id,
+                        uid: computeSHA256Block("simple@admin"),
+                    };
+                } else {
+                    return x;
+                }
+            };
+        }
     ],
      [
-       // We can kill our own sessions without spoofing
-       "killSessions",
-       "simple",
-       "simple",
-       "simple",
-       function() {
-           return function(x) {
-               return x;
-           };
-       }
+         // We can kill our own sessions without spoofing
+         "killSessions",
+         "simple",
+         "simple",
+         "simple",
+         function() {
+             return function(x) {
+                 return x;
+             };
+         }
      ],
      [
-       // We can kill by pattern by id
-       "killAllSessionsByPattern",
-       "simple",
-       "simple",
-       "killAny",
-       function() {
-           return function(x) {
-               if (!x.uid) {
-                   return {
-                       lsid: {
-                           id: x.id,
-                           uid: computeSHA256Block("simple@admin"),
-                       }
-                   };
-               } else {
-                   return {lsid: x};
-               }
-           };
-       }
+         // We can kill by pattern by id
+         "killAllSessionsByPattern",
+         "simple",
+         "simple",
+         "killAny",
+         function() {
+             return function(x) {
+                 if (!x.uid) {
+                     return {
+                         lsid: {
+                             id: x.id,
+                             uid: computeSHA256Block("simple@admin"),
+                         }
+                     };
+                 } else {
+                     return {lsid: x};
+                 }
+             };
+         }
      ],
      [
-       // We can kill any by user
-       "killAllSessions",
-       "simple",
-       "simple2",
-       "killAny",
-       function(user) {
-           return function(x) {
-               return {db: "admin", user: user};
-           };
-       }
+         // We can kill any by user
+         "killAllSessions",
+         "simple",
+         "simple2",
+         "killAny",
+         function(user) {
+             return function(x) {
+                 return {db: "admin", user: user};
+             };
+         }
      ],
      [
-       // We can kill any by pattern by user
-       "killAllSessionsByPattern",
-       "simple",
-       "simple2",
-       "killAny",
-       function(user) {
-           return function(x) {
-               return {uid: computeSHA256Block(user + "@admin")};
-           };
-       }
+         // We can kill any by pattern by user
+         "killAllSessionsByPattern",
+         "simple",
+         "simple2",
+         "killAny",
+         function(user) {
+             return function(x) {
+                 return {uid: computeSHA256Block(user + "@admin")};
+             };
+         }
      ]].forEach(function(cmd) {
         auth = auth.concat(makeAuthArgKill.apply({}, cmd));
     });
@@ -683,32 +713,32 @@ var _kill_sessions_api_module = (function() {
 
     // Tests for makeAuthArgKillFailure
     [[
-       // We can't kill another users sessions
-       "killSessions",
-       "simple",
-       "simple2",
-       function(user) {
-           return function(x) {
-               return {
-                   id: x.id,
-                   uid: computeSHA256Block(user + "@admin"),
-               };
-           };
-       },
+        // We can't kill another users sessions
+        "killSessions",
+        "simple",
+        "simple2",
+        function(user) {
+            return function(x) {
+                return {
+                    id: x.id,
+                    uid: computeSHA256Block(user + "@admin"),
+                };
+            };
+        },
     ],
      [
-       // We can't impersonate without impersonate
-       "killAllSessionsByPattern",
-       "simple",
-       "killAny",
-       function(user) {
-           return function(x) {
-               return {
-                   users: {},
-                   roles: {},
-               };
-           };
-       },
+         // We can't impersonate without impersonate
+         "killAllSessionsByPattern",
+         "simple",
+         "killAny",
+         function(user) {
+             return function(x) {
+                 return {
+                     users: {},
+                     roles: {},
+                 };
+             };
+         },
      ]].forEach(function(cmd) {
         auth = auth.concat(makeAuthArgKillFailure.apply({}, cmd));
     });
@@ -757,4 +787,4 @@ var _kill_sessions_api_module = (function() {
 })();
 
 // Globals
-KillSessionsTestHelper = _kill_sessions_api_module.KillSessionsTestHelper;
+export var KillSessionsTestHelper = _kill_sessions_api_module.KillSessionsTestHelper;

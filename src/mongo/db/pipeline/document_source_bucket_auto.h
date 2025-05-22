@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,12 +29,37 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+#include <cstdint>
+#include <exception>
+#include <memory>
+#include <set>
+#include <system_error>
+#include <utility>
+#include <vector>
+
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/pipeline/accumulation_statement.h"
 #include "mongo/db/pipeline/accumulator.h"
+#include "mongo/db/pipeline/dependencies.h"
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/expression.h"
+#include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/granularity_rounder.h"
+#include "mongo/db/pipeline/pipeline.h"
+#include "mongo/db/pipeline/stage_constraints.h"
+#include "mongo/db/pipeline/variables.h"
+#include "mongo/db/query/query_shape/serialization_options.h"
 #include "mongo/db/sorter/sorter.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/util/intrusive_counter.h"
 
 namespace mongo {
 
@@ -43,12 +67,23 @@ namespace mongo {
  * The $bucketAuto stage takes a user-specified number of buckets and automatically determines
  * boundaries such that the values are approximately equally distributed between those buckets.
  */
-class DocumentSourceBucketAuto final : public DocumentSource, public NeedsMergerDocumentSource {
+class DocumentSourceBucketAuto final : public DocumentSource {
 public:
-    Value serialize(boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final;
+    static constexpr StringData kStageName = "$bucketAuto"_sd;
+    Value serialize(const SerializationOptions& opts = SerializationOptions{}) const final;
+
     DepsTracker::State getDependencies(DepsTracker* deps) const final;
-    GetNextResult getNext() final;
+
+    void addVariableRefs(std::set<Variables::Id>* refs) const final;
+
     const char* getSourceName() const final;
+    boost::intrusive_ptr<DocumentSource> optimize() final;
+
+    static const Id& id;
+
+    Id getId() const override {
+        return id;
+    }
 
     StageConstraints constraints(Pipeline::SplitState pipeState) const final {
         return {StreamType::kBlocking,
@@ -56,20 +91,18 @@ public:
                 HostTypeRequirement::kNone,
                 DiskUseRequirement::kWritesTmpData,
                 FacetRequirement::kAllowed,
-                TransactionRequirement::kAllowed};
+                TransactionRequirement::kAllowed,
+                LookupRequirement::kAllowed,
+                UnionRequirement::kAllowed};
     }
 
     /**
      * The $bucketAuto stage must be run on the merging shard.
      */
-    boost::intrusive_ptr<DocumentSource> getShardSource() final {
-        return nullptr;
+    boost::optional<DistributedPlanLogic> distributedPlanLogic() final {
+        // {shardsStage, mergingStage, sortPattern}
+        return DistributedPlanLogic{nullptr, this, boost::none};
     }
-    MergingLogic mergingLogic() final {
-        return {this};
-    }
-
-    static const uint64_t kDefaultMaxMemoryUsageBytes = 100 * 1024 * 1024;
 
     /**
      * Convenience method to create a $bucketAuto stage.
@@ -81,9 +114,9 @@ public:
         const boost::intrusive_ptr<ExpressionContext>& expCtx,
         const boost::intrusive_ptr<Expression>& groupByExpression,
         int numBuckets,
+        uint64_t maxMemoryUsageBytes,
         std::vector<AccumulationStatement> accumulationStatements = {},
-        const boost::intrusive_ptr<GranularityRounder>& granularityRounder = nullptr,
-        uint64_t maxMemoryUsageBytes = kDefaultMaxMemoryUsageBytes);
+        const boost::intrusive_ptr<GranularityRounder>& granularityRounder = nullptr);
 
     /**
      * Parses a $bucketAuto stage from the user-supplied BSON.
@@ -91,8 +124,32 @@ public:
     static boost::intrusive_ptr<DocumentSource> createFromBson(
         BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
 
+    /**
+     * Returns the groupBy expression. The mutable getter can be used to alter
+     * the expression, but should not be used after execution has begun.
+     */
+    boost::intrusive_ptr<Expression> getGroupByExpression() const;
+    boost::intrusive_ptr<Expression>& getMutableGroupByExpression();
+    /**
+     * Returns the AccumulationStatements. The mutable getter can be used to alter
+     * the expression, but should not be used after execution has begun.
+     */
+    const std::vector<AccumulationStatement>& getAccumulationStatements() const;
+    std::vector<AccumulationStatement>& getMutableAccumulationStatements();
+
+    const SpecificStats* getSpecificStats() const final {
+        return &_stats;
+    }
+
+    bool usedDisk() final {
+        return _sorter ? _sorter->stats().spilledRanges() > 0
+                       : _stats.spillingStats.getSpills() > 0;
+    }
+
 protected:
+    GetNextResult doGetNext() final;
     void doDispose() final;
+    void doForceSpill() final;
 
 private:
     DocumentSourceBucketAuto(const boost::intrusive_ptr<ExpressionContext>& pExpCtx,
@@ -110,8 +167,17 @@ private:
                const std::vector<AccumulationStatement>& accumulationStatements);
         Value _min;
         Value _max;
-        std::vector<boost::intrusive_ptr<Accumulator>> _accums;
+        std::vector<boost::intrusive_ptr<AccumulatorState>> _accums;
     };
+
+    struct BucketDetails {
+        int currentBucketNum;
+        long long approxBucketSize = 0;
+        boost::optional<Value> previousMax;
+        boost::optional<std::pair<Value, Document>> currentMin;
+    };
+
+    SortOptions makeSortOptions();
 
     /**
      * Consumes all of the documents from the source in the pipeline and sorts them by their
@@ -121,25 +187,24 @@ private:
      */
     GetNextResult populateSorter();
 
+    void initializeBucketIteration();
+
     /**
      * Computes the 'groupBy' expression value for 'doc'.
      */
     Value extractKey(const Document& doc);
 
     /**
-     * Calculates the bucket boundaries for the input documents and places them into buckets.
+     * Returns the next bucket if exists. boost::none if none exist.
      */
-    void populateBuckets();
+    boost::optional<Bucket> populateNextBucket();
 
+    boost::optional<std::pair<Value, Document>> adjustBoundariesAndGetMinForNextBucket(
+        Bucket* currentBucket);
     /**
      * Adds the document in 'entry' to 'bucket' by updating the accumulators in 'bucket'.
      */
     void addDocumentToBucket(const std::pair<Value, Document>& entry, Bucket& bucket);
-
-    /**
-     * Adds 'newBucket' to _buckets and updates any boundaries if necessary.
-     */
-    void addBucket(Bucket& newBucket);
 
     /**
      * Makes a document using the information from bucket. This is what is returned when getNext()
@@ -147,19 +212,22 @@ private:
      */
     Document makeDocument(const Bucket& bucket);
 
+    SorterFileStats _sorterFileStats;
     std::unique_ptr<Sorter<Value, Document>> _sorter;
     std::unique_ptr<Sorter<Value, Document>::Iterator> _sortedInput;
 
     std::vector<AccumulationStatement> _accumulatedFields;
 
-    int _nBuckets;
     uint64_t _maxMemoryUsageBytes;
     bool _populated = false;
-    std::vector<Bucket> _buckets;
-    std::vector<Bucket>::iterator _bucketsIterator;
     boost::intrusive_ptr<Expression> _groupByExpression;
     boost::intrusive_ptr<GranularityRounder> _granularityRounder;
+    int _nBuckets;
     long long _nDocuments = 0;
+    long long _nDocPositions = 0;
+    BucketDetails _currentBucketDetails;
+
+    DocumentSourceBucketAutoStats _stats;
 };
 
 }  // namespace mongo

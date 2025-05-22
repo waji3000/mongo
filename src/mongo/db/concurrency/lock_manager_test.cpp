@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,18 +27,39 @@
  *    it in the license file.
  */
 
+#include <cstdint>
+#include <memory>
+#include <string>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+
+#include "mongo/base/string_data.h"
+#include "mongo/db/concurrency/lock_manager.h"
 #include "mongo/db/concurrency/lock_manager_defs.h"
 #include "mongo/db/concurrency/lock_manager_test_help.h"
+#include "mongo/db/concurrency/locker.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/service_context_test_fixture.h"
+#include "mongo/db/tenant_id.h"
+#include "mongo/unittest/death_test.h"
 #include "mongo/unittest/unittest.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
+namespace {
 
-TEST(ResourceId, Semantics) {
+namespace resource_id_test {
+
+TEST(ResourceIdTest, Semantics) {
     ResourceId resIdDb(RESOURCE_DATABASE, 324334234);
     ASSERT(resIdDb.getType() == RESOURCE_DATABASE);
     ASSERT(resIdDb.getHashId() == 324334234);
 
-    ResourceId resIdColl(RESOURCE_COLLECTION, std::string("TestDB.collection"));
+    ResourceId resIdColl(
+        RESOURCE_COLLECTION,
+        NamespaceString::createNamespaceString_forTest(boost::none, "TestDB.collection"));
     ASSERT(resIdColl.getType() == RESOURCE_COLLECTION);
 
     // Comparison functions
@@ -55,17 +75,10 @@ TEST(ResourceId, Semantics) {
     ASSERT_EQUALS(resId, resIdColl);
 }
 
-TEST(ResourceId, Constructors) {
-    ResourceId resIdString(RESOURCE_COLLECTION, std::string("TestDB.collection"));
-    ResourceId resIdStringData(RESOURCE_COLLECTION, StringData("TestDB.collection"));
-
-    ASSERT_EQUALS(resIdString, resIdStringData);
-}
-
-TEST(ResourceId, Masking) {
-    const ResourceType maxRes = static_cast<ResourceType>(ResourceTypesCount - 1);
-    const uint64_t maxHash = (1ULL << 61) - 1;  //  Only 61 bits usable for hash
-    ResourceType resources[3] = {maxRes, RESOURCE_GLOBAL, RESOURCE_METADATA};
+TEST(ResourceIdTest, Masking) {
+    const uint64_t maxHash =
+        (1ULL << (64 - ResourceId::resourceTypeBits)) - 1;  //  Only 60 bits usable for hash
+    ResourceType resources[3] = {RESOURCE_GLOBAL, RESOURCE_COLLECTION, RESOURCE_METADATA};
     uint64_t hashes[3] = {maxHash, maxHash / 3, maxHash / 3 * 2};
 
     //  The test below verifies that types/hashes are stored/retrieved unchanged
@@ -78,15 +91,23 @@ TEST(ResourceId, Masking) {
     }
 }
 
-//
-// LockManager
-//
+}  // namespace resource_id_test
 
-TEST(LockManager, Grant) {
+namespace lock_manager_test {
+
+class LockManagerTest : public ServiceContextTest {};
+
+TEST(LockManagerTest, IsModeCovered) {
+    ASSERT(isModeCovered(MODE_IS, MODE_IX));
+}
+
+TEST_F(LockManagerTest, Grant) {
     LockManager lockMgr;
-    const ResourceId resId(RESOURCE_COLLECTION, std::string("TestDB.collection"));
+    const ResourceId resId(
+        RESOURCE_COLLECTION,
+        NamespaceString::createNamespaceString_forTest(boost::none, "TestDB.collection"));
 
-    LockerImpl locker;
+    Locker locker(getServiceContext());
     TrackingLockGrantNotification notify;
 
     LockRequest request;
@@ -101,11 +122,13 @@ TEST(LockManager, Grant) {
     ASSERT(request.recursiveCount == 0);
 }
 
-TEST(LockManager, GrantMultipleNoConflict) {
+TEST_F(LockManagerTest, GrantMultipleNoConflict) {
     LockManager lockMgr;
-    const ResourceId resId(RESOURCE_COLLECTION, std::string("TestDB.collection"));
+    const ResourceId resId(
+        RESOURCE_COLLECTION,
+        NamespaceString::createNamespaceString_forTest(boost::none, "TestDB.collection"));
 
-    LockerImpl locker;
+    Locker locker(getServiceContext());
     TrackingLockGrantNotification notify;
 
     LockRequest request[6];
@@ -134,13 +157,15 @@ TEST(LockManager, GrantMultipleNoConflict) {
     lockMgr.unlock(&request[4]);
 }
 
-TEST(LockManager, GrantMultipleFIFOOrder) {
+TEST_F(LockManagerTest, GrantMultipleFIFOOrder) {
     LockManager lockMgr;
-    const ResourceId resId(RESOURCE_COLLECTION, std::string("TestDB.collection"));
+    const ResourceId resId(
+        RESOURCE_COLLECTION,
+        NamespaceString::createNamespaceString_forTest(boost::none, "TestDB.collection"));
 
-    std::unique_ptr<LockerImpl> locker[6];
+    std::unique_ptr<Locker> locker[6];
     for (int i = 0; i < 6; i++) {
-        locker[i].reset(new LockerImpl());
+        locker[i] = std::make_unique<Locker>(getServiceContext());
     }
 
     TrackingLockGrantNotification notify[6];
@@ -167,11 +192,13 @@ TEST(LockManager, GrantMultipleFIFOOrder) {
     lockMgr.unlock(&request[5]);
 }
 
-TEST(LockManager, GrantRecursive) {
+TEST_F(LockManagerTest, GrantRecursive) {
     LockManager lockMgr;
-    const ResourceId resId(RESOURCE_COLLECTION, std::string("TestDB.collection"));
+    const ResourceId resId(
+        RESOURCE_COLLECTION,
+        NamespaceString::createNamespaceString_forTest(boost::none, "TestDB.collection"));
 
-    LockerImpl locker;
+    Locker locker(getServiceContext());
     LockRequestCombo request(&locker);
 
     ASSERT(LOCK_OK == lockMgr.lock(resId, &request, MODE_S));
@@ -180,10 +207,7 @@ TEST(LockManager, GrantRecursive) {
     ASSERT(request.numNotifies == 0);
 
     // Acquire again, in the same mode
-    ASSERT(LOCK_OK == lockMgr.convert(resId, &request, MODE_S));
-    ASSERT(request.mode == MODE_S);
-    ASSERT(request.recursiveCount == 2);
-    ASSERT(request.numNotifies == 0);
+    ++request.recursiveCount;
 
     // Release first acquire
     lockMgr.unlock(&request);
@@ -195,96 +219,14 @@ TEST(LockManager, GrantRecursive) {
     ASSERT(request.recursiveCount == 0);
 }
 
-TEST(LockManager, GrantRecursiveCompatibleConvertUp) {
+TEST_F(LockManagerTest, Conflict) {
     LockManager lockMgr;
-    const ResourceId resId(RESOURCE_COLLECTION, std::string("TestDB.collection"));
+    const ResourceId resId(
+        RESOURCE_COLLECTION,
+        NamespaceString::createNamespaceString_forTest(boost::none, "TestDB.collection"));
 
-    LockerImpl locker;
-    LockRequestCombo request(&locker);
-
-    ASSERT(LOCK_OK == lockMgr.lock(resId, &request, MODE_IS));
-    ASSERT(request.mode == MODE_IS);
-    ASSERT(request.recursiveCount == 1);
-    ASSERT(request.numNotifies == 0);
-
-    // Acquire again, in *compatible*, but stricter mode
-    ASSERT(LOCK_OK == lockMgr.convert(resId, &request, MODE_S));
-    ASSERT(request.mode == MODE_S);
-    ASSERT(request.recursiveCount == 2);
-    ASSERT(request.numNotifies == 0);
-
-    // Release the first acquire
-    lockMgr.unlock(&request);
-    ASSERT(request.mode == MODE_S);
-    ASSERT(request.recursiveCount == 1);
-
-    // Release the second acquire
-    lockMgr.unlock(&request);
-    ASSERT(request.recursiveCount == 0);
-}
-
-TEST(LockManager, GrantRecursiveNonCompatibleConvertUp) {
-    LockManager lockMgr;
-    const ResourceId resId(RESOURCE_COLLECTION, std::string("TestDB.collection"));
-
-    LockerImpl locker;
-    LockRequestCombo request(&locker);
-
-    ASSERT(LOCK_OK == lockMgr.lock(resId, &request, MODE_S));
-    ASSERT(request.mode == MODE_S);
-    ASSERT(request.recursiveCount == 1);
-    ASSERT(request.numNotifies == 0);
-
-    // Acquire again, in *non-compatible*, but stricter mode
-    ASSERT(LOCK_OK == lockMgr.convert(resId, &request, MODE_X));
-    ASSERT(request.mode == MODE_X);
-    ASSERT(request.recursiveCount == 2);
-    ASSERT(request.numNotifies == 0);
-
-    // Release first acquire
-    lockMgr.unlock(&request);
-    ASSERT(request.mode == MODE_X);
-    ASSERT(request.recursiveCount == 1);
-
-    // Release second acquire
-    lockMgr.unlock(&request);
-    ASSERT(request.recursiveCount == 0);
-}
-
-TEST(LockManager, GrantRecursiveNonCompatibleConvertDown) {
-    LockManager lockMgr;
-    const ResourceId resId(RESOURCE_COLLECTION, std::string("TestDB.collection"));
-
-    LockerImpl locker;
-    LockRequestCombo request(&locker);
-
-    ASSERT(LOCK_OK == lockMgr.lock(resId, &request, MODE_X));
-    ASSERT(request.mode == MODE_X);
-    ASSERT(request.recursiveCount == 1);
-    ASSERT(request.numNotifies == 0);
-
-    // Acquire again, in *non-compatible*, but less strict mode
-    ASSERT(LOCK_OK == lockMgr.convert(resId, &request, MODE_S));
-    ASSERT(request.mode == MODE_X);
-    ASSERT(request.recursiveCount == 2);
-    ASSERT(request.numNotifies == 0);
-
-    // Release first acquire
-    lockMgr.unlock(&request);
-    ASSERT(request.mode == MODE_X);
-    ASSERT(request.recursiveCount == 1);
-
-    // Release second acquire
-    lockMgr.unlock(&request);
-    ASSERT(request.recursiveCount == 0);
-}
-
-TEST(LockManager, Conflict) {
-    LockManager lockMgr;
-    const ResourceId resId(RESOURCE_COLLECTION, std::string("TestDB.collection"));
-
-    LockerImpl locker1;
-    LockerImpl locker2;
+    Locker locker1(getServiceContext());
+    Locker locker2(getServiceContext());
 
     LockRequestCombo request1(&locker1);
     LockRequestCombo request2(&locker2);
@@ -318,11 +260,13 @@ TEST(LockManager, Conflict) {
     ASSERT(request2.numNotifies == 1);
 }
 
-TEST(LockManager, MultipleConflict) {
+TEST_F(LockManagerTest, MultipleConflict) {
     LockManager lockMgr;
-    const ResourceId resId(RESOURCE_COLLECTION, std::string("TestDB.collection"));
+    const ResourceId resId(
+        RESOURCE_COLLECTION,
+        NamespaceString::createNamespaceString_forTest(boost::none, "TestDB.collection"));
 
-    LockerImpl locker;
+    Locker locker(getServiceContext());
     TrackingLockGrantNotification notify;
 
     LockRequest request[6];
@@ -351,14 +295,16 @@ TEST(LockManager, MultipleConflict) {
     }
 }
 
-TEST(LockManager, ConflictCancelWaiting) {
+TEST_F(LockManagerTest, ConflictCancelWaiting) {
     LockManager lockMgr;
-    const ResourceId resId(RESOURCE_COLLECTION, std::string("TestDB.collection"));
+    const ResourceId resId(
+        RESOURCE_COLLECTION,
+        NamespaceString::createNamespaceString_forTest(boost::none, "TestDB.collection"));
 
-    LockerImpl locker1;
+    Locker locker1(getServiceContext());
     TrackingLockGrantNotification notify1;
 
-    LockerImpl locker2;
+    Locker locker2(getServiceContext());
     TrackingLockGrantNotification notify2;
 
     LockRequest request1;
@@ -384,11 +330,13 @@ TEST(LockManager, ConflictCancelWaiting) {
     lockMgr.unlock(&request1);
 }
 
-TEST(LockManager, ConflictCancelMultipleWaiting) {
+TEST_F(LockManagerTest, ConflictCancelMultipleWaiting) {
     LockManager lockMgr;
-    const ResourceId resId(RESOURCE_COLLECTION, std::string("TestDB.collection"));
+    const ResourceId resId(
+        RESOURCE_COLLECTION,
+        NamespaceString::createNamespaceString_forTest(boost::none, "TestDB.collection"));
 
-    LockerImpl locker;
+    Locker locker(getServiceContext());
     TrackingLockGrantNotification notify;
 
     LockRequest request[6];
@@ -417,201 +365,24 @@ TEST(LockManager, ConflictCancelMultipleWaiting) {
     lockMgr.unlock(&request[0]);
 }
 
-TEST(LockManager, CancelWaitingConversionWeakModes) {
-    LockManager lockMgr;
-    const ResourceId resId(RESOURCE_COLLECTION, std::string("TestDB.collection"));
-
-    LockerImpl locker1;
-    LockerImpl locker2;
-
-    LockRequestCombo request1(&locker1);
-    LockRequestCombo request2(&locker2);
-
-    // First request granted right away
-    ASSERT(LOCK_OK == lockMgr.lock(resId, &request1, MODE_IS));
-    ASSERT(request1.numNotifies == 0);
-
-    // Second request is granted right away
-    ASSERT(LOCK_OK == lockMgr.lock(resId, &request2, MODE_IX));
-    ASSERT(request2.numNotifies == 0);
-
-    // Convert first request to conflicting
-    ASSERT(LOCK_WAITING == lockMgr.convert(resId, &request1, MODE_S));
-    ASSERT(request1.mode == MODE_IS);
-    ASSERT(request1.convertMode == MODE_S);
-    ASSERT(request1.numNotifies == 0);
-
-    // Cancel the conflicting conversion
-    lockMgr.unlock(&request1);
-    ASSERT(request1.mode == MODE_IS);
-    ASSERT(request1.convertMode == MODE_NONE);
-    ASSERT(request1.numNotifies == 0);
-
-    // Free the remaining locks so the LockManager destructor does not complain
-    lockMgr.unlock(&request1);
-    lockMgr.unlock(&request2);
-}
-
-TEST(LockManager, CancelWaitingConversionStrongModes) {
-    LockManager lockMgr;
-    const ResourceId resId(RESOURCE_COLLECTION, std::string("TestDB.collection"));
-
-    LockerImpl locker1;
-    LockerImpl locker2;
-
-    LockRequestCombo request1(&locker1);
-    LockRequestCombo request2(&locker2);
-
-    // First request granted right away
-    ASSERT(LOCK_OK == lockMgr.lock(resId, &request1, MODE_S));
-    ASSERT(request1.numNotifies == 0);
-
-    // Second request is granted right away
-    ASSERT(LOCK_OK == lockMgr.lock(resId, &request2, MODE_S));
-    ASSERT(request2.numNotifies == 0);
-
-    // Convert second request to conflicting
-    ASSERT(LOCK_WAITING == lockMgr.convert(resId, &request2, MODE_X));
-    ASSERT(request2.mode == MODE_S);
-    ASSERT(request2.convertMode == MODE_X);
-    ASSERT(request2.numNotifies == 0);
-
-    // Cancel the conflicting upgrade
-    lockMgr.unlock(&request2);
-    ASSERT(request2.mode == MODE_S);
-    ASSERT(request2.convertMode == MODE_NONE);
-    ASSERT(request2.numNotifies == 0);
-
-    // Free the remaining locks so the LockManager destructor does not complain
-    lockMgr.unlock(&request1);
-    lockMgr.unlock(&request2);
-}
-
-TEST(LockManager, ConflictingConversion) {
-    LockManager lockMgr;
-    const ResourceId resId(RESOURCE_COLLECTION, std::string("TestDB.collection"));
-
-    LockerImpl locker1;
-    LockerImpl locker2;
-
-    LockRequestCombo request1(&locker1);
-    LockRequestCombo request2(&locker2);
-
-    // The S requests are granted right away
-    ASSERT(LOCK_OK == lockMgr.lock(resId, &request1, MODE_S));
-    ASSERT(request1.numNotifies == 0);
-
-    ASSERT(LOCK_OK == lockMgr.lock(resId, &request2, MODE_S));
-    ASSERT(request2.numNotifies == 0);
-
-    // Convert first request to conflicting
-    ASSERT(LOCK_WAITING == lockMgr.convert(resId, &request1, MODE_X));
-    ASSERT(request1.numNotifies == 0);
-
-    // Free the second lock and make sure the first is granted
-    lockMgr.unlock(&request2);
-    ASSERT(request1.mode == MODE_X);
-    ASSERT(request1.numNotifies == 1);
-    ASSERT(request2.numNotifies == 0);
-
-    // Frees the first reference, mode remains X
-    lockMgr.unlock(&request1);
-    ASSERT(request1.mode == MODE_X);
-    ASSERT(request1.recursiveCount == 1);
-
-    lockMgr.unlock(&request1);
-}
-
-TEST(LockManager, ConflictingConversionInTheMiddle) {
-    LockManager lockMgr;
-    const ResourceId resId(RESOURCE_COLLECTION, std::string("TestDB.collection"));
-
-    LockerImpl locker;
-    TrackingLockGrantNotification notify;
-
-    LockRequest request[3];
-    for (int i = 0; i < 3; i++) {
-        request[i].initNew(&locker, &notify);
-        lockMgr.lock(resId, &request[i], MODE_S);
-    }
-
-    // Upgrade the one in the middle (not the first one)
-    ASSERT(LOCK_WAITING == lockMgr.convert(resId, &request[1], MODE_X));
-
-    ASSERT(notify.numNotifies == 0);
-
-    // Release the two shared modes
-    lockMgr.unlock(&request[0]);
-    ASSERT(notify.numNotifies == 0);
-
-    lockMgr.unlock(&request[2]);
-    ASSERT(notify.numNotifies == 1);
-
-    ASSERT(request[1].mode == MODE_X);
-
-    // Request 1 should be unlocked twice
-    lockMgr.unlock(&request[1]);
-    lockMgr.unlock(&request[1]);
-}
-
-TEST(LockManager, ConvertUpgrade) {
-    LockManager lockMgr;
-    const ResourceId resId(RESOURCE_COLLECTION, std::string("TestDB.collection"));
-
-    LockerImpl locker1;
-    LockRequestCombo request1(&locker1);
-    ASSERT(LOCK_OK == lockMgr.lock(resId, &request1, MODE_S));
-
-    LockerImpl locker2;
-    LockRequestCombo request2(&locker2);
-    ASSERT(LOCK_OK == lockMgr.lock(resId, &request2, MODE_S));
-
-    // Upgrade the S lock to X
-    ASSERT(LOCK_WAITING == lockMgr.convert(resId, &request1, MODE_X));
-
-    ASSERT(!lockMgr.unlock(&request1));
-    ASSERT(lockMgr.unlock(&request1));
-
-    ASSERT(lockMgr.unlock(&request2));
-}
-
-TEST(LockManager, Downgrade) {
-    LockManager lockMgr;
-    const ResourceId resId(RESOURCE_COLLECTION, std::string("TestDB.collection"));
-
-    LockerImpl locker1;
-    LockRequestCombo request1(&locker1);
-    ASSERT(LOCK_OK == lockMgr.lock(resId, &request1, MODE_X));
-
-    LockerImpl locker2;
-    LockRequestCombo request2(&locker2);
-    ASSERT(LOCK_WAITING == lockMgr.lock(resId, &request2, MODE_S));
-
-    // Downgrade the X request to S
-    lockMgr.downgrade(&request1, MODE_S);
-
-    ASSERT(request2.numNotifies == 1);
-    ASSERT(request2.lastResult == LOCK_OK);
-    ASSERT(request2.recursiveCount == 1);
-
-    ASSERT(lockMgr.unlock(&request1));
-    ASSERT(lockMgr.unlock(&request2));
-}
-
-
 // Lock conflict matrix tests
-static void checkConflict(LockMode existingMode, LockMode newMode, bool hasConflict) {
+static void checkConflict(ServiceContext* serviceContext,
+                          LockMode existingMode,
+                          LockMode newMode,
+                          bool hasConflict) {
     LockManager lockMgr;
-    const ResourceId resId(RESOURCE_COLLECTION, std::string("TestDB.collection"));
+    const ResourceId resId(
+        RESOURCE_COLLECTION,
+        NamespaceString::createNamespaceString_forTest(boost::none, "TestDB.collection"));
 
-    LockerImpl lockerExisting;
+    Locker lockerExisting(serviceContext);
     TrackingLockGrantNotification notifyExisting;
     LockRequest requestExisting;
     requestExisting.initNew(&lockerExisting, &notifyExisting);
 
     ASSERT(LOCK_OK == lockMgr.lock(resId, &requestExisting, existingMode));
 
-    LockerImpl lockerNew;
+    Locker lockerNew(serviceContext);
     TrackingLockGrantNotification notifyNew;
     LockRequest requestNew;
     requestNew.initNew(&lockerNew, &notifyNew);
@@ -627,45 +398,47 @@ static void checkConflict(LockMode existingMode, LockMode newMode, bool hasConfl
     lockMgr.unlock(&requestExisting);
 }
 
-TEST(LockManager, ValidateConflictMatrix) {
-    checkConflict(MODE_IS, MODE_IS, false);
-    checkConflict(MODE_IS, MODE_IX, false);
-    checkConflict(MODE_IS, MODE_S, false);
-    checkConflict(MODE_IS, MODE_X, true);
+TEST_F(LockManagerTest, ValidateConflictMatrix) {
+    checkConflict(getServiceContext(), MODE_IS, MODE_IS, false);
+    checkConflict(getServiceContext(), MODE_IS, MODE_IX, false);
+    checkConflict(getServiceContext(), MODE_IS, MODE_S, false);
+    checkConflict(getServiceContext(), MODE_IS, MODE_X, true);
 
-    checkConflict(MODE_IX, MODE_IS, false);
-    checkConflict(MODE_IX, MODE_IX, false);
-    checkConflict(MODE_IX, MODE_S, true);
-    checkConflict(MODE_IX, MODE_X, true);
+    checkConflict(getServiceContext(), MODE_IX, MODE_IS, false);
+    checkConflict(getServiceContext(), MODE_IX, MODE_IX, false);
+    checkConflict(getServiceContext(), MODE_IX, MODE_S, true);
+    checkConflict(getServiceContext(), MODE_IX, MODE_X, true);
 
-    checkConflict(MODE_S, MODE_IS, false);
-    checkConflict(MODE_S, MODE_IX, true);
-    checkConflict(MODE_S, MODE_S, false);
-    checkConflict(MODE_S, MODE_X, true);
+    checkConflict(getServiceContext(), MODE_S, MODE_IS, false);
+    checkConflict(getServiceContext(), MODE_S, MODE_IX, true);
+    checkConflict(getServiceContext(), MODE_S, MODE_S, false);
+    checkConflict(getServiceContext(), MODE_S, MODE_X, true);
 
-    checkConflict(MODE_X, MODE_IS, true);
-    checkConflict(MODE_X, MODE_IX, true);
-    checkConflict(MODE_X, MODE_S, true);
-    checkConflict(MODE_X, MODE_X, true);
+    checkConflict(getServiceContext(), MODE_X, MODE_IS, true);
+    checkConflict(getServiceContext(), MODE_X, MODE_IX, true);
+    checkConflict(getServiceContext(), MODE_X, MODE_S, true);
+    checkConflict(getServiceContext(), MODE_X, MODE_X, true);
 }
 
-TEST(LockManager, EnqueueAtFront) {
+TEST_F(LockManagerTest, EnqueueAtFront) {
     LockManager lockMgr;
-    const ResourceId resId(RESOURCE_COLLECTION, std::string("TestDB.collection"));
+    const ResourceId resId(
+        RESOURCE_COLLECTION,
+        NamespaceString::createNamespaceString_forTest(boost::none, "TestDB.collection"));
 
-    LockerImpl lockerX;
+    Locker lockerX(getServiceContext());
     LockRequestCombo requestX(&lockerX);
 
     ASSERT(LOCK_OK == lockMgr.lock(resId, &requestX, MODE_X));
 
     // The subsequent request will block
-    LockerImpl lockerLow;
+    Locker lockerLow(getServiceContext());
     LockRequestCombo requestLow(&lockerLow);
 
     ASSERT(LOCK_WAITING == lockMgr.lock(resId, &requestLow, MODE_X));
 
     // This is a "queue jumping request", which will go before locker 2 above
-    LockerImpl lockerHi;
+    Locker lockerHi(getServiceContext());
     LockRequestCombo requestHi(&lockerHi);
     requestHi.enqueueAtFront = true;
 
@@ -687,18 +460,18 @@ TEST(LockManager, EnqueueAtFront) {
     ASSERT(lockMgr.unlock(&requestLow));
 }
 
-TEST(LockManager, CompatibleFirstImmediateGrant) {
+TEST_F(LockManagerTest, CompatibleFirstImmediateGrant) {
     LockManager lockMgr;
     const ResourceId resId(RESOURCE_GLOBAL, 0);
 
-    LockerImpl locker1;
+    Locker locker1(getServiceContext());
     LockRequestCombo request1(&locker1);
 
-    LockerImpl locker2;
+    Locker locker2(getServiceContext());
     LockRequestCombo request2(&locker2);
     request2.compatibleFirst = true;
 
-    LockerImpl locker3;
+    Locker locker3(getServiceContext());
     LockRequestCombo request3(&locker3);
 
     // Lock all in IS mode
@@ -707,14 +480,14 @@ TEST(LockManager, CompatibleFirstImmediateGrant) {
     ASSERT(LOCK_OK == lockMgr.lock(resId, &request3, MODE_IS));
 
     // Now an exclusive mode comes, which would block
-    LockerImpl lockerX;
+    Locker lockerX(getServiceContext());
     LockRequestCombo requestX(&lockerX);
 
     ASSERT(LOCK_WAITING == lockMgr.lock(resId, &requestX, MODE_X));
 
     // If an S comes, it should be granted, because of request2
     {
-        LockerImpl lockerS;
+        Locker lockerS(getServiceContext());
         LockRequestCombo requestS(&lockerS);
         ASSERT(LOCK_OK == lockMgr.lock(resId, &requestS, MODE_S));
         ASSERT(lockMgr.unlock(&requestS));
@@ -725,7 +498,7 @@ TEST(LockManager, CompatibleFirstImmediateGrant) {
 
     // If S comes again, it should be granted, because of request2 still there
     {
-        LockerImpl lockerS;
+        Locker lockerS(getServiceContext());
         LockRequestCombo requestS(&lockerS);
         ASSERT(LOCK_OK == lockMgr.lock(resId, &requestS, MODE_S));
         ASSERT(lockMgr.unlock(&requestS));
@@ -735,7 +508,7 @@ TEST(LockManager, CompatibleFirstImmediateGrant) {
     ASSERT(lockMgr.unlock(&request2));
 
     {
-        LockerImpl lockerS;
+        Locker lockerS(getServiceContext());
         LockRequestCombo requestS(&lockerS);
         ASSERT(LOCK_WAITING == lockMgr.lock(resId, &requestS, MODE_S));
         ASSERT(lockMgr.unlock(&requestS));
@@ -746,82 +519,70 @@ TEST(LockManager, CompatibleFirstImmediateGrant) {
     ASSERT(lockMgr.unlock(&requestX));
 }
 
-TEST(LockManager, CompatibleFirstGrantAlreadyQueued) {
+TEST_F(LockManagerTest, CompatibleFirstGrantAlreadyQueued) {
     LockManager lockMgr;
     const ResourceId resId(RESOURCE_GLOBAL, 0);
 
     // This tests the following behaviors (alternatives indicated with '|'):
     //   Lock held in X, queue: S X|IX IS, where S is compatibleFirst.
-    //   Once X unlocks|downgrades both the S and IS requests should proceed.
+    //   Once X unlocks both the S and IS requests should proceed.
 
-
-    enum UnblockMethod { kDowngrading, kUnlocking };
     LockMode conflictingModes[2] = {MODE_IX, MODE_X};
-    UnblockMethod unblockMethods[2] = {kDowngrading, kUnlocking};
 
     for (LockMode writerMode : conflictingModes) {
-        for (UnblockMethod unblockMethod : unblockMethods) {
-            LockerImpl locker1;
-            LockRequestCombo request1(&locker1);
+        Locker locker1(getServiceContext());
+        LockRequestCombo request1(&locker1);
 
-            LockerImpl locker2;
-            LockRequestCombo request2(&locker2);
-            request2.compatibleFirst = true;
+        Locker locker2(getServiceContext());
+        LockRequestCombo request2(&locker2);
+        request2.compatibleFirst = true;
 
-            LockerImpl locker3;
-            LockRequestCombo request3(&locker3);
+        Locker locker3(getServiceContext());
+        LockRequestCombo request3(&locker3);
 
-            LockerImpl locker4;
-            LockRequestCombo request4(&locker4);
+        Locker locker4(getServiceContext());
+        LockRequestCombo request4(&locker4);
 
-            // Hold the lock in X and establish the S IX|X IS queue.
-            ASSERT(LOCK_OK == lockMgr.lock(resId, &request1, MODE_X));
-            ASSERT(LOCK_WAITING == lockMgr.lock(resId, &request2, MODE_S));
-            ASSERT(LOCK_WAITING == lockMgr.lock(resId, &request3, writerMode));
-            ASSERT(LOCK_WAITING == lockMgr.lock(resId, &request4, MODE_IS));
+        // Hold the lock in X and establish the S IX|X IS queue.
+        ASSERT(LOCK_OK == lockMgr.lock(resId, &request1, MODE_X));
+        ASSERT(LOCK_WAITING == lockMgr.lock(resId, &request2, MODE_S));
+        ASSERT(LOCK_WAITING == lockMgr.lock(resId, &request3, writerMode));
+        ASSERT(LOCK_WAITING == lockMgr.lock(resId, &request4, MODE_IS));
 
-            // Now unlock the initial X, so all readers should be able to proceed, while the writer
-            // remains queued.
-            if (unblockMethod == kUnlocking) {
-                ASSERT(lockMgr.unlock(&request1));
-            } else {
-                invariant(unblockMethod == kDowngrading);
-                lockMgr.downgrade(&request1, MODE_S);
-            }
-            ASSERT(request2.lastResult == LOCK_OK);
-            ASSERT(request3.lastResult == LOCK_INVALID);
-            ASSERT(request4.lastResult == LOCK_OK);
+        // Now unlock the initial X, so all readers should be able to proceed, while the writer
+        // remains queued.
+        ASSERT(lockMgr.unlock(&request1));
 
-            // Now unlock the readers, and the writer succeeds as well.
-            ASSERT(lockMgr.unlock(&request2));
-            ASSERT(lockMgr.unlock(&request4));
-            if (unblockMethod == kDowngrading) {
-                ASSERT(lockMgr.unlock(&request1));
-            }
-            ASSERT(request3.lastResult == LOCK_OK);
+        ASSERT(request2.lastResult == LOCK_OK);
+        ASSERT(request3.lastResult == LOCK_INVALID);
+        ASSERT(request4.lastResult == LOCK_OK);
 
-            // Unlock the writer
-            ASSERT(lockMgr.unlock(&request3));
-        }
+        // Now unlock the readers, and the writer succeeds as well.
+        ASSERT(lockMgr.unlock(&request2));
+        ASSERT(lockMgr.unlock(&request4));
+        ASSERT(request3.lastResult == LOCK_OK);
+
+        // Unlock the writer
+        ASSERT(lockMgr.unlock(&request3));
     }
 }
 
-TEST(LockManager, CompatibleFirstDelayedGrant) {
+TEST_F(LockManagerTest, CompatibleFirstDelayedGrant) {
     LockManager lockMgr;
     const ResourceId resId(RESOURCE_GLOBAL, 0);
 
-    LockerImpl lockerXInitial;
+    Locker lockerXInitial(getServiceContext());
     LockRequestCombo requestXInitial(&lockerXInitial);
     ASSERT(LOCK_OK == lockMgr.lock(resId, &requestXInitial, MODE_X));
 
-    LockerImpl locker1;
+    Locker locker1(getServiceContext());
     LockRequestCombo request1(&locker1);
 
-    LockerImpl locker2;
+    Locker locker2(getServiceContext());
     LockRequestCombo request2(&locker2);
     request2.compatibleFirst = true;
 
-    LockerImpl locker3;
+    Locker locker3(getServiceContext());
     LockRequestCombo request3(&locker3);
 
     // Lock all in IS mode (should block behind the global lock)
@@ -830,7 +591,7 @@ TEST(LockManager, CompatibleFirstDelayedGrant) {
     ASSERT(LOCK_WAITING == lockMgr.lock(resId, &request3, MODE_IS));
 
     // Now an exclusive mode comes, which would block behind the IS modes
-    LockerImpl lockerX;
+    Locker lockerX(getServiceContext());
     LockRequestCombo requestX(&lockerX);
     ASSERT(LOCK_WAITING == lockMgr.lock(resId, &requestX, MODE_X));
 
@@ -842,7 +603,7 @@ TEST(LockManager, CompatibleFirstDelayedGrant) {
 
     // If an S comes, it should be granted, because of request2
     {
-        LockerImpl lockerS;
+        Locker lockerS(getServiceContext());
         LockRequestCombo requestS(&lockerS);
         ASSERT(LOCK_OK == lockMgr.lock(resId, &requestS, MODE_S));
         ASSERT(lockMgr.unlock(&requestS));
@@ -853,7 +614,7 @@ TEST(LockManager, CompatibleFirstDelayedGrant) {
 
     // If S comes again, it should be granted, because of request2 still there
     {
-        LockerImpl lockerS;
+        Locker lockerS(getServiceContext());
         LockRequestCombo requestS(&lockerS);
         ASSERT(LOCK_OK == lockMgr.lock(resId, &requestS, MODE_S));
         ASSERT(lockMgr.unlock(&requestS));
@@ -863,7 +624,7 @@ TEST(LockManager, CompatibleFirstDelayedGrant) {
     ASSERT(lockMgr.unlock(&request2));
 
     {
-        LockerImpl lockerS;
+        Locker lockerS(getServiceContext());
         LockRequestCombo requestS(&lockerS);
         ASSERT(LOCK_WAITING == lockMgr.lock(resId, &requestS, MODE_S));
         ASSERT(lockMgr.unlock(&requestS));
@@ -874,26 +635,26 @@ TEST(LockManager, CompatibleFirstDelayedGrant) {
     ASSERT(lockMgr.unlock(&requestX));
 }
 
-TEST(LockManager, CompatibleFirstCancelWaiting) {
+TEST_F(LockManagerTest, CompatibleFirstCancelWaiting) {
     LockManager lockMgr;
     const ResourceId resId(RESOURCE_GLOBAL, 0);
 
-    LockerImpl lockerSInitial;
+    Locker lockerSInitial(getServiceContext());
     LockRequestCombo requestSInitial(&lockerSInitial);
     ASSERT(LOCK_OK == lockMgr.lock(resId, &requestSInitial, MODE_S));
 
-    LockerImpl lockerX;
+    Locker lockerX(getServiceContext());
     LockRequestCombo requestX(&lockerX);
     ASSERT(LOCK_WAITING == lockMgr.lock(resId, &requestX, MODE_X));
 
-    LockerImpl lockerPending;
+    Locker lockerPending(getServiceContext());
     LockRequestCombo requestPending(&lockerPending);
     requestPending.compatibleFirst = true;
     ASSERT(LOCK_WAITING == lockMgr.lock(resId, &requestPending, MODE_S));
 
     // S1 is not granted yet, so the policy should still be FIFO
     {
-        LockerImpl lockerS;
+        Locker lockerS(getServiceContext());
         LockRequestCombo requestS(&lockerS);
         ASSERT(LOCK_WAITING == lockMgr.lock(resId, &requestS, MODE_S));
         ASSERT(lockMgr.unlock(&requestS));
@@ -903,7 +664,7 @@ TEST(LockManager, CompatibleFirstCancelWaiting) {
     ASSERT(lockMgr.unlock(&requestPending));
 
     {
-        LockerImpl lockerS;
+        Locker lockerS(getServiceContext());
         LockRequestCombo requestS(&lockerS);
         ASSERT(LOCK_WAITING == lockMgr.lock(resId, &requestS, MODE_S));
         ASSERT(lockMgr.unlock(&requestS));
@@ -914,26 +675,26 @@ TEST(LockManager, CompatibleFirstCancelWaiting) {
     ASSERT(lockMgr.unlock(&requestX));
 }
 
-TEST(LockManager, Fairness) {
+TEST_F(LockManagerTest, Fairness) {
     LockManager lockMgr;
     const ResourceId resId(RESOURCE_GLOBAL, 0);
 
     // Start with some 'regular' intent locks
-    LockerImpl lockerIS;
+    Locker lockerIS(getServiceContext());
     LockRequestCombo requestIS(&lockerIS);
     ASSERT(LOCK_OK == lockMgr.lock(resId, &requestIS, MODE_IS));
 
-    LockerImpl lockerIX;
+    Locker lockerIX(getServiceContext());
     LockRequestCombo requestIX(&lockerIX);
     ASSERT(LOCK_OK == lockMgr.lock(resId, &requestIX, MODE_IX));
 
     // Now a conflicting lock comes
-    LockerImpl lockerX;
+    Locker lockerX(getServiceContext());
     LockRequestCombo requestX(&lockerX);
     ASSERT(LOCK_WAITING == lockMgr.lock(resId, &requestX, MODE_X));
 
     // Now, whoever comes next should be blocked
-    LockerImpl lockerIX1;
+    Locker lockerIX1(getServiceContext());
     LockRequestCombo requestIX1(&lockerIX1);
     ASSERT(LOCK_WAITING == lockMgr.lock(resId, &requestIX1, MODE_IX));
 
@@ -953,4 +714,26 @@ TEST(LockManager, Fairness) {
     ASSERT(lockMgr.unlock(&requestIX1));
 }
 
+TEST_F(LockManagerTest, HasConflictingRequests) {
+    LockManager lockMgr;
+    ResourceId resId{RESOURCE_GLOBAL, 0};
+
+    Locker lockerIX{getServiceContext()};
+    LockRequestCombo requestIX{&lockerIX};
+    ASSERT_EQ(lockMgr.lock(resId, &requestIX, LockMode::MODE_IX), LockResult::LOCK_OK);
+    ASSERT_FALSE(lockMgr.hasConflictingRequests(resId, &requestIX));
+
+    Locker lockerX{getServiceContext()};
+    LockRequestCombo requestX{&lockerX};
+    ASSERT_EQ(lockMgr.lock(resId, &requestX, LockMode::MODE_X), LockResult::LOCK_WAITING);
+    ASSERT_TRUE(lockMgr.hasConflictingRequests(resId, &requestIX));
+    ASSERT_TRUE(lockMgr.hasConflictingRequests(resId, &requestX));
+
+    ASSERT(lockMgr.unlock(&requestIX));
+    ASSERT(lockMgr.unlock(&requestX));
+}
+
+}  // namespace lock_manager_test
+
+}  // namespace
 }  // namespace mongo

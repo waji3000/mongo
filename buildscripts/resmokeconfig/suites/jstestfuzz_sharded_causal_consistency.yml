@@ -2,33 +2,40 @@ test_kind: js_test
 
 selector:
   roots:
-  - jstestfuzz/out/*.js
+    - jstestfuzz/out/*.js
 
 executor:
   archive:
     hooks:
       - CheckReplDBHash
+      - CheckMetadataConsistencyInBackground
       - ValidateCollections
   config:
     shell_options:
-      eval: load("jstests/libs/override_methods/enable_causal_consistency.js")
-      readMode: commands
+      eval: await import("jstests/libs/override_methods/enable_causal_consistency.js")
+      crashOnInvalidBSONError: ""
+      objcheck: ""
       global_vars:
         TestData:
           runningWithCausalConsistency: true
-          usingReplicaSetShards: true
   hooks:
-  - class: CheckReplDBHash
-    shell_options:
-      global_vars:
-        TestData:
-          skipValidationOnInvalidViewDefinitions: true
-  - class: ValidateCollections
-    shell_options:
-      global_vars:
-        TestData:
-          skipValidationOnInvalidViewDefinitions: true
-          forceValidationWithFeatureCompatibilityVersion: "4.2"
+    - class: FuzzerRestoreSettings
+    - class: CheckReplDBHash
+      shell_options:
+        global_vars:
+          TestData:
+            skipValidationOnInvalidViewDefinitions: true
+    - class: CheckMetadataConsistencyInBackground
+    - class: ValidateCollections
+      shell_options:
+        global_vars:
+          TestData:
+            skipValidationOnInvalidViewDefinitions: true
+    - class: CheckRoutingTableConsistency
+      shell_options:
+        global_vars:
+          TestData:
+            mayForgeReshardingTempCollections: true
   fixture:
     class: ShardedClusterFixture
     mongos_options:
@@ -38,13 +45,7 @@ executor:
       set_parameters:
         disableLogicalSessionCacheRefresh: false
         enableTestCommands: 1
-        numInitialSyncAttempts: 1
         transactionLifetimeLimitSeconds: 1
         writePeriodicNoops: 1
     num_rs_nodes_per_shard: 2
     num_shards: 2
-    # TODO SERVER-32572 remove voting_secondaries: true
-    shard_options:
-      voting_secondaries: true
-    configsvr_options:
-      voting_secondaries: true

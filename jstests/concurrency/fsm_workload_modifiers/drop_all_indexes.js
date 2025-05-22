@@ -1,5 +1,3 @@
-'use strict';
-
 /**
  * drop_all_indexes.js
  *
@@ -8,7 +6,7 @@
  * that already existed at the start of setup are not dropped.
  */
 
-function dropAllIndexes($config, $super) {
+export function dropAllIndexes($config, $super) {
     $config.setup = function setup(db, collName, cluster) {
         var oldIndexes = db[collName].getIndexes().map(function(ixSpec) {
             return ixSpec.name;
@@ -21,7 +19,7 @@ function dropAllIndexes($config, $super) {
             var name = ixSpec.name;
             if (name !== '_id_' && !Array.contains(oldIndexes, name)) {
                 var res = db[collName].dropIndex(name);
-                assertAlways.commandWorked(res);
+                assert.commandWorked(res);
             }
         });
     };

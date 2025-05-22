@@ -2,27 +2,12 @@ test_kind: js_test
 
 selector:
   roots:
-  - jstests/disk/*.js
-  exclude_with_any_tags:
-  - requires_mobile_se
+    - jstests/disk/*.js
 
 executor:
-  archive:
-    hooks:
-      - ValidateCollections
   config:
     shell_options:
+      nodb: ""
       global_vars:
         TestData:
           storageEngine: wiredTiger
-      readMode: commands
-  hooks:
-  - class: ValidateCollections
-  - class: CleanEveryN
-    n: 1
-  fixture:
-    class: MongoDFixture
-    mongod_options:
-      set_parameters:
-        enableTestCommands: 1
-      storageEngine: wiredTiger

@@ -1,14 +1,17 @@
 [Unit]
 Description=MongoDB Database Server
-After=multi-user.target
 Documentation=https://docs.mongodb.org/manual
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 User=mongodb
 Group=mongodb
 EnvironmentFile=-/etc/default/mongod
+Environment="MONGODB_CONFIG_OVERRIDE_NOFORK=1"
+Environment="GLIBC_TUNABLES=glibc.pthread.rseq=0"
 ExecStart=/usr/bin/mongod --config /etc/mongod.conf
-PIDFile=/var/run/mongodb/mongod.pid
+RuntimeDirectory=mongodb
 # file size
 LimitFSIZE=infinity
 # cpu time
@@ -25,8 +28,8 @@ LimitMEMLOCK=infinity
 TasksMax=infinity
 TasksAccounting=false
 
-# Recommended limits for for mongod as specified in
-# http://docs.mongodb.org/manual/reference/ulimit/#recommended-settings
+# Recommended limits for mongod as specified in
+# https://docs.mongodb.com/manual/reference/ulimit/#recommended-ulimit-settings
 
 [Install]
 WantedBy=multi-user.target

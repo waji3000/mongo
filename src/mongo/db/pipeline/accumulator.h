@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,20 +29,29 @@
 
 #pragma once
 
-#include "mongo/platform/basic.h"
-
 #include <boost/intrusive_ptr.hpp>
+#include <boost/none.hpp>
 #include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+#include <functional>
 #include <vector>
 
-#include "mongo/base/init.h"
+#include "mongo/base/init.h"  // IWYU pragma: keep
+#include "mongo/base/string_data.h"
 #include "mongo/bson/bsontypes.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/exec/document_value/value_comparator.h"
+#include "mongo/db/memory_tracking/memory_usage_tracker.h"
 #include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/expression_context.h"
-#include "mongo/db/pipeline/value.h"
-#include "mongo/db/pipeline/value_comparator.h"
-#include "mongo/stdx/functional.h"
-#include "mongo/stdx/unordered_set.h"
+#include "mongo/db/query/query_shape/serialization_options.h"
+#include "mongo/db/query/stats/stats_gen.h"
+#include "mongo/db/query/stats/value_utils.h"
+#include "mongo/platform/decimal128.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/intrusive_counter.h"
 #include "mongo/util/summation.h"
 
 namespace mongo {
@@ -52,24 +60,38 @@ namespace mongo {
  * This enum indicates which documents an accumulator needs to see in order to compute its output.
  */
 enum class AccumulatorDocumentsNeeded {
-    // Accumulator needs to see all documents in a group.
+    // AccumulatorState needs to see all documents in a group.
     kAllDocuments,
 
-    // Accumulator only needs to see one document in a group, and when there is a sort order, that
-    // document must be the first document.
-    kFirstDocument,
+    // AccumulatorState only needs to see one document in a group, and when there is a sort order,
+    // that document must be the first document.
+    kFirstInputDocument,
 
-    // Accumulator only needs to see one document in a group, and when there is a sort order, that
-    // document must be the last document.
-    kLastDocument,
+    // AccumulatorState only needs to see one document in a group, and when there is a sort order,
+    // that document must be the last document.
+    kLastInputDocument,
+
+    // AccumulatorState may only need to see the first document in a group if there is an index that
+    // matches the sort order.
+    kFirstOutputDocument,
+
+    // AccumulatorState may only need to see the last document in a group if there is an index that
+    // matches the sort order.
+    kLastOutputDocument,
 };
 
-class Accumulator : public RefCountable {
+class AccumulatorState : public RefCountable {
 public:
-    using Factory = boost::intrusive_ptr<Accumulator> (*)(
-        const boost::intrusive_ptr<ExpressionContext>& expCtx);
+    using Factory = std::function<boost::intrusive_ptr<AccumulatorState>()>;
 
-    Accumulator(const boost::intrusive_ptr<ExpressionContext>& expCtx) : _expCtx(expCtx) {}
+    AccumulatorState(ExpressionContext* const expCtx,
+                     int64_t maxAllowedMemoryUsageBytes = std::numeric_limits<int64_t>::max())
+        : _memUsageTracker(maxAllowedMemoryUsageBytes), _expCtx(expCtx) {}
+
+    /** Marks the beginning of a new group. The input is the result of evaluating
+     *  AccumulatorExpression::initializer, which can read from the group key.
+     */
+    virtual void startNewGroup(const Value& input) {}
 
     /** Process input and update internal state.
      *  merging should be true when processing outputs from getValue(true).
@@ -77,6 +99,14 @@ public:
     void process(const Value& input, bool merging) {
         processInternal(input, merging);
     }
+
+    /**
+     * Finish processing all the pending operations, and clean up memory. Some accumulators
+     * ($accumulator for example) might do a batch processing in order to improve performace. In
+     * those cases, the memory consumption could spike up. Calling this function can help flush
+     * those batch.
+     */
+    virtual void reduceMemoryConsumptionIfAble() {}
 
     /** Marks the end of the evaluate() phase and return accumulated result.
      *  toBeMerged should be true when the outputs will be merged by process().
@@ -86,21 +116,48 @@ public:
     /// The name of the op as used in a serialization of the pipeline.
     virtual const char* getOpName() const = 0;
 
-    int memUsageForSorter() const {
-        dassert(_memUsageBytes != 0);  // This would mean subclass didn't set it
-        return _memUsageBytes;
+    int64_t getMemUsage() const {
+        return _memUsageTracker.currentMemoryBytes();
     }
 
-    /// Reset this accumulator to a fresh state ready to receive input.
+    /// Reset this accumulator to a fresh state, ready for a new call to startNewGroup.
     virtual void reset() = 0;
 
+    /// True if the accumulator needs input, false otherwise.
+    bool needsInput() const {
+        return _needsInput;
+    }
 
-    virtual bool isAssociative() const {
-        return false;
+    virtual ExpressionNary::Associativity getAssociativity() const {
+        return ExpressionNary::Associativity::kNone;
     }
 
     virtual bool isCommutative() const {
         return false;
+    }
+
+    /**
+     * Serializes this accumulator to a valid MQL accumulation statement that would be legal
+     * inside a $group.
+     *
+     * The parameter expression represents the input to any accumulator created by the
+     * serialized accumulation statement.
+     *
+     * When executing on a sharded cluster, the result of this function will be sent to each
+     * individual shard.
+     *
+     * This implementation assumes the accumulator has the simple syntax { <name>: <argument> },
+     * such as { $sum: <argument> }. This syntax has no room for an initializer. Subclasses with a
+     * more elaborate syntax such should override this method.
+     */
+    virtual Document serialize(boost::intrusive_ptr<Expression> initializer,
+                               boost::intrusive_ptr<Expression> argument,
+                               const SerializationOptions& options = {}) const {
+        ExpressionConstant const* ec = dynamic_cast<ExpressionConstant const*>(initializer.get());
+        invariant(ec);
+        invariant(ec->getValue().nullish());
+
+        return DOC(getOpName() << argument->serialize(options));
     }
 
     virtual AccumulatorDocumentsNeeded documentsNeeded() const {
@@ -111,32 +168,67 @@ protected:
     /// Update subclass's internal state based on input
     virtual void processInternal(const Value& input, bool merging) = 0;
 
-    const boost::intrusive_ptr<ExpressionContext>& getExpressionContext() const {
+    /**
+     * When accumulated values are merged, a different type of the input is expected compared to a
+     * normal accumulating pass.
+     */
+    MONGO_COMPILER_ALWAYS_INLINE void assertMergingInputType(const Value& input,
+                                                             BSONType requiredType) const {
+        uassert(9961600,
+                str::stream() << "Unexpected type on the merging pass of the " << getOpName()
+                              << ". This likely happened due to a malformed query.",
+                input.getType() == requiredType);
+    }
+
+    auto getExpressionContext() const {
         return _expCtx;
     }
 
+    // Utility to check that memory limit isn't exceeded.
+    void checkMemUsage() {
+        uassert(ErrorCodes::ExceededMemoryLimit,
+                str::stream() << getOpName()
+                              << " used too much memory and spilling to disk cannot reduce memory "
+                                 "consumption any further. Used: "
+                              << _memUsageTracker.currentMemoryBytes() << " bytes. Memory limit: "
+                              << _memUsageTracker.maxAllowedMemoryUsageBytes() << " bytes",
+                _memUsageTracker.withinMemoryLimit());
+    }
+
     /// subclasses are expected to update this as necessary
-    int _memUsageBytes = 0;
+    SimpleMemoryUsageTracker _memUsageTracker;
+
+    /// Member which tracks if this accumulator requires any more input values to compute its final
+    /// result. In general, most accumulators require all input values, however, some accumulators
+    /// can ignore input values under certain conditions. For example, $first can set this to
+    /// 'false' after it sees one value.
+    bool _needsInput = true;
 
 private:
-    boost::intrusive_ptr<ExpressionContext> _expCtx;
+    ExpressionContext* _expCtx;
 };
 
-
-class AccumulatorAddToSet final : public Accumulator {
+class AccumulatorAddToSet final : public AccumulatorState {
 public:
-    explicit AccumulatorAddToSet(const boost::intrusive_ptr<ExpressionContext>& expCtx);
+    static constexpr auto kName = "$addToSet"_sd;
+
+    const char* getOpName() const final {
+        return kName.data();
+    }
+
+    /**
+     * Creates a new $addToSet accumulator. If no memory limit is given, defaults to the value of
+     * the server parameter 'internalQueryMaxAddToSetBytes'.
+     */
+    AccumulatorAddToSet(ExpressionContext* expCtx,
+                        boost::optional<int> maxMemoryUsageBytes = boost::none);
 
     void processInternal(const Value& input, bool merging) final;
     Value getValue(bool toBeMerged) final;
-    const char* getOpName() const final;
     void reset() final;
 
-    static boost::intrusive_ptr<Accumulator> create(
-        const boost::intrusive_ptr<ExpressionContext>& expCtx);
-
-    bool isAssociative() const final {
-        return true;
+    ExpressionNary::Associativity getAssociativity() const final {
+        return ExpressionNary::Associativity::kFull;
     }
 
     bool isCommutative() const final {
@@ -144,24 +236,25 @@ public:
     }
 
 private:
-    ValueUnorderedSet _set;
+    ValueFlatUnorderedSet _set;
 };
 
-
-class AccumulatorFirst final : public Accumulator {
+class AccumulatorFirst final : public AccumulatorState {
 public:
-    explicit AccumulatorFirst(const boost::intrusive_ptr<ExpressionContext>& expCtx);
+    static constexpr auto kName = "$first"_sd;
+
+    const char* getOpName() const final {
+        return kName.data();
+    }
+
+    explicit AccumulatorFirst(ExpressionContext* expCtx);
 
     void processInternal(const Value& input, bool merging) final;
     Value getValue(bool toBeMerged) final;
-    const char* getOpName() const final;
     void reset() final;
 
-    static boost::intrusive_ptr<Accumulator> create(
-        const boost::intrusive_ptr<ExpressionContext>& expCtx);
-
     AccumulatorDocumentsNeeded documentsNeeded() const final {
-        return AccumulatorDocumentsNeeded::kFirstDocument;
+        return AccumulatorDocumentsNeeded::kFirstInputDocument;
     }
 
 private:
@@ -169,42 +262,83 @@ private:
     Value _first;
 };
 
-
-class AccumulatorLast final : public Accumulator {
+class AccumulatorInternalConstructStats final : public AccumulatorState {
 public:
-    explicit AccumulatorLast(const boost::intrusive_ptr<ExpressionContext>& expCtx);
+    static constexpr auto kName = "$_internalConstructStats"_sd;
+
+    const char* getOpName() const final {
+        return kName.data();
+    }
+
+    explicit AccumulatorInternalConstructStats(ExpressionContext* expCtx,
+                                               InternalConstructStatsAccumulatorParams);
 
     void processInternal(const Value& input, bool merging) final;
     Value getValue(bool toBeMerged) final;
-    const char* getOpName() const final;
     void reset() final;
 
-    static boost::intrusive_ptr<Accumulator> create(
-        const boost::intrusive_ptr<ExpressionContext>& expCtx);
+    bool isCommutative() const final {
+        return true;
+    }
+
+private:
+    double _count;  // Can't this be an int?
+    InternalConstructStatsAccumulatorParams _params;
+    std::vector<stats::SBEValue> _values;
+};
+
+class AccumulatorLast final : public AccumulatorState {
+public:
+    static constexpr auto kName = "$last"_sd;
+
+    const char* getOpName() const final {
+        return kName.data();
+    }
+
+    explicit AccumulatorLast(ExpressionContext* expCtx);
+
+    void processInternal(const Value& input, bool merging) final;
+    Value getValue(bool toBeMerged) final;
+    void reset() final;
 
     AccumulatorDocumentsNeeded documentsNeeded() const final {
-        return AccumulatorDocumentsNeeded::kLastDocument;
+        return AccumulatorDocumentsNeeded::kLastInputDocument;
     }
 
 private:
     Value _last;
 };
 
-
-class AccumulatorSum final : public Accumulator {
+class AccumulatorSum final : public AccumulatorState {
 public:
-    explicit AccumulatorSum(const boost::intrusive_ptr<ExpressionContext>& expCtx);
+    static constexpr auto kName = "$sum"_sd;
+
+    /**
+     * These aliases represent two possible sum states in AcculumatorSum:
+     *  - ConstantSumState, which is used in the cases of sums over non-decimal constants such as
+     *    {$sum: 1}. It stores the current sum as a running total.
+     *  - NonConstantSumState which is used in all other cases. It stores the current sum using a
+     *    DoubleDoubleSummation and a DecimalTotal.
+     */
+    using NonConstantSumState = std::pair<DoubleDoubleSummation, Decimal128>;
+    using ConstantSumState = std::variant<int, long long, double>;
+
+
+    static boost::optional<Value> getConstantArgument(boost::intrusive_ptr<Expression> arg);
+
+    const char* getOpName() const final {
+        return kName.data();
+    }
+
+    explicit AccumulatorSum(ExpressionContext* expCtx);
+    explicit AccumulatorSum(ExpressionContext* expCtx, boost::optional<Value> constantAddend);
 
     void processInternal(const Value& input, bool merging) final;
     Value getValue(bool toBeMerged) final;
-    const char* getOpName() const final;
     void reset() final;
 
-    static boost::intrusive_ptr<Accumulator> create(
-        const boost::intrusive_ptr<ExpressionContext>& expCtx);
-
-    bool isAssociative() const final {
-        return true;
+    ExpressionNary::Associativity getAssociativity() const final {
+        return ExpressionNary::Associativity::kFull;
     }
 
     bool isCommutative() const final {
@@ -212,28 +346,48 @@ public:
     }
 
 private:
+    /**
+     * Helper function that converts this accumulator from tracking a constant sum to a non constant
+     * one.
+     */
+    DoubleDoubleSummation _constantSumToDoubleDoubleSummation();
+
+    /**
+     * Helper function that initializes this accumulator to track a constant sum.
+     */
+    void _initConstant(const BSONType& type);
+
+    /**
+     * Helper functions which implement the behavior for processing the desired sum type.
+     */
+    void _processInternalConstant(const Value& input,
+                                  AccumulatorSum::ConstantSumState& constantTotal);
+    void _processInternalNonConstant(const Value& input,
+                                     AccumulatorSum::NonConstantSumState& nonConstantTotal);
+
+    // Tracks the original constant addend argument.
+    boost::optional<Value> constantAddend = boost::none;
     BSONType totalType = NumberInt;
-    DoubleDoubleSummation nonDecimalTotal;
-    Decimal128 decimalTotal;
+    BSONType nonDecimalTotalType = NumberInt;
+    std::variant<NonConstantSumState, ConstantSumState> sum =
+        std::make_pair<>(DoubleDoubleSummation(), Decimal128());
 };
 
-
-class AccumulatorMinMax : public Accumulator {
+class AccumulatorMinMax : public AccumulatorState {
 public:
     enum Sense : int {
-        MIN = 1,
-        MAX = -1,  // Used to "scale" comparison.
+        kMin = 1,
+        kMax = -1,  // Used to "scale" comparison.
     };
 
-    AccumulatorMinMax(const boost::intrusive_ptr<ExpressionContext>& expCtx, Sense sense);
+    AccumulatorMinMax(ExpressionContext* expCtx, Sense sense);
 
     void processInternal(const Value& input, bool merging) final;
     Value getValue(bool toBeMerged) final;
-    const char* getOpName() const final;
     void reset() final;
 
-    bool isAssociative() const final {
-        return true;
+    ExpressionNary::Associativity getAssociativity() const final {
+        return ExpressionNary::Associativity::kFull;
     }
 
     bool isCommutative() const final {
@@ -247,49 +401,68 @@ private:
 
 class AccumulatorMax final : public AccumulatorMinMax {
 public:
-    explicit AccumulatorMax(const boost::intrusive_ptr<ExpressionContext>& expCtx)
-        : AccumulatorMinMax(expCtx, MAX) {}
-    static boost::intrusive_ptr<Accumulator> create(
-        const boost::intrusive_ptr<ExpressionContext>& expCtx);
+    static constexpr auto kName = "$max"_sd;
+
+    const char* getOpName() const final {
+        return kName.data();
+    }
+
+    explicit AccumulatorMax(ExpressionContext* const expCtx)
+        : AccumulatorMinMax(expCtx, Sense::kMax) {}
 };
 
 class AccumulatorMin final : public AccumulatorMinMax {
 public:
-    explicit AccumulatorMin(const boost::intrusive_ptr<ExpressionContext>& expCtx)
-        : AccumulatorMinMax(expCtx, MIN) {}
-    static boost::intrusive_ptr<Accumulator> create(
-        const boost::intrusive_ptr<ExpressionContext>& expCtx);
+    static constexpr auto kName = "$min"_sd;
+
+    const char* getOpName() const final {
+        return kName.data();
+    }
+
+    explicit AccumulatorMin(ExpressionContext* const expCtx)
+        : AccumulatorMinMax(expCtx, Sense::kMin) {}
 };
 
-
-class AccumulatorPush final : public Accumulator {
+class AccumulatorPush final : public AccumulatorState {
 public:
-    explicit AccumulatorPush(const boost::intrusive_ptr<ExpressionContext>& expCtx);
+    static constexpr auto kName = "$push"_sd;
+
+    const char* getOpName() const final {
+        return kName.data();
+    }
+
+    /**
+     * Creates a new $push accumulator. If no memory limit is given, defaults to the value of the
+     * server parameter 'internalQueryMaxPushBytes'.
+     */
+    AccumulatorPush(ExpressionContext* expCtx,
+                    boost::optional<int> maxMemoryUsageBytes = boost::none);
 
     void processInternal(const Value& input, bool merging) final;
     Value getValue(bool toBeMerged) final;
-    const char* getOpName() const final;
     void reset() final;
-
-    static boost::intrusive_ptr<Accumulator> create(
-        const boost::intrusive_ptr<ExpressionContext>& expCtx);
 
 private:
-    std::vector<Value> vpValue;
+    std::vector<Value> _array;
 };
 
-
-class AccumulatorAvg final : public Accumulator {
+class AccumulatorAvg final : public AccumulatorState {
 public:
-    explicit AccumulatorAvg(const boost::intrusive_ptr<ExpressionContext>& expCtx);
+    static constexpr auto kName = "$avg"_sd;
+
+    const char* getOpName() const final {
+        return kName.data();
+    }
+
+    explicit AccumulatorAvg(ExpressionContext* expCtx);
 
     void processInternal(const Value& input, bool merging) final;
     Value getValue(bool toBeMerged) final;
-    const char* getOpName() const final;
     void reset() final;
 
-    static boost::intrusive_ptr<Accumulator> create(
-        const boost::intrusive_ptr<ExpressionContext>& expCtx);
+    bool isCommutative() const final {
+        return true;
+    }
 
 private:
     /**
@@ -298,21 +471,24 @@ private:
      */
     Decimal128 _getDecimalTotal() const;
 
-    bool _isDecimal;
+    BSONType _totalType = NumberInt;
+    BSONType _nonDecimalTotalType = NumberInt;
     DoubleDoubleSummation _nonDecimalTotal;
     Decimal128 _decimalTotal;
     long long _count;
 };
 
-
-class AccumulatorStdDev : public Accumulator {
+class AccumulatorStdDev : public AccumulatorState {
 public:
-    AccumulatorStdDev(const boost::intrusive_ptr<ExpressionContext>& expCtx, bool isSamp);
+    AccumulatorStdDev(ExpressionContext* expCtx, bool isSamp);
 
     void processInternal(const Value& input, bool merging) final;
     Value getValue(bool toBeMerged) final;
-    const char* getOpName() const final;
     void reset() final;
+
+    bool isCommutative() const final {
+        return true;
+    }
 
 private:
     const bool _isSamp;
@@ -323,33 +499,118 @@ private:
 
 class AccumulatorStdDevPop final : public AccumulatorStdDev {
 public:
-    explicit AccumulatorStdDevPop(const boost::intrusive_ptr<ExpressionContext>& expCtx)
+    static constexpr auto kName = "$stdDevPop"_sd;
+
+    const char* getOpName() const final {
+        return kName.data();
+    }
+
+    explicit AccumulatorStdDevPop(ExpressionContext* const expCtx)
         : AccumulatorStdDev(expCtx, false) {}
-    static boost::intrusive_ptr<Accumulator> create(
-        const boost::intrusive_ptr<ExpressionContext>& expCtx);
 };
 
 class AccumulatorStdDevSamp final : public AccumulatorStdDev {
 public:
-    explicit AccumulatorStdDevSamp(const boost::intrusive_ptr<ExpressionContext>& expCtx)
+    static constexpr auto kName = "$stdDevSamp"_sd;
+
+    const char* getOpName() const final {
+        return kName.data();
+    }
+
+    explicit AccumulatorStdDevSamp(ExpressionContext* const expCtx)
         : AccumulatorStdDev(expCtx, true) {}
-    static boost::intrusive_ptr<Accumulator> create(
-        const boost::intrusive_ptr<ExpressionContext>& expCtx);
 };
 
-class AccumulatorMergeObjects : public Accumulator {
+class AccumulatorMergeObjects : public AccumulatorState {
 public:
-    AccumulatorMergeObjects(const boost::intrusive_ptr<ExpressionContext>& expCtx);
+    static constexpr auto kName = "$mergeObjects"_sd;
+
+    const char* getOpName() const final {
+        return kName.data();
+    }
+
+    AccumulatorMergeObjects(ExpressionContext* expCtx);
 
     void processInternal(const Value& input, bool merging) final;
     Value getValue(bool toBeMerged) final;
-    const char* getOpName() const final;
     void reset() final;
-
-    static boost::intrusive_ptr<Accumulator> create(
-        const boost::intrusive_ptr<ExpressionContext>& expCtx);
 
 private:
     MutableDocument _output;
 };
-}
+
+class AccumulatorExpMovingAvg : public AccumulatorState {
+public:
+    static constexpr auto kName = "$expMovingAvg"_sd;
+
+    const char* getOpName() const final {
+        return kName.data();
+    }
+
+    AccumulatorExpMovingAvg(ExpressionContext* expCtx, Decimal128 alpha);
+
+    void processInternal(const Value& input, bool merging) final;
+    Value getValue(bool toBeMerged) final;
+    void reset() final;
+
+private:
+    Decimal128 _alpha;
+    Decimal128 _currentResult;
+    bool _init = false;
+    bool _isDecimal = false;
+};
+
+class AccumulatorConcatArrays : public AccumulatorState {
+public:
+    static constexpr auto kName = "$concatArrays"_sd;
+
+    const char* getOpName() const final {
+        return kName.data();
+    }
+
+    /**
+     * Creates a new $concatArrays accumulator. If 'maxMemoryUsageBytes' is not given, defaults to
+     * the value of the server parameter 'internalQueryMaxConcatArraysBytes'.
+     */
+    AccumulatorConcatArrays(ExpressionContext* expCtx,
+                            boost::optional<int> maxMemoryUsageBytes = boost::none);
+
+    void processInternal(const Value& input, bool merging) final;
+    Value getValue(bool) final;
+    void reset() final;
+
+private:
+    void addValuesFromArray(const Value& values);
+    std::vector<Value> _array;
+};
+
+class AccumulatorSetUnion : public AccumulatorState {
+public:
+    static constexpr auto kName = "$setUnion"_sd;
+
+    const char* getOpName() const final {
+        return kName.data();
+    }
+
+    /**
+     * Creates a new $setUnion accumulator. If 'maxMemoryUsageBytes' is not given, defaults to the
+     * value of the server parameter 'internalQueryMaxSetUnionBytes'.
+     */
+    AccumulatorSetUnion(ExpressionContext* expCtx,
+                        boost::optional<int> maxMemoryUsageBytes = boost::none);
+
+    void processInternal(const Value& input, bool merging) final;
+    Value getValue(bool toBeMerged) final;
+    void reset() final;
+
+    bool isCommutative() const final {
+        return true;
+    }
+
+private:
+    void addValues(const std::vector<Value>& values);
+
+    ValueFlatUnorderedSet _set;
+};
+
+}  // namespace mongo

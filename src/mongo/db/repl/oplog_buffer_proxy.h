@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -31,11 +30,15 @@
 #pragma once
 
 #include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+#include <cstddef>
 #include <memory>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/db/repl/oplog_buffer.h"
 #include "mongo/stdx/mutex.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/interruptible.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo {
 namespace repl {
@@ -47,7 +50,8 @@ class StorageInterface;
  * oplog buffer.
  */
 class OplogBufferProxy : public OplogBuffer {
-    MONGO_DISALLOW_COPYING(OplogBufferProxy);
+    OplogBufferProxy(const OplogBufferProxy&) = delete;
+    OplogBufferProxy& operator=(const OplogBufferProxy&) = delete;
 
 public:
     explicit OplogBufferProxy(std::unique_ptr<OplogBuffer> target);
@@ -59,19 +63,18 @@ public:
 
     void startup(OperationContext* opCtx) override;
     void shutdown(OperationContext* opCtx) override;
-    void pushEvenIfFull(OperationContext* opCtx, const Value& value) override;
-    void push(OperationContext* opCtx, const Value& value) override;
-    void pushAllNonBlocking(OperationContext* opCtx,
-                            Batch::const_iterator begin,
-                            Batch::const_iterator end) override;
-    void waitForSpace(OperationContext* opCtx, std::size_t size) override;
+    void push(OperationContext* opCtx,
+              Batch::const_iterator begin,
+              Batch::const_iterator end,
+              boost::optional<const Cost&> cost = boost::none) override;
+    void waitForSpace(OperationContext* opCtx, const Cost& cost) override;
     bool isEmpty() const override;
-    std::size_t getMaxSize() const override;
     std::size_t getSize() const override;
     std::size_t getCount() const override;
     void clear(OperationContext* opCtx) override;
     bool tryPop(OperationContext* opCtx, Value* value) override;
-    bool waitForData(Seconds waitDuration) override;
+    bool waitForDataFor(Milliseconds waitDuration, Interruptible* interruptible) override;
+    bool waitForDataUntil(Date_t deadline, Interruptible* interruptible) override;
     bool peek(OperationContext* opCtx, Value* value) override;
     boost::optional<Value> lastObjectPushed(OperationContext* opCtx) const override;
 

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,7 +29,10 @@
 
 #pragma once
 
-#include "mongo/base/disallow_copying.h"
+#include <cstddef>
+#include <cstdint>
+#include <mutex>
+
 #include "mongo/stdx/condition_variable.h"
 #include "mongo/stdx/mutex.h"
 
@@ -43,7 +45,8 @@ namespace unittest {
  * All threads are unblocked when the counter reaches zero and the counter is reset.
  */
 class Barrier {
-    MONGO_DISALLOW_COPYING(Barrier);
+    Barrier(const Barrier&) = delete;
+    Barrier& operator=(const Barrier&) = delete;
 
 public:
     /**

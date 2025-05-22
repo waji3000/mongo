@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Public Domain 2014-2018 MongoDB, Inc.
+# Public Domain 2014-present MongoDB, Inc.
 # Public Domain 2008-2014 WiredTiger, Inc.
 #
 # This is free and unencumbered software released into the public domain.
@@ -26,9 +26,8 @@
 # ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
 # OTHER DEALINGS IN THE SOFTWARE.
 
-import os, struct
 from suite_subprocess import suite_subprocess
-import wiredtiger, wttest
+import wttest
 
 # test_util09.py
 #    Utilities: wt loadtext
@@ -39,7 +38,7 @@ class test_util09(wttest.WiredTigerTestCase, suite_subprocess):
 
     def populate_file(self, filename, low, high):
         """
-        Insert some simple key / value lines into the file
+        Insert some simple key // value lines into the file
         """
         keys = {}
         with open("loadtext.in", "w") as f:
@@ -99,6 +98,3 @@ class test_util09(wttest.WiredTigerTestCase, suite_subprocess):
         keys = self.populate_file("loadtext.in", 200, 300)
         self.runWt(["loadtext", "table:" + self.tablename], infilename="loadtext.in")
         self.check_keys(self.tablename, keys)
-
-if __name__ == '__main__':
-    wttest.run()

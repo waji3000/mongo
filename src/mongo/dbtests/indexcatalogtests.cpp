@@ -1,6 +1,3 @@
-// indexcatalogtests.cpp : index_catalog.{h,cpp} unit tests.
-
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,171 +27,323 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <memory>
+#include <string>
+#include <vector>
 
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/catalog/collection.h"
-#include "mongo/db/catalog/collection_catalog_entry.h"
+#include "mongo/db/catalog/collection_catalog.h"
+#include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/index_catalog.h"
+#include "mongo/db/catalog/index_catalog_entry.h"
+#include "mongo/db/catalog_raii.h"
 #include "mongo/db/client.h"
-#include "mongo/db/db.h"
+#include "mongo/db/concurrency/d_concurrency.h"
+#include "mongo/db/concurrency/lock_manager_defs.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/index/index_descriptor.h"
-#include "mongo/dbtests/dbtests.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/dbtests/dbtests.h"  // IWYU pragma: keep
+#include "mongo/unittest/unittest.h"
 
+namespace mongo {
 namespace IndexCatalogTests {
 namespace {
 const auto kIndexVersion = IndexDescriptor::IndexVersion::kV2;
 }  // namespace
 
-static const char* const _ns = "unittests.indexcatalog";
+static const NamespaceString _nss =
+    NamespaceString::createNamespaceString_forTest("unittests.indexcatalog");
 
-class IndexIteratorTests {
+class IndexCatalogTestBase {
+protected:
+    // Helper to refetch the IndexCatalog from the catalog in order to see any changes made to the
+    // collection
+    const IndexCatalog* indexCatalog(OperationContext* opCtx) const {
+        return CollectionCatalog::get(opCtx)
+            ->lookupCollectionByNamespace(opCtx, _nss)
+            ->getIndexCatalog();
+    }
+};
+
+class IndexIteratorTests : IndexCatalogTestBase {
 public:
     IndexIteratorTests() {
         const ServiceContext::UniqueOperationContext opCtxPtr = cc().makeOperationContext();
         OperationContext& opCtx = *opCtxPtr;
-        Lock::DBLock lk(&opCtx, nsToDatabaseSubstring(_ns), MODE_X);
-        OldClientContext ctx(&opCtx, _ns);
+        Lock::DBLock lk(&opCtx, _nss.dbName(), MODE_X);
+        OldClientContext ctx(&opCtx, _nss);
         WriteUnitOfWork wuow(&opCtx);
 
-        _db = ctx.db();
-        _coll = _db->createCollection(&opCtx, _ns);
-        _catalog = _coll->getIndexCatalog();
+        ctx.db()->createCollection(&opCtx, _nss);
         wuow.commit();
     }
 
     ~IndexIteratorTests() {
         const ServiceContext::UniqueOperationContext opCtxPtr = cc().makeOperationContext();
         OperationContext& opCtx = *opCtxPtr;
-        Lock::DBLock lk(&opCtx, nsToDatabaseSubstring(_ns), MODE_X);
-        OldClientContext ctx(&opCtx, _ns);
+        Lock::DBLock lk(&opCtx, _nss.dbName(), MODE_X);
+        OldClientContext ctx(&opCtx, _nss);
         WriteUnitOfWork wuow(&opCtx);
 
-        _db->dropCollection(&opCtx, _ns).transitional_ignore();
+        ctx.db()->dropCollection(&opCtx, _nss).transitional_ignore();
         wuow.commit();
     }
 
     void run() {
         const ServiceContext::UniqueOperationContext opCtxPtr = cc().makeOperationContext();
         OperationContext& opCtx = *opCtxPtr;
-        dbtests::WriteContextForTests ctx(&opCtx, _ns);
+        dbtests::WriteContextForTests ctx(&opCtx, _nss.ns_forTest());
 
-        int numFinishedIndexesStart = _catalog->numIndexesReady(&opCtx);
+        int numFinishedIndexesStart = indexCatalog(&opCtx)->numIndexesReady();
 
-        dbtests::createIndex(&opCtx, _ns, BSON("x" << 1)).transitional_ignore();
-        dbtests::createIndex(&opCtx, _ns, BSON("y" << 1)).transitional_ignore();
+        dbtests::createIndex(&opCtx, _nss.ns_forTest(), BSON("x" << 1)).transitional_ignore();
+        dbtests::createIndex(&opCtx, _nss.ns_forTest(), BSON("y" << 1)).transitional_ignore();
 
-        ASSERT_TRUE(_catalog->numIndexesReady(&opCtx) == numFinishedIndexesStart + 2);
+        ASSERT_TRUE(indexCatalog(&opCtx)->numIndexesReady() == numFinishedIndexesStart + 2);
 
-        std::unique_ptr<IndexCatalog::IndexIterator> ii = _catalog->getIndexIterator(&opCtx, false);
+        auto ii =
+            indexCatalog(&opCtx)->getIndexIterator(&opCtx, IndexCatalog::InclusionPolicy::kReady);
         int indexesIterated = 0;
         bool foundIndex = false;
         while (ii->more()) {
-            IndexDescriptor* indexDesc = ii->next()->descriptor();
+            auto indexDesc = ii->next()->descriptor();
             indexesIterated++;
             BSONObjIterator boit(indexDesc->infoObj());
             while (boit.more() && !foundIndex) {
                 BSONElement e = boit.next();
-                if (str::equals(e.fieldName(), "name") && str::equals(e.valuestrsafe(), "y_1")) {
+                if (e.fieldNameStringData() == "name" && e.valueStringDataSafe() == "y_1") {
                     foundIndex = true;
                     break;
                 }
             }
         }
 
-        ASSERT_TRUE(indexesIterated == _catalog->numIndexesReady(&opCtx));
+        ASSERT_TRUE(indexesIterated == indexCatalog(&opCtx)->numIndexesReady());
         ASSERT_TRUE(foundIndex);
     }
-
-private:
-    IndexCatalog* _catalog;
-    Collection* _coll;
-    Database* _db;
 };
 
 /**
  * Test for IndexCatalog::refreshEntry().
  */
-class RefreshEntry {
+class RefreshEntry : IndexCatalogTestBase {
 public:
     RefreshEntry() {
         const ServiceContext::UniqueOperationContext opCtxPtr = cc().makeOperationContext();
         OperationContext& opCtx = *opCtxPtr;
-        Lock::DBLock lk(&opCtx, nsToDatabaseSubstring(_ns), MODE_X);
-        OldClientContext ctx(&opCtx, _ns);
+        Lock::DBLock lk(&opCtx, _nss.dbName(), MODE_X);
+        OldClientContext ctx(&opCtx, _nss);
         WriteUnitOfWork wuow(&opCtx);
 
-        _db = ctx.db();
-        _coll = _db->createCollection(&opCtx, _ns);
-        _catalog = _coll->getIndexCatalog();
+        ctx.db()->createCollection(&opCtx, _nss);
         wuow.commit();
     }
 
     ~RefreshEntry() {
         const ServiceContext::UniqueOperationContext opCtxPtr = cc().makeOperationContext();
         OperationContext& opCtx = *opCtxPtr;
-        Lock::DBLock lk(&opCtx, nsToDatabaseSubstring(_ns), MODE_X);
-        OldClientContext ctx(&opCtx, _ns);
+        Lock::DBLock lk(&opCtx, _nss.dbName(), MODE_X);
+        OldClientContext ctx(&opCtx, _nss);
         WriteUnitOfWork wuow(&opCtx);
 
-        _db->dropCollection(&opCtx, _ns).transitional_ignore();
+        ctx.db()->dropCollection(&opCtx, _nss).transitional_ignore();
         wuow.commit();
     }
 
     void run() {
         const ServiceContext::UniqueOperationContext opCtxPtr = cc().makeOperationContext();
         OperationContext& opCtx = *opCtxPtr;
-        dbtests::WriteContextForTests ctx(&opCtx, _ns);
+        dbtests::WriteContextForTests ctx(&opCtx, _nss.ns_forTest());
         const std::string indexName = "x_1";
 
-        ASSERT_OK(dbtests::createIndexFromSpec(
-            &opCtx,
-            _ns,
-            BSON("name" << indexName << "ns" << _ns << "key" << BSON("x" << 1) << "v"
-                        << static_cast<int>(kIndexVersion)
-                        << "expireAfterSeconds"
-                        << 5)));
+        ASSERT_OK(dbtests::createIndexFromSpec(&opCtx,
+                                               _nss.ns_forTest(),
+                                               BSON("name" << indexName << "key" << BSON("x" << 1)
+                                                           << "v" << static_cast<int>(kIndexVersion)
+                                                           << "expireAfterSeconds" << 5)));
 
-        const IndexDescriptor* desc = _catalog->findIndexByName(&opCtx, indexName);
+        const IndexDescriptor* desc = indexCatalog(&opCtx)->findIndexByName(&opCtx, indexName);
         ASSERT(desc);
         ASSERT_EQUALS(5, desc->infoObj()["expireAfterSeconds"].numberLong());
 
-        // Change value of "expireAfterSeconds" on disk.
+        // Change value of "expireAfterSeconds" on disk. This will update the metadata for the
+        // Collection but not propagate the change to the IndexCatalog
         {
+            AutoGetCollection autoColl(&opCtx, _nss, MODE_X);
+            CollectionWriter coll(&opCtx, autoColl);
+
             WriteUnitOfWork wuow(&opCtx);
-            _coll->getCatalogEntry()->updateTTLSetting(&opCtx, "x_1", 10);
+            coll.getWritableCollection(&opCtx)->updateTTLSetting(&opCtx, "x_1", 10);
             wuow.commit();
         }
 
-        // Verify that the catalog does not yet know of the change.
-        desc = _catalog->findIndexByName(&opCtx, indexName);
+        // Confirm that the index catalog does not yet know of the change.
+        desc = indexCatalog(&opCtx)->findIndexByName(&opCtx, indexName);
         ASSERT_EQUALS(5, desc->infoObj()["expireAfterSeconds"].numberLong());
 
         {
+            AutoGetCollection autoColl(&opCtx, _nss, MODE_X);
+            CollectionWriter coll(&opCtx, autoColl);
+
             // Notify the catalog of the change.
             WriteUnitOfWork wuow(&opCtx);
-            desc = _catalog->refreshEntry(&opCtx, desc);
+            desc = coll.getWritableCollection(&opCtx)->getIndexCatalog()->refreshEntry(
+                &opCtx, coll.getWritableCollection(&opCtx), desc, CreateIndexEntryFlags::kIsReady);
             wuow.commit();
         }
 
         // Test that the catalog reflects the change.
         ASSERT_EQUALS(10, desc->infoObj()["expireAfterSeconds"].numberLong());
     }
-
-private:
-    IndexCatalog* _catalog;
-    Collection* _coll;
-    Database* _db;
 };
 
-class IndexCatalogTests : public Suite {
+class PrepareUniqueIndexRecords : IndexCatalogTestBase {
 public:
-    IndexCatalogTests() : Suite("indexcatalogtests") {}
-    void setupTests() {
-        add<IndexIteratorTests>();
-        add<RefreshEntry>();
+    ~PrepareUniqueIndexRecords() {
+        auto opCtx = cc().makeOperationContext();
+        AutoGetDb db{opCtx.get(), _nss.dbName(), LockMode::MODE_X};
+        WriteUnitOfWork wuow{opCtx.get()};
+        ASSERT_OK(db.getDb()->dropCollection(opCtx.get(), _nss));
+        wuow.commit();
+    }
+
+    void run() {
+        auto opCtx = cc().makeOperationContext();
+        dbtests::WriteContextForTests ctx{opCtx.get(), _nss.ns_forTest()};
+
+        ASSERT_OK(dbtests::createIndexFromSpec(
+            opCtx.get(),
+            _nss.ns_forTest(),
+            BSON(IndexDescriptor::kIndexVersionFieldName
+                 << static_cast<int>(kIndexVersion) << IndexDescriptor::kIndexNameFieldName << "a_1"
+                 << IndexDescriptor::kKeyPatternFieldName << BSON("a" << 1)
+                 << IndexDescriptor::kPrepareUniqueFieldName << true)));
+
+        AutoGetCollection coll{opCtx.get(), _nss, LockMode::MODE_X};
+        auto doc1 = BSON("_id" << 1 << "a" << 1);
+        auto doc2 = BSON("_id" << 2 << "a" << 1);
+
+        {
+            WriteUnitOfWork wuow{opCtx.get()};
+            ASSERT_OK(indexCatalog(opCtx.get())
+                          ->indexRecords(opCtx.get(), *coll, {{RecordId{1}, {}, &doc1}}, nullptr));
+            wuow.commit();
+        }
+
+        {
+            WriteUnitOfWork wuow{opCtx.get()};
+            ASSERT_NOT_OK(
+                indexCatalog(opCtx.get())
+                    ->indexRecords(opCtx.get(), *coll, {{RecordId{2}, {}, &doc2}}, nullptr));
+        }
+
+        opCtx->setEnforceConstraints(false);
+
+        {
+            WriteUnitOfWork wuow{opCtx.get()};
+            ASSERT_OK(indexCatalog(opCtx.get())
+                          ->indexRecords(opCtx.get(), *coll, {{RecordId{2}, {}, &doc2}}, nullptr));
+            wuow.commit();
+        }
     }
 };
 
-SuiteInstance<IndexCatalogTests> indexCatalogTests;
-}
+class PrepareUniqueUpdateRecord : IndexCatalogTestBase {
+public:
+    ~PrepareUniqueUpdateRecord() {
+        auto opCtx = cc().makeOperationContext();
+        AutoGetDb db{opCtx.get(), _nss.dbName(), LockMode::MODE_X};
+        WriteUnitOfWork wuow{opCtx.get()};
+        ASSERT_OK(db.getDb()->dropCollection(opCtx.get(), _nss));
+        wuow.commit();
+    }
+
+    void run() {
+        auto opCtx = cc().makeOperationContext();
+        dbtests::WriteContextForTests ctx{opCtx.get(), _nss.ns_forTest()};
+
+        ASSERT_OK(dbtests::createIndexFromSpec(
+            opCtx.get(),
+            _nss.ns_forTest(),
+            BSON(IndexDescriptor::kIndexVersionFieldName
+                 << static_cast<int>(kIndexVersion) << IndexDescriptor::kIndexNameFieldName << "a_1"
+                 << IndexDescriptor::kKeyPatternFieldName << BSON("a" << 1)
+                 << IndexDescriptor::kPrepareUniqueFieldName << true)));
+
+        AutoGetCollection coll{opCtx.get(), _nss, LockMode::MODE_X};
+        auto doc1 = BSON("_id" << 1 << "a" << 1);
+        auto doc2 = BSON("_id" << 2 << "a" << 2);
+        auto updatedDoc2 = BSON("_id" << 2 << "a" << 1);
+
+        {
+            WriteUnitOfWork wuow{opCtx.get()};
+            ASSERT_OK(indexCatalog(opCtx.get())
+                          ->indexRecords(opCtx.get(),
+                                         *coll,
+                                         {{RecordId{1}, {}, &doc1}, {RecordId{2}, {}, &doc2}},
+                                         nullptr));
+            wuow.commit();
+        }
+
+        {
+            WriteUnitOfWork wuow{opCtx.get()};
+            int64_t keysInsertedOut, keysDeletedOut;
+            ASSERT_NOT_OK(indexCatalog(opCtx.get())
+                              ->updateRecord(opCtx.get(),
+                                             *coll,
+                                             doc2,
+                                             updatedDoc2,
+                                             nullptr,
+                                             RecordId{2},
+                                             &keysInsertedOut,
+                                             &keysDeletedOut));
+            ASSERT_EQ(keysInsertedOut, 0);
+            ASSERT_EQ(keysDeletedOut, 0);
+        }
+
+        opCtx->setEnforceConstraints(false);
+
+        {
+            WriteUnitOfWork wuow{opCtx.get()};
+            int64_t keysInsertedOut, keysDeletedOut;
+            ASSERT_OK(indexCatalog(opCtx.get())
+                          ->updateRecord(opCtx.get(),
+                                         *coll,
+                                         doc2,
+                                         updatedDoc2,
+                                         nullptr,
+                                         RecordId{2},
+                                         &keysInsertedOut,
+                                         &keysDeletedOut));
+            ASSERT_EQ(keysInsertedOut, 1);
+            ASSERT_EQ(keysDeletedOut, 1);
+            wuow.commit();
+        }
+    }
+};
+
+class IndexCatalogTests : public unittest::OldStyleSuiteSpecification {
+public:
+    IndexCatalogTests() : OldStyleSuiteSpecification("indexcatalogtests") {}
+    void setupTests() override {
+        add<IndexIteratorTests>();
+        add<RefreshEntry>();
+        add<PrepareUniqueIndexRecords>();
+        add<PrepareUniqueUpdateRecord>();
+    }
+};
+
+unittest::OldStyleSuiteInitializer<IndexCatalogTests> indexCatalogTests;
+
+}  // namespace IndexCatalogTests
+}  // namespace mongo

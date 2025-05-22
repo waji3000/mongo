@@ -1,112 +1,121 @@
 /**
  * A speculative snapshot must not include any writes ordered after any uncommitted writes.
  *
- * @tags: [uses_transactions]
+ * @tags: [
+ *  # The test runs commands that are not allowed with security token: endSession.
+ *  not_allowed_with_signed_security_token,
+ *  uses_transactions,
+ *  requires_majority_read_concern,
+ *  uses_parallel_shell,
+ *  # 'setDefaultRWConcern' is not supposed to be run on shard nodes.
+ *  command_not_supported_in_serverless,
+ * ]
  */
-(function() {
-    "use strict";
 
-    load("jstests/libs/check_log.js");
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
 
-    const dbName = "test";
-    const collName = "speculative_snapshot_includes_all_writes_1";
-    const collName2 = "speculative_snapshot_includes_all_writes_2";
-    const testDB = db.getSiblingDB(dbName);
-    const testColl = testDB[collName];
-    const testColl2 = testDB[collName2];
+const dbName = "test";
+const collName = "speculative_snapshot_includes_all_writes_1";
+const collName2 = "speculative_snapshot_includes_all_writes_2";
+const testDB = db.getSiblingDB(dbName);
+const testColl = testDB[collName];
+const testColl2 = testDB[collName2];
 
-    testDB.runCommand({drop: collName, writeConcern: {w: "majority"}});
-    testDB.runCommand({drop: collName2, writeConcern: {w: "majority"}});
+testDB.runCommand({drop: collName, writeConcern: {w: "majority"}});
+testDB.runCommand({drop: collName2, writeConcern: {w: "majority"}});
 
-    assert.commandWorked(testDB.createCollection(collName, {writeConcern: {w: "majority"}}));
-    assert.commandWorked(testDB.createCollection(collName2, {writeConcern: {w: "majority"}}));
+assert.commandWorked(testDB.createCollection(collName, {writeConcern: {w: "majority"}}));
+assert.commandWorked(testDB.createCollection(collName2, {writeConcern: {w: "majority"}}));
 
-    const sessionOptions = {causalConsistency: false};
-    const session = db.getMongo().startSession(sessionOptions);
-    const sessionDb = session.getDatabase(dbName);
-    const sessionColl = sessionDb.getCollection(collName);
-    const sessionColl2 = sessionDb.getCollection(collName2);
+const sessionOptions = {
+    causalConsistency: false
+};
 
-    const session2 = db.getMongo().startSession(sessionOptions);
-    const session2Db = session2.getDatabase(dbName);
-    const session2Coll = session2Db.getCollection(collName);
-    const session2Coll2 = session2Db.getCollection(collName2);
+function startSessionAndTransaction(readConcernLevel) {
+    let session = db.getMongo().startSession(sessionOptions);
+    jsTestLog("Start a transaction with readConcern " + readConcernLevel.level + ".");
+    session.startTransaction({readConcern: readConcernLevel});
+    return session;
+}
 
-    // Clear ramlog so checkLog can't find log messages from previous times this fail point was
-    // enabled.
-    assert.commandWorked(testDB.adminCommand({clearLog: 'global'}));
+let checkReads = (session, collExpected, coll2Expected) => {
+    let sessionDb = session.getDatabase(dbName);
+    let coll = sessionDb.getCollection(collName);
+    let coll2 = sessionDb.getCollection(collName2);
+    assert.sameMembers(collExpected, coll.find().toArray());
+    assert.sameMembers(coll2Expected, coll2.find().toArray());
+};
+
+const failPoint = configureFailPoint(
+    db, "hangAfterCollectionInserts", {collectionNS: testColl2.getFullName(), first_id: "b"});
+try {
+    // The default WC is majority and this test can't satisfy majority writes.
+    assert.commandWorked(testDB.adminCommand(
+        {setDefaultRWConcern: 1, defaultWriteConcern: {w: 1}, writeConcern: {w: "majority"}}));
 
     jsTest.log("Prepopulate the collections.");
     assert.commandWorked(testColl.insert([{_id: 0}], {writeConcern: {w: "majority"}}));
     assert.commandWorked(testColl2.insert([{_id: "a"}], {writeConcern: {w: "majority"}}));
 
     jsTest.log("Create the uncommitted write.");
-
-    assert.commandWorked(db.adminCommand({
-        configureFailPoint: "hangAfterCollectionInserts",
-        mode: "alwaysOn",
-        data: {collectionNS: testColl2.getFullName()}
-    }));
-
     const joinHungWrite = startParallelShell(() => {
         assert.commandWorked(
             db.getSiblingDB("test").speculative_snapshot_includes_all_writes_2.insert(
                 {_id: "b"}, {writeConcern: {w: "majority"}}));
     });
 
-    checkLog.contains(
-        db.getMongo(),
-        "hangAfterCollectionInserts fail point enabled for " + testColl2.getFullName());
+    failPoint.wait();
 
     jsTest.log("Create a write following the uncommitted write.");
     // Note this write must use local write concern; it cannot be majority committed until
     // the prior uncommitted write is committed.
     assert.commandWorked(testColl.insert([{_id: 1}]));
 
-    jsTestLog("Start a snapshot transaction.");
+    const snapshotSession = startSessionAndTransaction({level: "snapshot"});
+    checkReads(snapshotSession, [{_id: 0}], [{_id: "a"}]);
 
-    session.startTransaction({readConcern: {level: "snapshot"}});
+    const majoritySession = startSessionAndTransaction({level: "majority"});
+    checkReads(majoritySession, [{_id: 0}, {_id: 1}], [{_id: "a"}]);
 
-    assert.sameMembers([{_id: 0}], sessionColl.find().toArray());
+    const localSession = startSessionAndTransaction({level: "local"});
+    checkReads(localSession, [{_id: 0}, {_id: 1}], [{_id: "a"}]);
 
-    assert.sameMembers([{_id: "a"}], sessionColl2.find().toArray());
-
-    jsTestLog("Start a majority-read transaction.");
-
-    session2.startTransaction({readConcern: {level: "majority"}});
-
-    assert.sameMembers([{_id: 0}, {_id: 1}], session2Coll.find().toArray());
-
-    assert.sameMembers([{_id: "a"}], session2Coll2.find().toArray());
+    const defaultSession = startSessionAndTransaction({});
+    checkReads(defaultSession, [{_id: 0}, {_id: 1}], [{_id: "a"}]);
 
     jsTestLog("Allow the uncommitted write to finish.");
-    assert.commandWorked(db.adminCommand({
-        configureFailPoint: "hangAfterCollectionInserts",
-        mode: "off",
-    }));
-
+    failPoint.off();
     joinHungWrite();
 
     jsTestLog("Double-checking that writes not committed at start of snapshot cannot appear.");
-    assert.sameMembers([{_id: 0}], sessionColl.find().toArray());
+    checkReads(snapshotSession, [{_id: 0}], [{_id: "a"}]);
 
-    assert.sameMembers([{_id: "a"}], sessionColl2.find().toArray());
-
-    assert.sameMembers([{_id: 0}, {_id: 1}], session2Coll.find().toArray());
-
-    assert.sameMembers([{_id: "a"}], session2Coll2.find().toArray());
+    jsTestLog(
+        "Double-checking that writes performed before the start of a transaction of 'majority' or lower must appear.");
+    checkReads(majoritySession, [{_id: 0}, {_id: 1}], [{_id: "a"}]);
+    checkReads(localSession, [{_id: 0}, {_id: 1}], [{_id: "a"}]);
+    checkReads(defaultSession, [{_id: 0}, {_id: 1}], [{_id: "a"}]);
 
     jsTestLog("Committing transactions.");
-    session.commitTransaction();
-    session2.commitTransaction();
+    assert.commandWorked(snapshotSession.commitTransaction_forTesting());
+    assert.commandWorked(majoritySession.commitTransaction_forTesting());
+    assert.commandWorked(localSession.commitTransaction_forTesting());
+    assert.commandWorked(defaultSession.commitTransaction_forTesting());
 
-    assert.sameMembers([{_id: 0}, {_id: 1}], sessionColl.find().toArray());
+    jsTestLog("A new local read must see all committed writes.");
+    checkReads(defaultSession, [{_id: 0}, {_id: 1}], [{_id: "a"}, {_id: "b"}]);
 
-    assert.sameMembers([{_id: "a"}, {_id: "b"}], sessionColl2.find().toArray());
-
-    assert.sameMembers([{_id: 0}, {_id: 1}], session2Coll.find().toArray());
-
-    assert.sameMembers([{_id: "a"}, {_id: "b"}], session2Coll2.find().toArray());
-
-    session.endSession();
-}());
+    snapshotSession.endSession();
+    majoritySession.endSession();
+    localSession.endSession();
+    defaultSession.endSession();
+} finally {
+    failPoint.off();
+    // Unsetting CWWC is not allowed, so explicitly restore the default write concern to be majority
+    // by setting CWWC to {w: majority}.
+    assert.commandWorked(testDB.adminCommand({
+        setDefaultRWConcern: 1,
+        defaultWriteConcern: {w: "majority"},
+        writeConcern: {w: "majority"}
+    }));
+}

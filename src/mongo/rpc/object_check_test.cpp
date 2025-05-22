@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,57 +27,55 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include <iterator>
+#include <variant>
 
 #include "mongo/base/data_range_cursor.h"
-#include "mongo/db/jsobj.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/server_options.h"
-#include "mongo/rpc/object_check.h"
+#include "mongo/rpc/object_check.h"  // IWYU pragma: keep
+#include "mongo/stdx/type_traits.h"
+#include "mongo/unittest/death_test.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/scopeguard.h"
 
 namespace {
 
 using namespace mongo;
+using std::begin;
+using std::end;
 
 TEST(DataTypeValidated, BSONValidationEnabled) {
-    using std::swap;
-
     bool wasEnabled = serverGlobalParams.objcheck;
-    const auto setValidation = [&](bool enabled) { serverGlobalParams.objcheck = enabled; };
-    ON_BLOCK_EXIT(setValidation, wasEnabled);
+    const auto setValidation = [&](bool enabled) {
+        serverGlobalParams.objcheck = enabled;
+    };
+    ON_BLOCK_EXIT([=] { setValidation(wasEnabled); });
 
-    using std::begin;
-    using std::end;
-
-    BSONObj valid = BSON("baz"
-                         << "bar"
-                         << "garply"
-                         << BSON("foo"
-                                 << "bar"));
+    BSONObj valid = BSON("baz" << "bar"
+                               << "garply" << BSON("foo" << "bar"));
     char buf[1024] = {0};
     std::copy(valid.objdata(), valid.objdata() + valid.objsize(), begin(buf));
     {
         Validated<BSONObj> v;
         ConstDataRangeCursor cdrc(begin(buf), end(buf));
-        ASSERT_OK(cdrc.readAndAdvance(&v));
+        ASSERT_OK(cdrc.readAndAdvanceNoThrow(&v));
     }
 
     {
         // mess up the data
         DataRangeCursor drc(begin(buf), end(buf));
         // skip past size so we don't trip any sanity checks.
-        drc.advance(4).transitional_ignore();  // skip size
-        while (drc.writeAndAdvance(0xFF).isOK())
+        drc.advanceNoThrow(4).transitional_ignore();  // skip size
+        while (drc.writeAndAdvanceNoThrow(0xFF).isOK())
             ;
     }
 
     {
         Validated<BSONObj> v;
         ConstDataRangeCursor cdrc(begin(buf), end(buf));
-        ASSERT_NOT_OK(cdrc.readAndAdvance(&v));
+        ASSERT_NOT_OK(cdrc.readAndAdvanceNoThrow(&v));
     }
 
     {
@@ -86,7 +83,39 @@ TEST(DataTypeValidated, BSONValidationEnabled) {
         setValidation(false);
         Validated<BSONObj> v;
         ConstDataRangeCursor cdrc(begin(buf), end(buf));
-        ASSERT_OK(cdrc.readAndAdvance(&v));
+        ASSERT_OK(cdrc.readAndAdvanceNoThrow(&v));
     }
 }
+
+DEATH_TEST(ObjectCheck, BSONValidationEnabledWithCrashOnError, "50761") {
+    bool objcheckValue = serverGlobalParams.objcheck;
+    serverGlobalParams.objcheck = true;
+    ON_BLOCK_EXIT([=] { serverGlobalParams.objcheck = objcheckValue; });
+
+    bool crashOnErrorValue = serverGlobalParams.crashOnInvalidBSONError;
+    serverGlobalParams.crashOnInvalidBSONError = true;
+    ON_BLOCK_EXIT([&] { serverGlobalParams.crashOnInvalidBSONError = crashOnErrorValue; });
+
+    BSONObj valid = BSON("baz" << "bar"
+                               << "garply" << BSON("foo" << "bar"));
+    char buf[1024] = {0};
+    std::copy(valid.objdata(), valid.objdata() + valid.objsize(), begin(buf));
+
+    {
+        // mess up the data
+        DataRangeCursor drc(begin(buf), end(buf));
+        // skip past size so we don't trip any sanity checks.
+        drc.advanceNoThrow(4).transitional_ignore();  // skip size
+        while (drc.writeAndAdvanceNoThrow(0xFF).isOK())
+            ;
+    }
+
+    {
+        Validated<BSONObj> v;
+        ConstDataRangeCursor cdrc(begin(buf), end(buf));
+        // Crashes because of invalid BSON
+        cdrc.readAndAdvanceNoThrow(&v).ignore();
+    }
 }
+
+}  // namespace

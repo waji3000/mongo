@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,239 +27,389 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
 
-#include "mongo/platform/basic.h"
-
-#include <algorithm>
-#include <cmath>
-#include <utility>
+#include <queue>
 #include <vector>
 
-#include "mongo/db/query/plan_ranker.h"
 
-#include "mongo/db/exec/plan_stage.h"
-#include "mongo/db/exec/working_set.h"
-#include "mongo/db/query/explain.h"
-#include "mongo/db/query/query_knobs.h"
-#include "mongo/db/query/query_solution.h"
-#include "mongo/db/server_options.h"
-#include "mongo/db/server_parameters.h"
-#include "mongo/util/log.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/util/builder.h"
+#include "mongo/bson/util/builder_fwd.h"
+#include "mongo/db/exec/plan_stats.h"
+#include "mongo/db/query/plan_ranker.h"
+#include "mongo/db/query/stage_types.h"
+#include "mongo/logv2/log.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
+
+
+namespace mongo::plan_ranker {
 
 namespace {
+/**
+ * A plan scorer for the classic plan stage tree. Defines the plan productivity as a number
+ * of intermediate results returned, or advanced, by the root stage, divided by the "unit of works"
+ * which the plan performed. Each call to work(...) counts as one unit.
+ */
+class DefaultPlanScorer final : public PlanScorer<PlanStageStats> {
+protected:
+    double calculateProductivity(const PlanStageStats* stats) const final {
+        invariant(stats->common.works != 0);
+        return static_cast<double>(stats->common.advanced) /
+            static_cast<double>(stats->common.works);
+    }
+
+    std::string getProductivityFormula(const PlanStageStats* stats) const override {
+        StringBuilder sb;
+        sb << "(" << stats->common.advanced << " advanced)/(" << stats->common.works << " works)";
+        return sb.str();
+    }
+
+    double getNumberOfAdvances(const PlanStageStats* stats) const final {
+        return stats->common.advanced;
+    }
+
+    bool hasStage(StageType type, const PlanStageStats* root) const final {
+        return hasStage(root,
+                        [type](const PlanStageStats& stage) { return stage.stageType == type; });
+    }
+
+    bool hasFetch(const PlanStageStats* root) const final {
+        return hasStage(root, [](const PlanStageStats& stage) {
+            return stage.specific && stage.specific->doesFetch();
+        });
+    }
+
+    bool hasStage(const PlanStageStats* root,
+                  std::function<bool(const PlanStageStats&)> filter) const {
+        std::queue<const PlanStageStats*> remaining;
+        remaining.push(root);
+
+        while (!remaining.empty()) {
+            auto stats = remaining.front();
+            remaining.pop();
+
+            if (filter(*stats)) {
+                return true;
+            }
+
+            for (auto&& child : stats->children) {
+                remaining.push(child.get());
+            }
+        }
+        return false;
+    }
+};
 
 /**
- * Comparator for (scores, candidateIndex) in pickBestPlan().
+ * Return true if the nodes have the same type and the same number of children.
  */
-bool scoreComparator(const std::pair<double, size_t>& lhs, const std::pair<double, size_t>& rhs) {
-    // Just compare score in lhs.first and rhs.first;
-    // Ignore candidate array index in lhs.second and rhs.second.
-    return lhs.first > rhs.first;
+bool areNodesCompatible(const std::vector<const QuerySolutionNode*>& nodes) {
+    for (size_t i = 1; i < nodes.size(); ++i) {
+        if (nodes[i - 1]->getType() != nodes[i]->getType()) {
+            return false;
+        }
+
+        if (nodes[i - 1]->children.size() != nodes[i]->children.size()) {
+            return false;
+        }
+    }
+
+    return true;
 }
 
+/**
+ * Returns true if the value can serve as a type lower bound for the purposes of type bracketing.
+ * The function is designed to work with the 'interesting' for index prefix heuristic types only:
+ * Number, String, Date, Timestamp, Boolean, Object, Array, ObjectId. For other types it may return
+ * false positive results. The code of the function is based on index bounds build logic from
+ * 'index_bounds_builder.cpp'.
+ */
+bool isLowerBound(const BSONElement& value, bool isInclusive) {
+    switch (value.type()) {
+        case NumberInt:
+        case NumberDouble:
+        case NumberLong:
+        case NumberDecimal:
+            // Lower bound value for numbers.
+            return (std::isinf(value.numberDouble()) || std::isnan(value.numberDouble())) &&
+                isInclusive == true;
+        case String:
+            // Lower bound value for strings.
+            return value.str().empty() && isInclusive == true;
+        case Date:
+            // Lower bound value for dates.
+            return value.date() == Date_t::min() && isInclusive == true;
+        case bsonTimestamp:
+            // Lower bound value for timestamps.
+            return value.timestamp() == Timestamp::min() && isInclusive == true;
+        case jstOID:
+            // Lower bound value for ObjectID.
+            return value.OID() == OID() && isInclusive == true;
+        case Object:
+        case Array:
+            // Lower bound value for Object and Array.
+            return value.Obj().isEmpty() && isInclusive == true;
+        case BinData:
+        case EOO:
+        case MinKey:
+        case MaxKey:
+        case Bool:  // Boolean bounds are considered always open since they are non-selective.
+        case jstNULL:
+        case Undefined:
+        case Symbol:
+        case RegEx:
+        case DBRef:
+        case Code:
+        case CodeWScope:
+            return true;
+    }
+
+    MONGO_UNREACHABLE_TASSERT(8102100);
+}
+
+/**
+ * Returns true if the value can serve as a type upper bound for the purposes of type bracketing.
+ * The function is designed to work with the 'interesting' for index prefix heuristic types only:
+ * Number, String, Date, Timestamp, Boolean, Object, Array, ObjectId. For other types it may return
+ * false positive results. The code of the function is based on index bounds build logic from
+ * 'index_bounds_builder.cpp'.
+ */
+bool isUpperBound(const BSONElement& value, bool isInclusive) {
+    switch (value.type()) {
+        case NumberInt:
+        case NumberDouble:
+        case NumberLong:
+        case NumberDecimal:
+            // Upper bound value for numbers.
+            return std::isinf(value.numberDouble()) && isInclusive == true;
+        case String:
+            // A string value cannot be an upper bound value.
+            return false;
+        case Date:
+            // Upper bound value for Date.
+            return value.date() == Date_t::max() && isInclusive == true;
+        case bsonTimestamp:
+            // Upper bound value for Timestamp.
+            return value.timestamp() == Timestamp::max() && isInclusive == true;
+        case jstOID:
+            // Upper bound value for ObjectID.
+            return value.OID() == OID::max() && isInclusive == true;
+        case Object:
+            // Upper bound value for String.
+            return value.Obj().isEmpty() && isInclusive == false;
+        case Array:
+            // Upper bound value for Object.
+            return value.Obj().isEmpty() && isInclusive == false;
+        case BinData:
+            // Upper bound value for Array.
+            return value.valuesize() == 0 && isInclusive == false;
+        case EOO:
+        case MinKey:
+        case MaxKey:
+        case Bool:  // Boolean bounds are considered always open since they are non-selective.
+        case jstNULL:
+        case Undefined:
+        case Symbol:
+        case RegEx:
+        case DBRef:
+        case Code:
+        case CodeWScope:
+            return true;
+    }
+
+    MONGO_UNREACHABLE_TASSERT(8102101);
+}
+
+/**
+ * The function tries to detect if the interval is closed on both ends. Can return false
+ * positive results for the types not mentioned in the comment to 'isMinMaxValue' function.
+ */
+bool isClosedInterval(const Interval& interval) {
+    // If the bound types are different the interval is considered to be open.
+    if (interval.start.type() != interval.end.type()) {
+        return false;
+    }
+
+    switch (interval.getDirection()) {
+        // Point intervals, empty intervals, and null intervals have no direction.
+        case Interval::Direction::kDirectionNone:
+            return true;
+        case Interval::Direction::kDirectionAscending:
+            return !isLowerBound(interval.start, interval.startInclusive) &&
+                !isUpperBound(interval.end, interval.endInclusive);
+        case Interval::Direction::kDirectionDescending:
+            return !isUpperBound(interval.start, interval.startInclusive) &&
+                !isLowerBound(interval.end, interval.endInclusive);
+    }
+
+    MONGO_UNREACHABLE_TASSERT(8102102);
+}
+
+/**
+ * Returns true if this OIL contains only closed intervals.
+ */
+bool containsOnlyClosedIntervals(const OrderedIntervalList& oil) {
+    for (const auto& interval : oil.intervals) {
+        if (!isClosedInterval(interval)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+/**
+ * Calculates score for the given index bounds. The score reflects the following rules:
+ * - IndexBounds that has longest single point interval prefix wins,
+ * - if winner is not defined on the previous step then IndexBounds with the longest point
+ * interval prefix wins,
+ * - if winner is not defined on the previous step then IndexBounds with the longest closed
+ * interval prefix wins,
+ * - if winner is not defined, then IndexBounds with longest interval prefix wins
+ * - if winner is not defined, them IndexBounds with shortest index key pattern wins.
+ */
+uint64_t getIndexBoundsScore(const IndexBounds& bounds) {
+    const uint64_t indexKeyLength = static_cast<uint64_t>(bounds.fields.size());
+    uint64_t singlePointIntervalPrefix = 0;
+    uint64_t pointsIntervalPrefix = 0;
+    uint64_t closedIntervalPrefix = 0;
+    uint64_t intervalLength = 0;
+
+    for (const auto& field : bounds.fields) {
+        // Skip the $** index virtual field, as it's not part of the actual index key.
+        if (field.name == "$_path") {
+            continue;
+        }
+
+        // Stop scoring index bounds as soon as we see an all-values interval.
+        if (field.isMinToMax() || field.isMaxToMin()) {
+            break;
+        }
+
+        if (intervalLength == singlePointIntervalPrefix && field.isPoint()) {
+            ++singlePointIntervalPrefix;
+        }
+
+        if (intervalLength == pointsIntervalPrefix && field.containsOnlyPointIntervals()) {
+            ++pointsIntervalPrefix;
+        }
+
+        if (intervalLength == closedIntervalPrefix && containsOnlyClosedIntervals(field)) {
+            ++closedIntervalPrefix;
+        }
+
+        ++intervalLength;
+    }
+
+    // We pack calculated stats into one value to make their comparison simplier. For every
+    // prefix length we allocate 12 bits (4096 values) which is more then enough since an index
+    // can have no more than 32 fields (see "MongoDB Limits and Thresholds" reference).
+    // 'indexKeyLength' is treated differently because, unlike others, we prefer shorter index
+    // key prefix length (see the comment to the function for details).
+    uint64_t result = (singlePointIntervalPrefix << 52) | (pointsIntervalPrefix << 40) |
+        (closedIntervalPrefix << 28) | (intervalLength << 16) |
+        (std::numeric_limits<uint16_t>::max() - indexKeyLength);
+
+    return result;
+}
+
+/**
+ * Calculates scores for the given IndexBounds and add 1 to every winner's resultScores. i-th
+ * position in resultScores corresponds to i-th field in IndexBound.
+ */
+void scoreIndexBounds(const std::vector<const IndexBounds*>& bounds,
+                      std::vector<size_t>& resultScores) {
+    const size_t nfields = bounds.size();
+
+    std::vector<uint64_t> scores{};
+    scores.reserve(nfields);
+    for (size_t i = 0; i < bounds.size(); ++i) {
+        scores.emplace_back(getIndexBoundsScore(*bounds[i]));
+    }
+
+    auto topScore = max_element(scores.begin(), scores.end());
+    for (size_t i = 0; i < nfields; ++i) {
+        if (*topScore == scores[i]) {
+            resultScores[i] += 1;
+        }
+    }
+}
 }  // namespace
 
-namespace mongo {
-
-using std::endl;
-using std::vector;
-
-// static
-size_t PlanRanker::pickBestPlan(const vector<CandidatePlan>& candidates, PlanRankingDecision* why) {
-    invariant(!candidates.empty());
-    invariant(why);
-
-    // A plan that hits EOF is automatically scored above
-    // its peers. If multiple plans hit EOF during the same
-    // set of round-robin calls to work(), then all such plans
-    // receive the bonus.
-    double eofBonus = 1.0;
-
-    // Each plan will have a stat tree.
-    std::vector<std::unique_ptr<PlanStageStats>> statTrees;
-
-    // Get stat trees from each plan.
-    // Copy stats trees instead of transferring ownership
-    // because multi plan runner will need its own stats
-    // trees for explain.
-    for (size_t i = 0; i < candidates.size(); ++i) {
-        statTrees.push_back(candidates[i].root->getStats());
-    }
-
-    // Holds (score, candidateInndex).
-    // Used to derive scores and candidate ordering.
-    vector<std::pair<double, size_t>> scoresAndCandidateindices;
-
-    // Compute score for each tree.  Record the best.
-    for (size_t i = 0; i < statTrees.size(); ++i) {
-        LOG(5) << "Scoring plan " << i << ":" << endl
-               << redact(candidates[i].solution->toString()) << "Stats:\n"
-               << redact(Explain::statsToBSON(*statTrees[i]).jsonString(Strict, true));
-        LOG(2) << "Scoring query plan: " << Explain::getPlanSummary(candidates[i].root)
-               << " planHitEOF=" << statTrees[i]->common.isEOF;
-
-        double score = scoreTree(statTrees[i].get());
-        LOG(5) << "score = " << score;
-        if (statTrees[i]->common.isEOF) {
-            LOG(5) << "Adding +" << eofBonus << " EOF bonus to score.";
-            score += 1;
-        }
-        scoresAndCandidateindices.push_back(std::make_pair(score, i));
-    }
-
-    // Sort (scores, candidateIndex). Get best child and populate candidate ordering.
-    std::stable_sort(
-        scoresAndCandidateindices.begin(), scoresAndCandidateindices.end(), scoreComparator);
-
-    // Determine whether plans tied for the win.
-    if (scoresAndCandidateindices.size() > 1U) {
-        double bestScore = scoresAndCandidateindices[0].first;
-        double runnerUpScore = scoresAndCandidateindices[1].first;
-        const double epsilon = 1e-10;
-        why->tieForBest = std::abs(bestScore - runnerUpScore) < epsilon;
-    }
-
-    // Update results in 'why'
-    // Stats and scores in 'why' are sorted in descending order by score.
-    why->stats.clear();
-    why->scores.clear();
-    why->candidateOrder.clear();
-    for (size_t i = 0; i < scoresAndCandidateindices.size(); ++i) {
-        double score = scoresAndCandidateindices[i].first;
-        size_t candidateIndex = scoresAndCandidateindices[i].second;
-
-        // We shouldn't cache the scores with the EOF bonus included,
-        // as this is just a tie-breaking measure for plan selection.
-        // Plans not run through the multi plan runner will not receive
-        // the bonus.
-        //
-        // An example of a bad thing that could happen if we stored scores
-        // with the EOF bonus included:
-        //
-        //   Let's say Plan A hits EOF, is the highest ranking plan, and gets
-        //   cached as such. On subsequent runs it will not receive the bonus.
-        //   Eventually the plan cache feedback mechanism will evict the cache
-        //   entry---the scores will appear to have fallen due to the missing
-        //   EOF bonus.
-        //
-        // This begs the question, why don't we include the EOF bonus in
-        // scoring of cached plans as well? The problem here is that the cached
-        // plan runner always runs plans to completion before scoring. Queries
-        // that don't get the bonus in the multi plan runner might get the bonus
-        // after being run from the plan cache.
-        if (statTrees[candidateIndex]->common.isEOF) {
-            score -= eofBonus;
-        }
-
-        why->stats.push_back(std::move(statTrees[candidateIndex]));
-        why->scores.push_back(score);
-        why->candidateOrder.push_back(candidateIndex);
-    }
-
-    size_t bestChild = scoresAndCandidateindices[0].second;
-    return bestChild;
+std::unique_ptr<PlanScorer<PlanStageStats>> makePlanScorer() {
+    return std::make_unique<DefaultPlanScorer>();
 }
 
-// TODO: Move this out.  This is a signal for ranking but will become its own complicated
-// stats-collecting beast.
-double computeSelectivity(const PlanStageStats* stats) {
-    if (STAGE_IXSCAN == stats->stageType) {
-        IndexScanStats* iss = static_cast<IndexScanStats*>(stats->specific.get());
-        return iss->keyPattern.nFields();
-    } else {
-        double sum = 0;
-        for (size_t i = 0; i < stats->children.size(); ++i) {
-            sum += computeSelectivity(stats->children[i].get());
+std::vector<size_t> applyIndexPrefixHeuristic(const std::vector<const QuerySolution*>& solutions) {
+    std::vector<size_t> solutionScores(solutions.size(), 0);
+
+    std::vector<std::vector<const QuerySolutionNode*>> stack{};
+    stack.emplace_back();
+    stack.back().reserve(solutions.size());
+    for (auto solution : solutions) {
+        stack.back().emplace_back(solution->root());
+    }
+
+    while (!stack.empty()) {
+        auto top = std::move(stack.back());
+        stack.pop_back();
+
+        if (!areNodesCompatible(top)) {
+            return {};
         }
-        return sum;
-    }
-}
 
-bool hasStage(const StageType type, const PlanStageStats* stats) {
-    if (type == stats->stageType) {
-        return true;
-    }
-    for (size_t i = 0; i < stats->children.size(); ++i) {
-        if (hasStage(type, stats->children[i].get())) {
-            return true;
+        // Compatible nodes have the same number of children, see comment to 'areNodesCompatible'
+        // function.
+        for (size_t childIndex = 0; childIndex < top.front()->children.size(); ++childIndex) {
+            stack.emplace_back();
+            stack.back().reserve(solutions.size());
+            for (auto node : top) {
+                stack.back().emplace_back(node->children[childIndex].get());
+            }
         }
-    }
-    return false;
-}
 
-// static
-double PlanRanker::scoreTree(const PlanStageStats* stats) {
-    // We start all scores at 1.  Our "no plan selected" score is 0 and we want all plans to
-    // be greater than that.
-    double baseScore = 1;
+        if (top.front()->getType() == STAGE_IXSCAN ||
+            top.front()->getType() == STAGE_DISTINCT_SCAN) {
+            std::vector<const IndexBounds*> bounds{};
+            bounds.reserve(solutions.size());
 
-    // How many "units of work" did the plan perform. Each call to work(...)
-    // counts as one unit.
-    size_t workUnits = stats->common.works;
-    invariant(workUnits != 0);
+            for (auto&& node : top) {
+                const IndexBounds* nodeBounds;
+                switch (node->getType()) {
+                    case STAGE_IXSCAN: {
+                        nodeBounds = &static_cast<const IndexScanNode*>(node)->bounds;
+                        break;
+                    }
+                    case STAGE_DISTINCT_SCAN: {
+                        nodeBounds = &static_cast<const DistinctNode*>(node)->bounds;
+                        break;
+                    }
+                    default: {
+                        tasserted(9844200,
+                                  str::stream()
+                                      << "Unexpected node type for index prefix heuristic "
+                                      << node->getType());
+                    }
+                }
+                bounds.emplace_back(nodeBounds);
+            }
 
-    // How much did a plan produce?
-    // Range: [0, 1]
-    double productivity =
-        static_cast<double>(stats->common.advanced) / static_cast<double>(workUnits);
-
-    // Just enough to break a tie. Must be small enough to ensure that a more productive
-    // plan doesn't lose to a less productive plan due to tie breaking.
-    const double epsilon = std::min(1.0 / static_cast<double>(10 * workUnits), 1e-4);
-
-    // We prefer covered projections.
-    //
-    // We only do this when we have a projection stage because we have so many jstests that
-    // check bounds even when a collscan plan is just as good as the ixscan'd plan :(
-    double noFetchBonus = epsilon;
-    if (hasStage(STAGE_PROJECTION, stats) && hasStage(STAGE_FETCH, stats)) {
-        noFetchBonus = 0;
-    }
-
-    // In the case of ties, prefer solutions without a blocking sort
-    // to solutions with a blocking sort.
-    double noSortBonus = epsilon;
-    if (hasStage(STAGE_SORT, stats)) {
-        noSortBonus = 0;
-    }
-
-    // In the case of ties, prefer single index solutions to ixisect. Index
-    // intersection solutions are often slower than single-index solutions
-    // because they require examining a superset of index keys that would be
-    // examined by a single index scan.
-    //
-    // On the other hand, index intersection solutions examine the same
-    // number or fewer of documents. In the case that index intersection
-    // allows us to examine fewer documents, the penalty given to ixisect
-    // can be made up via the no fetch bonus.
-    double noIxisectBonus = epsilon;
-    if (hasStage(STAGE_AND_HASH, stats) || hasStage(STAGE_AND_SORTED, stats)) {
-        noIxisectBonus = 0;
-    }
-
-    double tieBreakers = noFetchBonus + noSortBonus + noIxisectBonus;
-    double score = baseScore + productivity + tieBreakers;
-
-    mongoutils::str::stream ss;
-    ss << "score(" << score << ") = baseScore(" << baseScore << ")"
-       << " + productivity((" << stats->common.advanced << " advanced)/(" << stats->common.works
-       << " works) = " << productivity << ")"
-       << " + tieBreakers(" << noFetchBonus << " noFetchBonus + " << noSortBonus
-       << " noSortBonus + " << noIxisectBonus << " noIxisectBonus = " << tieBreakers << ")";
-    std::string scoreStr = ss;
-    LOG(2) << scoreStr;
-
-    if (internalQueryForceIntersectionPlans.load()) {
-        if (hasStage(STAGE_AND_HASH, stats) || hasStage(STAGE_AND_SORTED, stats)) {
-            // The boost should be >2.001 to make absolutely sure the ixisect plan will win due
-            // to the combination of 1) productivity, 2) eof bonus, and 3) no ixisect bonus.
-            score += 3;
-            LOG(5) << "Score boosted to " << score << " due to intersection forcing.";
+            scoreIndexBounds(bounds, solutionScores);
         }
     }
 
-    return score;
-}
+    std::vector<size_t> winningSolutionIndices{};
+    winningSolutionIndices.reserve(solutions.size());
+    const auto topScore = max_element(solutionScores.begin(), solutionScores.end());
+    for (size_t index = 0; index < solutionScores.size(); ++index) {
+        if (solutionScores[index] == *topScore) {
+            winningSolutionIndices.emplace_back(index);
+        }
+    }
 
-}  // namespace mongo
+    return winningSolutionIndices;
+}
+}  // namespace mongo::plan_ranker

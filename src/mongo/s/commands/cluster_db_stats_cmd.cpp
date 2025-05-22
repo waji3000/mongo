@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,101 +27,166 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
+#include <string>
 #include <vector>
 
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/client/read_preference.h"
+#include "mongo/db/auth/action_type.h"
+#include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/auth/resource_pattern.h"
 #include "mongo/db/commands.h"
-#include "mongo/s/client/shard_registry.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/dbcommands_gen.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/service_context.h"
+#include "mongo/executor/remote_command_response.h"
+#include "mongo/idl/idl_parser.h"
+#include "mongo/s/async_requests_sender.h"
+#include "mongo/s/client/shard.h"
 #include "mongo/s/cluster_commands_helpers.h"
-#include "mongo/s/grid.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/database_name_util.h"
+#include "mongo/util/decorable.h"
 
 namespace mongo {
 namespace {
 
-void aggregateResults(const std::vector<AsyncRequestsSender::Response>& responses,
+void aggregateResults(const DBStatsCommand& cmd,
+                      const std::vector<AsyncRequestsSender::Response>& responses,
                       BSONObjBuilder& output) {
+    int scale = cmd.getScale();
+    long long collections = 0;
+    long long views = 0;
     long long objects = 0;
-    long long unscaledDataSize = 0;
-    long long dataSize = 0;
-    long long storageSize = 0;
-    long long numExtents = 0;
+    double unscaledDataSize = 0;
+    double dataSize = 0;
+    double storageSize = 0;
+    double totalSize = 0;
     long long indexes = 0;
-    long long indexSize = 0;
-    long long fileSize = 0;
+    double indexSize = 0;
+    double fsUsedSize = 0;
+    double fsTotalSize = 0;
+    double freeStorageSize = 0;
+    double totalFreeStorageSize = 0;
+    double indexFreeStorageSize = 0;
 
     for (const auto& response : responses) {
-        invariant(response.swResponse.getStatus().isOK());
+        invariant(response.swResponse.getStatus());
         const BSONObj& b = response.swResponse.getValue().data;
+        auto resp = DBStats::parse(IDLParserContext{"dbstats"}, b);
 
-        objects += b["objects"].numberLong();
-        unscaledDataSize += b["avgObjSize"].numberLong() * b["objects"].numberLong();
-        dataSize += b["dataSize"].numberLong();
-        storageSize += b["storageSize"].numberLong();
-        numExtents += b["numExtents"].numberLong();
-        indexes += b["indexes"].numberLong();
-        indexSize += b["indexSize"].numberLong();
-        fileSize += b["fileSize"].numberLong();
+        collections += resp.getCollections();
+        views += resp.getViews();
+        objects += resp.getObjects();
+        unscaledDataSize += resp.getAvgObjSize() * resp.getObjects();
+        dataSize += resp.getDataSize();
+        storageSize += resp.getStorageSize();
+        totalSize += resp.getTotalSize();
+        indexes += resp.getIndexes();
+        indexSize += resp.getIndexSize();
+        fsUsedSize += resp.getFsUsedSize().get_value_or(0);
+        fsTotalSize += resp.getFsTotalSize().get_value_or(0);
+        freeStorageSize += resp.getFreeStorageSize().get_value_or(0);
+        totalFreeStorageSize += resp.getTotalFreeStorageSize().get_value_or(0);
+        indexFreeStorageSize += resp.getIndexFreeStorageSize().get_value_or(0);
     }
 
-    // TODO SERVER-26110: Add aggregated 'collections' and 'views' metrics.
+    output.appendNumber("collections", collections);
+    output.appendNumber("views", views);
     output.appendNumber("objects", objects);
+
+    bool freeStorage = cmd.getFreeStorage();
 
     // avgObjSize on mongod is not scaled based on the argument to db.stats(), so we use
     // unscaledDataSize here for consistency.  See SERVER-7347.
-    output.append("avgObjSize", objects == 0 ? 0 : double(unscaledDataSize) / double(objects));
+    output.appendNumber("avgObjSize", objects == 0 ? 0 : unscaledDataSize / double(objects));
     output.appendNumber("dataSize", dataSize);
     output.appendNumber("storageSize", storageSize);
-    output.appendNumber("numExtents", numExtents);
+    if (freeStorage) {
+        output.appendNumber("freeStorageSize", freeStorageSize);
+    }
     output.appendNumber("indexes", indexes);
     output.appendNumber("indexSize", indexSize);
-    output.appendNumber("fileSize", fileSize);
+    if (freeStorage) {
+        output.appendNumber("indexFreeStorageSize", indexFreeStorageSize);
+    }
+    output.appendNumber("totalSize", totalSize);
+    if (freeStorage) {
+        output.appendNumber("totalFreeStorageSize", totalFreeStorageSize);
+    }
+    output.appendNumber("scaleFactor", scale);
+    output.appendNumber("fsUsedSize", fsUsedSize);
+    output.appendNumber("fsTotalSize", fsTotalSize);
 }
 
-class DBStatsCmd : public ErrmsgCommandDeprecated {
+class CmdDBStats final : public BasicCommandWithRequestParser<CmdDBStats> {
 public:
-    DBStatsCmd() : ErrmsgCommandDeprecated("dbStats", "dbstats") {}
+    using Request = DBStatsCommand;
+    using Reply = typename Request::Reply;
 
-    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const final {
         return AllowedOnSecondary::kAlways;
     }
 
-    bool adminOnly() const override {
+    bool maintenanceOk() const final {
         return false;
     }
 
-    bool supportsWriteConcern(const BSONObj& cmd) const override {
+    bool adminOnly() const final {
         return false;
     }
 
-    void addRequiredPrivileges(const std::string& dbname,
-                               const BSONObj& cmdObj,
-                               std::vector<Privilege>* out) const override {
-        ActionSet actions;
-        actions.addAction(ActionType::dbStats);
-        out->push_back(Privilege(ResourcePattern::forDatabaseName(dbname), actions));
+    bool supportsWriteConcern(const BSONObj&) const final {
+        return false;
     }
 
-    bool errmsgRun(OperationContext* opCtx,
-                   const std::string& dbName,
-                   const BSONObj& cmdObj,
-                   std::string& errmsg,
-                   BSONObjBuilder& output) override {
+    Status checkAuthForOperation(OperationContext* opCtx,
+                                 const DatabaseName& dbname,
+                                 const BSONObj&) const final {
+        auto as = AuthorizationSession::get(opCtx->getClient());
+        if (!as->isAuthorizedForActionsOnResource(ResourcePattern::forDatabaseName(dbname),
+                                                  ActionType::dbStats)) {
+            return {ErrorCodes::Unauthorized, "unauthorized"};
+        }
+        return Status::OK();
+    }
+
+    bool runWithRequestParser(OperationContext* opCtx,
+                              const DatabaseName& dbName,
+                              const BSONObj& cmdObj,
+                              const RequestParser& requestParser,
+                              BSONObjBuilder& output) final {
+        const auto& cmd = requestParser.request();
+        uassert(ErrorCodes::BadValue, "Scale must be greater than zero", cmd.getScale() > 0);
+
         auto shardResponses = scatterGatherUnversionedTargetAllShards(
             opCtx,
             dbName,
-            CommandHelpers::filterCommandRequestForPassthrough(cmdObj),
+            applyReadWriteConcern(
+                opCtx, this, CommandHelpers::filterCommandRequestForPassthrough(cmdObj)),
             ReadPreferenceSetting::get(opCtx),
             Shard::RetryPolicy::kIdempotent);
-        if (!appendRawResponses(opCtx, &errmsg, &output, shardResponses)) {
-            return false;
-        }
+        std::string errmsg;
+        auto appendResult = appendRawResponses(opCtx, &errmsg, &output, shardResponses);
+        uassert(ErrorCodes::OperationFailed, errmsg, appendResult.responseOK);
 
-        aggregateResults(shardResponses, output);
+        output.append("db", DatabaseNameUtil::serialize(dbName, cmd.getSerializationContext()));
+        aggregateResults(cmd, appendResult.successResponses, output);
         return true;
     }
 
-} clusterDBStatsCmd;
+    void validateResult(const BSONObj& resultObj) final {
+        DBStats::parse(IDLParserContext{"dbstats.reply"}, resultObj);
+    }
+};
+MONGO_REGISTER_COMMAND(CmdDBStats).forRouter();
 
 }  // namespace
 }  // namespace mongo

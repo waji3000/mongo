@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,25 +27,33 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <absl/container/node_hash_set.h>
+#include <boost/smart_ptr.hpp>
+#include <string>
+#include <vector>
 
-#include <boost/intrusive_ptr.hpp>
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
 
-#include "mongo/db/pipeline/aggregation_context_fixture.h"
-#include "mongo/db/pipeline/document.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/json.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/document_value_test_util.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/pipeline/document_source_out.h"
-#include "mongo/db/pipeline/document_value_test_util.h"
+#include "mongo/db/pipeline/expression_context_for_test.h"
+#include "mongo/db/pipeline/field_path.h"
+#include "mongo/db/pipeline/process_interface/stub_mongo_process_interface.h"
+#include "mongo/db/pipeline/serverless_aggregation_context_fixture.h"
+#include "mongo/db/tenant_id.h"
+#include "mongo/idl/server_parameter_test_util.h"
+#include "mongo/s/chunk_version.h"
+#include "mongo/unittest/unittest.h"
 
 namespace mongo {
 namespace {
-
-using boost::intrusive_ptr;
-
-StringData kModeFieldName = DocumentSourceOutSpec::kModeFieldName;
-StringData kUniqueKeyFieldName = DocumentSourceOutSpec::kUniqueKeyFieldName;
-StringData kDefaultMode = WriteMode_serializer(WriteModeEnum::kModeReplaceCollection);
-StringData kInsertDocumentsMode = WriteMode_serializer(WriteModeEnum::kModeInsertDocuments);
-StringData kReplaceDocumentsMode = WriteMode_serializer(WriteModeEnum::kModeReplaceDocuments);
 
 /**
  * For the purpsoses of this test, assume every collection is unsharded. Stages may ask this during
@@ -78,12 +85,12 @@ public:
 class DocumentSourceOutTest : public AggregationContextFixture {
 public:
     DocumentSourceOutTest() : AggregationContextFixture() {
-        getExpCtx()->mongoProcessInterface = std::make_shared<MongoProcessInterfaceForTest>();
+        getExpCtx()->setMongoProcessInterface(std::make_shared<MongoProcessInterfaceForTest>());
     }
 
-    intrusive_ptr<DocumentSourceOut> createOutStage(BSONObj spec) {
+    boost::intrusive_ptr<DocumentSourceOut> createOutStage(BSONObj spec) {
         auto specElem = spec.firstElement();
-        intrusive_ptr<DocumentSourceOut> outStage = dynamic_cast<DocumentSourceOut*>(
+        boost::intrusive_ptr<DocumentSourceOut> outStage = dynamic_cast<DocumentSourceOut*>(
             DocumentSourceOut::createFromBson(specElem, getExpCtx()).get());
         ASSERT_TRUE(outStage);
         return outStage;
@@ -96,328 +103,163 @@ TEST_F(DocumentSourceOutTest, FailsToParseIncorrectType) {
 
     spec = BSON("$out" << BSONArray());
     ASSERT_THROWS_CODE(createOutStage(spec), AssertionException, 16990);
+
+    spec = BSON("$out" << BSONObj());
+    ASSERT_THROWS_CODE(createOutStage(spec), AssertionException, ErrorCodes::IDLFailedToParse);
 }
 
 TEST_F(DocumentSourceOutTest, AcceptsStringArgument) {
-    BSONObj spec = BSON("$out"
-                        << "some_collection");
+    BSONObj spec = BSON("$out" << "some_collection");
     auto outStage = createOutStage(spec);
     ASSERT_EQ(outStage->getOutputNs().coll(), "some_collection");
 }
 
-TEST_F(DocumentSourceOutTest, SerializeDefaultsModeRecreateCollection) {
-    BSONObj spec = BSON("$out"
-                        << "some_collection");
+TEST_F(DocumentSourceOutTest, SerializeToString) {
+    BSONObj spec = BSON("$out" << "some_collection");
     auto outStage = createOutStage(spec);
     auto serialized = outStage->serialize().getDocument();
-    ASSERT_EQ(serialized["$out"][kModeFieldName].getStringData(), kDefaultMode);
+    ASSERT_EQ(serialized["$out"]["coll"].getStringData(), "some_collection");
 
     // Make sure we can reparse the serialized BSON.
     auto reparsedOutStage = createOutStage(serialized.toBson());
     auto reSerialized = reparsedOutStage->serialize().getDocument();
-    ASSERT_EQ(reSerialized["$out"][kModeFieldName].getStringData(), kDefaultMode);
+    ASSERT_EQ(reSerialized["$out"]["coll"].getStringData(), "some_collection");
 }
 
-TEST_F(DocumentSourceOutTest, SerializeUniqueKeyDefaultsToId) {
-    BSONObj spec = BSON("$out" << BSON("to"
-                                       << "target"
-                                       << "mode"
-                                       << kDefaultMode));
-    auto outStage = createOutStage(spec);
-    auto serialized = outStage->serialize().getDocument();
-    ASSERT_EQ(serialized["$out"][kModeFieldName].getStringData(), kDefaultMode);
-    ASSERT_DOCUMENT_EQ(serialized["$out"][kUniqueKeyFieldName].getDocument(),
-                       (Document{{"_id", 1}}));
+TEST_F(DocumentSourceOutTest, RedactionNoTimeseries) {
+    auto spec = fromjson(R"({
+            $out: {
+                db: "foo",
+                coll: "bar"
+            }
+        })");
+    auto docSource = DocumentSourceOut::createFromBson(spec.firstElement(), getExpCtx());
 
-    spec = BSON("$out"
-                << "some_collection");
-    outStage = createOutStage(spec);
-    serialized = outStage->serialize().getDocument();
-    ASSERT_EQ(serialized["$out"][kModeFieldName].getStringData(), kDefaultMode);
-    ASSERT_DOCUMENT_EQ(serialized["$out"][kUniqueKeyFieldName].getDocument(),
-                       (Document{{"_id", 1}}));
+    ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
+        R"({
+            $out: {
+                coll: "HASH<bar>",
+                db: "HASH<foo>"
+            }
+        })",
+        redact(*docSource));
 }
 
-TEST_F(DocumentSourceOutTest, SerializeCompoundUniqueKey) {
-    BSONObj spec = BSON("$out" << BSON("to"
-                                       << "target"
-                                       << "mode"
-                                       << kDefaultMode
-                                       << "uniqueKey"
-                                       << BSON("_id" << 1 << "shardKey" << 1)));
-    auto outStage = createOutStage(spec);
-    auto serialized = outStage->serialize().getDocument();
-    ASSERT_EQ(serialized["$out"][kModeFieldName].getStringData(), kDefaultMode);
-    ASSERT_DOCUMENT_EQ(serialized["$out"][kUniqueKeyFieldName].getDocument(),
-                       (Document{{"_id", 1}, {"shardKey", 1}}));
+TEST_F(DocumentSourceOutTest, RedactionTimeseries) {
+    auto spec = fromjson(R"({
+            $out: {
+                db: "foo",
+                coll: "bar",
+                timeseries: {
+                    timeField: "time",
+                    metaField: "meta",
+                    granularity: "minutes",
+                    bucketRoundingSeconds: 300,
+                    bucketMaxSpanSeconds: 300
+                }
+            }
+        })");
+    auto docSource = DocumentSourceOut::createFromBson(spec.firstElement(), getExpCtx());
+    ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
+        R"({
+            "$out": {
+                "coll": "HASH<bar>",
+                "db": "HASH<foo>",
+                "timeseries": {
+                    "timeField": "HASH<time>",
+                    "metaField": "HASH<meta>",
+                    "granularity": "minutes",
+                    "bucketRoundingSeconds": "?number",
+                    "bucketMaxSpanSeconds": "?number"
+                }
+            }
+        })",
+        redact(*docSource));
 }
 
-TEST_F(DocumentSourceOutTest, SerializeDottedPathUniqueKey) {
-    BSONObj spec = BSON("$out" << BSON("to"
-                                       << "target"
-                                       << "mode"
-                                       << kDefaultMode
-                                       << "uniqueKey"
-                                       << BSON("_id" << 1 << "a.b" << 1)));
-    auto outStage = createOutStage(spec);
-    auto serialized = outStage->serialize().getDocument();
-    ASSERT_EQ(serialized["$out"][kModeFieldName].getStringData(), kDefaultMode);
-    ASSERT_DOCUMENT_EQ(serialized["$out"][kUniqueKeyFieldName].getDocument(),
-                       (Document{{"_id", 1}, {"a.b", 1}}));
+using DocumentSourceOutServerlessTest = ServerlessAggregationContextFixture;
 
-    spec = BSON("$out" << BSON("to"
-                               << "target"
-                               << "mode"
-                               << kDefaultMode
-                               << "uniqueKey"
-                               << BSON("_id.a" << 1)));
-    outStage = createOutStage(spec);
-    serialized = outStage->serialize().getDocument();
-    ASSERT_EQ(serialized["$out"][kModeFieldName].getStringData(), kDefaultMode);
-    ASSERT_DOCUMENT_EQ(serialized["$out"][kUniqueKeyFieldName].getDocument(),
-                       (Document{{"_id.a", 1}}));
+TEST_F(DocumentSourceOutServerlessTest,
+       LiteParsedDocumentSourceLookupContainsExpectedNamespacesInServerless) {
+    RAIIServerParameterControllerForTest multitenancyController("multitenancySupport", true);
+
+    auto tenantId = TenantId(OID::gen());
+    NamespaceString nss =
+        NamespaceString::createNamespaceString_forTest(tenantId, "test", "testColl");
+    std::vector<BSONObj> pipeline;
+
+    auto stageSpec = BSON("$out" << "some_collection");
+    auto liteParsedLookup =
+        DocumentSourceOut::LiteParsed::parse(nss, stageSpec.firstElement(), LiteParserOptions{});
+    auto namespaceSet = liteParsedLookup->getInvolvedNamespaces();
+    ASSERT_EQ(1, namespaceSet.size());
+    ASSERT_EQ(1ul,
+              namespaceSet.count(NamespaceString::createNamespaceString_forTest(
+                  tenantId, "test", "some_collection")));
+
+    // The tenantId for the outputNs should be the same as that on the expCtx despite outputting
+    // into different dbs.
+    stageSpec = BSON("$out" << BSON("db" << "target_db"
+                                         << "coll"
+                                         << "some_collection"));
+    liteParsedLookup =
+        DocumentSourceOut::LiteParsed::parse(nss, stageSpec.firstElement(), LiteParserOptions{});
+    namespaceSet = liteParsedLookup->getInvolvedNamespaces();
+    ASSERT_EQ(1, namespaceSet.size());
+    ASSERT_EQ(1ul,
+              namespaceSet.count(NamespaceString::createNamespaceString_forTest(
+                  tenantId, "target_db", "some_collection")));
 }
 
-TEST_F(DocumentSourceOutTest, SerializeDottedPathUniqueKeySharedPrefix) {
-    BSONObj spec = BSON("$out" << BSON("to"
-                                       << "target"
-                                       << "mode"
-                                       << kDefaultMode
-                                       << "uniqueKey"
-                                       << BSON("_id" << 1 << "a.b" << 1 << "a.c" << 1)));
-    auto outStage = createOutStage(spec);
-    auto serialized = outStage->serialize().getDocument();
-    ASSERT_EQ(serialized["$out"][kModeFieldName].getStringData(), kDefaultMode);
-    ASSERT_DOCUMENT_EQ(serialized["$out"][kUniqueKeyFieldName].getDocument(),
-                       (Document{{"_id", 1}, {"a.b", 1}, {"a.c", 1}}));
+TEST_F(DocumentSourceOutServerlessTest, CreateFromBSONContainsExpectedNamespacesInServerless) {
+    RAIIServerParameterControllerForTest multitenancyController("multitenancySupport", true);
+
+    auto expCtx = getExpCtx();
+    ASSERT(expCtx->getNamespaceString().tenantId());
+    auto defaultDb = expCtx->getNamespaceString().dbName();
+
+    const std::string targetColl = "target_collection";
+    auto spec = BSON("$out" << targetColl);
+    auto outStage = DocumentSourceOut::createFromBson(spec.firstElement(), expCtx);
+    auto outSource = static_cast<DocumentSourceOut*>(outStage.get());
+    ASSERT(outSource);
+    ASSERT_EQ(outSource->getOutputNs(),
+              NamespaceString::createNamespaceString_forTest(defaultDb, targetColl));
+
+    // TODO SERVER-77000: update this test once the serialize function has been updated to use
+    // DatabaseNameUtil::serialize() instead.  We need to set the serialization context objs on the
+    // expCtx, and manipulate before calling outSource->serialize().
+    // Assert the tenantId is not included in the serialized namespace.
+    auto serialized = outSource->serialize().getDocument();
+    auto expectedDoc = Document{{"coll", targetColl},
+                                {"db", expCtx->getNamespaceString().dbName().toString_forTest()}};
+    ASSERT_DOCUMENT_EQ(serialized["$out"].getDocument(), expectedDoc);
+
+    // TODO SERVER-77000: uncomment the below
+    // expCtx->getSerializationContext().setPrefixState(true);
+    // std::string targetDb = str::stream()
+    //     << expCtx->getNamespaceString().tenantId()->toString() << "_" <<
+    //     expCtx->getNamespaceString().dbName().toString_forTest();
+    // serialized = outSource->serialize().getDocument();
+    // expectedDoc = Document{{"coll", targetColl}, {"db", targetDb}};
+    // ASSERT_DOCUMENT_EQ(serialized["$out"].getDocument(), expectedDoc);
+
+    // The tenantId for the outputNs should be the same as that on the expCtx despite outputting
+    // into different dbs.
+    const std::string targetDb = "target_db";
+    spec = BSON("$out" << BSON("db" << targetDb << "coll" << targetColl));
+    outStage = DocumentSourceOut::createFromBson(spec.firstElement(), expCtx);
+    outSource = static_cast<DocumentSourceOut*>(outStage.get());
+    ASSERT(outSource);
+    ASSERT(outSource->getOutputNs().tenantId());
+    ASSERT_EQ(*outSource->getOutputNs().tenantId(), *expCtx->getNamespaceString().tenantId());
+    ASSERT_EQ(outSource->getOutputNs().dbName().toString_forTest(), targetDb);
+
+    // Assert the tenantId is not included in the serialized namespace.
+    serialized = outSource->serialize().getDocument();
+    expectedDoc = Document{{"coll", targetColl}, {"db", targetDb}};
+    ASSERT_DOCUMENT_EQ(serialized["$out"].getDocument(), expectedDoc);
 }
 
-TEST_F(DocumentSourceOutTest, FailsToParseIfToIsNotString) {
-    BSONObj spec = BSON("$out" << BSONObj());
-    ASSERT_THROWS_CODE(createOutStage(spec), AssertionException, 40414);
-
-    spec = BSON("$out" << BSON("to" << 1));
-    ASSERT_THROWS_CODE(createOutStage(spec), AssertionException, ErrorCodes::TypeMismatch);
-
-    spec = BSON("$out" << BSON("to" << BSON("a" << 1)));
-    ASSERT_THROWS_CODE(createOutStage(spec), AssertionException, ErrorCodes::TypeMismatch);
-}
-
-TEST_F(DocumentSourceOutTest, FailsToParseIfToIsNotAValidUserCollection) {
-    BSONObj spec = BSON("$out" << BSON("to"
-                                       << "$test"
-                                       << "mode"
-                                       << kDefaultMode));
-    ASSERT_THROWS_CODE(createOutStage(spec), AssertionException, 17385);
-
-    spec = BSON("$out" << BSON("to"
-                               << "system.views"
-                               << "mode"
-                               << kDefaultMode));
-    ASSERT_THROWS_CODE(createOutStage(spec), AssertionException, 17385);
-
-    spec = BSON("$out" << BSON("to"
-                               << ".test."
-                               << "mode"
-                               << kDefaultMode));
-    ASSERT_THROWS_CODE(createOutStage(spec), AssertionException, ErrorCodes::InvalidNamespace);
-}
-
-TEST_F(DocumentSourceOutTest, FailsToParseIfDbIsNotString) {
-    BSONObj spec = BSON("$out" << BSON("to"
-                                       << "test"
-                                       << "mode"
-                                       << kDefaultMode
-                                       << "db"
-                                       << true));
-    ASSERT_THROWS_CODE(createOutStage(spec), AssertionException, ErrorCodes::TypeMismatch);
-
-    spec = BSON("$out" << BSON("to"
-                               << "test"
-                               << "mode"
-                               << kDefaultMode
-                               << "db"
-                               << BSONArray()));
-    ASSERT_THROWS_CODE(createOutStage(spec), AssertionException, ErrorCodes::TypeMismatch);
-
-    spec = BSON("$out" << BSON("to"
-                               << "test"
-                               << "mode"
-                               << kDefaultMode
-                               << "db"
-                               << BSON(""
-                                       << "test")));
-    ASSERT_THROWS_CODE(createOutStage(spec), AssertionException, ErrorCodes::TypeMismatch);
-}
-
-TEST_F(DocumentSourceOutTest, FailsToParseIfDbIsNotAValidDatabaseName) {
-    BSONObj spec = BSON("$out" << BSON("to"
-                                       << "test"
-                                       << "mode"
-                                       << kInsertDocumentsMode
-                                       << "db"
-                                       << "$invalid"));
-    ASSERT_THROWS_CODE(createOutStage(spec), AssertionException, 17385);
-
-    spec = BSON("$out" << BSON("to"
-                               << "test"
-                               << "mode"
-                               << kInsertDocumentsMode
-                               << "db"
-                               << ".test"));
-    ASSERT_THROWS_CODE(createOutStage(spec), AssertionException, ErrorCodes::InvalidNamespace);
-}
-
-TEST_F(DocumentSourceOutTest, FailsToParseIfModeIsNotString) {
-    BSONObj spec = BSON("$out" << BSON("to"
-                                       << "test"
-                                       << "mode"
-                                       << true));
-    ASSERT_THROWS_CODE(createOutStage(spec), AssertionException, ErrorCodes::TypeMismatch);
-
-    spec = BSON("$out" << BSON("to"
-                               << "test"
-                               << "mode"
-                               << BSONArray()));
-    ASSERT_THROWS_CODE(createOutStage(spec), AssertionException, ErrorCodes::TypeMismatch);
-
-    spec = BSON("$out" << BSON("to"
-                               << "test"
-                               << "mode"
-                               << BSON("" << kDefaultMode)));
-    ASSERT_THROWS_CODE(createOutStage(spec), AssertionException, ErrorCodes::TypeMismatch);
-}
-
-TEST_F(DocumentSourceOutTest, CorrectlyAddressesMatchingTargetAndAggregationNamespaces) {
-    const auto targetNsSameAsAggregationNs = getExpCtx()->ns;
-    const auto targetColl = targetNsSameAsAggregationNs.coll();
-    const auto targetDb = targetNsSameAsAggregationNs.db();
-
-    BSONObj spec = BSON(
-        "$out" << BSON("to" << targetColl << "mode" << kInsertDocumentsMode << "db" << targetDb));
-    ASSERT_THROWS_CODE(createOutStage(spec), AssertionException, 50992);
-
-    spec = BSON(
-        "$out" << BSON("to" << targetColl << "mode" << kReplaceDocumentsMode << "db" << targetDb));
-    ASSERT_THROWS_CODE(createOutStage(spec), AssertionException, 50992);
-
-    spec = BSON("$out" << BSON("to" << targetColl << "mode" << kDefaultMode << "db" << targetDb));
-    auto outStage = createOutStage(spec);
-    ASSERT_EQ(outStage->getOutputNs().db(), targetNsSameAsAggregationNs.db());
-    ASSERT_EQ(outStage->getOutputNs().coll(), targetNsSameAsAggregationNs.coll());
-}
-
-TEST_F(DocumentSourceOutTest, FailsToParseIfModeIsUnsupportedString) {
-    BSONObj spec = BSON("$out" << BSON("to"
-                                       << "test"
-                                       << "mode"
-                                       << "unsupported"));
-    ASSERT_THROWS_CODE(createOutStage(spec), AssertionException, ErrorCodes::BadValue);
-
-    spec = BSON("$out" << BSON("to"
-                               << "test"
-                               << "mode"
-                               << "merge"));
-    ASSERT_THROWS_CODE(createOutStage(spec), AssertionException, ErrorCodes::BadValue);
-}
-
-TEST_F(DocumentSourceOutTest, FailsToParseIfUniqueKeyIsNotAnObject) {
-    BSONObj spec = BSON("$out" << BSON("to"
-                                       << "test"
-                                       << "mode"
-                                       << kDefaultMode
-                                       << "uniqueKey"
-                                       << 1));
-    ASSERT_THROWS_CODE(createOutStage(spec), AssertionException, ErrorCodes::TypeMismatch);
-
-    spec = BSON("$out" << BSON("to"
-                               << "test"
-                               << "mode"
-                               << kDefaultMode
-                               << "uniqueKey"
-                               << BSONArray()));
-    ASSERT_THROWS_CODE(createOutStage(spec), AssertionException, ErrorCodes::TypeMismatch);
-
-    spec = BSON("$out" << BSON("to"
-                               << "test"
-                               << "mode"
-                               << kDefaultMode
-                               << "uniqueKey"
-                               << "_id"));
-    ASSERT_THROWS_CODE(createOutStage(spec), AssertionException, ErrorCodes::TypeMismatch);
-}
-
-TEST_F(DocumentSourceOutTest, FailsToParseIfUniqueKeyHasDuplicateFields) {
-    BSONObj spec = BSON("$out" << BSON("to"
-                                       << "test"
-                                       << "mode"
-                                       << kDefaultMode
-                                       << "uniqueKey"
-                                       << BSON("_id" << 1 << "_id" << 1)));
-    ASSERT_THROWS_CODE(createOutStage(spec), AssertionException, ErrorCodes::BadValue);
-
-    spec = BSON("$out" << BSON("to"
-                               << "test"
-                               << "mode"
-                               << kDefaultMode
-                               << "uniqueKey"
-                               << BSON("x" << 1 << "y" << 1 << "x" << 1)));
-    ASSERT_THROWS_CODE(createOutStage(spec), AssertionException, ErrorCodes::BadValue);
-}
-
-TEST_F(DocumentSourceOutTest, FailsToParseIfTargetCollectionVersionIsSpecifiedOnMongos) {
-    BSONObj spec = BSON("$out" << BSON("to"
-                                       << "test"
-                                       << "mode"
-                                       << kDefaultMode
-                                       << "uniqueKey"
-                                       << BSON("_id" << 1)
-                                       << "targetCollectionVersion"
-                                       << ChunkVersion(0, 0, OID::gen()).toBSON()));
-    getExpCtx()->inMongos = true;
-    ASSERT_THROWS_CODE(createOutStage(spec), AssertionException, 50984);
-
-    // Test that 'targetCollectionVersion' is accepted if _from_ mongos.
-    getExpCtx()->inMongos = false;
-    getExpCtx()->fromMongos = true;
-    ASSERT(createOutStage(spec) != nullptr);
-
-    // Test that 'targetCollectionVersion' is not accepted if on mongod but not from mongos.
-    getExpCtx()->inMongos = false;
-    getExpCtx()->fromMongos = false;
-    ASSERT_THROWS_CODE(createOutStage(spec), AssertionException, 51018);
-}
-
-TEST_F(DocumentSourceOutTest, FailsToParseifUniqueKeyIsNotSentFromMongos) {
-    BSONObj spec = BSON("$out" << BSON("to"
-                                       << "test"
-                                       << "mode"
-                                       << kDefaultMode
-                                       << "targetCollectionVersion"
-                                       << ChunkVersion(0, 0, OID::gen()).toBSON()));
-    getExpCtx()->fromMongos = true;
-    ASSERT_THROWS_CODE(createOutStage(spec), AssertionException, 51017);
-}
-
-TEST_F(DocumentSourceOutTest, CorrectlyUsesTargetDbThatMatchesAggregationDb) {
-    const auto targetDbSameAsAggregationDb = getExpCtx()->ns.db();
-    const auto targetColl = "test"_sd;
-    BSONObj spec = BSON("$out" << BSON("to" << targetColl << "mode" << kDefaultMode << "db"
-                                            << targetDbSameAsAggregationDb));
-
-    auto outStage = createOutStage(spec);
-    ASSERT_EQ(outStage->getOutputNs().db(), targetDbSameAsAggregationDb);
-    ASSERT_EQ(outStage->getOutputNs().coll(), targetColl);
-}
-
-// TODO (SERVER-36832): Allow "replaceCollection" to a foreign database.
-TEST_F(DocumentSourceOutTest, CorrectlyUsesForeignTargetDb) {
-    const auto foreignDb = "someOtherDb"_sd;
-    const auto targetColl = "test"_sd;
-    BSONObj spec =
-        BSON("$out" << BSON("to" << targetColl << "mode" << kDefaultMode << "db" << foreignDb));
-
-    ASSERT_THROWS_CODE(createOutStage(spec), AssertionException, 50939);
-}
 }  // namespace
 }  // namespace mongo

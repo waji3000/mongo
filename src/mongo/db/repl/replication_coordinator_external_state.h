@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -33,14 +32,10 @@
 #include <boost/optional.hpp>
 #include <cstddef>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/bson/timestamp.h"
-#include "mongo/db/repl/member_state.h"
 #include "mongo/db/repl/optime.h"
 #include "mongo/executor/task_executor.h"
-#include "mongo/stdx/functional.h"
 #include "mongo/util/concurrency/thread_pool.h"
-#include "mongo/util/time_support.h"
 
 namespace mongo {
 
@@ -66,7 +61,9 @@ class ReplicationCoordinator;
  * ReplicationCoordinatorImpl should be moved here.
  */
 class ReplicationCoordinatorExternalState {
-    MONGO_DISALLOW_COPYING(ReplicationCoordinatorExternalState);
+    ReplicationCoordinatorExternalState(const ReplicationCoordinatorExternalState&) = delete;
+    ReplicationCoordinatorExternalState& operator=(const ReplicationCoordinatorExternalState&) =
+        delete;
 
 public:
     ReplicationCoordinatorExternalState() {}
@@ -77,7 +74,7 @@ public:
      *
      * NOTE: Only starts threads if they are not already started,
      */
-    virtual void startThreads(const ReplSettings& settings) = 0;
+    virtual void startThreads() = 0;
 
     /**
      * Returns true if an incomplete initial sync is detected.
@@ -91,11 +88,6 @@ public:
                                              ReplicationCoordinator* replCoord) = 0;
 
     /**
-     * Stops the data replication threads = bgsync, applier, reporter.
-     */
-    virtual void stopDataReplication(OperationContext* opCtx) = 0;
-
-    /**
      * Performs any necessary external state specific shutdown tasks, such as cleaning up
      * the threads it started.
      */
@@ -105,6 +97,7 @@ public:
      * Returns task executor for scheduling tasks to be run asynchronously.
      */
     virtual executor::TaskExecutor* getTaskExecutor() const = 0;
+    virtual std::shared_ptr<executor::TaskExecutor> getSharedTaskExecutor() const = 0;
 
     /**
      * Returns shared db worker thread pool for collection cloning.
@@ -117,16 +110,23 @@ public:
     virtual Status initializeReplSetStorage(OperationContext* opCtx, const BSONObj& config) = 0;
 
     /**
+     * Called when a node is ready to start drain mode for oplog application, after it completes
+     * draining for oplog writes. It is called outside of the global X lock and the replication
+     * replication coordinator mutex.
+     */
+    virtual void onWriterDrainComplete(OperationContext* opCtx) = 0;
+
+    /**
      * Called when a node on way to becoming a primary is ready to leave drain mode. It is called
      * outside of the global X lock and the replication coordinator mutex.
      *
      * Throws on errors.
      */
-    virtual void onDrainComplete(OperationContext* opCtx) = 0;
+    virtual void onApplierDrainComplete(OperationContext* opCtx) = 0;
 
     /**
      * Called as part of the process of transitioning to primary and run with the global X lock and
-     * the replication coordinator mutex acquired, so no majoirty writes are allowed while in this
+     * the replication coordinator mutex acquired, so no majority writes are allowed while in this
      * state. See the call site in ReplicationCoordinatorImpl for details about when and how it is
      * called.
      *
@@ -138,11 +138,11 @@ public:
     virtual OpTime onTransitionToPrimary(OperationContext* opCtx) = 0;
 
     /**
-     * Simple wrapper around SyncSourceFeedback::forwardSlaveProgress.  Signals to the
+     * Simple wrapper around SyncSourceFeedback::forwardSecondaryProgress.  Signals to the
      * SyncSourceFeedback thread that it needs to wake up and send a replSetUpdatePosition
      * command upstream.
      */
-    virtual void forwardSlaveProgress() = 0;
+    virtual void forwardSecondaryProgress(bool prioritized = false) = 0;
 
     /**
      * Returns true if "host" is one of the network identities of this node.
@@ -150,14 +150,41 @@ public:
     virtual bool isSelf(const HostAndPort& host, ServiceContext* service) = 0;
 
     /**
+     * Returns true if "host" is one of the network identities of this node, without actually
+     * going out to the network and checking.
+     */
+    virtual bool isSelfFastPath(const HostAndPort& host) = 0;
+
+    /**
+     * Returns true if "host" is one of the network identities of this node, without
+     * checking the fast path first.
+     */
+    virtual bool isSelfSlowPath(const HostAndPort& host,
+                                ServiceContext* service,
+                                Milliseconds timeout) = 0;
+
+    /**
      * Gets the replica set config document from local storage, or returns an error.
      */
     virtual StatusWith<BSONObj> loadLocalConfigDocument(OperationContext* opCtx) = 0;
 
     /**
-     * Stores the replica set config document in local storage, or returns an error.
+     * Stores the replica set config document in local storage and writes a no-op in the oplog, or
+     * returns an error.
      */
-    virtual Status storeLocalConfigDocument(OperationContext* opCtx, const BSONObj& config) = 0;
+    virtual Status storeLocalConfigDocument(OperationContext* opCtx,
+                                            const BSONObj& config,
+                                            bool writeOplog) = 0;
+
+    /**
+     * Replaces the replica set config document in local storage, or returns an error.
+     **/
+    virtual Status replaceLocalConfigDocument(OperationContext* opCtx, const BSONObj& config) = 0;
+
+    /**
+     * Creates the collection for "lastVote" documents and initializes it, or returns an error.
+     */
+    virtual Status createLocalLastVoteCollection(OperationContext* opCtx) = 0;
 
     /**
      * Gets the replica set lastVote document from local storage, or returns an error.
@@ -176,15 +203,20 @@ public:
     virtual void setGlobalTimestamp(ServiceContext* service, const Timestamp& newTime) = 0;
 
     /**
+     * Gets the global opTime timestamp, i.e. the latest cluster time.
+     */
+    virtual Timestamp getGlobalTimestamp(ServiceContext* service) = 0;
+
+    /**
      * Checks if the oplog exists.
      */
     virtual bool oplogExists(OperationContext* opCtx) = 0;
 
     /**
-     * Gets the last optime of an operation performed on this host, from stable
-     * storage.
+     * Gets the last optime, and corresponding wall clock time, of an operation performed on this
+     * host, from stable storage.
      */
-    virtual StatusWith<OpTime> loadLastOpTime(OperationContext* opCtx) = 0;
+    virtual StatusWith<OpTimeAndWallTime> loadLastOpTimeAndWallTime(OperationContext* opCtx) = 0;
 
     /**
      * Returns the HostAndPort of the remote client connected to us that initiated the operation
@@ -200,11 +232,10 @@ public:
     virtual void closeConnections() = 0;
 
     /**
-     * Resets any active sharding metadata on this server and stops any sharding-related threads
-     * (such as the balancer). It is called after stepDown to ensure that if the node becomes
-     * primary again in the future it will recover its state from a clean slate.
+     * Called after this node has stepped down. This includes stepDowns caused by rollback or node
+     * removal, so this function must also be able to handle those situations.
      */
-    virtual void shardingOnStepDownHook() = 0;
+    virtual void onStepDownHook() = 0;
 
     /**
      * Notifies the bgsync and syncSourceFeedback threads to choose a new sync source.
@@ -222,9 +253,19 @@ public:
     virtual void startProducerIfStopped() = 0;
 
     /**
-     * Drops all snapshots and clears the "committed" snapshot.
+     * Notify interested parties that member data for other nodes has changed.
      */
-    virtual void dropAllSnapshots() = 0;
+    virtual void notifyOtherMemberDataChanged() = 0;
+
+    /**
+     * True if we have discovered that no sync source's oplog overlaps with ours.
+     */
+    virtual bool tooStale() = 0;
+
+    /**
+     * Clears the "committed" snapshot.
+     */
+    virtual void clearCommittedSnapshot() = 0;
 
     /**
      * Updates the committed snapshot to the newCommitPoint, and deletes older snapshots.
@@ -234,11 +275,11 @@ public:
     virtual void updateCommittedSnapshot(const OpTime& newCommitPoint) = 0;
 
     /**
-     * Updates the local snapshot to a consistent point for secondary reads.
+     * Updates the lastApplied snapshot to a consistent point for secondary reads.
      *
-     * It is illegal to call with a optime that does not name an existing snapshot.
+     * It is illegal to call with a non-existent optime.
      */
-    virtual void updateLocalSnapshot(const OpTime& optime) = 0;
+    virtual void updateLastAppliedSnapshot(const OpTime& optime) = 0;
 
     /**
      * Returns whether or not the SnapshotThread is active.
@@ -251,21 +292,11 @@ public:
     virtual void notifyOplogMetadataWaiters(const OpTime& committedOpTime) = 0;
 
     /**
-     * Returns earliest drop optime of drop pending collections.
-     * Returns boost::none if there are no drop pending collections.
-     */
-    virtual boost::optional<OpTime> getEarliestDropPendingOpTime() const = 0;
-
-    /**
      * Returns multiplier to apply to election timeout to obtain upper bound
      * on randomized offset.
      */
     virtual double getElectionTimeoutOffsetLimitFraction() const = 0;
 
-    /**
-     * Returns true if the current storage engine supports read committed.
-     */
-    virtual bool isReadCommittedSupportedByStorageEngine(OperationContext* opCtx) const = 0;
 
     /**
      * Returns true if the current storage engine supports snapshot read concern.
@@ -299,6 +330,24 @@ public:
      * Stops periodic noop writes to oplog.
      */
     virtual void stopNoopWriter() = 0;
+
+    /**
+     * Returns whether cluster-wide write concern is set on config server or not.
+     *
+     * Assert will be raised if running a command on the config server failed.
+     */
+    virtual bool isCWWCSetOnConfigShard(OperationContext* opCtx) const = 0;
+
+    /**
+     * Used to check if the server is a shardServer and has been added to a sharded cluster via
+     * addShard.
+     */
+    virtual bool isShardPartOfShardedCluster(OperationContext* opCtx) const = 0;
+
+    /**
+     * Returns the JournalListener used by storage to inform replication of durability.
+     */
+    virtual JournalListener* getReplicationJournalListener() = 0;
 };
 
 }  // namespace repl

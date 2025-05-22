@@ -3,16 +3,16 @@
  * @tags: [requires_sharding]
  */
 
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+
 // Verify that system collections are treated correctly
 function runTest(admindb) {
-    var authzErrorCode = 13;
-
     admindb.createUser({user: "admin", pwd: "pwd", roles: ["userAdminAnyDatabase"]});
     assert.eq(1, admindb.auth("admin", "pwd"));
 
     var sysCollections = ["system.js", "system.profile", "system.roles", "system.users"];
     var sysPrivs = new Array();
-    for (var i in sysCollections) {
+    for (let i in sysCollections) {
         sysPrivs.push(
             {resource: {db: admindb.getName(), collection: sysCollections[i]}, actions: ['find']});
     }
@@ -26,22 +26,24 @@ function runTest(admindb) {
     admindb.createUser({user: "user", pwd: "pwd", roles: ["FindInDB"]});
 
     // Verify the find on all collections exludes system collections
+    admindb.logout();
     assert.eq(1, admindb.auth("user", "pwd"));
 
     assert.doesNotThrow(function() {
         admindb.foo.findOne();
     });
-    for (var i in sysCollections) {
+    for (let i in sysCollections) {
         assert.commandFailed(admindb.runCommand({count: sysCollections[i]}));
     }
 
     // Verify that find on system collections gives find permissions
+    admindb.logout();
     assert.eq(1, admindb.auth("sysUser", "pwd"));
 
     assert.throws(function() {
         admindb.foo.findOne();
     });
-    for (var i in sysCollections) {
+    for (let i in sysCollections) {
         assert.commandWorked(admindb.runCommand({count: sysCollections[i]}));
     }
 
@@ -54,8 +56,6 @@ runTest(conn.getDB("admin"));
 MongoRunner.stopMongod(conn);
 
 jsTest.log('Test sharding');
-// TODO: Remove 'shardAsReplicaSet: false' when SERVER-32672 is fixed.
-var st = new ShardingTest(
-    {shards: 2, config: 3, keyFile: 'jstests/libs/key1', other: {shardAsReplicaSet: false}});
+var st = new ShardingTest({shards: 2, config: 3, keyFile: 'jstests/libs/key1'});
 runTest(st.s.getDB("admin"));
 st.stop();

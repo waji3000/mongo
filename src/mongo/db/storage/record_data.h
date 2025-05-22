@@ -1,6 +1,3 @@
-// record_data.h
-
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -32,6 +29,8 @@
 
 #pragma once
 
+#include <type_traits>
+
 #include "mongo/bson/bsonobj.h"
 #include "mongo/util/shared_buffer.h"
 
@@ -44,7 +43,7 @@ namespace mongo {
  */
 class RecordData {
 public:
-    RecordData() : _data(NULL), _size(0) {}
+    RecordData() : _data(nullptr), _size(0) {}
     RecordData(const char* data, int size) : _data(data), _size(size) {}
 
     RecordData(SharedBuffer ownedData, int size)
@@ -62,7 +61,7 @@ public:
      * Returns true if this owns its own memory, and false otherwise
      */
     bool isOwned() const {
-        return _ownedData.get();
+        return _size == 0 || _ownedData.get();
     }
 
     SharedBuffer releaseBuffer() {
@@ -100,5 +99,8 @@ private:
     int _size;
     SharedBuffer _ownedData;
 };
+
+MONGO_STATIC_ASSERT(std::is_nothrow_move_constructible_v<RecordData>);
+MONGO_STATIC_ASSERT(std::is_nothrow_move_assignable_v<RecordData>);
 
 }  // namespace mongo

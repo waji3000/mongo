@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,17 +27,30 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <js/ComparisonOperators.h>
+#include <js/Object.h>
+#include <js/PropertyDescriptor.h>
+#include <js/RootingAPI.h>
+#include <jsapi.h>
+#include <string>
 
-#include "mongo/scripting/mozjs/oid.h"
+#include <js/CallArgs.h>
+#include <js/PropertySpec.h>
+#include <js/TypeDecls.h>
 
+#include "mongo/base/error_codes.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/scripting/engine.h"
 #include "mongo/scripting/mozjs/implscope.h"
-#include "mongo/scripting/mozjs/objectwrapper.h"
+#include "mongo/scripting/mozjs/internedstring.h"
+#include "mongo/scripting/mozjs/oid.h"
 #include "mongo/scripting/mozjs/valuereader.h"
 #include "mongo/scripting/mozjs/valuewriter.h"
-#include "mongo/scripting/mozjs/wrapconstrainedmethod.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/scripting/mozjs/wrapconstrainedmethod.h"  // IWYU pragma: keep
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 namespace mozjs {
@@ -51,16 +63,16 @@ const JSFunctionSpec OIDInfo::methods[3] = {
 
 const char* const OIDInfo::className = "ObjectId";
 
-void OIDInfo::finalize(JSFreeOp* fop, JSObject* obj) {
-    auto oid = static_cast<OID*>(JS_GetPrivate(obj));
+void OIDInfo::finalize(JS::GCContext* gcCtx, JSObject* obj) {
+    auto oid = JS::GetMaybePtrFromReservedSlot<OID>(obj, OIDSlot);
 
     if (oid) {
-        getScope(fop)->trackedDelete(oid);
+        getScope(gcCtx)->trackedDelete(oid);
     }
 }
 
 void OIDInfo::Functions::toString::call(JSContext* cx, JS::CallArgs args) {
-    auto oid = static_cast<OID*>(JS_GetPrivate(args.thisv().toObjectOrNull()));
+    auto oid = JS::GetMaybePtrFromReservedSlot<OID>(args.thisv().toObjectOrNull(), OIDSlot);
 
     std::string str = str::stream() << "ObjectId(\"" << oid->toString() << "\")";
 
@@ -68,13 +80,13 @@ void OIDInfo::Functions::toString::call(JSContext* cx, JS::CallArgs args) {
 }
 
 void OIDInfo::Functions::toJSON::call(JSContext* cx, JS::CallArgs args) {
-    auto oid = static_cast<OID*>(JS_GetPrivate(args.thisv().toObjectOrNull()));
+    auto oid = JS::GetMaybePtrFromReservedSlot<OID>(args.thisv().toObjectOrNull(), OIDSlot);
 
     ValueReader(cx, args.rval()).fromBSON(BSON("$oid" << oid->toString()), nullptr, false);
 }
 
 void OIDInfo::Functions::getter::call(JSContext* cx, JS::CallArgs args) {
-    auto oid = static_cast<OID*>(JS_GetPrivate(args.thisv().toObjectOrNull()));
+    auto oid = JS::GetMaybePtrFromReservedSlot<OID>(args.thisv().toObjectOrNull(), OIDSlot);
 
     ValueReader(cx, args.rval()).fromStringData(oid->toString());
 }
@@ -98,7 +110,7 @@ void OIDInfo::make(JSContext* cx, const OID& oid, JS::MutableHandleValue out) {
 
     JS::RootedObject thisv(cx);
     scope->getProto<OIDInfo>().newObject(&thisv);
-    JS_SetPrivate(thisv, scope->trackedNew<OID>(oid));
+    JS::SetReservedSlot(thisv, OIDSlot, JS::PrivateValue(scope->trackedNew<OID>(oid)));
 
     out.setObjectOrNull(thisv);
 }
@@ -109,7 +121,7 @@ OID OIDInfo::getOID(JSContext* cx, JS::HandleValue value) {
 }
 
 OID OIDInfo::getOID(JSContext* cx, JS::HandleObject object) {
-    auto oid = static_cast<OID*>(JS_GetPrivate(object));
+    auto oid = JS::GetMaybePtrFromReservedSlot<OID>(object, OIDSlot);
 
     if (oid) {
         return *oid;
@@ -125,10 +137,9 @@ void OIDInfo::postInstall(JSContext* cx, JS::HandleObject global, JS::HandleObje
     if (!JS_DefinePropertyById(cx,
                                proto,
                                getScope(cx)->getInternedStringId(InternedString::str),
-                               undef,
-                               JSPROP_ENUMERATE | JSPROP_SHARED,
                                smUtils::wrapConstrainedMethod<Functions::getter, true, OIDInfo>,
-                               nullptr)) {
+                               nullptr,
+                               JSPROP_ENUMERATE)) {
         uasserted(ErrorCodes::JSInterpreterFailure, "Failed to JS_DefinePropertyById");
     }
 }

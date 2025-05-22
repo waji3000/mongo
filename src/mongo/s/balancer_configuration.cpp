@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,25 +27,70 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/s/balancer_configuration.h"
-
+#include <boost/date_time/posix_time/posix_time_types.hpp>
+// IWYU pragma: no_include "boost/date_time/gregorian_calendar.ipp"
 #include <algorithm>
+#include <boost/date_time/posix_time/posix_time_duration.hpp>
+#include <boost/date_time/posix_time/posix_time_io.hpp>
+#include <boost/date_time/posix_time/ptime.hpp>
+#include <boost/date_time/time_duration.hpp>
+#include <boost/iterator/iterator_traits.hpp>
+#include <boost/operators.hpp>
+#include <cstdio>
+#include <deque>
+#include <iterator>
+#include <sstream>
+#include <string>
+#include <utility>
+#include <vector>
 
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
 #include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
 #include "mongo/bson/util/bson_extract.h"
+#include "mongo/db/generic_argument_util.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/logv2/log.h"
+#include "mongo/s/balancer_configuration.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/grid.h"
-#include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
+
 
 namespace mongo {
 namespace {
+
+// parses time of day in "hh:mm" format assuming 'hh' is 00-23
+bool toPointInTime(const std::string& str, boost::posix_time::ptime* timeOfDay) {
+    int hh = 0;
+    int mm = 0;
+    if (2 != sscanf(str.c_str(), "%d:%d", &hh, &mm)) {
+        return false;
+    }
+
+    // verify that time is well formed
+    if ((hh / 24) || (mm / 60)) {
+        return false;
+    }
+
+    boost::posix_time::ptime res(boost::posix_time::second_clock::local_time().date(),
+                                 boost::posix_time::hours(hh) + boost::posix_time::minutes(mm));
+    *timeOfDay = res;
+    return true;
+}
 
 const char kValue[] = "value";
 const char kEnabled[] = "enabled";
@@ -54,23 +98,39 @@ const char kStopped[] = "stopped";
 const char kMode[] = "mode";
 const char kActiveWindow[] = "activeWindow";
 const char kWaitForDelete[] = "_waitForDelete";
-
-const NamespaceString kSettingsNamespace("config", "settings");
+const char kAttemptToBalanceJumboChunks[] = "attemptToBalanceJumboChunks";
 
 }  // namespace
 
 const char BalancerSettingsType::kKey[] = "balancer";
-const char* BalancerSettingsType::kBalancerModes[] = {"full", "autoSplitOnly", "off"};
+const std::vector<std::string> BalancerSettingsType::kBalancerModes = {"full", "off"};
+const BSONObj BalancerSettingsType::kSchema = BSON(
+    "properties" << BSON("_id" << BSON("enum" << BSON_ARRAY(BalancerSettingsType::kKey)) << kMode
+                               << BSON("enum" << kBalancerModes) << kStopped
+                               << BSON("bsonType" << "bool") << kActiveWindow
+                               << BSON("bsonType" << "object"
+                                                  << "required" << BSON_ARRAY("start" << "stop"))
+                               << "_secondaryThrottle"
+                               << BSON("oneOf" << BSON_ARRAY(BSON("bsonType" << "bool")
+                                                             << BSON("bsonType" << "object")))
+                               << kWaitForDelete << BSON("bsonType" << "bool")
+                               << kAttemptToBalanceJumboChunks << BSON("bsonType" << "bool"))
+                 << "additionalProperties" << false);
 
 const char ChunkSizeSettingsType::kKey[] = "chunksize";
-const uint64_t ChunkSizeSettingsType::kDefaultMaxChunkSizeBytes{64 * 1024 * 1024};
+const uint64_t ChunkSizeSettingsType::kDefaultMaxChunkSizeBytes{128 * 1024 * 1024};
+const BSONObj ChunkSizeSettingsType::kSchema = BSON(
+    "properties" << BSON("_id" << BSON("enum" << BSON_ARRAY(ChunkSizeSettingsType::kKey)) << kValue
+                               << BSON("bsonType" << "number"
+                                                  << "minimum" << 1 << "maximum" << 1024))
+                 << "additionalProperties" << false);
 
-const char AutoSplitSettingsType::kKey[] = "autosplit";
+const char AutoMergeSettingsType::kKey[] = "automerge";
 
 BalancerConfiguration::BalancerConfiguration()
     : _balancerSettings(BalancerSettingsType::createDefault()),
       _maxChunkSizeBytes(ChunkSizeSettingsType::kDefaultMaxChunkSizeBytes),
-      _shouldAutoSplit(true) {}
+      _shouldAutoMerge(true) {}
 
 BalancerConfiguration::~BalancerConfiguration() = default;
 
@@ -83,12 +143,12 @@ Status BalancerConfiguration::setBalancerMode(OperationContext* opCtx,
                                               BalancerSettingsType::BalancerMode mode) {
     auto updateStatus = Grid::get(opCtx)->catalogClient()->updateConfigDocument(
         opCtx,
-        kSettingsNamespace,
+        NamespaceString::kConfigSettingsNamespace,
         BSON("_id" << BalancerSettingsType::kKey),
         BSON("$set" << BSON(kStopped << (mode == BalancerSettingsType::kOff) << kMode
                                      << BalancerSettingsType::kBalancerModes[mode])),
         true,
-        ShardingCatalogClient::kMajorityWriteConcern);
+        defaultMajorityWriteConcernDoNotUse());
 
     Status refreshStatus = refreshAndCheck(opCtx);
     if (!refreshStatus.isOK()) {
@@ -96,7 +156,31 @@ Status BalancerConfiguration::setBalancerMode(OperationContext* opCtx,
     }
 
     if (!updateStatus.isOK() && (getBalancerMode() != mode)) {
-        return updateStatus.getStatus().withContext("Failed to update balancer configuration");
+        return updateStatus.getStatus().withContext(str::stream()
+                                                    << "Failed to set the balancer mode to "
+                                                    << BalancerSettingsType::kBalancerModes[mode]);
+    }
+
+    return Status::OK();
+}
+
+Status BalancerConfiguration::changeAutoMergeSettings(OperationContext* opCtx, bool enable) {
+    auto updateStatus = Grid::get(opCtx)->catalogClient()->updateConfigDocument(
+        opCtx,
+        NamespaceString::kConfigSettingsNamespace,
+        BSON("_id" << AutoMergeSettingsType::kKey),
+        BSON("$set" << BSON(kEnabled << enable)),
+        true,
+        defaultMajorityWriteConcernDoNotUse());
+
+    Status refreshStatus = refreshAndCheck(opCtx);
+    if (!refreshStatus.isOK()) {
+        return refreshStatus;
+    }
+
+    if (!updateStatus.isOK() && (shouldAutoMerge() != enable)) {
+        return updateStatus.getStatus().withContext(
+            str::stream() << "Failed to " << (enable ? "enable" : "disable") << " auto merge");
     }
 
     return Status::OK();
@@ -104,17 +188,16 @@ Status BalancerConfiguration::setBalancerMode(OperationContext* opCtx,
 
 bool BalancerConfiguration::shouldBalance() const {
     stdx::lock_guard<stdx::mutex> lk(_balancerSettingsMutex);
-    if (_balancerSettings.getMode() == BalancerSettingsType::kOff ||
-        _balancerSettings.getMode() == BalancerSettingsType::kAutoSplitOnly) {
+    if (_balancerSettings.getMode() != BalancerSettingsType::kFull) {
         return false;
     }
 
     return _balancerSettings.isTimeInBalancingWindow(boost::posix_time::second_clock::local_time());
 }
 
-bool BalancerConfiguration::shouldBalanceForAutoSplit() const {
+bool BalancerConfiguration::shouldBalanceForAutoMerge() const {
     stdx::lock_guard<stdx::mutex> lk(_balancerSettingsMutex);
-    if (_balancerSettings.getMode() == BalancerSettingsType::kOff) {
+    if (_balancerSettings.getMode() == BalancerSettingsType::kOff || !shouldAutoMerge()) {
         return false;
     }
 
@@ -131,23 +214,35 @@ bool BalancerConfiguration::waitForDelete() const {
     return _balancerSettings.waitForDelete();
 }
 
+bool BalancerConfiguration::attemptToBalanceJumboChunks() const {
+    stdx::lock_guard<stdx::mutex> lk(_balancerSettingsMutex);
+    return _balancerSettings.attemptToBalanceJumboChunks();
+}
+
 Status BalancerConfiguration::refreshAndCheck(OperationContext* opCtx) {
-    // Balancer configuration
-    Status balancerSettingsStatus = _refreshBalancerSettings(opCtx);
-    if (!balancerSettingsStatus.isOK()) {
-        return balancerSettingsStatus.withContext("Failed to refresh the balancer settings");
-    }
+    try {
+        Lock::ExclusiveLock settingsRefreshLock(opCtx, _settingsRefreshMutex);
 
-    // Chunk size settings
-    Status chunkSizeStatus = _refreshChunkSizeSettings(opCtx);
-    if (!chunkSizeStatus.isOK()) {
-        return chunkSizeStatus.withContext("Failed to refresh the chunk sizes settings");
-    }
+        // Balancer configuration
+        Status balancerSettingsStatus = _refreshBalancerSettings(opCtx);
+        if (!balancerSettingsStatus.isOK()) {
+            return balancerSettingsStatus.withContext("Failed to refresh the balancer settings");
+        }
 
-    // AutoSplit settings
-    Status autoSplitStatus = _refreshAutoSplitSettings(opCtx);
-    if (!autoSplitStatus.isOK()) {
-        return autoSplitStatus.withContext("Failed to refresh the autoSplit settings");
+        // Chunk size settings
+        Status chunkSizeStatus = _refreshChunkSizeSettings(opCtx);
+        if (!chunkSizeStatus.isOK()) {
+            return chunkSizeStatus.withContext("Failed to refresh the chunk sizes settings");
+        }
+
+        // Global auto merge settings
+        Status autoMergeStatus = _refreshAutoMergeSettings(opCtx);
+        if (!autoMergeStatus.isOK()) {
+            return autoMergeStatus.withContext("Failed to refresh the autoMerge settings");
+        }
+    } catch (DBException& e) {
+        e.addContext("Failed to refresh the balancer configuration settings");
+        return e.toStatus();
     }
 
     return Status::OK();
@@ -192,8 +287,10 @@ Status BalancerConfiguration::_refreshChunkSizeSettings(OperationContext* opCtx)
     }
 
     if (settings.getMaxChunkSizeBytes() != getMaxChunkSizeBytes()) {
-        log() << "MaxChunkSize changing from " << getMaxChunkSizeBytes() / (1024 * 1024) << "MB"
-              << " to " << settings.getMaxChunkSizeBytes() / (1024 * 1024) << "MB";
+        LOGV2(22640,
+              "Changing MaxChunkSize setting",
+              "newMaxChunkSizeMB"_attr = settings.getMaxChunkSizeBytes() / (1024 * 1024),
+              "oldMaxChunkSizeMB"_attr = getMaxChunkSizeBytes() / (1024 * 1024));
 
         _maxChunkSizeBytes.store(settings.getMaxChunkSizeBytes());
     }
@@ -201,13 +298,13 @@ Status BalancerConfiguration::_refreshChunkSizeSettings(OperationContext* opCtx)
     return Status::OK();
 }
 
-Status BalancerConfiguration::_refreshAutoSplitSettings(OperationContext* opCtx) {
-    AutoSplitSettingsType settings = AutoSplitSettingsType::createDefault();
+Status BalancerConfiguration::_refreshAutoMergeSettings(OperationContext* opCtx) {
+    AutoMergeSettingsType settings = AutoMergeSettingsType::createDefault();
 
     auto settingsObjStatus =
-        Grid::get(opCtx)->catalogClient()->getGlobalSettings(opCtx, AutoSplitSettingsType::kKey);
+        Grid::get(opCtx)->catalogClient()->getGlobalSettings(opCtx, AutoMergeSettingsType::kKey);
     if (settingsObjStatus.isOK()) {
-        auto settingsStatus = AutoSplitSettingsType::fromBSON(settingsObjStatus.getValue());
+        auto settingsStatus = AutoMergeSettingsType::fromBSON(settingsObjStatus.getValue());
         if (!settingsStatus.isOK()) {
             return settingsStatus.getStatus();
         }
@@ -217,11 +314,10 @@ Status BalancerConfiguration::_refreshAutoSplitSettings(OperationContext* opCtx)
         return settingsObjStatus.getStatus();
     }
 
-    if (settings.getShouldAutoSplit() != getShouldAutoSplit()) {
-        log() << "ShouldAutoSplit changing from " << getShouldAutoSplit() << " to "
-              << settings.getShouldAutoSplit();
+    if (settings.isEnabled() != shouldAutoMerge()) {
+        LOGV2(7351300, "Changing auto merge settings", "enabled"_attr = settings.isEnabled());
 
-        _shouldAutoSplit.store(settings.getShouldAutoSplit());
+        _shouldAutoMerge.store(settings.isEnabled());
     }
 
     return Status::OK();
@@ -252,10 +348,15 @@ StatusWith<BalancerSettingsType> BalancerSettingsType::fromBSON(const BSONObj& o
                 return status;
             auto it = std::find(std::begin(kBalancerModes), std::end(kBalancerModes), modeStr);
             if (it == std::end(kBalancerModes)) {
-                return Status(ErrorCodes::BadValue, "Invalid balancer mode");
+                LOGV2_WARNING(
+                    7575700,
+                    "Balancer turned off because currently set balancing mode is not valid",
+                    "currentMode"_attr = modeStr,
+                    "supportedModes"_attr = kBalancerModes);
+                settings._mode = kOff;
+            } else {
+                settings._mode = static_cast<BalancerMode>(it - std::begin(kBalancerModes));
             }
-
-            settings._mode = static_cast<BalancerMode>(it - std::begin(kBalancerModes));
         }
     }
 
@@ -321,6 +422,16 @@ StatusWith<BalancerSettingsType> BalancerSettingsType::fromBSON(const BSONObj& o
         settings._waitForDelete = waitForDelete;
     }
 
+    {
+        bool attemptToBalanceJumboChunks;
+        Status status = bsonExtractBooleanFieldWithDefault(
+            obj, kAttemptToBalanceJumboChunks, false, &attemptToBalanceJumboChunks);
+        if (!status.isOK())
+            return status;
+
+        settings._attemptToBalanceJumboChunks = attemptToBalanceJumboChunks;
+    }
+
     return settings;
 }
 
@@ -331,9 +442,17 @@ bool BalancerSettingsType::isTimeInBalancingWindow(const boost::posix_time::ptim
         return true;
     }
 
-    LOG(1).stream() << "inBalancingWindow: "
-                    << " now: " << now << " startTime: " << *_activeWindowStart
-                    << " stopTime: " << *_activeWindowStop;
+    auto timeToString = [](const boost::posix_time::ptime& time) {
+        std::ostringstream ss;
+        ss << time;
+        return ss.str();
+    };
+    LOGV2_DEBUG(24094,
+                1,
+                "inBalancingWindow",
+                "now"_attr = timeToString(now),
+                "activeWindowStart"_attr = timeToString(*_activeWindowStart),
+                "activeWindowStop"_attr = timeToString(*_activeWindowStop));
 
     if (*_activeWindowStop > *_activeWindowStart) {
         if ((now >= *_activeWindowStart) && (now <= *_activeWindowStop)) {
@@ -383,20 +502,14 @@ bool ChunkSizeSettingsType::checkMaxChunkSizeValid(uint64_t maxChunkSizeBytes) {
     return false;
 }
 
-AutoSplitSettingsType::AutoSplitSettingsType() = default;
-
-AutoSplitSettingsType AutoSplitSettingsType::createDefault() {
-    return AutoSplitSettingsType();
-}
-
-StatusWith<AutoSplitSettingsType> AutoSplitSettingsType::fromBSON(const BSONObj& obj) {
-    bool shouldAutoSplit;
-    Status status = bsonExtractBooleanField(obj, kEnabled, &shouldAutoSplit);
+StatusWith<AutoMergeSettingsType> AutoMergeSettingsType::fromBSON(const BSONObj& obj) {
+    bool isEnabled;
+    Status status = bsonExtractBooleanField(obj, kEnabled, &isEnabled);
     if (!status.isOK())
         return status;
 
-    AutoSplitSettingsType settings;
-    settings._shouldAutoSplit = shouldAutoSplit;
+    AutoMergeSettingsType settings;
+    settings._isEnabled = isEnabled;
 
     return settings;
 }

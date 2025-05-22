@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -29,23 +28,32 @@
  */
 #include "mongo/s/catalog/type_mongos.h"
 
+
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
 #include "mongo/base/status_with.h"
+#include "mongo/bson/bsonelement.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
-const NamespaceString MongosType::ConfigNS("config.mongos");
+const NamespaceString MongosType::ConfigNS(NamespaceString::kConfigMongosNamespace);
 
 const BSONField<std::string> MongosType::name("_id");
+const BSONField<Date_t> MongosType::created("created");
 const BSONField<Date_t> MongosType::ping("ping");
 const BSONField<long long> MongosType::uptime("up");
 const BSONField<bool> MongosType::waiting("waiting");
 const BSONField<std::string> MongosType::mongoVersion("mongoVersion");
 const BSONField<long long> MongosType::configVersion("configVersion");
 const BSONField<BSONArray> MongosType::advisoryHostFQDNs("advisoryHostFQDNs");
+const BSONField<bool> MongosType::embeddedRouter("embeddedRouter");
 
 StatusWith<MongosType> MongosType::fromBSON(const BSONObj& source) {
     MongosType mt;
@@ -90,6 +98,15 @@ StatusWith<MongosType> MongosType::fromBSON(const BSONObj& source) {
         mt._mongoVersion = mtMongoVersion;
     }
 
+    if (source.hasField(created.name())) {
+        BSONElement mtCreatedElem;
+        Status status =
+            bsonExtractTypedField(source, created.name(), BSONType::Date, &mtCreatedElem);
+        if (!status.isOK())
+            return status;
+        mt._created = mtCreatedElem.date();
+    }
+
     if (source.hasField(configVersion.name())) {
         long long mtConfigVersion;
         Status status = bsonExtractIntegerField(source, configVersion.name(), &mtConfigVersion);
@@ -118,23 +135,31 @@ StatusWith<MongosType> MongosType::fromBSON(const BSONObj& source) {
         }
     }
 
+    if (source.hasField(embeddedRouter.name())) {
+        bool mtEmbeddedRouter;
+        Status status = bsonExtractBooleanField(source, embeddedRouter.name(), &mtEmbeddedRouter);
+        if (!status.isOK())
+            return status;
+        mt._embeddedRouter = mtEmbeddedRouter;
+    }
+
     return mt;
 }
 
 Status MongosType::validate() const {
-    if (!_name.is_initialized() || _name->empty()) {
+    if (!_name.has_value() || _name->empty()) {
         return {ErrorCodes::NoSuchKey, str::stream() << "missing " << name.name() << " field"};
     }
 
-    if (!_ping.is_initialized()) {
+    if (!_ping.has_value()) {
         return {ErrorCodes::NoSuchKey, str::stream() << "missing " << ping.name() << " field"};
     }
 
-    if (!_uptime.is_initialized()) {
+    if (!_uptime.has_value()) {
         return {ErrorCodes::NoSuchKey, str::stream() << "missing " << uptime.name() << " field"};
     }
 
-    if (!_waiting.is_initialized()) {
+    if (!_waiting.has_value()) {
         return {ErrorCodes::NoSuchKey, str::stream() << "missing " << waiting.name() << " field"};
     }
 
@@ -154,10 +179,14 @@ BSONObj MongosType::toBSON() const {
         builder.append(waiting.name(), getWaiting());
     if (_mongoVersion)
         builder.append(mongoVersion.name(), getMongoVersion());
+    if (_created)
+        builder.append(created.name(), getCreated());
     if (_configVersion)
         builder.append(configVersion.name(), getConfigVersion());
     if (_advisoryHostFQDNs)
         builder.append(advisoryHostFQDNs.name(), getAdvisoryHostFQDNs());
+    if (_embeddedRouter)
+        builder.append(embeddedRouter.name(), isEmbeddedRouter());
 
     return builder.obj();
 }
@@ -165,6 +194,10 @@ BSONObj MongosType::toBSON() const {
 void MongosType::setName(const std::string& name) {
     invariant(!name.empty());
     _name = name;
+}
+
+void MongosType::setCreated(const Date_t& created) {
+    _created = created;
 }
 
 void MongosType::setPing(const Date_t& ping) {
@@ -190,6 +223,10 @@ void MongosType::setConfigVersion(const long long configVersion) {
 
 void MongosType::setAdvisoryHostFQDNs(const std::vector<std::string>& advisoryHostFQDNs) {
     _advisoryHostFQDNs = advisoryHostFQDNs;
+}
+
+void MongosType::setEmbeddedRouter(bool embeddedRouter) {
+    _embeddedRouter = embeddedRouter;
 }
 
 std::string MongosType::toString() const {

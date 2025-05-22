@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,20 +27,21 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <boost/move/utility_core.hpp>
+#include <memory>
+#include <mutex>
 
-#include <algorithm>
+#include <absl/container/node_hash_set.h>
+#include <boost/optional/optional.hpp>
 
 #include "mongo/db/service_liaison_mock.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/util/periodic_runner_factory.h"
 
 namespace mongo {
 
 MockServiceLiaisonImpl::MockServiceLiaisonImpl() {
-    _timerFactory = stdx::make_unique<executor::AsyncTimerFactoryMock>();
+    _timerFactory = std::make_unique<executor::AsyncTimerFactoryMock>();
     _runner = makePeriodicRunner(getGlobalServiceContext());
-    _runner->startup();
 }
 
 LogicalSessionIdSet MockServiceLiaisonImpl::getActiveOpSessions() const {
@@ -49,14 +49,12 @@ LogicalSessionIdSet MockServiceLiaisonImpl::getActiveOpSessions() const {
     return _activeSessions;
 }
 
-LogicalSessionIdSet MockServiceLiaisonImpl::getOpenCursorSessions() const {
+LogicalSessionIdSet MockServiceLiaisonImpl::getOpenCursorSessions(OperationContext* opCtx) const {
     stdx::unique_lock<stdx::mutex> lk(_mutex);
     return _cursorSessions;
 }
 
-void MockServiceLiaisonImpl::join() {
-    _runner->shutdown();
-}
+void MockServiceLiaisonImpl::join() {}
 
 Date_t MockServiceLiaisonImpl::now() const {
     return _timerFactory->now();
@@ -110,11 +108,11 @@ const KillAllSessionsByPattern* MockServiceLiaisonImpl::matchKilled(const Logica
     return _matcher->match(lsid);
 }
 
-std::pair<Status, int> MockServiceLiaisonImpl::killCursorsWithMatchingSessions(
-    OperationContext* opCtx, const SessionKiller::Matcher& matcher) {
+int MockServiceLiaisonImpl::killCursorsWithMatchingSessions(OperationContext* opCtx,
+                                                            const SessionKiller::Matcher& matcher) {
 
     _matcher = matcher;
-    return std::make_pair(Status::OK(), 0);
+    return 0;
 }
 
 }  // namespace mongo

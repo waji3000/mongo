@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,7 +29,6 @@
 
 #pragma once
 
-#include <cstddef>
 #include <string>
 
 #include "mongo/platform/random.h"

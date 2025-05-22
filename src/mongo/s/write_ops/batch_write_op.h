@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,27 +29,40 @@
 
 #pragma once
 
+#include <boost/optional/optional.hpp>
+#include <functional>
 #include <map>
+#include <memory>
 #include <set>
 #include <vector>
 
-#include "mongo/base/disallow_copying.h"
-#include "mongo/base/owned_pointer_vector.h"
 #include "mongo/base/status.h"
-#include "mongo/db/logical_session_id.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/query/write_ops/write_ops_parsers.h"
+#include "mongo/db/session/logical_session_id.h"
+#include "mongo/db/shard_id.h"
 #include "mongo/rpc/write_concern_error_detail.h"
+#include "mongo/s/chunk_manager.h"
 #include "mongo/s/ns_targeter.h"
 #include "mongo/s/write_ops/batched_command_request.h"
 #include "mongo/s/write_ops/batched_command_response.h"
-#include "mongo/s/write_ops/write_error_detail.h"
+#include "mongo/s/write_ops/batched_upsert_detail.h"
+#include "mongo/s/write_ops/pause_migrations_during_multi_updates_enablement.h"
 #include "mongo/s/write_ops/write_op.h"
 #include "mongo/stdx/unordered_map.h"
 
 namespace mongo {
 
 class OperationContext;
-class TargetedWriteBatch;
+
 class TrackedErrors;
+
+// Conservative overhead per element contained in the write batch. This value was calculated as 1
+// byte (element type) + 5 bytes (max string encoding of the array index encoded as string and the
+// maximum key is 99999) + 1 byte (zero terminator) = 7 bytes
+const int kWriteCommandBSONArrayPerElementOverheadBytes = 7;
 
 /**
  * Simple struct for storing an error with an endpoint.
@@ -58,12 +70,11 @@ class TrackedErrors;
  * Certain types of errors are not stored in WriteOps or must be returned to a caller.
  */
 struct ShardError {
-    ShardError(const ShardEndpoint& endpoint, const WriteErrorDetail& error) : endpoint(endpoint) {
-        error.cloneTo(&this->error);
-    }
+    ShardError(const ShardEndpoint& endpoint, const write_ops::WriteError& error)
+        : endpoint(endpoint), error(error) {}
 
     ShardEndpoint endpoint;
-    WriteErrorDetail error;
+    write_ops::WriteError error;
 };
 
 /**
@@ -72,23 +83,16 @@ struct ShardError {
  * Certain types of errors are not stored in WriteOps or must be returned to a caller.
  */
 struct ShardWCError {
-    ShardWCError(const ShardEndpoint& endpoint, const WriteConcernErrorDetail& error)
-        : endpoint(endpoint) {
+    ShardWCError(const ShardId& shardName, const WriteConcernErrorDetail& error)
+        : shardName(shardName) {
         error.cloneTo(&this->error);
     }
 
-    ShardEndpoint endpoint;
+    ShardId shardName;
     WriteConcernErrorDetail error;
 };
 
-/**
- * Compares endpoints in a map.
- */
-struct EndpointComp {
-    bool operator()(const ShardEndpoint* endpointA, const ShardEndpoint* endpointB) const;
-};
-
-using TargetedBatchMap = std::map<const ShardEndpoint*, TargetedWriteBatch*, EndpointComp>;
+using TargetedBatchMap = std::map<ShardId, std::unique_ptr<TargetedWriteBatch>>;
 
 /**
  * The BatchWriteOp class manages the lifecycle of a batched write received by mongos.  Each
@@ -117,11 +121,12 @@ using TargetedBatchMap = std::map<const ShardEndpoint*, TargetedWriteBatch*, End
  *
  */
 class BatchWriteOp {
-    MONGO_DISALLOW_COPYING(BatchWriteOp);
+    BatchWriteOp(const BatchWriteOp&) = delete;
+    BatchWriteOp& operator=(const BatchWriteOp&) = delete;
 
 public:
     BatchWriteOp(OperationContext* opCtx, const BatchedCommandRequest& clientRequest);
-    ~BatchWriteOp();
+    ~BatchWriteOp() = default;
 
     /**
      * Targets one or more of the next write ops in this batch op using a NSTargeter.  The
@@ -138,15 +143,20 @@ public:
      * targeting errors, but if not we should refresh once first.)
      *
      * Returned TargetedWriteBatches are owned by the caller.
+     * If a write without a shard key or a time-series retryable update is detected, return an OK
+     * StatusWith that has the corresponding WriteType as the value.
      */
-    Status targetBatch(const NSTargeter& targeter,
-                       bool recordTargetErrors,
-                       std::map<ShardId, TargetedWriteBatch*>* targetedBatches);
+    StatusWith<WriteType> targetBatch(const NSTargeter& targeter,
+                                      bool recordTargetErrors,
+                                      TargetedBatchMap* targetedBatches);
 
     /**
      * Fills a BatchCommandRequest from a TargetedWriteBatch for this BatchWriteOp.
      */
-    BatchedCommandRequest buildBatchRequest(const TargetedWriteBatch& targetedBatch) const;
+    BatchedCommandRequest buildBatchRequest(
+        const TargetedWriteBatch& targetedBatch,
+        const NSTargeter& targeter,
+        boost::optional<bool> allowShardKeyUpdatesWithoutFullShardKeyInQuery) const;
 
     /**
      * Stores a response from one of the outstanding TargetedWriteBatches for this BatchWriteOp.
@@ -164,7 +174,9 @@ public:
      * Stores an error that occurred trying to send/recv a TargetedWriteBatch for this
      * BatchWriteOp.
      */
-    void noteBatchError(const TargetedWriteBatch& targetedBatch, const WriteErrorDetail& error);
+    void noteBatchError(const TargetedWriteBatch& targetedBatch,
+                        const write_ops::WriteError& error,
+                        const WriteConcernErrorDetail* wce = nullptr);
 
     /**
      * Aborts any further writes in the batch with the provided error.  There must be no pending
@@ -172,14 +184,7 @@ public:
      *
      * Batch is finished immediately after aborting.
      */
-    void abortBatch(const WriteErrorDetail& error);
-
-    /**
-     * Disposes of all tracked targeted batches when an error is encountered during a transaction.
-     * This is safe because any partially written data on shards will be rolled back if mongos
-     * decides to abort.
-     */
-    void forgetTargetedBatchesOnTransactionAbortingError();
+    void abortBatch(const write_ops::WriteError& error);
 
     /**
      * Returns false if the batch write op needs more processing.
@@ -197,16 +202,31 @@ public:
      */
     int numWriteOpsIn(WriteOpState state) const;
 
+    boost::optional<int> getNShardsOwningChunks();
+
+    /**
+     * Returns the WriteOp with index referencing the write item in the batch.
+     */
+    WriteOp& getWriteOp(int index);
+
+    /**
+     * This method is used for writes of type WithoutShardKeyWithId to clear the deferred WCEs
+     * if a retry of the broadcast is needed. Otherwise they are added to _wcErrors.
+     * See _deferredWCErrors for more details.
+     */
+    void handleDeferredWriteConcernErrors();
+
+    /**
+     * Used by writes of type WithoutShardKeyWithId sent in a batch to clear the responses if a
+     * retry of the broadcast is needed. Otherwise they are used to increment batch stats.
+     */
+    void handleDeferredResponses(bool hasAnyStaleShardResponse);
+
 private:
     /**
      * Maintains the batch execution statistics when a response is received.
      */
     void _incBatchStats(const BatchedCommandResponse& response);
-
-    /**
-     * Helper function to cancel all the write ops of targeted batches in a map.
-     */
-    void _cancelBatches(const WriteErrorDetail& why, TargetedBatchMap&& batchMapToCancel);
 
     OperationContext* const _opCtx;
 
@@ -219,15 +239,36 @@ private:
     // Array of ops being processed from the client request
     std::vector<WriteOp> _writeOps;
 
-    // Current outstanding batch op write requests
-    // Not owned here but tracked for reporting
-    std::set<const TargetedWriteBatch*> _targeted;
-
     // Write concern responses from all write batches so far
     std::vector<ShardWCError> _wcErrors;
 
+    // Optionally stores a map of write concern errors from all shards encountered during
+    // the current round of execution. This is used only in the specific case where we are
+    // processing writes of type WriteType::WithoutShardKeyWithId, and is necessary because
+    // if we see a staleness error we restart the broadcasting protocol and do not care about
+    // results or WC errors from previous rounds of the protocol. Thus we temporarily save the
+    // errors here, and at the end of each round of execution we check if the operations specified
+    // by the opIdx have reached a terminal state. If so, these errors are final and will be moved
+    // to _wcErrors. If the op is not in a terminal state, we must be restarting the protocol and
+    // therefore we discard the errors.
+    boost::optional<stdx::unordered_map<int /* opIdx */, std::vector<ShardWCError>>>
+        _deferredWCErrors;
+
+    // Optionally stores a vector of TargetedWriteBatch and response pair for writes of type
+    // WithoutShardKeyWithId in a targeted batch to defer updating batch stats until we are sure
+    // that there is no retry of such writes is needed. This is necessary for responses that have
+    // n > 0 in a given round because we do not want to increment the batch stats multiple times for
+    // retried statements.
+    boost::optional<
+        std::vector<std::pair<const TargetedWriteBatch*, const BatchedCommandResponse*>>>
+        _deferredResponses;
+
     // Upserted ids for the whole write batch
     std::vector<std::unique_ptr<BatchedUpsertDetail>> _upsertedIds;
+
+    // Statement ids for the ops that had already been executed, thus were not executed in this
+    // batch write.
+    std::vector<StmtId> _retriedStmtIds;
 
     // Stats for the entire batch op
     int _numInserted{0};
@@ -235,56 +276,14 @@ private:
     int _numMatched{0};
     int _numModified{0};
     int _numDeleted{0};
-};
 
-/**
- * Data structure representing the information needed to make a batch request, along with
- * pointers to where the resulting responses should be placed.
- *
- * Internal support for storage as a doubly-linked list, to allow the TargetedWriteBatch to
- * efficiently be registered for reporting.
- */
-class TargetedWriteBatch {
-    MONGO_DISALLOW_COPYING(TargetedWriteBatch);
+    // Set to true if this write is part of a transaction.
+    const bool _inTransaction{false};
+    const bool _isRetryableWrite{false};
 
-public:
-    TargetedWriteBatch(const ShardEndpoint& endpoint) : _endpoint(endpoint) {}
+    boost::optional<int> _nShardsOwningChunks;
 
-    const ShardEndpoint& getEndpoint() const {
-        return _endpoint;
-    }
-
-    const std::vector<TargetedWrite*>& getWrites() const {
-        return _writes.vector();
-    }
-
-    size_t getNumOps() const {
-        return _writes.size();
-    }
-
-    int getEstimatedSizeBytes() const {
-        return _estimatedSizeBytes;
-    }
-
-    /**
-     * TargetedWrite is owned here once given to the TargetedWriteBatch.
-     */
-    void addWrite(TargetedWrite* targetedWrite, int estWriteSize) {
-        _writes.mutableVector().push_back(targetedWrite);
-        _estimatedSizeBytes += estWriteSize;
-    }
-
-private:
-    // Where to send the batch
-    const ShardEndpoint _endpoint;
-
-    // Where the responses go
-    // TargetedWrite*s are owned by the TargetedWriteBatch
-    OwnedPointerVector<TargetedWrite> _writes;
-
-    // Conservatvely estimated size of the batch, for ensuring it doesn't grow past the maximum BSON
-    // size
-    int _estimatedSizeBytes{0};
+    PauseMigrationsDuringMultiUpdatesEnablement _pauseMigrationsDuringMultiUpdatesParameter;
 };
 
 /**
@@ -300,6 +299,8 @@ public:
 
     void addError(ShardError error);
 
+    bool hasError(int errCode) const;
+
     const std::vector<ShardError>& getErrors(int errCode) const;
 
 private:
@@ -307,4 +308,28 @@ private:
     TrackedErrorMap _errorMap;
 };
 
+typedef std::function<const NSTargeter&(const WriteOp& writeOp)> GetTargeterFn;
+typedef std::function<int(const WriteOp& writeOp, ShardId& shard)> GetWriteSizeFn;
+
+// Utility function to merge write concern errors received from various shards.
+boost::optional<WriteConcernErrorDetail> mergeWriteConcernErrors(
+    const std::vector<ShardWCError>& wcErrors);
+
+// Utility function to add the actualCollection field into a WriteError if it does not already
+// exist, contacting the primary shard if it needs to.
+void populateCollectionUUIDMismatch(OperationContext* opCtx,
+                                    write_ops::WriteError* error,
+                                    boost::optional<std::string>* actualCollection,
+                                    bool* hasContactedPrimaryShard);
+
+// Helper function to target ready writeOps. See BatchWriteOp::targetBatch for details.
+StatusWith<WriteType> targetWriteOps(OperationContext* opCtx,
+                                     std::vector<WriteOp>& writeOps,
+                                     bool ordered,
+                                     bool recordTargetErrors,
+                                     PauseMigrationsDuringMultiUpdatesEnablement& pauseMigrations,
+                                     GetTargeterFn getTargeterFn,
+                                     GetWriteSizeFn getWriteSizeFn,
+                                     int baseCommandSizeBytes,
+                                     TargetedBatchMap& batchMap);
 }  // namespace mongo

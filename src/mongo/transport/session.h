@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,34 +29,48 @@
 
 #pragma once
 
+#include <boost/optional/optional.hpp>
+#include <cstdint>
+#include <functional>
 #include <memory>
+#include <variant>
 
-#include "mongo/base/disallow_copying.h"
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/config.h"  // IWYU pragma: keep
+#include "mongo/db/auth/restriction_environment.h"
+#include "mongo/db/baton.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/rpc/message.h"
 #include "mongo/transport/session_id.h"
 #include "mongo/util/decorable.h"
+#include "mongo/util/duration.h"
 #include "mongo/util/future.h"
+#include "mongo/util/net/cidr.h"
 #include "mongo/util/net/hostandport.h"
+#include "mongo/util/net/sockaddr.h"
 #include "mongo/util/time_support.h"
+#ifdef MONGO_CONFIG_SSL
+#include "mongo/util/net/ssl_types.h"
+#endif
 
 namespace mongo {
+
+class SSLManagerInterface;
+
 namespace transport {
 
-class TransportLayer;
 class Session;
-class Baton;
-using BatonHandle = std::shared_ptr<Baton>;
-
-using SessionHandle = std::shared_ptr<Session>;
-using ConstSessionHandle = std::shared_ptr<const Session>;
+class SessionManager;
+class TransportLayer;
 
 /**
  * This type contains data needed to associate Messages with connections
  * (on the transport side) and Messages with Client objects (on the database side).
  */
 class Session : public std::enable_shared_from_this<Session>, public Decorable<Session> {
-    MONGO_DISALLOW_COPYING(Session);
+    Session(const Session&) = delete;
+    Session& operator=(const Session&) = delete;
 
 public:
     /**
@@ -65,27 +78,25 @@ public:
      */
     using Id = SessionId;
 
-    /**
-     * Tags for groups of connections.
-     */
-    using TagMask = uint32_t;
-
     static const Status ClosedStatus;
 
-    static constexpr TagMask kEmptyTagMask = 0;
-    static constexpr TagMask kKeepOpen = 1;
-    static constexpr TagMask kInternalClient = 2;
-    static constexpr TagMask kLatestVersionInternalClientKeepOpen = 4;
-    static constexpr TagMask kExternalClientKeepOpen = 8;
-    static constexpr TagMask kPending = 1 << 31;
-
-    virtual ~Session() = default;
+    ~Session() override;
 
     Id id() const {
         return _id;
     }
 
     virtual TransportLayer* getTransportLayer() const = 0;
+
+    /**
+     * Signals the Session that an OperationContext is/is-not active on the associated Client.
+     * This method is not thread safe and should only be called from the Client's thread.
+     *
+     * While this method is marked virtual, it is not actually meant to be overridden by
+     * child classes.  The use of virtual here is to resolve an otherwise circular linking
+     * by way of using the type erased vtable lookup at runtime.
+     */
+    virtual void setInOperation(bool state);
 
     /**
      * Ends this Session.
@@ -107,7 +118,13 @@ public:
      * Source (receive) a new Message from the remote host for this Session.
      */
     virtual StatusWith<Message> sourceMessage() = 0;
-    virtual Future<Message> asyncSourceMessage(const transport::BatonHandle& handle = nullptr) = 0;
+    virtual Future<Message> asyncSourceMessage(const BatonHandle& handle = nullptr) = 0;
+
+    /**
+     * Waits for the availability of incoming data.
+     */
+    virtual Status waitForData() = 0;
+    virtual Future<void> asyncWaitForData() = 0;
 
     /**
      * Sink (send) a Message to the remote host for this Session.
@@ -115,24 +132,23 @@ public:
      * Async version will keep the buffer alive until the operation completes.
      */
     virtual Status sinkMessage(Message message) = 0;
-    virtual Future<void> asyncSinkMessage(Message message,
-                                          const transport::BatonHandle& handle = nullptr) = 0;
+    virtual Future<void> asyncSinkMessage(Message message, const BatonHandle& handle = nullptr) = 0;
 
     /**
      * Cancel any outstanding async operations. There is no way to cancel synchronous calls.
      * Futures will finish with an ErrorCodes::CallbackCancelled error if they haven't already
      * completed.
      */
-    virtual void cancelAsyncOperations(const transport::BatonHandle& handle = nullptr) = 0;
+    virtual void cancelAsyncOperations(const BatonHandle& handle = nullptr) = 0;
 
     /**
-    * This should only be used to detect when the remote host has disappeared without
-    * notice. It does NOT work correctly for ensuring that operations complete or fail
-    * by some deadline.
-    *
-    * This timeout will only effect calls sourceMessage()/sinkMessage(). Async operations do not
-    * currently support timeouts.
-    */
+     * This should only be used to detect when the remote host has disappeared without
+     * notice. It does NOT work correctly for ensuring that operations complete or fail
+     * by some deadline.
+     *
+     * This timeout will only effect calls sourceMessage()/sinkMessage(). Async operations do not
+     * currently support timeouts.
+     */
     virtual void setTimeout(boost::optional<Milliseconds> timeout) = 0;
 
     /**
@@ -145,47 +161,109 @@ public:
      */
     virtual bool isConnected() = 0;
 
+    /**
+     * Returns true if this session was connected through an L4 load balancer.
+     */
+    virtual bool isLoadBalancerPeer() const = 0;
+
+    /**
+     * Returns true if the connection is on a load balancer port.
+     */
+    virtual bool isConnectedToLoadBalancerPort() const = 0;
+
+    /**
+     * Signal the session that the client declared being from a load balancer.
+     */
+    virtual void setisLoadBalancerPeer(bool helloHasLoadBalancedOption) = 0;
+
+    /**
+     * Returns true if this session binds to the operation state, which implies open cursors and
+     * in-progress transactions should be killed upon client disconnection.
+     */
+    virtual bool bindsToOperationState() const = 0;
+
+    /**
+     * Returns true if this session corresponds to a connection accepted from the router port.
+     */
+    virtual bool isFromRouterPort() const {
+        return false;
+    }
+
+    /**
+     * Returns the HostAndPort of the directly-connected remote
+     * to this session.
+     */
     virtual const HostAndPort& remote() const = 0;
+
+    /**
+     * Returns the HostAndPort of the local endpoint of this session.
+     */
     virtual const HostAndPort& local() const = 0;
 
     /**
-     * Atomically set all of the session tags specified in the 'tagsToSet' bit field. If the
-     * 'kPending' tag is set, indicating that no tags have yet been specified for the session, this
-     * function also clears that tag as part of the same atomic operation.
-     *
-     * The 'kPending' tag is only for new sessions; callers should not set it directly.
+     * Returns the source remote endpoint. The server determines the
+     * source remote endpoint via the following set of rules:
+     *  1. If the connection was accepted via the load balancer port:
+     *      a. If the TCP packet presented a valid proxy protocol header, then
+     *         the source remote endpoint is a HostAndPort constructed from the
+     *         source IP address and source port presented in that header.
+     *      b. If the TCP packet did not present a valid proxy protocol header,
+     *         then the transport layer will fail to parse and fail session establishment.
+     *  2. If the connection was NOT accepted via the load balancer port:
+     *      a. The source remote endpoint is always remote(). The proxy protocol
+     *         header is only parsed if presented by a load balancer connection.
      */
-    virtual void setTags(TagMask tagsToSet);
+    virtual const HostAndPort& getSourceRemoteEndpoint() const {
+        return remote();
+    }
 
     /**
-     * Atomically clears all of the session tags specified in the 'tagsToUnset' bit field. If the
-     * 'kPending' tag is set, indicating that no tags have yet been specified for the session, this
-     * function also clears that tag as part of the same atomic operation.
+     * Returns the proxy endpoint. The server determines the
+     * proxy endpoint via the following set of rules:
+     *  1. If the connection was accepted via the load balancer port:
+     *      a. If the TCP packet presented a valid proxy protocol header, then
+     *         the proxy endpoint is a HostAndPort constructed from the
+     *         destination IP address and destination port presented in that header.
+     *      b. If the TCP packet did not present a valid proxy protocol header,
+     *         then the transport layer will fail to parse and fail session establishment.
+     *  2. If the connection was NOT accepted via the load balancer port:
+     *      a. The proxy endpoint is always boost::none since there are no proxies.
      */
-    virtual void unsetTags(TagMask tagsToUnset);
+    virtual boost::optional<const HostAndPort&> getProxiedDstEndpoint() const {
+        return boost::none;
+    }
 
+    virtual void appendToBSON(BSONObjBuilder& bb) const = 0;
+
+    BSONObj toBSON() const {
+        BSONObjBuilder builder;
+        appendToBSON(builder);
+        return builder.obj();
+    }
+
+    virtual bool isExemptedByCIDRList(
+        const std::vector<std::variant<CIDR, std::string>>& exemptions) const = 0;
+
+#ifdef MONGO_CONFIG_SSL
     /**
-     * Loads the session tags, passes them to 'mutateFunc' and then stores the result of that call
-     * as the new session tags, all in one atomic operation.
-     *
-     * In order to ensure atomicity, 'mutateFunc' may get called multiple times, so it should not
-     * perform expensive computations or operations with side effects.
-     *
-     * If the 'kPending' tag is set originally, mutateTags() will unset it regardless of the result
-     * of the 'mutateFunc' call. The 'kPending' tag is only for new sessions; callers should never
-     * try to set it.
+     * Get the SSL configuration associated with this session, if any.
      */
-    virtual void mutateTags(const stdx::function<TagMask(TagMask)>& mutateFunc);
+    virtual const SSLConfiguration* getSSLConfiguration() const = 0;
+#endif
 
-    virtual TagMask getTags() const;
+    virtual const RestrictionEnvironment& getAuthEnvironment() const = 0;
 
 protected:
     Session();
 
+    std::shared_ptr<SessionManager> getSessionManager() const {
+        return _sessionManager.lock();
+    }
+
 private:
     const Id _id;
-
-    AtomicWord<TagMask> _tags;
+    bool _inOperation{false};
+    std::weak_ptr<SessionManager> _sessionManager;
 };
 
 }  // namespace transport

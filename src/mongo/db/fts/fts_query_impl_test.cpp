@@ -1,6 +1,3 @@
-// fts_query_impl_test.cpp
-
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,8 +27,9 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <algorithm>
 
+#include "mongo/base/string_data.h"
 #include "mongo/bson/json.h"
 #include "mongo/db/fts/fts_query_impl.h"
 #include "mongo/unittest/unittest.h"
@@ -481,5 +479,5 @@ TEST(FTSQueryImpl, CloneParsedQuery) {
     ASSERT(castedClone->getNegatedPhr() == q.getNegatedPhr());
     ASSERT(castedClone->getTermsForBounds() == q.getTermsForBounds());
 }
-}
-}
+}  // namespace fts
+}  // namespace mongo

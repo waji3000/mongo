@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,13 +29,15 @@
 
 #pragma once
 
-#include <string>
+#include <boost/optional.hpp>
 
-#include "mongo/db/clientcursor.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/catalog/collection.h"
 #include "mongo/db/dbmessage.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/query/canonical_query.h"
-#include "mongo/rpc/message.h"
+#include "mongo/db/query/client_cursor/clientcursor.h"
+#include "mongo/db/query/plan_executor.h"
 
 namespace mongo {
 
@@ -50,60 +51,28 @@ class OperationContext;
  * If false, the caller should close the cursor and indicate this to the client by sending back
  * a cursor ID of 0.
  */
-bool shouldSaveCursor(OperationContext* opCtx,
-                      const Collection* collection,
-                      PlanExecutor::ExecState finalState,
-                      PlanExecutor* exec);
+bool shouldSaveCursor(OperationContext* opCtx, const CollectionPtr& collection, PlanExecutor* exec);
 
 /**
- * Similar to shouldSaveCursor(), but used in getMore to determine whether we should keep
- * the cursor around for additional getMores().
+ * Similar to shouldSaveCursor(), but used in getMore to determine whether we should keep the cursor
+ * around for additional getMores().
  *
- * If false, the caller should close the cursor and indicate this to the client by sending back
- * a cursor ID of 0.
+ * If false, the caller should close the cursor and indicate this to the client by sending back a
+ * cursor ID of 0.
  */
-bool shouldSaveCursorGetMore(PlanExecutor::ExecState finalState,
-                             PlanExecutor* exec,
-                             bool isTailable);
-
-/**
- * Fills out the CurOp for "opCtx" with information about this query.
- */
-void beginQueryOp(OperationContext* opCtx,
-                  const NamespaceString& nss,
-                  const BSONObj& queryObj,
-                  long long ntoreturn,
-                  long long ntoskip);
+bool shouldSaveCursorGetMore(PlanExecutor* exec, bool isTailable);
 
 /**
  * 1) Fills out CurOp for "opCtx" with information regarding this query's execution.
- * 2) Reports index usage to the CollectionInfoCache.
+ * 2) Reports index usage to the CollectionQueryInfo.
  *
  * Uses explain functionality to extract stats from 'exec'.
  */
 void endQueryOp(OperationContext* opCtx,
-                Collection* collection,
+                const CollectionPtr& collection,
                 const PlanExecutor& exec,
                 long long numResults,
-                CursorId cursorId);
-
-/**
- * Called from the getMore entry point in ops/query.cpp.
- * Returned buffer is the message to return to the client.
- */
-Message getMore(OperationContext* opCtx,
-                const char* ns,
-                int ntoreturn,
-                long long cursorid,
-                bool* exhaust,
-                bool* isCursorAuthorized);
-
-/**
- * Run the query 'q' and place the result in 'result'.
- */
-std::string runQuery(OperationContext* opCtx,
-                     QueryMessage& q,
-                     const NamespaceString& ns,
-                     Message& result);
+                boost::optional<ClientCursorPin&> cursor,
+                const BSONObj& cmdObj);
 
 }  // namespace mongo

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,6 +29,11 @@
 
 #pragma once
 
+#include <string>
+
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/bson/oid.h"
 #include "mongo/db/repl/optime.h"
 
@@ -54,17 +58,25 @@ public:
     static const int kNoPrimary = -1;
 
     OplogQueryMetadata() = default;
-    OplogQueryMetadata(repl::OpTime lastOpCommitted,
+    OplogQueryMetadata(repl::OpTimeAndWallTime lastOpCommitted,
                        repl::OpTime lastOpApplied,
+                       repl::OpTime lastOpWritten,
                        int rbid,
                        int currentPrimaryIndex,
-                       int currentSyncSourceIndex);
+                       int currentSyncSourceIndex,
+                       std::string currentSyncSourceHost);
+    explicit OplogQueryMetadata(const OplogQueryMetadata&) = default;
+    OplogQueryMetadata(OplogQueryMetadata&&) = default;
+    OplogQueryMetadata& operator=(const OplogQueryMetadata&) = delete;
+    OplogQueryMetadata& operator=(OplogQueryMetadata&&) = default;
 
     /**
      * format:
      * {
      *     lastOpCommitted: {ts: Timestamp(0, 0), term: 0},
+     *     lastCommittedWall: ISODate("2018-07-25T19:21:22.449Z")
      *     lastOpApplied: {ts: Timestamp(0, 0), term: 0},
+     *     lastOpWritten: {ts: Timestamp(0, 0), term: 0},
      *     rbid: 0
      *     primaryIndex: 0,
      *     syncSourceIndex: 0
@@ -76,7 +88,7 @@ public:
     /**
      * Returns the OpTime of the most recently committed op of which the sender was aware.
      */
-    repl::OpTime getLastOpCommitted() const {
+    repl::OpTimeAndWallTime getLastOpCommitted() const {
         return _lastOpCommitted;
     }
 
@@ -88,11 +100,20 @@ public:
     }
 
     /**
-     * Returns the index of the current primary from the perspective of the sender.
-     * Returns kNoPrimary if there is no primary.
+     * Returns the OpTime of the most recent operation to be written by the sender.
      */
-    int getPrimaryIndex() const {
-        return _currentPrimaryIndex;
+    repl::OpTime getLastOpWritten() const {
+        return _lastOpWritten;
+    }
+
+    /**
+     * True if the sender thinks there is a primary.
+     *
+     * Note: the $oplogQueryData's primaryIndex isn't safe to use, we don't know which config
+     * version it's from. All we can safely say is whether the sender thinks there's a primary.
+     */
+    bool hasPrimaryIndex() const {
+        return _currentPrimaryIndex != kNoPrimary;
     }
 
     /**
@@ -101,6 +122,14 @@ public:
      */
     int getSyncSourceIndex() const {
         return _currentSyncSourceIndex;
+    }
+
+    /**
+     * Returns the host of the sync source of the sender.
+     * Returns empty string if it has no sync source.
+     */
+    std::string getSyncSourceHost() const {
+        return _currentSyncSourceHost;
     }
 
     /**
@@ -116,11 +145,13 @@ public:
     std::string toString() const;
 
 private:
-    repl::OpTime _lastOpCommitted;
+    repl::OpTimeAndWallTime _lastOpCommitted;
     repl::OpTime _lastOpApplied;
+    repl::OpTime _lastOpWritten;
     int _rbid = -1;
     int _currentPrimaryIndex = kNoPrimary;
     int _currentSyncSourceIndex = -1;
+    std::string _currentSyncSourceHost;
 };
 
 }  // namespace rpc

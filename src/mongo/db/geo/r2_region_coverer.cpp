@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,15 +27,28 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
 
+#include <boost/core/checked_delete.hpp>
+// IWYU pragma: no_include "boost/intrusive/detail/std_fwd.hpp"
 #include <algorithm>
+#include <cstddef>
+#include <functional>
+#include <ostream>
+#include <r1interval.h>
+#include <s2cellid.h>
+#include <s2edgeindex.h>
+#include <util/math/vector3-inl.h>
 
-#include "mongo/platform/basic.h"
+#include <boost/smart_ptr/scoped_ptr.hpp>
 
+#include "mongo/base/string_data.h"
 #include "mongo/db/geo/r2_region_coverer.h"
 #include "mongo/db/geo/shapes.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
+#include "mongo/util/assert_util.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
+
 
 namespace mongo {
 
@@ -55,14 +67,12 @@ struct R2RegionCoverer::CompareQueueEntries : public less<QueueEntry> {
     }
 };
 
-// Doesn't take ownership of "hashConverter". The caller should guarantee its life cycle
-// is longer than this coverer.
-R2RegionCoverer::R2RegionCoverer(GeoHashConverter* hashConverter)
-    : _hashConverter(hashConverter),
+R2RegionCoverer::R2RegionCoverer(std::unique_ptr<GeoHashConverter> hashConverter)
+    : _hashConverter(std::move(hashConverter)),
       _minLevel(0u),
       _maxLevel(GeoHash::kMaxBits),
       _maxCells(kDefaultMaxCells),
-      _region(NULL),
+      _region(nullptr),
       _candidateQueue(new CandidateQueue),
       _results(new vector<GeoHash>) {}
 
@@ -98,7 +108,7 @@ void R2RegionCoverer::getCovering(const R2Region& region, vector<GeoHash>* cover
     // children they have (fewest children first), and then by the number of
     // fully contained children (fewest children first).
 
-    verify(_minLevel <= _maxLevel);
+    MONGO_verify(_minLevel <= _maxLevel);
     dassert(_candidateQueue->empty());
     dassert(_results->empty());
     _region = &region;
@@ -109,7 +119,10 @@ void R2RegionCoverer::getCovering(const R2Region& region, vector<GeoHash>* cover
         Candidate* candidate = _candidateQueue->top().second;  // Owned
         _candidateQueue->pop();
         // REDACT?? I think this may have User info, but I'm not sure how to redact
-        LOG(3) << "Pop: " << redact(candidate->cell.toString());
+        LOGV2_DEBUG(20637,
+                    3,
+                    "Pop: {candidate_cell}",
+                    "candidate_cell"_attr = redact(candidate->cell.toString()));
 
         // Try to expand this cell into its children
         if (candidate->cell.getBits() < _minLevel || candidate->numChildren == 1 ||
@@ -124,11 +137,18 @@ void R2RegionCoverer::getCovering(const R2Region& region, vector<GeoHash>* cover
             candidate->isTerminal = true;
             addCandidate(candidate);
         }
-        LOG(3) << "Queue: " << _candidateQueue->size();
+        LOGV2_DEBUG(20638,
+                    3,
+                    "Queue: {candidateQueue_size}",
+                    "candidateQueue_size"_attr = _candidateQueue->size());
     }
 
-    _region = NULL;
+    _region = nullptr;
     cover->swap(*_results);
+}
+
+const GeoHashConverter& R2RegionCoverer::getHashConverter() const {
+    return *_hashConverter;
 }
 
 // Caller owns the returned pointer
@@ -137,7 +157,7 @@ R2RegionCoverer::Candidate* R2RegionCoverer::newCandidate(const GeoHash& cell) {
     Box box = _hashConverter->unhashToBoxCovering(cell);
 
     if (_region->fastDisjoint(box)) {
-        return NULL;
+        return nullptr;
     }
 
     Candidate* candidate = new Candidate();
@@ -153,7 +173,7 @@ R2RegionCoverer::Candidate* R2RegionCoverer::newCandidate(const GeoHash& cell) {
 
 // Takes ownership of "candidate"
 void R2RegionCoverer::addCandidate(Candidate* candidate) {
-    if (candidate == NULL)
+    if (candidate == nullptr)
         return;
 
     if (candidate->isTerminal) {
@@ -162,7 +182,7 @@ void R2RegionCoverer::addCandidate(Candidate* candidate) {
         return;
     }
 
-    verify(candidate->numChildren == 0);
+    MONGO_verify(candidate->numChildren == 0);
 
     // Expand children
     int numTerminals = expandChildren(candidate);
@@ -186,14 +206,18 @@ void R2RegionCoverer::addCandidate(Candidate* candidate) {
                          numTerminals);
         _candidateQueue->push(make_pair(priority, candidate));  // queue owns candidate
         // REDACT??
-        LOG(3) << "Push: " << redact(candidate->cell.toString()) << " (" << priority << ") ";
+        LOGV2_DEBUG(20639,
+                    3,
+                    "Push: {candidate_cell} ({priority}) ",
+                    "candidate_cell"_attr = redact(candidate->cell.toString()),
+                    "priority"_attr = priority);
     }
 }
 
 // Dones't take ownership of "candidate"
 int R2RegionCoverer::expandChildren(Candidate* candidate) {
     GeoHash childCells[4];
-    invariant(candidate->cell.subdivide(childCells));
+    tassert(9911943, "", candidate->cell.subdivide(childCells));
 
     int numTerminals = 0;
     for (int i = 0; i < 4; ++i) {
@@ -333,7 +357,7 @@ void getDifferenceInternal(GeoHash cellId,
         }
     }
 }
-}
+}  // namespace
 
 void R2CellUnion::getDifference(const R2CellUnion& cellUnion) {
     std::vector<GeoHash> diffCellIds;

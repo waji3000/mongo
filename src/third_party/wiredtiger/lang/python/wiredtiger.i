@@ -1,5 +1,5 @@
 /*-
- * Public Domain 2014-2018 MongoDB, Inc.
+ * Public Domain 2014-present MongoDB, Inc.
  * Public Domain 2008-2014 WiredTiger, Inc.
  *
  * This is free and unencumbered software released into the public domain.
@@ -30,6 +30,9 @@
  * wiredtiger.i
  *	The SWIG interface file defining the wiredtiger python API.
  */
+%include <pybuffer.i>
+%include <cstring.i>
+
 %define DOCSTRING
 "Python wrappers around the WiredTiger C API
 
@@ -40,6 +43,7 @@ This provides an API similar to the C API, with the following modifications:
   - Statistics cursors behave a little differently and are best handled using the C-like functions
   - C Constants starting with WT_STAT_DSRC are instead exposed under wiredtiger.stat.dsrc
   - C Constants starting with WT_STAT_CONN are instead exposed under wiredtiger.stat.conn
+  - C Constants starting with WT_STAT_SESSION are instead exposed under wiredtiger.stat.session
 "
 %enddef
 
@@ -52,24 +56,46 @@ from packing import pack, unpack
 ## @endcond
 %}
 
-/* Set the input argument to point to a temporary variable */ 
+/*
+ * For some reason, SWIG doesn't import some types from stdint.h.  We need to tell SWIG something
+ * about those type we use.  We don't need to be exact in our typing here, SWIG just needs hints
+ * so it knows what Python types to map to.
+ */
+%inline %{
+    typedef unsigned int uint32_t;
+%}
+
+/* Set the input argument to point to a temporary variable */
 %typemap(in, numinputs=0) WT_CONNECTION ** (WT_CONNECTION *temp = NULL) {
 	$1 = &temp;
 }
 %typemap(in, numinputs=0) WT_SESSION ** (WT_SESSION *temp = NULL) {
 	$1 = &temp;
 }
-%typemap(in, numinputs=0) WT_ASYNC_OP ** (WT_ASYNC_OP *temp = NULL) {
-	$1 = &temp;
-}
 %typemap(in, numinputs=0) WT_CURSOR ** (WT_CURSOR *temp = NULL) {
 	$1 = &temp;
 }
-
-%typemap(in) WT_ASYNC_CALLBACK * (PyObject *callback_obj = NULL) %{
-	callback_obj = $input;
-	$1 = &pyApiAsyncCallback;
-%}
+%typemap(in, numinputs=0) WT_FILE_HANDLE ** (WT_FILE_HANDLE *temp = NULL) {
+	$1 = &temp;
+ }
+%typemap(in, numinputs=0) WT_FILE_SYSTEM ** (WT_FILE_SYSTEM *temp = NULL) {
+	$1 = &temp;
+ }
+%typemap(in, numinputs=0) WT_PAGE_LOG ** (WT_PAGE_LOG *temp = NULL) {
+	$1 = &temp;
+ }
+%typemap(in, numinputs=0) WT_PAGE_LOG_HANDLE ** (WT_PAGE_LOG_HANDLE *temp = NULL) {
+	$1 = &temp;
+ }
+%typemap(in, numinputs=0) WT_STORAGE_SOURCE ** (WT_STORAGE_SOURCE *temp = NULL) {
+	$1 = &temp;
+ }
+%typemap(in, numinputs=0) bool * (bool temp = false) {
+	$1 = &temp;
+ }
+%typemap(in, numinputs=0) wt_off_t * (wt_off_t temp = false) {
+	$1 = &temp;
+}
 
 %typemap(in, numinputs=0) WT_EVENT_HANDLER * %{
 	$1 = &pyApiEventHandler;
@@ -95,47 +121,23 @@ from packing import pack, unpack
 		}
 	}
 }
-%typemap(argout) WT_ASYNC_OP ** {
-	$result = SWIG_NewPointerObj(SWIG_as_voidptr(*$1),
-	    SWIGTYPE_p___wt_async_op, 0);
-	if (*$1 != NULL) {
-		PY_CALLBACK *pcb;
-
-		(*$1)->c.flags |= WT_CURSTD_RAW;
-		PyObject_SetAttrString($result, "is_column",
-		    PyBool_FromLong(strcmp((*$1)->key_format, "r") == 0));
-		PyObject_SetAttrString($result, "key_format",
-		    PyString_InternFromString((*$1)->key_format));
-		PyObject_SetAttrString($result, "value_format",
-		    PyString_InternFromString((*$1)->value_format));
-
-		if (__wt_calloc_def((WT_ASYNC_OP_IMPL *)(*$1), 1, &pcb) != 0)
-			SWIG_exception_fail(SWIG_MemoryError, "WT calloc failed");
-		else {
-			pcb->pyobj = $result;
-			Py_XINCREF(pcb->pyobj);
-			/* XXX Is there a way to avoid SWIG's numbering? */
-			pcb->pyasynccb = callback_obj5;
-			Py_XINCREF(pcb->pyasynccb);
-			(*$1)->c.lang_private = pcb;
-		}
-	}
-}
-
 %typemap(argout) WT_CURSOR ** {
 	$result = SWIG_NewPointerObj(SWIG_as_voidptr(*$1),
 	    SWIGTYPE_p___wt_cursor, 0);
 	if (*$1 != NULL) {
 		PY_CALLBACK *pcb;
-		uint32_t json;
+		uint64_t json, version_cursor;
 
 		json = (*$1)->flags & WT_CURSTD_DUMP_JSON;
+		version_cursor = (*$1)->flags & WT_CURSTD_VERSION_CURSOR;
 		if (!json)
 			(*$1)->flags |= WT_CURSTD_RAW;
 		PyObject_SetAttrString($result, "is_json",
 		    PyBool_FromLong(json != 0));
 		PyObject_SetAttrString($result, "is_column",
 		    PyBool_FromLong(strcmp((*$1)->key_format, "r") == 0));
+		PyObject_SetAttrString($result, "is_version_cursor",
+		    PyBool_FromLong(version_cursor != 0));
 		PyObject_SetAttrString($result, "key_format",
 		    PyString_InternFromString((*$1)->key_format));
 		PyObject_SetAttrString($result, "value_format",
@@ -151,6 +153,195 @@ from packing import pack, unpack
 	}
 }
 
+%typemap(in,numinputs=1) (WT_MODIFY *entries, int *nentriesp) (WT_MODIFY *mod, int nentries) {
+	nentries = (int) PyLong_AsLong($input);
+	if (__wt_calloc_def(NULL, (size_t)nentries, &mod) != 0)
+		SWIG_exception_fail(SWIG_MemoryError, "WT calloc failed");
+	$1 = mod;
+	$2 = &nentries;
+}
+
+%typemap(argout) (WT_MODIFY *entries, int *nentriesp) {
+	int i;
+
+	$result = PyList_New(*$2);
+	for (i = 0; i < *$2; i++) {
+		PyObject *o = SWIG_NewPointerObj(Py_None, SWIGTYPE_p___wt_modify, 0);
+		PyObject_SetAttrString(o, "data", PyBytes_FromStringAndSize(
+		    $1[i].data.data, $1[i].data.size));
+		PyObject_SetAttrString(o, "offset",
+		    PyInt_FromLong($1[i].offset));
+		PyObject_SetAttrString(o, "size",
+		    PyInt_FromLong($1[i].size));
+		PyList_SetItem($result, i, o);
+	}
+}
+
+%typemap(argout) (WT_MODIFY *entries_string, int *nentriesp) {
+	int i;
+
+	$result = PyList_New(*$2);
+	for (i = 0; i < *$2; i++) {
+		PyObject *o = SWIG_NewPointerObj(Py_None, SWIGTYPE_p___wt_modify, 0);
+		PyObject_SetAttrString(o, "data", PyUnicode_FromStringAndSize(
+		    $1[i].data.data, $1[i].data.size));
+		PyObject_SetAttrString(o, "offset",
+		    PyInt_FromLong($1[i].offset));
+		PyObject_SetAttrString(o, "size",
+		    PyInt_FromLong($1[i].size));
+		PyList_SetItem($result, i, o);
+	}
+ }
+
+%typemap(in) const WT_ITEM * (WT_ITEM val) {
+	if (unpackBytesOrString($input, &val.data, &val.size) != 0)
+		SWIG_exception_fail(SWIG_AttributeError,
+		    "bad string value for WT_ITEM");
+	$1 = &val;
+}
+
+/* Why do we need an explicit conversion for plh_put - doesn't the previous typemap cover this? */
+%typemap(in) struct __wt_item *buf (WT_ITEM item) {
+	if (unpackBytesOrString($input, &item.data, &item.size) != 0)
+		SWIG_exception_fail(SWIG_AttributeError,
+		  "bad string value for WT_ITEM");
+	$1 = &item;
+}
+
+/*
+ * This typemap removes the three last arguments for plh_get, and uses local variables for them instead.
+ * The local variables will be used in the matching argout typemap.
+ * Code in this typemap appears before the call to the API function.
+ */
+%typemap(in,numinputs=0) (WT_ITEM *results_array, u_int *results_count)
+  (WT_ITEM results[32], u_int count) {
+	memset(&results, 0, sizeof(results));
+	count = 32;
+	$1 = results;
+	$2 = &count;
+}
+
+/*
+ * This typemap is for plh_get, and is used in conjunction with the previous typemap.
+ * Code in this typemap appears after the call to the API function.
+ * Using the local variables set up previously, and used in the call to plh_get
+ * now are converted to a python list of byte strings.
+ */
+%typemap(argout) (WT_ITEM *results_array, u_int *results_count) {
+	int i;
+	u_int n;
+	WT_ITEM *results_array;
+
+	results_array = $1;
+	$result = PyList_New(*$2);
+	for (n = 0; n < *$2; n++) {
+		PyBytesObject *pbo = PyBytes_FromStringAndSize(results_array[n].data, results_array[n].size);
+		PyList_SetItem($result, (int)n, pbo);
+	}
+	/* Free in reverse order, since the first item might hold all the memory used by other items. */
+	for (i = *$2 - 1; i >= 0; i--)
+		free(results_array[i].mem);
+}
+
+/*
+ * This typemap removes the three last arguments for pl_get_complete_checkpoint_ext, and uses local
+ * variables for them instead.
+ * The local variables will be used in the matching argout typemap.
+ * Code in this typemap appears before the call to the API function.
+ */
+%typemap(in,numinputs=0) (uint64_t *checkpoint_lsn, uint64_t *checkpoint_id,
+  uint64_t *checkpoint_timestamp, WT_ITEM *checkpoint_metadata)
+  (uint64_t lsn, uint64_t id, uint64_t timestamp, WT_ITEM metadata) {
+	memset(&metadata, 0, sizeof(metadata));
+	$1 = &lsn;
+	$2 = &id;
+	$3 = &timestamp;
+	$4 = &metadata;
+}
+
+/*
+ * This typemap is for pl_get_complete_checkpoint_ext, and is used in conjunction with the previous
+ * typemap. Code in this typemap appears after the call to the API function.
+ * Using the local variables set up previously, and used in the call to
+ * pl_get_complete_checkpoint_ext now are converted to a python tuple.
+ */
+%typemap(argout)(uint64_t *checkpoint_lsn, uint64_t *checkpoint_id, uint64_t *checkpoint_timestamp,
+  WT_ITEM *checkpoint_metadata) {
+	PyBytesObject *pbo;
+	WT_ITEM *checkpoint_metadata;
+
+	checkpoint_metadata = $4;
+
+	if (checkpoint_metadata->data != NULL) {
+		pbo = PyUnicode_FromStringAndSize(checkpoint_metadata->data, checkpoint_metadata->size);
+		free(checkpoint_metadata->mem);
+	} else
+		pbo = PyUnicode_FromStringAndSize("", 0);
+
+	$result = PyTuple_New(4);
+	PyTuple_SetItem($result, 0, PyLong_FromUnsignedLongLong(*$1));
+	PyTuple_SetItem($result, 1, PyLong_FromUnsignedLongLong(*$2));
+	PyTuple_SetItem($result, 2, PyLong_FromUnsignedLongLong(*$3));
+	PyTuple_SetItem($result, 3, pbo);
+}
+
+%typemap(in,numinputs=0) (char ***dirlist, int *countp) (char **list, uint32_t nentries) {
+	$1 = &list;
+	$2 = &nentries;
+}
+
+%typemap(argout) (char ***dirlist, int *countp) {
+	int i;
+	char **list;
+
+	$result = PyList_New(*$2);
+	list = (*$1);
+	/*
+	 * When we're done with the individual C strings, free them.
+	 * In theory, we should call the fs_directory_list_free() method,
+	 * but that's awkward, since we don't have the file system and session.
+	 */
+	for (i = 0; i < *$2; i++) {
+		PyObject *o = PyString_InternFromString(list[i]);
+		PyList_SetItem($result, i, o);
+		free(list[i]);
+	}
+	free(list);
+}
+
+
+%typemap(argout) WT_FILE_HANDLE ** {
+	$result = SWIG_NewPointerObj(SWIG_as_voidptr(*$1), SWIGTYPE_p___wt_file_handle, 0);
+}
+
+%typemap(argout) WT_FILE_SYSTEM ** {
+	$result = SWIG_NewPointerObj(SWIG_as_voidptr(*$1), SWIGTYPE_p___wt_file_system, 0);
+}
+
+%typemap(argout) WT_PAGE_LOG ** {
+	$result = SWIG_NewPointerObj(SWIG_as_voidptr(*$1), SWIGTYPE_p___wt_page_log, 0);
+}
+
+%typemap(argout) WT_PAGE_LOG_HANDLE ** {
+	$result = SWIG_NewPointerObj(SWIG_as_voidptr(*$1), SWIGTYPE_p___wt_page_log_handle, 0);
+}
+
+%typemap(argout) WT_STORAGE_SOURCE ** {
+	$result = SWIG_NewPointerObj(SWIG_as_voidptr(*$1), SWIGTYPE_p___wt_storage_source, 0);
+}
+
+%typemap(argout) bool * {
+	$result = PyBool_FromLong(*$1);
+}
+
+%typemap(argout) wt_off_t * {
+	$result = PyInt_FromLong(*$1);
+}
+
+%typemap(freearg) (WT_MODIFY *, int *nentriesp) {
+	__wt_free(NULL, $1);
+}
+
 %typemap(in) WT_MODIFY * (int len, WT_MODIFY *modarray, int i) {
 	len = PyList_Size($input);
 	/*
@@ -163,23 +354,32 @@ from packing import pack, unpack
 	modarray[0].size = (size_t)len;
 	for (i = 1; i <= len; i++) {
 		PyObject *dataobj, *modobj, *offsetobj, *sizeobj;
-		char *datadata;
+		void *datadata;
 		long offset, size;
-		Py_ssize_t datasize;
+		size_t datasize;
 
-		if ((modobj = PySequence_GetItem($input, i - 1)) == NULL)
+		if ((modobj = PySequence_GetItem($input, i - 1)) == NULL) {
+			freeModifyArray(modarray);
 			SWIG_exception_fail(SWIG_IndexError,
 			    "Modify sequence failed");
+		}
 
 		WT_GETATTR(dataobj, modobj, "data");
-		if (PyString_AsStringAndSize(dataobj, &datadata,
-		    &datasize) < 0) {
+		if (unpackBytesOrString(dataobj, &datadata, &datasize) != 0) {
 			Py_DECREF(dataobj);
 			Py_DECREF(modobj);
+			freeModifyArray(modarray);
 			SWIG_exception_fail(SWIG_AttributeError,
 			    "Modify.data bad value");
 		}
-		modarray[i].data.data = malloc(datasize);
+		if (datasize != 0 &&
+		    __wt_malloc(NULL, datasize, &modarray[i].data.data) != 0) {
+			Py_DECREF(dataobj);
+			Py_DECREF(modobj);
+			freeModifyArray(modarray);
+			SWIG_exception_fail(SWIG_AttributeError,
+			    "Modify.data failed malloc");
+		}
 		memcpy(modarray[i].data.data, datadata, datasize);
 		modarray[i].data.size = datasize;
 		Py_DECREF(dataobj);
@@ -188,6 +388,7 @@ from packing import pack, unpack
 		if ((offset = PyInt_AsLong(offsetobj)) < 0) {
 			Py_DECREF(offsetobj);
 			Py_DECREF(modobj);
+			freeModifyArray(modarray);
 			SWIG_exception_fail(SWIG_RuntimeError,
 			    "Modify.offset bad value");
 		}
@@ -198,6 +399,7 @@ from packing import pack, unpack
 		if ((size = PyInt_AsLong(sizeobj)) < 0) {
 			Py_DECREF(sizeobj);
 			Py_DECREF(modobj);
+			freeModifyArray(modarray);
 			SWIG_exception_fail(SWIG_RuntimeError,
 			    "Modify.size bad value");
 		}
@@ -209,14 +411,7 @@ from packing import pack, unpack
 }
 
 %typemap(freearg) WT_MODIFY * {
-	/* The WT_MODIFY arg is in position 2.  Is there a better way? */
-	WT_MODIFY *modarray = modarray2;
-	size_t i, len;
-
-	len = modarray[0].size;
-	for (i = 1; i <= len; i++)
-		__wt_free(NULL, modarray[i].data.data);
-	__wt_free(NULL, modarray);
+	freeModifyArray($1);
 }
 
 /* 64 bit typemaps. */
@@ -227,12 +422,15 @@ from packing import pack, unpack
 	$result = PyLong_FromUnsignedLongLong($1);
 }
 
+/* Internal _set_key, _set_value methods take a 'bytes' object as parameter. */
+%pybuffer_binary(unsigned char *data, int);
+
 /* Throw away references after close. */
 %define DESTRUCTOR(class, method)
 %feature("shadow") class::method %{
 	def method(self, *args):
 		'''method(self, config) -> int
-		
+
 		@copydoc class::method'''
 		try:
 			self._freecb()
@@ -243,7 +441,12 @@ from packing import pack, unpack
 %enddef
 DESTRUCTOR(__wt_connection, close)
 DESTRUCTOR(__wt_cursor, close)
+DESTRUCTOR(__wt_file_handle, close)
+DESTRUCTOR(__wt_page_log, pl_terminate)
+DESTRUCTOR(__wt_page_log_handle, plh_close)
 DESTRUCTOR(__wt_session, close)
+DESTRUCTOR(__wt_storage_source, ss_terminate)
+DESTRUCTOR(__wt_file_system, fs_terminate)
 
 /*
  * OVERRIDE_METHOD must be used when overriding or extending an existing
@@ -269,7 +472,7 @@ DESTRUCTOR(__wt_session, close)
 %typemap(default) const char *config { $1 = NULL; }
 %typemap(default) WT_CURSOR *to_dup { $1 = NULL; }
 
-/* 
+/*
  * Error returns other than WT_NOTFOUND generate an exception.
  * Use our own exception type, in future tailored to the kind
  * of error.
@@ -304,14 +507,15 @@ DESTRUCTOR(__wt_session, close)
  * asttribute to None, and free the PY_CALLBACK.
  */
 typedef struct {
-	PyObject *pyobj;	/* the python Session/Cursor/AsyncOp object */
-	PyObject *pyasynccb;	/* the callback to use for AsyncOp */
+	PyObject *pyobj;	/* the python Session/Cursor object */
 } PY_CALLBACK;
 
 static PyObject *wtError;
+static PyObject *wtRollbackError;
 
 static int sessionFreeHandler(WT_SESSION *session_arg);
 static int cursorFreeHandler(WT_CURSOR *cursor_arg);
+static int unpackBytesOrString(PyObject *obj, void **data, size_t *size);
 
 #define WT_GETATTR(var, parent, name)					\
 	do if ((var = PyObject_GetAttrString(parent, name)) == NULL) {	\
@@ -323,19 +527,31 @@ static int cursorFreeHandler(WT_CURSOR *cursor_arg);
 
 %init %{
 	/*
-	 * Create an exception type and put it into the _wiredtiger module.
-	 * First increment the reference count because PyModule_AddObject
-	 * decrements it.  Then note that "m" is the local variable for the
-	 * module in the SWIG generated code.  If there is a SWIG variable for
-	 * this, I haven't found it.
+	 * Create exception types and put them into the _wiredtiger module.
+	 * For each, first increment the reference count because PyModule_AddObject
+	 * decrements it, and we don't want to look it up later.
 	 */
 	wtError = PyErr_NewException("_wiredtiger.WiredTigerError", NULL, NULL);
 	Py_INCREF(wtError);
 	PyModule_AddObject(m, "WiredTigerError", wtError);
+
+	wtRollbackError = PyErr_NewException("_wiredtiger.WiredTigerRollbackError", wtError, NULL);
+	Py_INCREF(wtRollbackError);
+	PyModule_AddObject(m, "WiredTigerRollbackError", wtRollbackError);
 %}
 
 %pythoncode %{
 WiredTigerError = _wiredtiger.WiredTigerError
+WiredTigerRollbackError = _wiredtiger.WiredTigerRollbackError
+
+# Python3 has no explicit long type, recnos work as ints
+import sys
+if sys.version_info >= (3, 0, 0):
+	def _wt_recno(i):
+		return i
+else:
+	def _wt_recno(i):
+		return long(i)
 
 ## @cond DISABLE
 # Implements the iterable contract
@@ -346,19 +562,20 @@ class IterableCursor:
 	def __iter__(self):
 		return self
 
-	def next(self):
+	def __next__(self):
 		if self.cursor.next() == WT_NOTFOUND:
 			raise StopIteration
 		return self.cursor.get_keys() + self.cursor.get_values()
+
+	def next(self):
+		return self.__next__()
 ## @endcond
 
-# An abstract class, which must be subclassed with notify() overridden.
-class AsyncCallback:
-	def __init__(self):
-		raise NotImplementedError
+def wiredtiger_calc_modify(session, oldv, newv, maxdiff, nmod):
+	return _wiredtiger_calc_modify(session, oldv, newv, maxdiff, nmod)
 
-	def notify(self, op, op_ret, flags):
-		raise NotImplementedError
+def wiredtiger_calc_modify_string(session, oldv, newv, maxdiff, nmod):
+	return _wiredtiger_calc_modify_string(session, oldv, newv, maxdiff, nmod)
 
 %}
 
@@ -407,9 +624,13 @@ class AsyncCallback:
 %enddef
 
 SELFHELPER(struct __wt_connection, connection)
-SELFHELPER(struct __wt_async_op, op)
 SELFHELPER(struct __wt_session, session)
 SELFHELPER(struct __wt_cursor, cursor)
+SELFHELPER(struct __wt_file_handle, file_handle)
+SELFHELPER(struct __wt_file_system, file_system)
+SELFHELPER(struct __wt_page_log, page_log)
+SELFHELPER(struct __wt_page_log_handle, page_log_handle)
+SELFHELPER(struct __wt_storage_source, storage_source)
 
  /*
   * Create an error exception if it has not already
@@ -419,7 +640,10 @@ SELFHELPER(struct __wt_cursor, cursor)
 do {
 	if (PyErr_Occurred() == NULL) {
 		/* We could use PyErr_SetObject for more complex reporting. */
-		SWIG_SetErrorMsg(wtError, wiredtiger_strerror(result));
+                if (PyErr_Occurred() == NULL && (intptr_t)result == WT_ROLLBACK)
+			SWIG_SetErrorMsg(wtRollbackError, wiredtiger_strerror(result));
+                else
+			SWIG_SetErrorMsg(wtError, wiredtiger_strerror(result));
 	}
 	SWIG_fail;
 } while(0)
@@ -431,22 +655,6 @@ do {
 	if (result != 0)
 		SWIG_ERROR_IF_NOT_SET(result);
 }
-
-/* Async operations can return EBUSY when no ops are available. */
-%define EBUSY_OK(m)
-%exception m {
-retry:
-	$action
-	if (result != 0 && result != EBUSY)
-		SWIG_ERROR_IF_NOT_SET(result);
-	else if (result == EBUSY) {
-		SWIG_PYTHON_THREAD_BEGIN_ALLOW;
-		__wt_sleep(0, 10000);
-		SWIG_PYTHON_THREAD_END_ALLOW;
-		goto retry;
-	}
-}
-%enddef
 
 /* An API that returns a value that shouldn't be checked uses this. */
 %define ANY_OK(m)
@@ -482,16 +690,17 @@ retry:
 }
 %enddef
 
-EBUSY_OK(__wt_connection::async_new_op)
-ANY_OK(__wt_async_op::get_type)
 NOTFOUND_OK(__wt_cursor::next)
 NOTFOUND_OK(__wt_cursor::prev)
 NOTFOUND_OK(__wt_cursor::remove)
 NOTFOUND_OK(__wt_cursor::search)
 NOTFOUND_OK(__wt_cursor::update)
 NOTFOUND_OK(__wt_cursor::_modify)
+NOTFOUND_OK(__wt_cursor::largest_key)
 ANY_OK(__wt_modify::__wt_modify)
 ANY_OK(__wt_modify::~__wt_modify)
+ANY_OK(__wt_page_log_get_args::__wt_page_log_get_args)
+ANY_OK(__wt_page_log_put_args::__wt_page_log_put_args)
 
 COMPARE_OK(__wt_cursor::_compare)
 COMPARE_OK(__wt_cursor::_equals)
@@ -501,8 +710,8 @@ COMPARE_NOTFOUND_OK(__wt_cursor::_search_near)
 %exception __wt_connection::get_home;
 %exception __wt_connection::is_new;
 %exception __wt_connection::search_near;
-%exception __wt_async_op::_set_key;
-%exception __wt_async_op::_set_value;
+%exception __wt_session::get_last_error;
+%exception __wt_session::strerror;
 %exception __wt_cursor::_set_key;
 %exception __wt_cursor::_set_key_str;
 %exception __wt_cursor::_set_value;
@@ -510,14 +719,7 @@ COMPARE_NOTFOUND_OK(__wt_cursor::_search_near)
 %exception wiredtiger_strerror;
 %exception wiredtiger_version;
 %exception diagnostic_build;
-
-/* WT_ASYNC_OP customization. */
-/* First, replace the varargs get / set methods with Python equivalents. */
-%ignore __wt_async_op::get_key;
-%ignore __wt_async_op::get_value;
-%ignore __wt_async_op::set_key;
-%ignore __wt_async_op::set_value;
-%immutable __wt_async_op::connection;
+%exception standalone_build;
 
 /* WT_CURSOR customization. */
 /* First, replace the varargs get / set methods with Python equivalents. */
@@ -531,24 +733,98 @@ COMPARE_NOTFOUND_OK(__wt_cursor::_search_near)
 %ignore __wt_modify::offset;
 %ignore __wt_modify::size;
 
+/* Replace get_raw_key_value method with a Python equivalent */
+%ignore __wt_cursor::get_raw_key_value;
+
 /* Next, override methods that return integers via arguments. */
 %ignore __wt_cursor::compare(WT_CURSOR *, WT_CURSOR *, int *);
 %ignore __wt_cursor::equals(WT_CURSOR *, WT_CURSOR *, int *);
 %ignore __wt_cursor::search_near(WT_CURSOR *, int *);
+%ignore __wt_page_log::get_complete_checkpoint(WT_PAGE_LOG *, int *);
+%ignore __wt_page_log::get_open_checkpoint(WT_PAGE_LOG *, int *);
+
+/* TODO: workaround for issues with getting a Python version of structs working. */
+%ignore __wt_page_log_put_args::backlink_lsn;
+%ignore __wt_page_log_put_args::base_lsn;
+%ignore __wt_page_log_put_args::backlink_checkpoint_id;
+%ignore __wt_page_log_put_args::base_checkpoint_id;
+%ignore __wt_page_log_put_args::flags;
+%ignore __wt_page_log_put_args::lsn;
+%ignore __wt_page_log_get_args::lsn;
+%ignore __wt_page_log_get_args::backlink_lsn;
+%ignore __wt_page_log_get_args::base_lsn;
+%ignore __wt_page_log_get_args::backlink_checkpoint_id;
+%ignore __wt_page_log_get_args::base_checkpoint_id;
+%ignore __wt_page_log_get_args::lsn_frontier;
+%ignore __wt_page_log_get_args::delta_count;
 
 OVERRIDE_METHOD(__wt_cursor, WT_CURSOR, compare, (self, other))
 OVERRIDE_METHOD(__wt_cursor, WT_CURSOR, equals, (self, other))
 OVERRIDE_METHOD(__wt_cursor, WT_CURSOR, search_near, (self))
+OVERRIDE_METHOD(__wt_page_log, WT_PAGE_LOG, get_complete_checkpoint, (self))
+OVERRIDE_METHOD(__wt_page_log, WT_PAGE_LOG, get_open_checkpoint, (self))
 
 /* SWIG magic to turn Python byte strings into data / size. */
 %apply (char *STRING, int LENGTH) { (char *data, int size) };
 
 /* Handle binary data returns from get_key/value -- avoid cstring.i: it creates a list of returns. */
 %typemap(in,numinputs=0) (char **datap, int *sizep) (char *data, int size) { $1 = &data; $2 = &size; }
+%typemap(in,numinputs=0) (char **charp, int *sizep) (char *data, int size) { $1 = &data; $2 = &size; }
+%typemap(in,numinputs=0) (char **metadatap, int *metadatasizep, char **datap, int *datasizep) (char *metadata, int metadatasize, char *data, int datasize) { $1 = &metadata; $2 = &metadatasize; $3 = &data; $4 = &datasize; }
+%typemap(in,numinputs=0) (char **key_datap, int *key_sizep, char **value_datap, int *value_sizep) (char *key_data, int key_size, char *value_data, int value_size) { $1 = &key_data; $2 = &key_size; $3 = &value_data; $4 = &value_size; }
 %typemap(frearg) (char **datap, int *sizep) "";
+%typemap(frearg) (char **metadatap, int *metadatasizep, char **datap, int *datasizep) "";
+%typemap(frearg) (char **key_datap, int *key_sizep, char **value_datap, int *value_sizep) "";
+%typemap(argout) (char **charp, int *sizep) {
+	if (*$1)
+		$result = PyUnicode_FromStringAndSize(*$1, *$2);
+}
+
 %typemap(argout) (char **datap, int *sizep) {
 	if (*$1)
-		$result = SWIG_FromCharPtrAndSize(*$1, *$2);
+		$result = PyBytes_FromStringAndSize(*$1, *$2);
+}
+
+%typemap(argout)(char **metadatap, int *metadatasizep, char **datap, int *datasizep) (
+    PyObject *metadata, PyObject *data) {
+	if (*$1 && *$3) {
+		metadata = PyBytes_FromStringAndSize(*$1, *$2);
+		$result = metadata;
+		data = PyBytes_FromStringAndSize(*$3, *$4);
+		$result = SWIG_AppendOutput($result, data);
+	} else {
+		SWIG_exception_fail(SWIG_AttributeError, "invalid pointer argument");
+	}
+}
+
+%typemap(argout)(char **key_datap, int *key_sizep, char **value_datap, int *value_sizep) (
+    PyObject *key_data, PyObject *value_data) {
+	if (*$1 && *$3) {
+		key_data = PyBytes_FromStringAndSize(*$1, *$2);
+		$result = key_data;
+		value_data = PyBytes_FromStringAndSize(*$3, *$4);
+		$result = SWIG_AppendOutput($result, value_data);
+	} else {
+		SWIG_exception_fail(SWIG_AttributeError, "invalid pointer argument");
+	}
+}
+
+/* Handle binary data input from FILE_HANDLE->fh_write. */
+%typemap(in,numinputs=1) (size_t length, const void *buf) (Py_ssize_t length, const void *buf = NULL) {
+    if (PyBytes_AsStringAndSize($input, &buf, &length) < 0)
+        SWIG_exception_fail(SWIG_AttributeError,
+          "bad bytes input argument");
+    $1 = length;
+    $2 = buf;
+}
+
+/* Handle binary data input from FILE_HANDLE->fh_read. */
+%typemap(in,numinputs=1) (size_t length, void *buf) (Py_ssize_t length, const void *buf = NULL) {
+      if (PyBytes_AsStringAndSize($input, &buf, &length) < 0)
+          SWIG_exception_fail(SWIG_AttributeError,
+            "bad bytes input argument");
+    $1 = length;
+    $2 = buf;
 }
 
 /* Handle record number returns from get_recno */
@@ -557,7 +833,7 @@ OVERRIDE_METHOD(__wt_cursor, WT_CURSOR, search_near, (self))
 %typemap(argout) (uint64_t *recnop) { $result = PyLong_FromUnsignedLongLong(*$1); }
 
 /* Handle returned hexadecimal timestamps. */
-%typemap(in,numinputs=0) (char *hex_timestamp) (char tsbuf[WT_TS_HEX_SIZE]) { $1 = tsbuf; }
+%typemap(in,numinputs=0) (char *hex_timestamp) (char tsbuf[WT_TS_HEX_STRING_SIZE]) { $1 = tsbuf; }
 %typemap(argout) (char *hex_timestamp) {
 	if (*$1)
 		$result = SWIG_FromCharPtr($1);
@@ -569,150 +845,9 @@ typedef int int_void;
 typedef int int_void;
 %typemap(out) int_void { $result = VOID_Object; }
 
-%extend __wt_async_op {
-	/* Get / set keys and values */
-	void _set_key(char *data, int size) {
-		WT_ITEM k;
-		k.data = data;
-		k.size = (uint32_t)size;
-		$self->set_key($self, &k);
-	}
-
-	int_void _set_recno(uint64_t recno) {
-		WT_ITEM k;
-		uint8_t recno_buf[20];
-		size_t size;
-		int ret;
-		if ((ret = wiredtiger_struct_size(NULL,
-		    &size, "r", recno)) != 0 ||
-		    (ret = wiredtiger_struct_pack(NULL,
-		    recno_buf, sizeof (recno_buf), "r", recno)) != 0)
-			return (ret);
-
-		k.data = recno_buf;
-		k.size = (uint32_t)size;
-		$self->set_key($self, &k);
-		return (ret);
-	}
-
-	void _set_value(char *data, int size) {
-		WT_ITEM v;
-		v.data = data;
-		v.size = (uint32_t)size;
-		$self->set_value($self, &v);
-	}
-
-	/* Don't return values, just throw exceptions on failure. */
-	int_void _get_key(char **datap, int *sizep) {
-		WT_ITEM k;
-		int ret = $self->get_key($self, &k);
-		if (ret == 0) {
-			*datap = (char *)k.data;
-			*sizep = (int)k.size;
-		}
-		return (ret);
-	}
-
-	int_void _get_recno(uint64_t *recnop) {
-		WT_ITEM k;
-		int ret = $self->get_key($self, &k);
-		if (ret == 0)
-			ret = wiredtiger_struct_unpack(NULL,
-			    k.data, k.size, "q", recnop);
-		return (ret);
-	}
-
-	int_void _get_value(char **datap, int *sizep) {
-		WT_ITEM v;
-		int ret = $self->get_value($self, &v);
-		if (ret == 0) {
-			*datap = (char *)v.data;
-			*sizep = (int)v.size;
-		}
-		return (ret);
-	}
-
-	int _freecb() {
-		return (cursorFreeHandler($self));
-	}
-
-%pythoncode %{
-	def get_key(self):
-		'''get_key(self) -> object
-		
-		@copydoc WT_ASYNC_OP::get_key
-		Returns only the first column.'''
-		k = self.get_keys()
-		if len(k) == 1:
-			return k[0]
-		return k
-
-	def get_keys(self):
-		'''get_keys(self) -> (object, ...)
-		
-		@copydoc WT_ASYNC_OP::get_key'''
-		if self.is_column:
-			return [self._get_recno(),]
-		else:
-			return unpack(self.key_format, self._get_key())
-
-	def get_value(self):
-		'''get_value(self) -> object
-		
-		@copydoc WT_ASYNC_OP::get_value
-		Returns only the first column.'''
-		v = self.get_values()
-		if len(v) == 1:
-			return v[0]
-		return v
-
-	def get_values(self):
-		'''get_values(self) -> (object, ...)
-		
-		@copydoc WT_ASYNC_OP::get_value'''
-		return unpack(self.value_format, self._get_value())
-
-	def set_key(self, *args):
-		'''set_key(self) -> None
-		
-		@copydoc WT_ASYNC_OP::set_key'''
-		if len(args) == 1 and type(args[0]) == tuple:
-			args = args[0]
-		if self.is_column:
-			self._set_recno(long(args[0]))
-		else:
-			# Keep the Python string pinned
-			self._key = pack(self.key_format, *args)
-			self._set_key(self._key)
-
-	def set_value(self, *args):
-		'''set_value(self) -> None
-		
-		@copydoc WT_ASYNC_OP::set_value'''
-		if len(args) == 1 and type(args[0]) == tuple:
-			args = args[0]
-		# Keep the Python string pinned
-		self._value = pack(self.value_format, *args)
-		self._set_value(self._value)
-
-	def __getitem__(self, key):
-		'''Python convenience for searching'''
-		self.set_key(key)
-		if self.search() != 0:
-			raise KeyError
-		return self.get_value()
-
-	def __setitem__(self, key, value):
-		'''Python convenience for inserting'''
-		self.set_key(key)
-		self.set_key(value)
-		self.insert()
-%}
-};
-
 %extend __wt_cursor {
 	/* Get / set keys and values */
-	void _set_key(char *data, int size) {
+	void _set_key(unsigned char *data, int size) {
 		WT_ITEM k;
 		k.data = data;
 		k.size = (uint32_t)size;
@@ -741,7 +876,7 @@ typedef int int_void;
 		return (ret);
 	}
 
-	void _set_value(char *data, int size) {
+	void _set_value(unsigned char *data, int size) {
 		WT_ITEM v;
 		v.data = data;
 		v.size = (uint32_t)size;
@@ -764,11 +899,11 @@ typedef int int_void;
 		return (ret);
 	}
 
-	int_void _get_json_key(char **datap, int *sizep) {
+	int_void _get_json_key(char **charp, int *sizep) {
 		const char *k;
 		int ret = $self->get_key($self, &k);
 		if (ret == 0) {
-			*datap = (char *)k;
+			*charp = (char *)k;
 			*sizep = strlen(k);
 		}
 		return (ret);
@@ -783,6 +918,18 @@ typedef int int_void;
 		return (ret);
 	}
 
+	int_void _get_raw_key_value(char **key_datap, int *key_sizep, char **value_datap, int *value_sizep) {
+		WT_ITEM k, v;
+		int ret = $self->get_raw_key_value($self, &k, &v);
+		if (ret == 0) {
+			*key_datap = (char *)k.data;
+			*key_sizep = (int)k.size;
+			*value_datap = (char *)v.data;
+			*value_sizep = (int)v.size;
+		}
+		return (ret);
+	}
+
 	int_void _get_value(char **datap, int *sizep) {
 		WT_ITEM v;
 		int ret = $self->get_value($self, &v);
@@ -793,12 +940,25 @@ typedef int int_void;
 		return (ret);
 	}
 
-	int_void _get_json_value(char **datap, int *sizep) {
+	int_void _get_json_value(char **charp, int *sizep) {
 		const char *k;
 		int ret = $self->get_value($self, &k);
 		if (ret == 0) {
-			*datap = (char *)k;
+			*charp = (char *)k;
 			*sizep = strlen(k);
+		}
+		return (ret);
+	}
+
+	int_void _get_version_cursor_value(char **metadatap, int *metadatasizep, char **datap, int *datasizep) {
+		WT_ITEM metadata;
+		WT_ITEM v;
+		int ret = $self->get_value($self, &metadata, &v);
+		if (ret == 0) {
+			*metadatap = (char *)metadata.data;
+			*metadatasizep = (int)metadata.size;
+			*datap = (char *)v.data;
+			*datasizep = (int)v.size;
 		}
 		return (ret);
 	}
@@ -873,7 +1033,7 @@ typedef int int_void;
 %pythoncode %{
 	def get_key(self):
 		'''get_key(self) -> object
-		
+
 		@copydoc WT_CURSOR::get_key
 		Returns only the first column.'''
 		k = self.get_keys()
@@ -883,7 +1043,7 @@ typedef int int_void;
 
 	def get_keys(self):
 		'''get_keys(self) -> (object, ...)
-		
+
 		@copydoc WT_CURSOR::get_key'''
 		if self.is_json:
 			return [self._get_json_key()]
@@ -894,7 +1054,7 @@ typedef int int_void;
 
 	def get_value(self):
 		'''get_value(self) -> object
-		
+
 		@copydoc WT_CURSOR::get_value
 		Returns only the first column.'''
 		v = self.get_values()
@@ -904,21 +1064,37 @@ typedef int int_void;
 
 	def get_values(self):
 		'''get_values(self) -> (object, ...)
-		
+
 		@copydoc WT_CURSOR::get_value'''
 		if self.is_json:
 			return [self._get_json_value()]
+		elif self.is_version_cursor:
+			result = self._get_version_cursor_value()
+			metadata = unpack("QQQQQQBBBB", result[0])
+			data = unpack(self.value_format[10:], result[1])
+			return metadata + data
 		else:
 			return unpack(self.value_format, self._get_value())
 
+	def get_raw_key_value(self):
+		'''get_raw_key_value(self) -> object
+
+		@copydoc WT_CURSOR::get_raw_key_value
+		Returns a tuple containing both the key and the value.'''
+
+		result = self._get_raw_key_value()
+		keys = unpack(self.key_format, result[0])
+		values = unpack(self.value_format, result[1])
+		return (keys[0], values[0])
+
 	def set_key(self, *args):
 		'''set_key(self) -> None
-		
+
 		@copydoc WT_CURSOR::set_key'''
 		if len(args) == 1 and type(args[0]) == tuple:
 			args = args[0]
 		if self.is_column:
-			self._set_recno(long(args[0]))
+			self._set_recno(_wt_recno(args[0]))
 		elif self.is_json:
 			self._set_key_str(args[0])
 		else:
@@ -928,7 +1104,7 @@ typedef int int_void;
 
 	def set_value(self, *args):
 		'''set_value(self) -> None
-		
+
 		@copydoc WT_CURSOR::set_value'''
 		if self.is_json:
 			self._set_value_str(args[0])
@@ -980,6 +1156,9 @@ typedef int int_void;
 		self.data = data
 		self.offset = offset
 		self.size = size
+
+	def __repr__(self):
+		return 'Modify(\'%s\', %d, %d)' % (self.data, self.offset, self.size)
 %}
 };
 
@@ -999,6 +1178,213 @@ typedef int int_void;
 	}
 };
 
+%define CONCAT(a,b)   a##b
+%enddef
+
+ /*
+  * SIDESTEP_METHOD is a workaround.  We don't yet have some methods exposed in
+  * a way that makes them callable.  For some reason, this workaround works,
+  * even though it's awkward.
+  */
+%define SIDESTEP_METHOD(cclass, method, cargs, cargs_call)
+%ignore cclass::method;
+%rename (method) cclass::CONCAT(_,method);
+%extend cclass {
+    int CONCAT(_, method) cargs {
+        return (self->method cargs_call );
+     }
+};
+%enddef
+
+SIDESTEP_METHOD(__wt_page_log, pl_begin_checkpoint,
+  (WT_SESSION *session, int checkpoint_id),
+  (self, session, checkpoint_id))
+
+SIDESTEP_METHOD(__wt_page_log, pl_complete_checkpoint,
+  (WT_SESSION *session, int checkpoint_id),
+  (self, session, checkpoint_id))
+
+SIDESTEP_METHOD(__wt_page_log, pl_complete_checkpoint_ext,
+  (WT_SESSION *session, int checkpoint_id, uint64_t checkpoint_timestamp, const WT_ITEM *checkpoint_metadata, uint64_t *lsnp),
+  (self, session, checkpoint_id, checkpoint_timestamp, checkpoint_metadata, lsnp))
+
+SIDESTEP_METHOD(__wt_page_log, pl_get_complete_checkpoint,
+  (WT_SESSION *session, int *checkpoint_id),
+  (self, session, checkpoint_id))
+
+SIDESTEP_METHOD(__wt_page_log, pl_get_complete_checkpoint_ext,
+  (WT_SESSION *session, uint64_t *checkpoint_lsn, uint64_t *checkpoint_id,
+    uint64_t *checkpoint_timestamp, WT_ITEM *checkpoint_metadata),
+  (self, session, checkpoint_lsn, checkpoint_id, checkpoint_timestamp, checkpoint_metadata))
+
+SIDESTEP_METHOD(__wt_page_log, pl_get_last_lsn,
+  (WT_SESSION *session, int *lsn),
+  (self, session, lsn))
+
+SIDESTEP_METHOD(__wt_page_log, pl_get_open_checkpoint,
+  (WT_SESSION *session, int *checkpoint_id),
+  (self, session, checkpoint_id))
+
+SIDESTEP_METHOD(__wt_page_log, pl_open_handle,
+  (WT_SESSION *session, int table_id, WT_PAGE_LOG_HANDLE **handle),
+  (self, session, table_id, handle))
+
+SIDESTEP_METHOD(__wt_page_log, pl_set_last_materialized_lsn,
+  (WT_SESSION *session, uint64_t lsn),
+  (self, session, lsn))
+
+SIDESTEP_METHOD(__wt_page_log, terminate,
+  (WT_SESSION *session),
+  (self, session))
+
+SIDESTEP_METHOD(__wt_page_log_handle, plh_put,
+  (WT_SESSION *session, int page_id, int checkpoint_id, WT_PAGE_LOG_PUT_ARGS *put_args, WT_ITEM *buf),
+  (self, session, page_id, checkpoint_id, put_args, buf))
+
+SIDESTEP_METHOD(__wt_page_log_handle, plh_get,
+  (WT_SESSION *session, int page_id, int checkpoint_id, WT_PAGE_LOG_GET_ARGS *get_args,
+    WT_ITEM *results_array, u_int *results_count),
+  (self, session, page_id, checkpoint_id, get_args, results_array, results_count))
+
+SIDESTEP_METHOD(__wt_page_log_handle, plh_close,
+  (WT_SESSION *session),
+  (self, session))
+
+SIDESTEP_METHOD(__wt_storage_source, ss_customize_file_system,
+  (WT_SESSION *session, const char *bucket_name,
+    const char *auth_token, const char *config, WT_FILE_SYSTEM **file_systemp),
+  (self, session, bucket_name, auth_token, config, file_systemp))
+
+SIDESTEP_METHOD(__wt_storage_source, ss_flush,
+  (WT_SESSION *session, WT_FILE_SYSTEM *file_system,
+    const char *source, const char *object, const char *config),
+  (self, session, file_system, source, object, config))
+
+SIDESTEP_METHOD(__wt_storage_source, ss_flush_finish,
+  (WT_SESSION *session, WT_FILE_SYSTEM *file_system,
+    const char *source, const char *object, const char *config),
+  (self, session, file_system, source, object, config))
+
+SIDESTEP_METHOD(__wt_storage_source, terminate,
+  (WT_SESSION *session),
+  (self, session))
+
+SIDESTEP_METHOD(__wt_file_system, fs_exist,
+  (WT_SESSION *session, const char *name, bool *existp),
+  (self, session, name, existp))
+
+SIDESTEP_METHOD(__wt_file_system, fs_open_file,
+  (WT_SESSION *session, const char *name, WT_FS_OPEN_FILE_TYPE file_type,
+    uint32_t flags, WT_FILE_HANDLE **file_handlep),
+  (self, session, name, file_type, flags, file_handlep))
+
+SIDESTEP_METHOD(__wt_file_system, fs_remove,
+  (WT_SESSION *session, const char *name, uint32_t flags),
+  (self, session, name, flags))
+
+SIDESTEP_METHOD(__wt_file_system, fs_rename,
+  (WT_SESSION *session, const char *from, const char *to, uint32_t flags),
+  (self, session, from, to, flags))
+
+SIDESTEP_METHOD(__wt_file_system, fs_size,
+  (WT_SESSION *session, const char *name, wt_off_t *sizep),
+  (self, session, name, sizep))
+
+SIDESTEP_METHOD(__wt_file_system, terminate,
+  (WT_SESSION *session),
+  (self, session))
+
+SIDESTEP_METHOD(__wt_file_handle, close,
+  (WT_SESSION *session),
+  (self, session))
+
+SIDESTEP_METHOD(__wt_file_handle, fh_advise,
+  (WT_SESSION *session, wt_off_t offset, wt_off_t len, int advice),
+  (self, session, offset, len, advice))
+
+SIDESTEP_METHOD(__wt_file_handle, fh_extend,
+  (WT_SESSION *session, wt_off_t offset),
+  (self, session, offset))
+
+SIDESTEP_METHOD(__wt_file_handle, fh_extend_nolock,
+  (WT_SESSION *session, wt_off_t offset),
+  (self, session, offset))
+
+SIDESTEP_METHOD(__wt_file_handle, fh_lock,
+  (WT_SESSION *session, bool lock),
+  (self, session, lock))
+
+SIDESTEP_METHOD(__wt_file_handle, fh_map,
+  (WT_SESSION *session, bool lock, void *mapped_regionp, size_t *lengthp, void *mapped_cookiep),
+  (self, session, mapped_regionp, lengthp, mapped_cookiep))
+
+SIDESTEP_METHOD(__wt_file_handle, fh_map_discard,
+  (WT_SESSION *session, void *map, size_t length, void *mapped_cookie),
+  (self, session, map, length, mapped_cookie))
+
+SIDESTEP_METHOD(__wt_file_handle, fh_map_preload,
+  (WT_SESSION *session, const void *map, size_t length, void *mapped_cookie),
+  (self, session, map, length, mapped_cookie))
+
+SIDESTEP_METHOD(__wt_file_handle, fh_unmap,
+  (WT_SESSION *session, void *mapped_region, size_t length, void *mapped_cookie),
+  (self, session, mapped_region, length, mapped_cookie))
+
+   /*
+SIDESTEP_METHOD(__wt_file_handle, fh_read,
+  (WT_SESSION *session, wt_off_t offset, size_t len, void *buf),
+  (self, session, offset, len, buf))
+   */
+
+SIDESTEP_METHOD(__wt_file_handle, fh_size,
+  (WT_SESSION *session, wt_off_t *sizep),
+  (self, session, sizep))
+
+SIDESTEP_METHOD(__wt_file_handle, fh_sync,
+  (WT_SESSION *session),
+  (self, session))
+
+SIDESTEP_METHOD(__wt_file_handle, fh_sync_nowait,
+  (WT_SESSION *session),
+  (self, session))
+
+SIDESTEP_METHOD(__wt_file_handle, fh_truncate,
+  (WT_SESSION *session, wt_off_t offset),
+  (self, session, offset))
+
+SIDESTEP_METHOD(__wt_file_handle, fh_write,
+  (WT_SESSION *session, unsigned long offset, size_t length, const void *buf),
+  (self, session, offset, length, buf))
+
+%ignore __wt_file_handle::fh_read;
+%rename (fh_read) __wt_file_handle::_fh_read;
+%extend __wt_file_handle {
+    int _fh_read(WT_SESSION *session, unsigned long offset, size_t length, void *buf) {
+        return (self->fh_read(self, session, offset, length, buf));
+    }
+};
+
+%ignore __wt_file_system::fs_directory_list;
+%ignore __wt_file_system::fs_directory_list_single;
+%rename (fs_directory_list) __wt_file_system::_fs_directory_list;
+%rename (fs_directory_list_single) __wt_file_system::_fs_directory_list_single;
+%extend __wt_file_system {
+    int _fs_directory_list(WT_SESSION *session, const char *directory, const char *prefix,
+      char ***dirlist, int *countp) {
+        return (self->fs_directory_list(self, session, directory, prefix, dirlist, countp));
+    }
+    int _fs_directory_list_single(WT_SESSION *session, const char *directory, const char *prefix,
+      char ***dirlist, int *countp) {
+        return (self->fs_directory_list_single(self, session, directory, prefix, dirlist, countp));
+    }
+};
+
+/*
+ * No need for a directory_list_free method, as the list and its components
+ * are freed immediately after the directory_list call.
+ */
+%ignore __wt_file_system::fs_directory_list_free;
+
 %{
 int diagnostic_build() {
 #ifdef HAVE_DIAGNOSTIC
@@ -1010,26 +1396,30 @@ int diagnostic_build() {
 %}
 int diagnostic_build();
 
+%{
+int standalone_build() {
+#ifdef WT_STANDALONE_BUILD
+	return 1;
+#else
+	return 0;
+#endif
+}
+%}
+int standalone_build();
+
 /* Remove / rename parts of the C API that we don't want in Python. */
 %immutable __wt_cursor::session;
 %immutable __wt_cursor::uri;
 %ignore __wt_cursor::key_format;
 %ignore __wt_cursor::value_format;
 %immutable __wt_session::connection;
-%immutable __wt_async_op::connection;
-%immutable __wt_async_op::uri;
-%immutable __wt_async_op::config;
-%ignore __wt_async_op::key_format;
-%ignore __wt_async_op::value_format;
 
-%ignore __wt_async_callback;
 %ignore __wt_collator;
 %ignore __wt_compressor;
 %ignore __wt_config_item;
 %ignore __wt_data_source;
 %ignore __wt_encryptor;
 %ignore __wt_event_handler;
-%ignore __wt_extractor;
 %ignore __wt_item;
 %ignore __wt_lsn;
 
@@ -1037,7 +1427,6 @@ int diagnostic_build();
 %ignore __wt_connection::add_compressor;
 %ignore __wt_connection::add_data_source;
 %ignore __wt_connection::add_encryptor;
-%ignore __wt_connection::add_extractor;
 %ignore __wt_connection::get_extension_api;
 %ignore __wt_session::log_printf;
 
@@ -1047,22 +1436,91 @@ OVERRIDE_METHOD(__wt_session, WT_SESSION, log_printf, (self, msg))
 %ignore wiredtiger_struct_size;
 %ignore wiredtiger_struct_unpack;
 
+%ignore wiredtiger_calc_modify;
 %ignore wiredtiger_extension_init;
 %ignore wiredtiger_extension_terminate;
 
+
 /* Convert 'int *' to output args for wiredtiger_version */
 %apply int *OUTPUT { int * };
+%cstring_output_allocate(char **, );
 
-%rename(AsyncOp) __wt_async_op;
 %rename(Cursor) __wt_cursor;
 %rename(Modify) __wt_modify;
 %rename(Session) __wt_session;
 %rename(Connection) __wt_connection;
+%rename(FileHandle) __wt_file_handle;
+%rename(PageLog) __wt_page_log;
+%rename(PageLogGetArgs) __wt_page_log_get_args;
+%rename(PageLogHandle) __wt_page_log_handle;
+%rename(PageLogPutArgs) __wt_page_log_put_args;
+%rename(StorageSource) __wt_storage_source;
+%rename(StorageSource) __wt_storage_source;
+%rename(FileSystem) __wt_file_system;
 
 %include "wiredtiger.h"
 
-/* Add event handler support. */
+/*
+ * The original wiredtiger_calc_modify was ignored, now we define our own.
+ * Python needs to know whether to return a bytes object or a string.
+ * Part of the smarts to do that is the output typemap, which matches on
+ * the naming of the parameter: entries vs. entries_string
+ */
+extern int _wiredtiger_calc_modify(WT_SESSION *session,
+    const WT_ITEM *oldv, const WT_ITEM *newv,
+    size_t maxdiff, WT_MODIFY *entries, int *nentriesp);
+extern int _wiredtiger_calc_modify_string(WT_SESSION *session,
+    const WT_ITEM *oldv, const WT_ITEM *newv,
+    size_t maxdiff, WT_MODIFY *entries_string, int *nentriesp);
 %{
+int _wiredtiger_calc_modify(WT_SESSION *session,
+    const WT_ITEM *oldv, const WT_ITEM *newv,
+    size_t maxdiff, WT_MODIFY *entries, int *nentriesp)
+{
+	return (wiredtiger_calc_modify(
+	    session, oldv, newv, maxdiff, entries, nentriesp));
+}
+
+int _wiredtiger_calc_modify_string(WT_SESSION *session,
+    const WT_ITEM *oldv, const WT_ITEM *newv,
+    size_t maxdiff, WT_MODIFY *entries_string, int *nentriesp)
+{
+	return (wiredtiger_calc_modify(
+	    session, oldv, newv, maxdiff, entries_string, nentriesp));
+}
+
+/* Add event handler support. */
+
+static void
+freeModifyArray(WT_MODIFY *modarray)
+{
+	size_t i, len;
+
+	len = modarray[0].size;
+	for (i = 1; i <= len; i++)
+		__wt_free(NULL, modarray[i].data.data);
+	__wt_free(NULL, modarray);
+}
+
+static int unpackBytesOrString(PyObject *obj, void **datap, size_t *sizep)
+{
+	void *data;
+	Py_ssize_t sz;
+
+	if (PyBytes_AsStringAndSize(obj, &data, &sz) < 0) {
+#if PY_VERSION_HEX >= 0x03000000
+		PyErr_Clear();
+		if ((data = PyUnicode_AsUTF8AndSize(obj, &sz)) != 0)
+			*sizep = strlen((char *)data) + 1;
+		else
+#endif
+			return (-1);
+	}
+	*datap = data;
+	*sizep = sz;
+	return (0);
+}
+
 /* Write to and flush the stream. */
 static int
 writeToPythonStream(const char *streamname, const char *message)
@@ -1084,7 +1542,7 @@ writeToPythonStream(const char *streamname, const char *message)
 	strcpy(&msg[msglen], "\n");
 
 	/* Acquire python Global Interpreter Lock. Otherwise can segfault. */
-	SWIG_PYTHON_THREAD_BEGIN_BLOCK; 
+	SWIG_PYTHON_THREAD_BEGIN_BLOCK;
 
 	ret = 1;
 	if ((sys = PyImport_ImportModule("sys")) == NULL)
@@ -1153,7 +1611,6 @@ pythonClose(PY_CALLBACK *pcb)
 		ret = EINVAL;  /* any non-zero value will do. */
 	}
 	Py_XDECREF(pcb->pyobj);
-	Py_XDECREF(pcb->pyasynccb);
 
 	SWIG_PYTHON_THREAD_END_BLOCK;
 
@@ -1191,7 +1648,7 @@ cursorCloseHandler(WT_CURSOR *cursor)
 	cursor->lang_private = NULL;
 	if (pcb != NULL)
 		ret = pythonClose(pcb);
-	__wt_free((WT_SESSION_IMPL *)cursor->session, pcb);
+	__wt_free(CUR2S(cursor), pcb);
 
 	return (ret);
 }
@@ -1218,7 +1675,7 @@ cursorFreeHandler(WT_CURSOR *cursor)
 
 	pcb = (PY_CALLBACK *)cursor->lang_private;
 	cursor->lang_private = NULL;
-	__wt_free((WT_SESSION_IMPL *)cursor->session, pcb);
+	__wt_free(CUR2S(cursor), pcb);
 	return (0);
 }
 
@@ -1242,70 +1699,6 @@ static WT_EVENT_HANDLER pyApiEventHandler = {
 };
 %}
 
-/* Add async callback support. */
-%{
-
-static int
-pythonAsyncCallback(WT_ASYNC_CALLBACK *cb, WT_ASYNC_OP *asyncop, int opret,
-    uint32_t flags)
-{
-	int ret, t_ret;
-	PY_CALLBACK *pcb;
-	PyObject *arglist, *notify_method, *pyresult;
-	WT_ASYNC_OP_IMPL *op;
-	WT_SESSION_IMPL *session;
-
-	/*
-	 * Ensure the global interpreter lock is held since we'll be
-	 * making Python calls now.
-	 */
-	SWIG_PYTHON_THREAD_BEGIN_BLOCK;
-
-	op = (WT_ASYNC_OP_IMPL *)asyncop;
-	session = O2S(op);
-	pcb = (PY_CALLBACK *)asyncop->c.lang_private;
-	asyncop->c.lang_private = NULL;
-	ret = 0;
-
-	if (pcb->pyasynccb == NULL)
-		goto err;
-	if ((arglist = Py_BuildValue("(Oii)", pcb->pyobj,
-	    opret, flags)) == NULL)
-		goto err;
-	if ((notify_method = PyObject_GetAttrString(pcb->pyasynccb,
-	    "notify")) == NULL)
-		goto err;
-
-	pyresult = PyEval_CallObject(notify_method, arglist);
-	if (pyresult == NULL || !PyArg_Parse(pyresult, "i", &ret))
-		goto err;
-
-	if (0) {
-		if (ret == 0)
-			ret = EINVAL;
-err:		__wt_err(session, ret, "python async callback error");
-	}
-	Py_XDECREF(pyresult);
-	Py_XDECREF(notify_method);
-	Py_XDECREF(arglist);
-
-	SWIG_PYTHON_THREAD_END_BLOCK;
-
-	if (pcb != NULL) {
-		if ((t_ret = pythonClose(pcb) != 0) && ret == 0)
-			ret = t_ret;
-	}
-	__wt_free(session, pcb);
-
-	if (ret == 0 && (opret == 0 || opret == WT_NOTFOUND))
-		return (0);
-	else
-		return (1);
-}
-
-static WT_ASYNC_CALLBACK pyApiAsyncCallback = { pythonAsyncCallback };
-%}
-
 %pythoncode %{
 class stat:
 	'''keys for statistics cursors'''
@@ -1318,12 +1711,17 @@ class stat:
 		'''keys for cursors on data source statistics'''
 		pass
 
+	class session:
+		'''keys for cursors on session statistics'''
+		pass
+
 ## @}
 
 import sys
 # All names starting with 'WT_STAT_DSRC_' are renamed to
 # the wiredtiger.stat.dsrc class, those starting with 'WT_STAT_CONN' are
-# renamed to wiredtiger.stat.conn class.
+# renamed to the wiredtiger.stat.conn class. All names starting with 'WT_STAT_SESSION'
+# are renamed to the wiredtiger.stat.session class.
 def _rename_with_prefix(prefix, toclass):
 	curmodule = sys.modules[__name__]
 	for name in dir(curmodule):
@@ -1334,5 +1732,8 @@ def _rename_with_prefix(prefix, toclass):
 
 _rename_with_prefix('WT_STAT_CONN_', stat.conn)
 _rename_with_prefix('WT_STAT_DSRC_', stat.dsrc)
+_rename_with_prefix('WT_STAT_SESSION_', stat.session)
+_rename_with_prefix('WT_FS_', FileSystem)
+_rename_with_prefix('WT_FILE_HANDLE_', FileHandle)
 del _rename_with_prefix
 %}

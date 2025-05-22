@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,7 +27,8 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <algorithm>
+#include <limits>
 
 #include "mongo/db/field_parser.h"
 
@@ -207,7 +207,7 @@ FieldParser::FieldState FieldParser::extract(BSONElement elem,
 
     if (elem.type() == String) {
         // Extract everything, including embedded null characters.
-        *out = string(elem.valuestr(), elem.valuestrsize() - 1);
+        *out = elem.str();
         return FIELD_SET;
     }
 
@@ -295,7 +295,10 @@ FieldParser::FieldState FieldParser::extractNumber(BSONElement elem,
     }
 
     if (elem.isNumber()) {
-        *out = elem.numberInt();
+        auto num = std::clamp(elem.safeNumberLong(),
+                              static_cast<long long>(std::numeric_limits<int>::min()),
+                              static_cast<long long>(std::numeric_limits<int>::max()));
+        *out = static_cast<int>(num);
         return FIELD_SET;
     }
 
@@ -353,7 +356,7 @@ FieldParser::FieldState FieldParser::extractNumber(BSONElement elem,
     }
 
     if (elem.isNumber()) {
-        *out = elem.numberLong();
+        *out = elem.safeNumberLong();
         return FIELD_SET;
     }
 

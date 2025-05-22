@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,10 +27,10 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+// IWYU pragma: no_include "cxxabi.h"
+
 
 #include "mongo/unittest/barrier.h"
-
 #include "mongo/util/assert_util.h"
 
 namespace mongo {

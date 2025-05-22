@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,26 +29,36 @@
 
 #include "mongo/db/exec/or.h"
 
+#include <iterator>
+#include <memory>
+#include <utility>
+#include <vector>
+
+#include <absl/container/node_hash_map.h>
+
+#include "mongo/bson/bsonobj.h"
 #include "mongo/db/exec/filter.h"
-#include "mongo/db/exec/scoped_timer.h"
-#include "mongo/db/exec/working_set_common.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
 
 using std::unique_ptr;
-using std::vector;
-using stdx::make_unique;
 
 // static
 const char* OrStage::kStageType = "OR";
 
-OrStage::OrStage(OperationContext* opCtx, WorkingSet* ws, bool dedup, const MatchExpression* filter)
-    : PlanStage(kStageType, opCtx), _ws(ws), _filter(filter), _currentChild(0), _dedup(dedup) {}
+OrStage::OrStage(ExpressionContext* expCtx,
+                 WorkingSet* ws,
+                 bool dedup,
+                 const MatchExpression* filter)
+    : PlanStage(kStageType, expCtx),
+      _ws(ws),
+      _filter(filter),
+      _currentChild(0),
+      _dedup(dedup),
+      _recordIdDeduplicator(expCtx) {}
 
-void OrStage::addChild(PlanStage* child) {
-    _children.emplace_back(child);
+void OrStage::addChild(std::unique_ptr<PlanStage> child) {
+    _children.emplace_back(std::move(child));
 }
 
 void OrStage::addChildren(Children childrenToAdd) {
@@ -58,7 +67,7 @@ void OrStage::addChildren(Children childrenToAdd) {
                      std::make_move_iterator(childrenToAdd.end()));
 }
 
-bool OrStage::isEOF() {
+bool OrStage::isEOF() const {
     return _currentChild >= _children.size();
 }
 
@@ -78,14 +87,11 @@ PlanStage::StageState OrStage::doWork(WorkingSetID* out) {
             ++_specificStats.dupsTested;
 
             // ...and we've seen the RecordId before
-            if (_seen.end() != _seen.find(member->recordId)) {
+            if (!_recordIdDeduplicator.insert(member->recordId)) {
                 // ...drop it.
                 ++_specificStats.dupsDropped;
                 _ws->free(id);
                 return PlanStage::NEED_TIME;
-            } else {
-                // Otherwise, note that we've seen it.
-                _seen.insert(member->recordId);
             }
         }
 
@@ -108,12 +114,6 @@ PlanStage::StageState OrStage::doWork(WorkingSetID* out) {
         } else {
             return PlanStage::NEED_TIME;
         }
-    } else if (PlanStage::FAILURE == childStatus || PlanStage::DEAD == childStatus) {
-        // The stage which produces a failure is responsible for allocating a working set member
-        // with error details.
-        invariant(WorkingSet::INVALID_ID != id);
-        *out = id;
-        return childStatus;
     } else if (PlanStage::NEED_YIELD == childStatus) {
         *out = id;
     }
@@ -126,14 +126,12 @@ unique_ptr<PlanStageStats> OrStage::getStats() {
     _commonStats.isEOF = isEOF();
 
     // Add a BSON representation of the filter to the stats tree, if there is one.
-    if (NULL != _filter) {
-        BSONObjBuilder bob;
-        _filter->serialize(&bob);
-        _commonStats.filter = bob.obj();
+    if (_filter) {
+        _commonStats.filter = _filter->serialize();
     }
 
-    unique_ptr<PlanStageStats> ret = make_unique<PlanStageStats>(_commonStats, STAGE_OR);
-    ret->specific = make_unique<OrStats>(_specificStats);
+    unique_ptr<PlanStageStats> ret = std::make_unique<PlanStageStats>(_commonStats, STAGE_OR);
+    ret->specific = std::make_unique<OrStats>(_specificStats);
     for (size_t i = 0; i < _children.size(); ++i) {
         ret->children.emplace_back(_children[i]->getStats());
     }

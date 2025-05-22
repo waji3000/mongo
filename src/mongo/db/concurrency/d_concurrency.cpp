@@ -27,231 +27,248 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
-
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/concurrency/d_concurrency.h"
 
-#include <string>
-#include <vector>
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
 
-#include "mongo/db/concurrency/global_lock_acquisition_tracker.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/db/concurrency/lock_manager_defs.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/server_parameters.h"
-#include "mongo/db/service_context.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/db/storage/recovery_unit.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
-#include "mongo/util/stacktrace.h"
+#include "mongo/util/scopeguard.h"
+#include "mongo/util/str.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 namespace mongo {
 
-Lock::TempRelease::TempRelease(Locker* lockState)
-    : _lockState(lockState),
-      _lockSnapshot(),
-      _locksReleased(_lockState->saveLockStateAndUnlock(&_lockSnapshot)) {}
+Lock::ResourceLock::ResourceLock(ResourceLock&& other)
+    : _opCtx(other._opCtx), _rid(std::move(other._rid)), _result(other._result) {
+    other._opCtx = nullptr;
+    other._result = LOCK_INVALID;
+}
 
-Lock::TempRelease::~TempRelease() {
-    if (_locksReleased) {
-        invariant(!_lockState->isLocked());
-        _lockState->restoreLockState(_lockSnapshot);
+void Lock::ResourceLock::_lock(LockMode mode, Date_t deadline) {
+    invariant(_result == LOCK_INVALID);
+    shard_role_details::getLocker(_opCtx)->lock(_opCtx, _rid, mode, deadline);
+    _result = LOCK_OK;
+}
+
+void Lock::ResourceLock::_unlock() {
+    if (_isLocked()) {
+        shard_role_details::getLocker(_opCtx)->unlock(_rid);
+        _result = LOCK_INVALID;
     }
 }
 
-namespace {
-
-/**
- * ResourceMutexes can be constructed during initialization, thus the code must ensure the vector
- * of labels is constructed before items are added to it. This factory encapsulates all members
- * that need to be initialized before first use. A pointer is allocated to an instance of this
- * factory and the first call will construct an instance.
- */
-class ResourceIdFactory {
-public:
-    static ResourceId newResourceIdForMutex(std::string resourceLabel) {
-        ensureInitialized();
-        return resourceIdFactory->_newResourceIdForMutex(std::move(resourceLabel));
-    }
-
-    static std::string nameForId(ResourceId resourceId) {
-        stdx::lock_guard<stdx::mutex> lk(resourceIdFactory->labelsMutex);
-        return resourceIdFactory->labels.at(resourceId.getHashId());
-    }
-
-    /**
-     * Must be called in a single-threaded context (e.g: program initialization) before the factory
-     * is safe to use in a multi-threaded context.
-     */
-    static void ensureInitialized() {
-        if (!resourceIdFactory) {
-            resourceIdFactory = new ResourceIdFactory();
-        }
-    }
-
-private:
-    ResourceId _newResourceIdForMutex(std::string resourceLabel) {
-        stdx::lock_guard<stdx::mutex> lk(labelsMutex);
-        invariant(nextId == labels.size());
-        labels.push_back(std::move(resourceLabel));
-
-        return ResourceId(RESOURCE_MUTEX, nextId++);
-    }
-
-    static ResourceIdFactory* resourceIdFactory;
-
-    std::uint64_t nextId = 0;
-    std::vector<std::string> labels;
-    stdx::mutex labelsMutex;
-};
-
-ResourceIdFactory* ResourceIdFactory::resourceIdFactory;
-
-/**
- * Guarantees `ResourceIdFactory::ensureInitialized` is called at least once during initialization.
- */
-struct ResourceIdFactoryInitializer {
-    ResourceIdFactoryInitializer() {
-        ResourceIdFactory::ensureInitialized();
-    }
-} resourceIdFactoryInitializer;
-
-}  // namespace
-
-
-Lock::ResourceMutex::ResourceMutex(std::string resourceLabel)
-    : _rid(ResourceIdFactory::newResourceIdForMutex(std::move(resourceLabel))) {}
-
-std::string Lock::ResourceMutex::getName(ResourceId resourceId) {
-    invariant(resourceId.getType() == RESOURCE_MUTEX);
-    return ResourceIdFactory::nameForId(resourceId);
-}
-
-bool Lock::ResourceMutex::isExclusivelyLocked(Locker* locker) {
-    return locker->isLockHeldForMode(_rid, MODE_X);
-}
-
-bool Lock::ResourceMutex::isAtLeastReadLocked(Locker* locker) {
-    return locker->isLockHeldForMode(_rid, MODE_IS);
+void Lock::ExclusiveLock::lock() {
+    // The contract of the condition_variable-like utilities is that that the lock is returned in
+    // the locked state so the acquisition below must be guaranteed to always succeed.
+    invariant(_opCtx);
+    UninterruptibleLockGuard ulg(_opCtx);  // NOLINT.
+    _lock(MODE_X);
 }
 
 Lock::GlobalLock::GlobalLock(OperationContext* opCtx,
                              LockMode lockMode,
                              Date_t deadline,
                              InterruptBehavior behavior)
-    : GlobalLock(opCtx, lockMode, deadline, behavior, EnqueueOnly()) {
-    waitForLockUntil(deadline);
-}
+    : GlobalLock(opCtx, lockMode, deadline, behavior, GlobalLockSkipOptions{}) {}
 
 Lock::GlobalLock::GlobalLock(OperationContext* opCtx,
                              LockMode lockMode,
                              Date_t deadline,
                              InterruptBehavior behavior,
-                             EnqueueOnly enqueueOnly)
-    : _opCtx(opCtx),
-      _result(LOCK_INVALID),
-      _pbwm(opCtx->lockState(), resourceIdParallelBatchWriterMode),
-      _interruptBehavior(behavior),
-      _isOutermostLock(!opCtx->lockState()->isLocked()) {
-    _enqueue(lockMode, deadline);
+                             GlobalLockSkipOptions options)
+    : _opCtx(opCtx), _interruptBehavior(behavior), _skipRSTLLock(options.skipRSTLLock) {
+    if (!options.skipFlowControlTicket) {
+        shard_role_details::getLocker(_opCtx)->getFlowControlTicket(_opCtx, lockMode);
+    }
+
+    try {
+        const bool acquireMultiDocumentTxnBarrier = [&] {
+            if (opCtx->inMultiDocumentTransaction()) {
+                invariant(lockMode == MODE_IS || lockMode == MODE_IX);
+                return true;
+            }
+            return lockMode == MODE_S || lockMode == MODE_X;
+        }();
+        if (acquireMultiDocumentTxnBarrier) {
+            _multiDocTxnBarrier.emplace(
+                _opCtx, resourceIdMultiDocumentTransactionsBarrier, lockMode, deadline);
+        }
+        ScopeGuard unlockMultiDocTxnBarrier([this] { _multiDocTxnBarrier.reset(); });
+
+        _result = LOCK_INVALID;
+        if (options.skipRSTLLock) {
+            _takeGlobalLockOnly(lockMode, deadline);
+        } else {
+            _takeGlobalAndRSTLLocks(lockMode, deadline);
+        }
+        _result = LOCK_OK;
+
+        unlockMultiDocTxnBarrier.dismiss();
+    } catch (const DBException& ex) {
+        // If our opCtx is interrupted or we got a LockTimeout or MaxTimeMSExpired, either throw or
+        // suppress the exception depending on the specified interrupt behavior. For any other
+        // exception, always throw.
+        if ((opCtx->checkForInterruptNoAssert().isOK() && ex.code() != ErrorCodes::LockTimeout &&
+             ex.code() != ErrorCodes::MaxTimeMSExpired) ||
+            _interruptBehavior == InterruptBehavior::kThrow) {
+            throw;
+        }
+    }
+    auto acquiredLockMode = shard_role_details::getLocker(_opCtx)->getLockMode(resourceIdGlobal);
+    shard_role_details::getLocker(_opCtx)->setGlobalLockTakenInMode(acquiredLockMode);
+}
+
+void Lock::GlobalLock::_takeGlobalLockOnly(LockMode lockMode, Date_t deadline) {
+    shard_role_details::getLocker(_opCtx)->lockGlobal(_opCtx, lockMode, deadline);
+}
+
+void Lock::GlobalLock::_takeGlobalAndRSTLLocks(LockMode lockMode, Date_t deadline) {
+    shard_role_details::getLocker(_opCtx)->lock(
+        _opCtx, resourceIdReplicationStateTransitionLock, MODE_IX, deadline);
+    ScopeGuard unlockRSTL([this] {
+        shard_role_details::getLocker(_opCtx)->unlock(resourceIdReplicationStateTransitionLock);
+    });
+
+    shard_role_details::getLocker(_opCtx)->lockGlobal(_opCtx, lockMode, deadline);
+
+    unlockRSTL.dismiss();
 }
 
 Lock::GlobalLock::GlobalLock(GlobalLock&& otherLock)
     : _opCtx(otherLock._opCtx),
       _result(otherLock._result),
-      _pbwm(std::move(otherLock._pbwm)),
+      _multiDocTxnBarrier(std::move(otherLock._multiDocTxnBarrier)),
       _interruptBehavior(otherLock._interruptBehavior),
-      _isOutermostLock(otherLock._isOutermostLock) {
+      _skipRSTLLock(otherLock._skipRSTLLock) {
     // Mark as moved so the destructor doesn't invalidate the newly-constructed lock.
     otherLock._result = LOCK_INVALID;
 }
 
-void Lock::GlobalLock::_enqueue(LockMode lockMode, Date_t deadline) {
-    try {
-        if (_opCtx->lockState()->shouldConflictWithSecondaryBatchApplication()) {
-            _pbwm.lock(MODE_IS);
-        }
+Lock::GlobalLock::~GlobalLock() {
+    // Preserve the original lock result which will be overridden by unlock().
+    auto lockResult = _result;
+    auto* locker = shard_role_details::getLocker(_opCtx);
 
-        _result = _opCtx->lockState()->lock(
-            _opCtx, resourceIdReplicationStateTransitionLock, MODE_IX, deadline);
-        if (_result != LOCK_OK) {
-            if (_opCtx->lockState()->shouldConflictWithSecondaryBatchApplication()) {
-                _pbwm.unlock();
-            }
-            return;
+    if (isLocked()) {
+        // Abandon our snapshot if destruction of the GlobalLock object results in actually
+        // unlocking the global lock. Recursive locking and the two-phase locking protocol may
+        // prevent lock release.
+        const bool willReleaseLock =
+            !locker->isGlobalLockedRecursively() && !locker->inAWriteUnitOfWork();
+        if (willReleaseLock) {
+            shard_role_details::getRecoveryUnit(_opCtx)->abandonSnapshot();
         }
-
-        // At this point the RSTL is locked and must be unlocked if acquiring the GlobalLock fails.
-        // We only want to unlock the RSTL if we were interrupted acquiring the GlobalLock and not
-        // if we were interrupted acquiring the RSTL itself. If we were interrupted acquiring the
-        // RSTL then the RSTL will not be locked and we do not want to attempt to unlock it.
-        try {
-            _result = _opCtx->lockState()->lockGlobalBegin(_opCtx, lockMode, deadline);
-        } catch (...) {
-            _opCtx->lockState()->unlock(resourceIdReplicationStateTransitionLock);
-            throw;
-        }
-    } catch (const ExceptionForCat<ErrorCategory::Interruption>&) {
-        // The kLeaveUnlocked behavior suppresses this exception.
-        if (_interruptBehavior == InterruptBehavior::kThrow)
-            throw;
-    }
-}
-
-void Lock::GlobalLock::waitForLockUntil(Date_t deadline) {
-    try {
-        if (_result == LOCK_WAITING) {
-            _result = _opCtx->lockState()->lockGlobalComplete(_opCtx, deadline);
-        }
-
-        if (_result != LOCK_OK) {
-            _opCtx->lockState()->unlock(resourceIdReplicationStateTransitionLock);
-
-            if (_opCtx->lockState()->shouldConflictWithSecondaryBatchApplication()) {
-                _pbwm.unlock();
-            }
-        }
-    } catch (const ExceptionForCat<ErrorCategory::Interruption>&) {
-        _opCtx->lockState()->unlock(resourceIdReplicationStateTransitionLock);
-        // The kLeaveUnlocked behavior suppresses this exception.
-        if (_interruptBehavior == InterruptBehavior::kThrow)
-            throw;
+        _unlock();
     }
 
-    if (_opCtx->lockState()->isWriteLocked()) {
-        GlobalLockAcquisitionTracker::get(_opCtx).setGlobalExclusiveLockTaken();
+    if (!_skipRSTLLock && (lockResult == LOCK_OK || lockResult == LOCK_WAITING)) {
+        locker->unlock(resourceIdReplicationStateTransitionLock);
     }
 }
 
 void Lock::GlobalLock::_unlock() {
-    _opCtx->lockState()->unlockGlobal();
+    shard_role_details::getLocker(_opCtx)->unlockGlobal();
     _result = LOCK_INVALID;
 }
 
-Lock::DBLock::DBLock(OperationContext* opCtx, StringData db, LockMode mode, Date_t deadline)
-    : _id(RESOURCE_DATABASE, db),
+Lock::TenantLock::TenantLock(OperationContext* opCtx,
+                             const TenantId& tenantId,
+                             LockMode mode,
+                             Date_t deadline)
+    : _id{RESOURCE_TENANT, tenantId}, _opCtx{opCtx} {
+    dassert(shard_role_details::getLocker(_opCtx)->isLockHeldForMode(
+        resourceIdGlobal, isSharedLockMode(mode) ? MODE_IS : MODE_IX));
+    shard_role_details::getLocker(_opCtx)->lock(_opCtx, _id, mode, deadline);
+}
+
+Lock::TenantLock::TenantLock(TenantLock&& otherLock)
+    : _id(otherLock._id), _opCtx(otherLock._opCtx) {
+    otherLock._opCtx = nullptr;
+}
+
+Lock::TenantLock::~TenantLock() {
+    if (_opCtx) {
+        shard_role_details::getLocker(_opCtx)->unlock(_id);
+    }
+}
+
+Lock::DBLock::DBLock(OperationContext* opCtx,
+                     const DatabaseName& dbName,
+                     LockMode mode,
+                     Date_t deadline,
+                     boost::optional<LockMode> tenantLockMode)
+    : DBLock(opCtx, dbName, mode, deadline, DBLockSkipOptions{}, tenantLockMode) {}
+
+Lock::DBLock::DBLock(OperationContext* opCtx,
+                     const DatabaseName& dbName,
+                     LockMode mode,
+                     Date_t deadline,
+                     DBLockSkipOptions options,
+                     boost::optional<LockMode> tenantLockMode)
+    : _id(RESOURCE_DATABASE, dbName),
       _opCtx(opCtx),
       _result(LOCK_INVALID),
       _mode(mode),
-      _globalLock(
-          opCtx, isSharedLockMode(_mode) ? MODE_IS : MODE_IX, deadline, InterruptBehavior::kThrow) {
-    massert(28539, "need a valid database name", !db.empty() && nsIsDbOnly(db));
+      _oldBlockingAllowed(shard_role_details::getRecoveryUnit((_opCtx))->getBlockingAllowed()) {
 
-    if (!_globalLock.isLocked()) {
-        invariant(deadline != Date_t::max() || _opCtx->lockState()->hasMaxLockTimeout());
-        return;
+    _globalLock.emplace(opCtx,
+                        isSharedLockMode(_mode) ? MODE_IS : MODE_IX,
+                        deadline,
+                        InterruptBehavior::kThrow,
+                        std::move(options));
+
+    massert(28539, "need a valid database name", !dbName.isEmpty());
+
+    tassert(6671501,
+            str::stream() << "Tenant lock mode " << modeName(*tenantLockMode)
+                          << " specified for database " << dbName.toStringForErrorMsg()
+                          << " that does not belong to a tenant",
+            !tenantLockMode || dbName.tenantId());
+
+    // Acquire the tenant lock.
+    if (dbName.tenantId()) {
+        const auto effectiveTenantLockMode = [&]() {
+            const auto defaultTenantLockMode = isSharedLockMode(_mode) ? MODE_IS : MODE_IX;
+            if (tenantLockMode) {
+                tassert(6671505,
+                        str::stream() << "Requested tenant lock mode " << modeName(*tenantLockMode)
+                                      << " that is weaker than the default one  "
+                                      << modeName(defaultTenantLockMode) << " for database "
+                                      << dbName.toStringForErrorMsg() << " of tenant  "
+                                      << dbName.tenantId()->toString(),
+                        isModeCovered(defaultTenantLockMode, *tenantLockMode));
+                return *tenantLockMode;
+            } else {
+                return defaultTenantLockMode;
+            }
+        }();
+        _tenantLock.emplace(opCtx, *dbName.tenantId(), effectiveTenantLockMode, deadline);
     }
 
-    // The check for the admin db is to ensure direct writes to auth collections
-    // are serialized (see SERVER-16092).
-    if ((_id == resourceIdAdminDB) && !isSharedLockMode(_mode)) {
-        _mode = MODE_X;
+    shard_role_details::getLocker(_opCtx)->lock(_opCtx, _id, _mode, deadline);
+
+    // If a user operation on secondaries acquires a lock in MODE_S and then blocks on a prepare
+    // conflict with a prepared transaction, a deadlock will occur at the commit time of the
+    // prepared transaction when it attempts to reacquire (since locks were yielded on
+    // secondaries) an IX lock that conflicts with the MODE_S lock held by the user operation.
+    // User operations that acquire MODE_X locks and block on prepare conflicts could lead to
+    // the same problem. However, user operations on secondaries should never hold MODE_X locks, but
+    // we add it here for completeness. Since prepared transactions reacquire database locks at
+    // commit time, instruct the storage engine that it may not block on prepared transactions.
+    if (mode == MODE_X || mode == MODE_S) {
+        shard_role_details::getRecoveryUnit((_opCtx))->setBlockingAllowed(false);
     }
 
-    _result = _opCtx->lockState()->lock(_opCtx, _id, _mode, deadline);
-    invariant(_result == LOCK_OK || _result == LOCK_TIMEOUT);
+    _result = LOCK_OK;
 }
 
 Lock::DBLock::DBLock(DBLock&& otherLock)
@@ -259,98 +276,65 @@ Lock::DBLock::DBLock(DBLock&& otherLock)
       _opCtx(otherLock._opCtx),
       _result(otherLock._result),
       _mode(otherLock._mode),
-      _globalLock(std::move(otherLock._globalLock)) {
+      _globalLock(std::move(otherLock._globalLock)),
+      _tenantLock(std::move(otherLock._tenantLock)),
+      _oldBlockingAllowed(otherLock._oldBlockingAllowed) {
     // Mark as moved so the destructor doesn't invalidate the newly-constructed lock.
     otherLock._result = LOCK_INVALID;
 }
 
 Lock::DBLock::~DBLock() {
     if (isLocked()) {
-        _opCtx->lockState()->unlock(_id);
+        shard_role_details::getLocker(_opCtx)->unlock(_id);
+        shard_role_details::getRecoveryUnit((_opCtx))->setBlockingAllowed(_oldBlockingAllowed);
     }
 }
 
-void Lock::DBLock::relockWithMode(LockMode newMode) {
-    // 2PL would delay the unlocking
-    invariant(!_opCtx->lockState()->inAWriteUnitOfWork());
-
-    // Not allowed to change global intent
-    invariant(!isSharedLockMode(_mode) || isSharedLockMode(newMode));
-
-    _opCtx->lockState()->unlock(_id);
-    _mode = newMode;
-
-    invariant(LOCK_OK == _opCtx->lockState()->lock(_opCtx, _id, _mode));
-}
-
-
-Lock::CollectionLock::CollectionLock(Locker* lockState,
-                                     StringData ns,
+Lock::CollectionLock::CollectionLock(OperationContext* opCtx,
+                                     const NamespaceString& ns,
                                      LockMode mode,
                                      Date_t deadline)
-    : _id(RESOURCE_COLLECTION, ns), _result(LOCK_INVALID), _lockState(lockState) {
-    massert(28538, "need a non-empty collection name", nsIsFull(ns));
+    : _id(RESOURCE_COLLECTION, ns),
+      _opCtx(opCtx),
+      _oldBlockingAllowed(shard_role_details::getRecoveryUnit((_opCtx))->getBlockingAllowed()) {
+    invariant(!ns.coll().empty());
+    dassert(shard_role_details::getLocker(_opCtx)->isDbLockedForMode(
+        ns.dbName(), isSharedLockMode(mode) ? MODE_IS : MODE_IX));
 
-    dassert(_lockState->isDbLockedForMode(nsToDatabaseSubstring(ns),
-                                          isSharedLockMode(mode) ? MODE_IS : MODE_IX));
-    LockMode actualLockMode = mode;
-    if (!supportsDocLocking()) {
-        actualLockMode = isSharedLockMode(mode) ? MODE_S : MODE_X;
+    shard_role_details::getLocker(_opCtx)->lock(_opCtx, _id, mode, deadline);
+
+    // If a user operation on secondaries acquires a lock in MODE_S and then blocks on a prepare
+    // conflict with a prepared transaction, a deadlock will occur at the commit time of the
+    // prepared transaction when it attempts to reacquire (since locks were yielded on
+    // secondaries) an IX lock that conflicts with the MODE_S lock held by the user operation.
+    // User operations that acquire MODE_X locks and block on prepare conflicts could lead to
+    // the same problem. However, user operations on secondaries should never hold MODE_X locks, but
+    // we add it here for completeness. Since prepared transactions reacquire collection locks at
+    // commit time, instruct the storage engine that it may not block on prepared transactions.
+    if (mode == MODE_X || mode == MODE_S) {
+        shard_role_details::getRecoveryUnit((_opCtx))->setBlockingAllowed(false);
     }
-
-    _result = _lockState->lock(_id, actualLockMode, deadline);
-    invariant(_result == LOCK_OK || _result == LOCK_TIMEOUT);
 }
 
 Lock::CollectionLock::CollectionLock(CollectionLock&& otherLock)
-    : _id(otherLock._id), _result(otherLock._result), _lockState(otherLock._lockState) {
-    otherLock._lockState = nullptr;
-    otherLock._result = LOCK_INVALID;
+    : _id(otherLock._id),
+      _opCtx(otherLock._opCtx),
+      _oldBlockingAllowed(otherLock._oldBlockingAllowed) {
+    otherLock._opCtx = nullptr;
+}
+
+Lock::CollectionLock& Lock::CollectionLock::operator=(CollectionLock&& other) {
+    _id = other._id;
+    _opCtx = other._opCtx;
+    _oldBlockingAllowed = other._oldBlockingAllowed;
+    other._opCtx = nullptr;
+    return *this;
 }
 
 Lock::CollectionLock::~CollectionLock() {
-    if (isLocked()) {
-        _lockState->unlock(_id);
-    }
-}
-
-namespace {
-stdx::mutex oplogSerialization;  // for OplogIntentWriteLock
-}  // namespace
-
-Lock::OplogIntentWriteLock::OplogIntentWriteLock(Locker* lockState)
-    : _lockState(lockState), _serialized(false) {
-    _lockState->lock(resourceIdOplog, MODE_IX);
-}
-
-Lock::OplogIntentWriteLock::~OplogIntentWriteLock() {
-    if (_serialized) {
-        oplogSerialization.unlock();
-    }
-    _lockState->unlock(resourceIdOplog);
-}
-
-void Lock::OplogIntentWriteLock::serializeIfNeeded() {
-    if (!supportsDocLocking() && !_serialized) {
-        oplogSerialization.lock();
-        _serialized = true;
-    }
-}
-
-Lock::ParallelBatchWriterMode::ParallelBatchWriterMode(Locker* lockState)
-    : _pbwm(lockState, resourceIdParallelBatchWriterMode, MODE_X),
-      _shouldNotConflictBlock(lockState) {}
-
-void Lock::ResourceLock::lock(LockMode mode) {
-    invariant(_result == LOCK_INVALID);
-    _result = _locker->lock(_rid, mode);
-    invariant(_result == LOCK_OK);
-}
-
-void Lock::ResourceLock::unlock() {
-    if (_result == LOCK_OK) {
-        _locker->unlock(_rid);
-        _result = LOCK_INVALID;
+    if (_opCtx) {
+        shard_role_details::getLocker(_opCtx)->unlock(_id);
+        shard_role_details::getRecoveryUnit((_opCtx))->setBlockingAllowed(_oldBlockingAllowed);
     }
 }
 

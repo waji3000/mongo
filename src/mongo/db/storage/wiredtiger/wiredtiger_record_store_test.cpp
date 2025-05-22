@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,50 +27,57 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include <memory>
-#include <sstream>
+#include <algorithm>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <cstring>
+#include <iterator>
 #include <string>
-#include <time.h>
+#include <utility>
+#include <wiredtiger.h>
 
 #include "mongo/base/checked_cast.h"
-#include "mongo/base/init.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/base/init.h"  // IWYU pragma: keep
 #include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobjbuilder.h"
-#include "mongo/db/concurrency/write_conflict_exception.h"
-#include "mongo/db/json.h"
-#include "mongo/db/operation_context_noop.h"
-#include "mongo/db/storage/kv/kv_prefix.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/bson/json.h"
+#include "mongo/db/client.h"
+#include "mongo/db/global_settings.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/storage/kv/kv_engine.h"
 #include "mongo/db/storage/record_store_test_harness.h"
+#include "mongo/db/storage/recovery_unit.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_kv_engine.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_oplog_manager.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_record_store.h"
-#include "mongo/db/storage/wiredtiger/wiredtiger_record_store_oplog_stones.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_record_store_test_harness.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_recovery_unit.h"
-#include "mongo/db/storage/wiredtiger/wiredtiger_size_storer.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_util.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/unittest/temp_dir.h"
+#include "mongo/db/transaction_resources.h"
+#include "mongo/stdx/thread.h"
+#include "mongo/unittest/barrier.h"
+#include "mongo/unittest/death_test.h"
 #include "mongo/unittest/unittest.h"
-#include "mongo/util/fail_point.h"
-#include "mongo/util/scopeguard.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 namespace {
 
-using std::unique_ptr;
-using std::string;
-using std::stringstream;
-
 TEST(WiredTigerRecordStoreTest, GenerateCreateStringEmptyDocument) {
     BSONObj spec = fromjson("{}");
-    StatusWith<std::string> result = WiredTigerRecordStore::parseOptionsField(spec);
+    StatusWith<std::string> result = WiredTigerRecordStoreBase::parseOptionsField(spec);
     ASSERT_OK(result.getStatus());
     ASSERT_EQ(result.getValue(), "");  // "," would also be valid.
 }
 
 TEST(WiredTigerRecordStoreTest, GenerateCreateStringUnknownField) {
     BSONObj spec = fromjson("{unknownField: 1}");
-    StatusWith<std::string> result = WiredTigerRecordStore::parseOptionsField(spec);
+    StatusWith<std::string> result = WiredTigerRecordStoreBase::parseOptionsField(spec);
     const Status& status = result.getStatus();
     ASSERT_NOT_OK(status);
     ASSERT_EQUALS(ErrorCodes::InvalidOptions, status);
@@ -79,7 +85,7 @@ TEST(WiredTigerRecordStoreTest, GenerateCreateStringUnknownField) {
 
 TEST(WiredTigerRecordStoreTest, GenerateCreateStringNonStringConfig) {
     BSONObj spec = fromjson("{configString: 12345}");
-    StatusWith<std::string> result = WiredTigerRecordStore::parseOptionsField(spec);
+    StatusWith<std::string> result = WiredTigerRecordStoreBase::parseOptionsField(spec);
     const Status& status = result.getStatus();
     ASSERT_NOT_OK(status);
     ASSERT_EQUALS(ErrorCodes::TypeMismatch, status);
@@ -87,33 +93,33 @@ TEST(WiredTigerRecordStoreTest, GenerateCreateStringNonStringConfig) {
 
 TEST(WiredTigerRecordStoreTest, GenerateCreateStringEmptyConfigString) {
     BSONObj spec = fromjson("{configString: ''}");
-    StatusWith<std::string> result = WiredTigerRecordStore::parseOptionsField(spec);
+    StatusWith<std::string> result = WiredTigerRecordStoreBase::parseOptionsField(spec);
     ASSERT_OK(result.getStatus());
     ASSERT_EQ(result.getValue(), ",");  // "" would also be valid.
 }
 
 TEST(WiredTigerRecordStoreTest, GenerateCreateStringInvalidConfigStringOption) {
     BSONObj spec = fromjson("{configString: 'abc=def'}");
-    ASSERT_EQ(WiredTigerRecordStore::parseOptionsField(spec), ErrorCodes::BadValue);
+    ASSERT_EQ(WiredTigerRecordStoreBase::parseOptionsField(spec), ErrorCodes::BadValue);
 }
 
 TEST(WiredTigerRecordStoreTest, GenerateCreateStringValidConfigStringOption) {
     BSONObj spec = fromjson("{configString: 'prefix_compression=true'}");
-    ASSERT_EQ(WiredTigerRecordStore::parseOptionsField(spec),
+    ASSERT_EQ(WiredTigerRecordStoreBase::parseOptionsField(spec),
               std::string("prefix_compression=true,"));
 }
 
 TEST(WiredTigerRecordStoreTest, Isolation1) {
     const auto harnessHelper(newRecordStoreHarnessHelper());
-    unique_ptr<RecordStore> rs(harnessHelper->newNonCappedRecordStore());
-
+    std::unique_ptr<RecordStore> rs(harnessHelper->newRecordStore());
     RecordId id1;
     RecordId id2;
 
     {
         ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        auto& ru = *shard_role_details::getRecoveryUnit(opCtx.get());
         {
-            WriteUnitOfWork uow(opCtx.get());
+            StorageWriteTransaction txn(ru);
 
             StatusWith<RecordId> res = rs->insertRecord(opCtx.get(), "a", 2, Timestamp());
             ASSERT_OK(res.getStatus());
@@ -123,17 +129,21 @@ TEST(WiredTigerRecordStoreTest, Isolation1) {
             ASSERT_OK(res.getStatus());
             id2 = res.getValue();
 
-            uow.commit();
+            txn.commit();
         }
     }
 
     {
-        ServiceContext::UniqueOperationContext t1(harnessHelper->newOperationContext());
-        auto client2 = harnessHelper->serviceContext()->makeClient("c2");
-        auto t2 = harnessHelper->newOperationContext(client2.get());
+        auto client1 = harnessHelper->serviceContext()->getService()->makeClient("c1");
+        auto t1 = harnessHelper->newOperationContext(client1.get());
+        auto& ru1 = *shard_role_details::getRecoveryUnit(t1.get());
 
-        unique_ptr<WriteUnitOfWork> w1(new WriteUnitOfWork(t1.get()));
-        unique_ptr<WriteUnitOfWork> w2(new WriteUnitOfWork(t2.get()));
+        auto client2 = harnessHelper->serviceContext()->getService()->makeClient("c2");
+        auto t2 = harnessHelper->newOperationContext(client2.get());
+        auto& ru2 = *shard_role_details::getRecoveryUnit(t2.get());
+
+        auto w1 = std::make_unique<StorageWriteTransaction>(ru1);
+        auto w2 = std::make_unique<StorageWriteTransaction>(ru2);
 
         rs->dataFor(t1.get(), id1);
         rs->dataFor(t2.get(), id1);
@@ -145,9 +155,9 @@ TEST(WiredTigerRecordStoreTest, Isolation1) {
             // this should fail
             rs->updateRecord(t2.get(), id1, "c", 2).transitional_ignore();
             ASSERT(0);
-        } catch (WriteConflictException&) {
-            w2.reset(NULL);
-            t2.reset(NULL);
+        } catch (const StorageUnavailableException&) {
+            w2.reset();
+            t2.reset();
         }
 
         w1->commit();  // this should succeed
@@ -156,15 +166,16 @@ TEST(WiredTigerRecordStoreTest, Isolation1) {
 
 TEST(WiredTigerRecordStoreTest, Isolation2) {
     const auto harnessHelper(newRecordStoreHarnessHelper());
-    unique_ptr<RecordStore> rs(harnessHelper->newNonCappedRecordStore());
+    std::unique_ptr<RecordStore> rs(harnessHelper->newRecordStore());
 
     RecordId id1;
     RecordId id2;
 
     {
         ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        auto& ru = *shard_role_details::getRecoveryUnit(opCtx.get());
         {
-            WriteUnitOfWork uow(opCtx.get());
+            StorageWriteTransaction txn(ru);
 
             StatusWith<RecordId> res = rs->insertRecord(opCtx.get(), "a", 2, Timestamp());
             ASSERT_OK(res.getStatus());
@@ -174,99 +185,49 @@ TEST(WiredTigerRecordStoreTest, Isolation2) {
             ASSERT_OK(res.getStatus());
             id2 = res.getValue();
 
-            uow.commit();
+            txn.commit();
         }
     }
 
     {
-        ServiceContext::UniqueOperationContext t1(harnessHelper->newOperationContext());
-        auto client2 = harnessHelper->serviceContext()->makeClient("c2");
+        auto client1 = harnessHelper->serviceContext()->getService()->makeClient("c1");
+        auto t1 = harnessHelper->newOperationContext(client1.get());
+        auto& ru1 = *shard_role_details::getRecoveryUnit(t1.get());
+
+        auto client2 = harnessHelper->serviceContext()->getService()->makeClient("c2");
         auto t2 = harnessHelper->newOperationContext(client2.get());
+        auto& ru2 = *shard_role_details::getRecoveryUnit(t2.get());
 
         // ensure we start transactions
         rs->dataFor(t1.get(), id2);
         rs->dataFor(t2.get(), id2);
 
         {
-            WriteUnitOfWork w(t1.get());
+            StorageWriteTransaction w(ru1);
             ASSERT_OK(rs->updateRecord(t1.get(), id1, "b", 2));
             w.commit();
         }
 
         {
-            WriteUnitOfWork w(t2.get());
-            ASSERT_EQUALS(string("a"), rs->dataFor(t2.get(), id1).data());
+            StorageWriteTransaction w(ru2);
+            ASSERT_EQUALS(std::string("a"), rs->dataFor(t2.get(), id1).data());
             try {
                 // this should fail as our version of id1 is too old
                 rs->updateRecord(t2.get(), id1, "c", 2).transitional_ignore();
                 ASSERT(0);
-            } catch (WriteConflictException&) {
+            } catch (const StorageUnavailableException&) {
             }
         }
     }
 }
 
-
-StatusWith<RecordId> insertBSON(ServiceContext::UniqueOperationContext& opCtx,
-                                unique_ptr<RecordStore>& rs,
-                                const Timestamp& opTime) {
-    BSONObj obj = BSON("ts" << opTime);
-    WriteUnitOfWork wuow(opCtx.get());
-    WiredTigerRecordStore* wrs = checked_cast<WiredTigerRecordStore*>(rs.get());
-    invariant(wrs);
-    Status status = wrs->oplogDiskLocRegister(opCtx.get(), opTime, false);
-    if (!status.isOK())
-        return StatusWith<RecordId>(status);
-    StatusWith<RecordId> res = rs->insertRecord(opCtx.get(), obj.objdata(), obj.objsize(), opTime);
-    if (res.isOK())
-        wuow.commit();
-    return res;
-}
-
-TEST(WiredTigerRecordStoreTest, CappedCursorRollover) {
-    unique_ptr<RecordStoreHarnessHelper> harnessHelper(newRecordStoreHarnessHelper());
-    unique_ptr<RecordStore> rs(harnessHelper->newCappedRecordStore("a.b", 10000, 5));
-
-    {  // first insert 3 documents
-        ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
-        for (int i = 0; i < 3; ++i) {
-            WriteUnitOfWork uow(opCtx.get());
-            StatusWith<RecordId> res = rs->insertRecord(opCtx.get(), "a", 2, Timestamp());
-            ASSERT_OK(res.getStatus());
-            uow.commit();
-        }
-    }
-
-    // set up our cursor that should rollover
-
-    auto client2 = harnessHelper->serviceContext()->makeClient("c2");
-    auto cursorCtx = harnessHelper->newOperationContext(client2.get());
-    auto cursor = rs->getCursor(cursorCtx.get());
-    ASSERT(cursor->next());
-    cursor->save();
-    cursorCtx->recoveryUnit()->abandonSnapshot();
-
-    {  // insert 100 documents which causes rollover
-        auto client3 = harnessHelper->serviceContext()->makeClient("c3");
-        auto opCtx = harnessHelper->newOperationContext(client3.get());
-        for (int i = 0; i < 100; i++) {
-            WriteUnitOfWork uow(opCtx.get());
-            StatusWith<RecordId> res = rs->insertRecord(opCtx.get(), "a", 2, Timestamp());
-            ASSERT_OK(res.getStatus());
-            uow.commit();
-        }
-    }
-
-    // cursor should now be dead
-    ASSERT_FALSE(cursor->restore());
-    ASSERT(!cursor->next());
-}
-
-RecordId _oplogOrderInsertOplog(OperationContext* opCtx,
-                                const unique_ptr<RecordStore>& rs,
-                                int inc) {
+RecordId oplogOrderInsertOplog(OperationContext* opCtx,
+                               KVEngine* engine,
+                               const std::unique_ptr<RecordStore>& rs,
+                               int inc) {
     Timestamp opTime = Timestamp(5, inc);
-    Status status = rs->oplogDiskLocRegister(opCtx, opTime, false);
+    Status status = engine->oplogDiskLocRegister(
+        *shard_role_details::getRecoveryUnit(opCtx), rs.get(), opTime, false);
     ASSERT_OK(status);
     BSONObj obj = BSON("ts" << opTime);
     StatusWith<RecordId> res = rs->insertRecord(opCtx, obj.objdata(), obj.objsize(), opTime);
@@ -274,91 +235,122 @@ RecordId _oplogOrderInsertOplog(OperationContext* opCtx,
     return res.getValue();
 }
 
-// Test that even when the oplog durability loop is paused, we can still advance the commit point as
-// long as the commit for each insert comes before the next insert starts.
+/**
+ * Test that even when the oplog durability loop is paused, we can still advance the commit point as
+ * long as the commit for each insert comes before the next insert starts.
+ */
 TEST(WiredTigerRecordStoreTest, OplogDurableVisibilityInOrder) {
-    ON_BLOCK_EXIT([] { WTPausePrimaryOplogDurabilityLoop.setMode(FailPoint::off); });
-    WTPausePrimaryOplogDurabilityLoop.setMode(FailPoint::alwaysOn);
+    {
+        // Set replset settings before creation of underlying WiredTigerKvEngine
+        repl::ReplSettings replSettings;
+        replSettings.setReplSetString("realReplicaSet");
+        setGlobalReplSettings(replSettings);
+    }
+    std::unique_ptr<RecordStoreHarnessHelper> harnessHelper(newRecordStoreHarnessHelper());
+    std::unique_ptr<RecordStore> rs(harnessHelper->newOplogRecordStore());
+    auto engine = static_cast<WiredTigerKVEngine*>(harnessHelper->getEngine());
+    engine->getOplogManager()->stop();
+    {
+        // Settings are remembered by the engine, reset now to avoid contaminating other tests
+        repl::ReplSettings replSettings;
+        setGlobalReplSettings(replSettings);
+    }
 
-    unique_ptr<RecordStoreHarnessHelper> harnessHelper(newRecordStoreHarnessHelper());
-    unique_ptr<RecordStore> rs(harnessHelper->newCappedRecordStore("local.oplog.rs", 100000, -1));
-    auto wtrs = checked_cast<WiredTigerRecordStore*>(rs.get());
+    auto isOpHidden = [&engine](const RecordId& id) {
+        return engine->getOplogManager()->getOplogReadTimestamp() <
+            static_cast<std::uint64_t>(id.getLong());
+    };
 
     {
         ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
-        WriteUnitOfWork uow(opCtx.get());
-        RecordId id = _oplogOrderInsertOplog(opCtx.get(), rs, 1);
-        ASSERT(wtrs->isOpHidden_forTest(id));
-        uow.commit();
-        ASSERT(wtrs->isOpHidden_forTest(id));
+        auto& ru = *shard_role_details::getRecoveryUnit(opCtx.get());
+        StorageWriteTransaction txn(ru);
+        RecordId id = oplogOrderInsertOplog(opCtx.get(), engine, rs, 1);
+        ASSERT(isOpHidden(id));
+        txn.commit();
+        ASSERT(isOpHidden(id));
     }
 
     {
         ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
-        WriteUnitOfWork uow(opCtx.get());
-        RecordId id = _oplogOrderInsertOplog(opCtx.get(), rs, 2);
-        ASSERT(wtrs->isOpHidden_forTest(id));
-        uow.commit();
-        ASSERT(wtrs->isOpHidden_forTest(id));
+        auto& ru = *shard_role_details::getRecoveryUnit(opCtx.get());
+        StorageWriteTransaction txn(ru);
+        RecordId id = oplogOrderInsertOplog(opCtx.get(), engine, rs, 2);
+        ASSERT(isOpHidden(id));
+        txn.commit();
+        ASSERT(isOpHidden(id));
     }
 }
 
-// Test that Oplog entries inserted while there are hidden entries do not become visible until the
-// op and all earlier ops are durable.
+/**
+ * Test that Oplog entries inserted while there are hidden entries do not become visible until the
+ * op and all earlier ops are durable.
+ */
 TEST(WiredTigerRecordStoreTest, OplogDurableVisibilityOutOfOrder) {
-    ON_BLOCK_EXIT([] { WTPausePrimaryOplogDurabilityLoop.setMode(FailPoint::off); });
-    WTPausePrimaryOplogDurabilityLoop.setMode(FailPoint::alwaysOn);
+    {
+        // Set replset settings before creation of underlying WiredTigerKvEngine
+        repl::ReplSettings replSettings;
+        replSettings.setReplSetString("realReplicaSet");
+        setGlobalReplSettings(replSettings);
+    }
+    std::unique_ptr<RecordStoreHarnessHelper> harnessHelper(newRecordStoreHarnessHelper());
+    std::unique_ptr<RecordStore> rs(harnessHelper->newOplogRecordStore());
+    auto engine = static_cast<WiredTigerKVEngine*>(harnessHelper->getEngine());
+    engine->getOplogManager()->stop();
+    {
+        // Settings are remembered by the engine, reset now to avoid contaminating other tests
+        repl::ReplSettings replSettings;
+        setGlobalReplSettings(replSettings);
+    }
 
-    unique_ptr<RecordStoreHarnessHelper> harnessHelper(newRecordStoreHarnessHelper());
-    unique_ptr<RecordStore> rs(harnessHelper->newCappedRecordStore("local.oplog.rs", 100000, -1));
-
-    auto wtrs = checked_cast<WiredTigerRecordStore*>(rs.get());
+    auto isOpHidden = [&engine](const RecordId& id) {
+        return engine->getOplogManager()->getOplogReadTimestamp() <
+            static_cast<std::uint64_t>(id.getLong());
+    };
 
     ServiceContext::UniqueOperationContext longLivedOp(harnessHelper->newOperationContext());
-    WriteUnitOfWork uow(longLivedOp.get());
-    RecordId id1 = _oplogOrderInsertOplog(longLivedOp.get(), rs, 1);
-    ASSERT(wtrs->isOpHidden_forTest(id1));
+    auto& longLivedRu = *shard_role_details::getRecoveryUnit(longLivedOp.get());
+    StorageWriteTransaction txn(longLivedRu);
+    RecordId id1 = oplogOrderInsertOplog(longLivedOp.get(), engine, rs, 1);
+    ASSERT(isOpHidden(id1));
 
 
     RecordId id2;
     {
-        auto innerClient = harnessHelper->serviceContext()->makeClient("inner");
+        auto innerClient = harnessHelper->serviceContext()->getService()->makeClient("inner");
         ServiceContext::UniqueOperationContext opCtx(
             harnessHelper->newOperationContext(innerClient.get()));
-        WriteUnitOfWork uow(opCtx.get());
-        id2 = _oplogOrderInsertOplog(opCtx.get(), rs, 2);
-        ASSERT(wtrs->isOpHidden_forTest(id2));
-        uow.commit();
+        auto& ru = *shard_role_details::getRecoveryUnit(opCtx.get());
+        StorageWriteTransaction txn(ru);
+        id2 = oplogOrderInsertOplog(opCtx.get(), engine, rs, 2);
+        ASSERT(isOpHidden(id2));
+        txn.commit();
     }
 
-    ASSERT(wtrs->isOpHidden_forTest(id1));
-    ASSERT(wtrs->isOpHidden_forTest(id2));
+    ASSERT(isOpHidden(id1));
+    ASSERT(isOpHidden(id2));
 
-    uow.commit();
+    txn.commit();
 
-    ASSERT(wtrs->isOpHidden_forTest(id1));
-    ASSERT(wtrs->isOpHidden_forTest(id2));
+    ASSERT(isOpHidden(id1));
+    ASSERT(isOpHidden(id2));
 
-    // Wait a bit and check again to make sure they don't become visible automatically.
-    sleepsecs(1);
-    ASSERT(wtrs->isOpHidden_forTest(id1));
-    ASSERT(wtrs->isOpHidden_forTest(id2));
+    engine->getOplogManager()->start(
+        longLivedOp.get(), *engine, *rs, getGlobalReplSettings().isReplSet());
+    engine->waitForAllEarlierOplogWritesToBeVisible(longLivedOp.get(), rs.get());
 
-    WTPausePrimaryOplogDurabilityLoop.setMode(FailPoint::off);
-
-    rs->waitForAllEarlierOplogWritesToBeVisible(longLivedOp.get());
-
-    ASSERT(!wtrs->isOpHidden_forTest(id1));
-    ASSERT(!wtrs->isOpHidden_forTest(id2));
+    ASSERT_FALSE(isOpHidden(id1));
+    ASSERT_FALSE(isOpHidden(id2));
 }
 
 TEST(WiredTigerRecordStoreTest, AppendCustomStatsMetadata) {
     std::unique_ptr<RecordStoreHarnessHelper> harnessHelper = newRecordStoreHarnessHelper();
-    unique_ptr<RecordStore> rs(harnessHelper->newNonCappedRecordStore("a.b"));
+    std::unique_ptr<RecordStore> rs(harnessHelper->newRecordStore("a.b"));
 
     ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+    auto& ru = *shard_role_details::getRecoveryUnit(opCtx.get());
     BSONObjBuilder builder;
-    rs->appendCustomStats(opCtx.get(), &builder, 1.0);
+    rs->appendAllCustomStats(ru, &builder, 1.0);
     BSONObj customStats = builder.obj();
 
     BSONElement wiredTigerElement = customStats.getField(kWiredTigerEngineName);
@@ -376,32 +368,29 @@ TEST(WiredTigerRecordStoreTest, AppendCustomStatsMetadata) {
     ASSERT_EQUALS(creationStringElement.type(), String);
 }
 
-TEST(WiredTigerRecordStoreTest, CappedCursorYieldFirst) {
-    unique_ptr<RecordStoreHarnessHelper> harnessHelper(newRecordStoreHarnessHelper());
-    unique_ptr<RecordStore> rs(harnessHelper->newCappedRecordStore("a.b", 10000, 50));
+TEST(WiredTigerRecordStoreTest, AppendCustomNumericStats) {
+    std::unique_ptr<RecordStoreHarnessHelper> harnessHelper = newRecordStoreHarnessHelper();
+    std::unique_ptr<RecordStore> rs(harnessHelper->newRecordStore("a.c"));
 
-    RecordId id1;
+    ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+    auto& ru = *shard_role_details::getRecoveryUnit(opCtx.get());
+    BSONObjBuilder builder;
+    rs->appendNumericCustomStats(ru, &builder, 1.0);
+    BSONObj customStats = builder.obj();
 
-    {  // first insert a document
-        ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
-        WriteUnitOfWork uow(opCtx.get());
-        StatusWith<RecordId> res = rs->insertRecord(opCtx.get(), "a", 2, Timestamp());
-        ASSERT_OK(res.getStatus());
-        id1 = res.getValue();
-        uow.commit();
-    }
+    BSONElement wiredTigerElement = customStats.getField(kWiredTigerEngineName);
+    ASSERT_TRUE(wiredTigerElement.isABSONObj());
+    BSONObj wiredTiger = wiredTigerElement.Obj();
 
-    ServiceContext::UniqueOperationContext cursorCtx(harnessHelper->newOperationContext());
-    auto cursor = rs->getCursor(cursorCtx.get());
+    ASSERT_FALSE(wiredTiger.hasField("metadata"));
+    ASSERT_FALSE(wiredTiger.hasField("creationString"));
 
-    // See that things work if you yield before you first call next().
-    cursor->save();
-    cursorCtx->recoveryUnit()->abandonSnapshot();
-    ASSERT_TRUE(cursor->restore());
-    auto record = cursor->next();
-    ASSERT(record);
-    ASSERT_EQ(id1, record->id);
-    ASSERT(!cursor->next());
+    BSONElement cacheElement = wiredTiger.getField("cache");
+    ASSERT_TRUE(cacheElement.isABSONObj());
+    BSONObj cache = cacheElement.Obj();
+
+    BSONElement bytesElement = cache.getField("bytes currently in the cache");
+    ASSERT_TRUE(bytesElement.isNumber());
 }
 
 BSONObj makeBSONObjWithSize(const Timestamp& opTime, int size, char fill = 'x') {
@@ -416,456 +405,495 @@ BSONObj makeBSONObjWithSize(const Timestamp& opTime, int size, char fill = 'x') 
     return obj;
 }
 
-StatusWith<RecordId> insertBSONWithSize(OperationContext* opCtx,
-                                        RecordStore* rs,
-                                        const Timestamp& opTime,
-                                        int size) {
+StatusWith<RecordId> insertBSONWithSize(
+    OperationContext* opCtx, KVEngine* engine, RecordStore* rs, const Timestamp& opTime, int size) {
     BSONObj obj = makeBSONObjWithSize(opTime, size);
 
-    WriteUnitOfWork wuow(opCtx);
-    WiredTigerRecordStore* wtrs = checked_cast<WiredTigerRecordStore*>(rs);
-    invariant(wtrs);
-    Status status = wtrs->oplogDiskLocRegister(opCtx, opTime, false);
+    auto& ru = *shard_role_details::getRecoveryUnit(opCtx);
+    StorageWriteTransaction txn(ru);
+    WiredTigerRecordStore* wtRS = checked_cast<WiredTigerRecordStore*>(rs);
+    invariant(wtRS);
+    Status status = engine->oplogDiskLocRegister(
+        *shard_role_details::getRecoveryUnit(opCtx), rs, opTime, false);
     if (!status.isOK()) {
         return StatusWith<RecordId>(status);
     }
     StatusWith<RecordId> res = rs->insertRecord(opCtx, obj.objdata(), obj.objsize(), opTime);
     if (res.isOK()) {
-        wuow.commit();
+        txn.commit();
     }
     return res;
 }
 
-// Insert records into an oplog and verify the number of stones that are created.
-TEST(WiredTigerRecordStoreTest, OplogStones_CreateNewStone) {
-    std::unique_ptr<RecordStoreHarnessHelper> harnessHelper = newRecordStoreHarnessHelper();
+void testTruncateRange(int64_t numRecordsToInsert,
+                       int64_t deletionPosBegin,
+                       int64_t deletionPosEnd) {
+    auto harnessHelper = newRecordStoreHarnessHelper();
+    std::unique_ptr<RecordStore> rs(harnessHelper->newRecordStore());
+    auto engine = harnessHelper->getEngine();
 
-    const int64_t cappedMaxSize = 10 * 1024;  // 10KB
-    unique_ptr<RecordStore> rs(
-        harnessHelper->newCappedRecordStore("local.oplog.stones", cappedMaxSize, -1));
+    auto wtRS = checked_cast<WiredTigerRecordStore*>(rs.get());
 
-    WiredTigerRecordStore* wtrs = static_cast<WiredTigerRecordStore*>(rs.get());
-    WiredTigerRecordStore::OplogStones* oplogStones = wtrs->oplogStones();
+    std::vector<RecordId> recordIds;
 
-    oplogStones->setMinBytesPerStone(100);
+    auto opCtx = harnessHelper->newOperationContext();
+    auto& ru = *shard_role_details::getRecoveryUnit(opCtx.get());
 
+    for (int i = 0; i < numRecordsToInsert; i++) {
+        auto recordId = insertBSONWithSize(opCtx.get(), engine, wtRS, Timestamp(1, i), 100);
+        ASSERT_OK(recordId);
+        recordIds.emplace_back(std::move(recordId.getValue()));
+    }
+
+    auto sizePerRecord = wtRS->dataSize() / wtRS->numRecords();
+
+    std::sort(recordIds.begin(), recordIds.end());
+
+    const auto& beginId = recordIds[deletionPosBegin];
+    const auto& endId = recordIds[deletionPosEnd];
+    {
+        StorageWriteTransaction txn(ru);
+
+        auto numRecordsDeleted = deletionPosEnd - deletionPosBegin + 1;
+
+        ASSERT_OK(wtRS->rangeTruncate(
+            opCtx.get(), beginId, endId, -(sizePerRecord * numRecordsDeleted), -numRecordsDeleted));
+
+        ASSERT_EQ(wtRS->dataSize(), sizePerRecord * (numRecordsToInsert - numRecordsDeleted));
+        ASSERT_EQ(wtRS->numRecords(), (numRecordsToInsert - numRecordsDeleted));
+
+        txn.commit();
+    }
+    std::set<RecordId> expectedRemainingRecordIds;
+    std::copy(recordIds.begin(),
+              recordIds.begin() + deletionPosBegin,
+              std::inserter(expectedRemainingRecordIds, expectedRemainingRecordIds.end()));
+    std::copy(recordIds.begin() + deletionPosEnd + 1,
+              recordIds.end(),
+              std::inserter(expectedRemainingRecordIds, expectedRemainingRecordIds.end()));
+
+    std::set<RecordId> actualRemainingRecordIds;
+
+    auto cursor = wtRS->getCursor(opCtx.get(), true);
+    while (auto record = cursor->next()) {
+        actualRemainingRecordIds.emplace(record->id);
+    }
+    ASSERT_EQ(expectedRemainingRecordIds, actualRemainingRecordIds);
+}
+TEST(WiredTigerRecordStoreTest, RangeTruncateTest) {
+    testTruncateRange(100, 3, 50);
+}
+TEST(WiredTigerRecordStoreTest, RangeTruncateSameValueTest) {
+    testTruncateRange(100, 3, 3);
+}
+DEATH_TEST(WiredTigerRecordStoreTest,
+           RangeTruncateIncorrectOrderTest,
+           "Start position cannot be after end position") {
+    testTruncateRange(100, 4, 3);
+}
+
+TEST(WiredTigerRecordStoreTest, GetLatestOplogTest) {
+    std::unique_ptr<RecordStoreHarnessHelper> harnessHelper(newRecordStoreHarnessHelper());
+    std::unique_ptr<RecordStore> rs(harnessHelper->newOplogRecordStore());
+    auto engine = harnessHelper->getEngine();
+
+    auto wtRS = checked_cast<WiredTigerRecordStore::Oplog*>(rs.get());
+
+    // 1) Initialize the top of oplog to "1".
+    ServiceContext::UniqueOperationContext op1(harnessHelper->newOperationContext());
+    auto& ru1 = *shard_role_details::getRecoveryUnit(op1.get());
+
+    Timestamp tsOne = [&] {
+        StorageWriteTransaction op1Txn(ru1);
+        Timestamp tsOne = Timestamp(static_cast<unsigned long long>(
+            oplogOrderInsertOplog(op1.get(), engine, rs, 1).getLong()));
+        op1Txn.commit();
+        return tsOne;
+    }();
+    // Asserting on a recovery unit without a snapshot.
+    ASSERT_EQ(tsOne, wtRS->getLatestTimestamp(ru1));
+
+    // 2) Open a hole at time "2".
+    boost::optional<StorageWriteTransaction> op1txn(ru1);
+    // Don't save the return value because the compiler complains about unused variables.
+    oplogOrderInsertOplog(op1.get(), engine, rs, 2);
+
+    // Store the client with an uncommitted transaction. Create a new, concurrent client.
+    auto client1 = Client::releaseCurrent();
+    Client::initThread("client2", getGlobalServiceContext()->getService());
+
+    ServiceContext::UniqueOperationContext op2(harnessHelper->newOperationContext());
+    auto& ru2 = *shard_role_details::getRecoveryUnit(op2.get());
+    // Should not see uncommitted write from op1.
+    ASSERT_EQ(tsOne, wtRS->getLatestTimestamp(ru2));
+
+    Timestamp tsThree = [&] {
+        StorageWriteTransaction op2Txn(ru2);
+        Timestamp tsThree = Timestamp(static_cast<unsigned long long>(
+            oplogOrderInsertOplog(op2.get(), engine, rs, 3).getLong()));
+        op2Txn.commit();
+        return tsThree;
+    }();
+    // After committing, three is the top of oplog.
+    ASSERT_EQ(tsThree, wtRS->getLatestTimestamp(ru2));
+
+    // Switch to client 1.
+    op2.reset();
+    auto client2 = Client::releaseCurrent();
+    Client::setCurrent(std::move(client1));
+
+    op1txn->commit();
+    // Committing the write at timestamp "2" does not change the top of oplog result. A new query
+    // with client 1 will see timestamp "3".
+    ASSERT_EQ(tsThree, wtRS->getLatestTimestamp(ru1));
+}
+
+TEST(WiredTigerRecordStoreTest, CursorInActiveTxnAfterNext) {
+    std::unique_ptr<RecordStoreHarnessHelper> harnessHelper(newRecordStoreHarnessHelper());
+    std::unique_ptr<RecordStore> rs(harnessHelper->newRecordStore());
+
+    RecordId rid1;
+    {
+        ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        auto& ru = *shard_role_details::getRecoveryUnit(opCtx.get());
+
+        StorageWriteTransaction txn(ru);
+        StatusWith<RecordId> res = rs->insertRecord(opCtx.get(), "a", 2, Timestamp());
+        ASSERT_OK(res.getStatus());
+        rid1 = res.getValue();
+
+        res = rs->insertRecord(opCtx.get(), "b", 2, Timestamp());
+        ASSERT_OK(res.getStatus());
+
+        txn.commit();
+    }
+
+    // Cursors should always ensure they are in an active transaction when next() is called.
     {
         ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
 
-        ASSERT_EQ(0U, oplogStones->numStones());
+        auto& ru = *WiredTigerRecoveryUnit::get(shard_role_details::getRecoveryUnit(opCtx.get()));
 
-        // Inserting a record smaller than 'minBytesPerStone' shouldn't create a new oplog stone.
-        ASSERT_EQ(insertBSONWithSize(opCtx.get(), rs.get(), Timestamp(1, 1), 99), RecordId(1, 1));
-        ASSERT_EQ(0U, oplogStones->numStones());
-        ASSERT_EQ(1, oplogStones->currentRecords());
-        ASSERT_EQ(99, oplogStones->currentBytes());
+        auto cursor = rs->getCursor(opCtx.get());
+        ASSERT(cursor->next());
+        ASSERT_TRUE(ru.isActive());
 
-        // Inserting another record such that their combined size exceeds 'minBytesPerStone' should
-        // cause a new stone to be created.
-        ASSERT_EQ(insertBSONWithSize(opCtx.get(), rs.get(), Timestamp(1, 2), 51), RecordId(1, 2));
-        ASSERT_EQ(1U, oplogStones->numStones());
-        ASSERT_EQ(0, oplogStones->currentRecords());
-        ASSERT_EQ(0, oplogStones->currentBytes());
+        // Committing a StorageWriteTransaction will end the current transaction.
+        StorageWriteTransaction txn(ru);
+        ASSERT_TRUE(ru.isActive());
+        txn.commit();
+        ASSERT_FALSE(ru.isActive());
 
-        // Inserting a record such that the combined size of this record and the previously inserted
-        // one exceed 'minBytesPerStone' shouldn't cause a new stone to be created because we've
-        // started filling a new stone.
-        ASSERT_EQ(insertBSONWithSize(opCtx.get(), rs.get(), Timestamp(1, 3), 50), RecordId(1, 3));
-        ASSERT_EQ(1U, oplogStones->numStones());
-        ASSERT_EQ(1, oplogStones->currentRecords());
-        ASSERT_EQ(50, oplogStones->currentBytes());
-
-        // Inserting a record such that the combined size of this record and the previously inserted
-        // one is exactly equal to 'minBytesPerStone' should cause a new stone to be created.
-        ASSERT_EQ(insertBSONWithSize(opCtx.get(), rs.get(), Timestamp(1, 4), 50), RecordId(1, 4));
-        ASSERT_EQ(2U, oplogStones->numStones());
-        ASSERT_EQ(0, oplogStones->currentRecords());
-        ASSERT_EQ(0, oplogStones->currentBytes());
-
-        // Inserting a single record that exceeds 'minBytesPerStone' should cause a new stone to
-        // be created.
-        ASSERT_EQ(insertBSONWithSize(opCtx.get(), rs.get(), Timestamp(1, 5), 101), RecordId(1, 5));
-        ASSERT_EQ(3U, oplogStones->numStones());
-        ASSERT_EQ(0, oplogStones->currentRecords());
-        ASSERT_EQ(0, oplogStones->currentBytes());
+        // If a cursor is used after a WUOW commits, it should implicitly start a new transaction.
+        ASSERT(cursor->next());
+        ASSERT_TRUE(ru.isActive());
     }
 }
 
-// Insert records into an oplog and try to update them. The updates shouldn't succeed if the size of
-// record is changed.
-TEST(WiredTigerRecordStoreTest, OplogStones_UpdateRecord) {
-    std::unique_ptr<RecordStoreHarnessHelper> harnessHelper = newRecordStoreHarnessHelper();
+TEST(WiredTigerRecordStoreTest, CursorInActiveTxnAfterSeek) {
+    std::unique_ptr<RecordStoreHarnessHelper> harnessHelper(newRecordStoreHarnessHelper());
+    std::unique_ptr<RecordStore> rs(harnessHelper->newRecordStore());
 
-    const int64_t cappedMaxSize = 10 * 1024;  // 10KB
-    unique_ptr<RecordStore> rs(
-        harnessHelper->newCappedRecordStore("local.oplog.stones", cappedMaxSize, -1));
-
-    WiredTigerRecordStore* wtrs = static_cast<WiredTigerRecordStore*>(rs.get());
-    WiredTigerRecordStore::OplogStones* oplogStones = wtrs->oplogStones();
-
-    oplogStones->setMinBytesPerStone(100);
-
-    // Insert two records such that one makes up a full stone and the other is a part of the stone
-    // currently being filled.
+    RecordId rid1;
     {
         ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        auto& ru = *shard_role_details::getRecoveryUnit(opCtx.get());
 
-        ASSERT_EQ(insertBSONWithSize(opCtx.get(), rs.get(), Timestamp(1, 1), 100), RecordId(1, 1));
-        ASSERT_EQ(insertBSONWithSize(opCtx.get(), rs.get(), Timestamp(1, 2), 50), RecordId(1, 2));
+        StorageWriteTransaction txn(ru);
+        StatusWith<RecordId> res = rs->insertRecord(opCtx.get(), "a", 2, Timestamp());
+        ASSERT_OK(res.getStatus());
+        rid1 = res.getValue();
 
-        ASSERT_EQ(1U, oplogStones->numStones());
-        ASSERT_EQ(1, oplogStones->currentRecords());
-        ASSERT_EQ(50, oplogStones->currentBytes());
+        res = rs->insertRecord(opCtx.get(), "b", 2, Timestamp());
+        ASSERT_OK(res.getStatus());
+
+        txn.commit();
     }
 
-    // Attempts to grow the records should fail.
+    // Cursors should always ensure they are in an active transaction when seekExact() or seek() is
+    // called.
     {
         ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
 
-        BSONObj changed1 = makeBSONObjWithSize(Timestamp(1, 1), 101);
-        BSONObj changed2 = makeBSONObjWithSize(Timestamp(1, 2), 51);
+        auto& ru = *WiredTigerRecoveryUnit::get(shard_role_details::getRecoveryUnit(opCtx.get()));
 
-        WriteUnitOfWork wuow(opCtx.get());
-        ASSERT_NOT_OK(
-            rs->updateRecord(opCtx.get(), RecordId(1, 1), changed1.objdata(), changed1.objsize()));
-        ASSERT_NOT_OK(
-            rs->updateRecord(opCtx.get(), RecordId(1, 2), changed2.objdata(), changed2.objsize()));
-    }
+        auto cursor = rs->getCursor(opCtx.get());
+        ASSERT(cursor->seekExact(rid1));
+        ASSERT_TRUE(ru.isActive());
 
-    // Attempts to shrink the records should also fail.
-    {
-        ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        // Committing a StorageWriteTransaction will end the current transaction.
+        StorageWriteTransaction txn(ru);
+        ASSERT_TRUE(ru.isActive());
+        txn.commit();
+        ASSERT_FALSE(ru.isActive());
 
-        BSONObj changed1 = makeBSONObjWithSize(Timestamp(1, 1), 99);
-        BSONObj changed2 = makeBSONObjWithSize(Timestamp(1, 2), 49);
+        // If a cursor is used after a WUOW commits, it should implicitly start a new transaction.
+        ASSERT(cursor->seekExact(rid1));
+        ASSERT_TRUE(ru.isActive());
 
-        WriteUnitOfWork wuow(opCtx.get());
-        ASSERT_NOT_OK(
-            rs->updateRecord(opCtx.get(), RecordId(1, 1), changed1.objdata(), changed1.objsize()));
-        ASSERT_NOT_OK(
-            rs->updateRecord(opCtx.get(), RecordId(1, 2), changed2.objdata(), changed2.objsize()));
-    }
-
-    // Changing the contents of the records without changing their size should succeed.
-    {
-        ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
-
-        BSONObj changed1 = makeBSONObjWithSize(Timestamp(1, 1), 100, 'y');
-        BSONObj changed2 = makeBSONObjWithSize(Timestamp(1, 2), 50, 'z');
-
-        WriteUnitOfWork wuow(opCtx.get());
-        ASSERT_OK(
-            rs->updateRecord(opCtx.get(), RecordId(1, 1), changed1.objdata(), changed1.objsize()));
-        ASSERT_OK(
-            rs->updateRecord(opCtx.get(), RecordId(1, 2), changed2.objdata(), changed2.objsize()));
-        wuow.commit();
-
-        ASSERT_EQ(1U, oplogStones->numStones());
-        ASSERT_EQ(1, oplogStones->currentRecords());
-        ASSERT_EQ(50, oplogStones->currentBytes());
+        // End the transaction and test seek()
+        {
+            StorageWriteTransaction txn(ru);
+            txn.commit();
+        }
+        ASSERT_FALSE(ru.isActive());
+        ASSERT(cursor->seek(rid1, SeekableRecordCursor::BoundInclusion::kInclude));
+        ASSERT_TRUE(ru.isActive());
     }
 }
 
-// Insert multiple records and truncate the oplog using RecordStore::truncate(). The operation
-// should leave no stones, including the partially filled one.
-TEST(WiredTigerRecordStoreTest, OplogStones_Truncate) {
-    std::unique_ptr<RecordStoreHarnessHelper> harnessHelper = newRecordStoreHarnessHelper();
+// Verify clustered record stores.
+// This test case complements StorageEngineTest:TemporaryRecordStoreClustered which verifies
+// clustered temporary record stores.
+TEST(WiredTigerRecordStoreTest, ClusteredRecordStore) {
+    const std::unique_ptr<RecordStoreHarnessHelper> harnessHelper(newRecordStoreHarnessHelper());
+    const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+    auto& ru = *shard_role_details::getRecoveryUnit(opCtx.get());
 
-    const int64_t cappedMaxSize = 10 * 1024;  // 10KB
-    unique_ptr<RecordStore> rs(
-        harnessHelper->newCappedRecordStore("local.oplog.stones", cappedMaxSize, -1));
-
-    WiredTigerRecordStore* wtrs = static_cast<WiredTigerRecordStore*>(rs.get());
-    WiredTigerRecordStore::OplogStones* oplogStones = wtrs->oplogStones();
-
-    oplogStones->setMinBytesPerStone(100);
-
+    const std::string ns = "testRecordStore";
+    const NamespaceString nss = NamespaceString::createNamespaceString_forTest(ns);
+    const std::string uri = WiredTigerUtil::kTableUriPrefix + ns;
+    WiredTigerRecordStoreBase::WiredTigerTableConfig wtTableConfig =
+        getWiredTigerTableConfigFromStartupOptions();
+    wtTableConfig.keyFormat = KeyFormat::String;
+    bool isReplSet = getGlobalReplSettings().isReplSet();
+    bool shouldRecoverFromOplogAsStandalone =
+        repl::ReplSettings::shouldRecoverFromOplogAsStandalone();
+    wtTableConfig.logEnabled =
+        WiredTigerUtil::useTableLogging(nss, isReplSet, shouldRecoverFromOplogAsStandalone);
+    const std::string config = WiredTigerRecordStoreBase::generateCreateString(
+        NamespaceStringUtil::serializeForCatalog(nss), wtTableConfig);
     {
-        ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
-
-        ASSERT_EQ(insertBSONWithSize(opCtx.get(), rs.get(), Timestamp(1, 1), 50), RecordId(1, 1));
-        ASSERT_EQ(insertBSONWithSize(opCtx.get(), rs.get(), Timestamp(1, 2), 50), RecordId(1, 2));
-        ASSERT_EQ(insertBSONWithSize(opCtx.get(), rs.get(), Timestamp(1, 3), 50), RecordId(1, 3));
-
-        ASSERT_EQ(1U, oplogStones->numStones());
-        ASSERT_EQ(1, oplogStones->currentRecords());
-        ASSERT_EQ(50, oplogStones->currentBytes());
+        StorageWriteTransaction txn(ru);
+        WiredTigerRecoveryUnit* ru =
+            checked_cast<WiredTigerRecoveryUnit*>(shard_role_details::getRecoveryUnit(opCtx.get()));
+        WiredTigerSession* s = ru->getSession();
+        invariantWTOK(s->create(uri.c_str(), config.c_str()), *s);
+        txn.commit();
     }
 
+    WiredTigerRecordStore::Params params;
+    params.baseParams.uuid = boost::none;
+    params.baseParams.ident = ns;
+    params.baseParams.engineName = std::string{kWiredTigerEngineName};
+    params.baseParams.keyFormat = KeyFormat::String;
+    params.baseParams.overwrite = false;
+    params.baseParams.isLogged =
+        WiredTigerUtil::useTableLogging(nss, isReplSet, shouldRecoverFromOplogAsStandalone);
+    params.baseParams.forceUpdateWithFullDocument = false;
+    params.inMemory = false;
+    params.sizeStorer = nullptr;
+    params.tracksSizeAdjustments = true;
+
+    const auto wtKvEngine = static_cast<WiredTigerKVEngine*>(harnessHelper->getEngine());
+    auto rs = std::make_unique<WiredTigerRecordStore>(
+        wtKvEngine,
+        WiredTigerRecoveryUnit::get(*shard_role_details::getRecoveryUnit(opCtx.get())),
+        params);
+
+    const auto id = StringData{"1"};
+    const auto rid = RecordId(id);
+    const auto data = "data";
     {
-        ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
-
-        ASSERT_EQ(3, rs->numRecords(opCtx.get()));
-        ASSERT_EQ(150, rs->dataSize(opCtx.get()));
-
-        WriteUnitOfWork wuow(opCtx.get());
-        ASSERT_OK(rs->truncate(opCtx.get()));
-        wuow.commit();
-
-        ASSERT_EQ(0, rs->dataSize(opCtx.get()));
-        ASSERT_EQ(0, rs->numRecords(opCtx.get()));
-        ASSERT_EQ(0U, oplogStones->numStones());
-        ASSERT_EQ(0, oplogStones->currentRecords());
-        ASSERT_EQ(0, oplogStones->currentBytes());
+        StorageWriteTransaction txn(ru);
+        StatusWith<RecordId> s =
+            rs->insertRecord(opCtx.get(), rid, data, strlen(data), Timestamp());
+        ASSERT_TRUE(s.isOK());
+        ASSERT_EQUALS(1, rs->numRecords());
+        txn.commit();
     }
+    // Read the record back.
+    RecordData rd;
+    ASSERT_TRUE(rs->findRecord(opCtx.get(), rid, &rd));
+    ASSERT_EQ(0, memcmp(data, rd.data(), strlen(data)));
+    // Update the record.
+    const auto dataUpdated = "updated";
+    {
+        StorageWriteTransaction txn(ru);
+        ASSERT_OK(rs->updateRecord(opCtx.get(), rid, dataUpdated, strlen(dataUpdated)));
+        ASSERT_EQUALS(1, rs->numRecords());
+        txn.commit();
+    }
+    ASSERT_TRUE(rs->findRecord(opCtx.get(), rid, &rd));
+    ASSERT_EQ(0, memcmp(dataUpdated, rd.data(), strlen(dataUpdated)));
 }
 
-// Insert multiple records, truncate the oplog using RecordStore::cappedTruncateAfter(), and
-// verify that the metadata for each stone is updated. If a full stone is partially truncated, then
-// it should become the stone currently being filled.
-TEST(WiredTigerRecordStoreTest, OplogStones_CappedTruncateAfter) {
-    std::unique_ptr<RecordStoreHarnessHelper> harnessHelper = newRecordStoreHarnessHelper();
+// Make sure numRecords and dataSize are accurate after a delete rolls back and some other
+// transaction deletes the same rows before we have a chance of patching up the metadata.
+TEST(WiredTigerRecordStoreTest, SizeInfoAccurateAfterRollbackWithDelete) {
+    const auto harnessHelper(newRecordStoreHarnessHelper());
+    std::unique_ptr<RecordStore> rs(harnessHelper->newRecordStore());
 
-    const int64_t cappedMaxSize = 10 * 1024;  // 10KB
-    unique_ptr<RecordStore> rs(
-        harnessHelper->newCappedRecordStore("local.oplog.stones", cappedMaxSize, -1));
+    RecordId rid;  // This record will be deleted by two transactions.
 
-    WiredTigerRecordStore* wtrs = static_cast<WiredTigerRecordStore*>(rs.get());
-    WiredTigerRecordStore::OplogStones* oplogStones = wtrs->oplogStones();
-
-    oplogStones->setMinBytesPerStone(1000);
+    ServiceContext::UniqueOperationContext ctx(harnessHelper->newOperationContext());
+    auto& ru = *shard_role_details::getRecoveryUnit(ctx.get());
 
     {
-        ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
-
-        ASSERT_EQ(insertBSONWithSize(opCtx.get(), rs.get(), Timestamp(1, 1), 400), RecordId(1, 1));
-        ASSERT_EQ(insertBSONWithSize(opCtx.get(), rs.get(), Timestamp(1, 2), 800), RecordId(1, 2));
-
-        ASSERT_EQ(insertBSONWithSize(opCtx.get(), rs.get(), Timestamp(1, 3), 200), RecordId(1, 3));
-        ASSERT_EQ(insertBSONWithSize(opCtx.get(), rs.get(), Timestamp(1, 4), 250), RecordId(1, 4));
-        ASSERT_EQ(insertBSONWithSize(opCtx.get(), rs.get(), Timestamp(1, 5), 300), RecordId(1, 5));
-        ASSERT_EQ(insertBSONWithSize(opCtx.get(), rs.get(), Timestamp(1, 6), 350), RecordId(1, 6));
-
-        ASSERT_EQ(insertBSONWithSize(opCtx.get(), rs.get(), Timestamp(1, 7), 50), RecordId(1, 7));
-        ASSERT_EQ(insertBSONWithSize(opCtx.get(), rs.get(), Timestamp(1, 8), 100), RecordId(1, 8));
-        ASSERT_EQ(insertBSONWithSize(opCtx.get(), rs.get(), Timestamp(1, 9), 150), RecordId(1, 9));
-
-        ASSERT_EQ(9, rs->numRecords(opCtx.get()));
-        ASSERT_EQ(2600, rs->dataSize(opCtx.get()));
-        ASSERT_EQ(2U, oplogStones->numStones());
-        ASSERT_EQ(3, oplogStones->currentRecords());
-        ASSERT_EQ(300, oplogStones->currentBytes());
+        StorageWriteTransaction txn(ru);
+        rid = rs->insertRecord(ctx.get(), "a", 2, Timestamp()).getValue();
+        txn.commit();
     }
 
-    // Make sure all are visible.
-    rs->waitForAllEarlierOplogWritesToBeVisible(harnessHelper->newOperationContext().get());
+    ASSERT_EQ(1, rs->numRecords());
+    ASSERT_EQ(2, rs->dataSize());
 
-    // Truncate data using an inclusive RecordId that exists inside the stone currently being
-    // filled.
-    {
-        ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+    StorageWriteTransaction txn(ru);
 
-        rs->cappedTruncateAfter(opCtx.get(), RecordId(1, 8), true);
+    auto aborted = std::make_shared<unittest::Barrier>(2);
+    auto deleted = std::make_shared<unittest::Barrier>(2);
 
-        ASSERT_EQ(7, rs->numRecords(opCtx.get()));
-        ASSERT_EQ(2350, rs->dataSize(opCtx.get()));
-        ASSERT_EQ(2U, oplogStones->numStones());
-        ASSERT_EQ(1, oplogStones->currentRecords());
-        ASSERT_EQ(50, oplogStones->currentBytes());
-    }
+    // This thread will delete the record and then rollback. We'll block the roll back process after
+    // rolling back the WT transaction and before running the rest of the registered changes,
+    // allowing the main thread to delete the same rows again.
+    stdx::thread abortedThread([&harnessHelper, &rs, &rid, aborted, deleted]() {
+        auto client = harnessHelper->serviceContext()->getService()->makeClient("c1");
+        auto ctx = harnessHelper->newOperationContext(client.get());
+        auto& ru = *shard_role_details::getRecoveryUnit(ctx.get());
+        StorageWriteTransaction txn(ru);
+        // Registered changes are executed in reverse order.
+        rs->deleteRecord(ctx.get(), rid);
+        shard_role_details::getRecoveryUnit(ctx.get())->onRollback(
+            [&](OperationContext*) { deleted->countDownAndWait(); });
+        shard_role_details::getRecoveryUnit(ctx.get())->onRollback(
+            [&](OperationContext*) { aborted->countDownAndWait(); });
+    });
 
-    // Truncate data using an inclusive RecordId that refers to the 'lastRecord' of a full stone.
-    // The stone should become the one currently being filled.
-    {
-        ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+    // Wait for the other thread to abort.
+    aborted->countDownAndWait();
 
-        rs->cappedTruncateAfter(opCtx.get(), RecordId(1, 6), true);
+    rs->deleteRecord(ctx.get(), rid);
 
-        ASSERT_EQ(5, rs->numRecords(opCtx.get()));
-        ASSERT_EQ(1950, rs->dataSize(opCtx.get()));
-        ASSERT_EQ(1U, oplogStones->numStones());
-        ASSERT_EQ(3, oplogStones->currentRecords());
-        ASSERT_EQ(750, oplogStones->currentBytes());
-    }
+    // Notify the other thread we have deleted, let it complete the rollback.
+    deleted->countDownAndWait();
 
-    // Truncate data using a non-inclusive RecordId that exists inside the stone currently being
-    // filled.
-    {
-        ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+    txn.commit();
 
-        rs->cappedTruncateAfter(opCtx.get(), RecordId(1, 3), false);
-
-        ASSERT_EQ(3, rs->numRecords(opCtx.get()));
-        ASSERT_EQ(1400, rs->dataSize(opCtx.get()));
-        ASSERT_EQ(1U, oplogStones->numStones());
-        ASSERT_EQ(1, oplogStones->currentRecords());
-        ASSERT_EQ(200, oplogStones->currentBytes());
-    }
-
-    // Truncate data using a non-inclusive RecordId that refers to the 'lastRecord' of a full stone.
-    // The stone should remain intact.
-    {
-        ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
-
-        rs->cappedTruncateAfter(opCtx.get(), RecordId(1, 2), false);
-
-        ASSERT_EQ(2, rs->numRecords(opCtx.get()));
-        ASSERT_EQ(1200, rs->dataSize(opCtx.get()));
-        ASSERT_EQ(1U, oplogStones->numStones());
-        ASSERT_EQ(0, oplogStones->currentRecords());
-        ASSERT_EQ(0, oplogStones->currentBytes());
-    }
-
-    // Truncate data using a non-inclusive RecordId that exists inside a full stone. The stone
-    // should become the one currently being filled.
-    {
-        ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
-
-        rs->cappedTruncateAfter(opCtx.get(), RecordId(1, 1), false);
-
-        ASSERT_EQ(1, rs->numRecords(opCtx.get()));
-        ASSERT_EQ(400, rs->dataSize(opCtx.get()));
-        ASSERT_EQ(0U, oplogStones->numStones());
-        ASSERT_EQ(1, oplogStones->currentRecords());
-        ASSERT_EQ(400, oplogStones->currentBytes());
-    }
+    abortedThread.join();
+    ASSERT_EQ(0, rs->numRecords());
+    ASSERT_EQ(0, rs->dataSize());
 }
 
-// Verify that oplog stones are reclaimed when cappedMaxSize is exceeded.
-TEST(WiredTigerRecordStoreTest, OplogStones_ReclaimStones) {
-    std::unique_ptr<RecordStoreHarnessHelper> harnessHelper = newRecordStoreHarnessHelper();
+// Makes sure that when records are inserted with provided recordIds, the
+// WiredTigerRecordStore correctly keeps track of the largest recordId it
+// has seen in the in-memory variable.
+// TODO (SERVER-88375): Revise / delete this test after the recordId tracking
+// problem has been properly solved.
+TEST(WiredTigerRecordStoreTest, LargestRecordIdSeenIsCorrectWhenGivenRecordIds) {
+    const auto harnessHelper(newRecordStoreHarnessHelper());
+    std::unique_ptr<RecordStore> rs(harnessHelper->newRecordStore());
 
-    const int64_t cappedMaxSize = 10 * 1024;  // 10KB
-    unique_ptr<RecordStore> rs(
-        harnessHelper->newCappedRecordStore("local.oplog.stones", cappedMaxSize, -1));
+    std::vector<RecordId> reservedRids;
+    RecordId rid;
 
-    WiredTigerRecordStore* wtrs = static_cast<WiredTigerRecordStore*>(rs.get());
-    WiredTigerRecordStore::OplogStones* oplogStones = wtrs->oplogStones();
-
-    {
-        ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
-        ASSERT_OK(wtrs->updateCappedSize(opCtx.get(), 230U));
-    }
-
-    oplogStones->setMinBytesPerStone(100);
+    ServiceContext::UniqueOperationContext ctx(harnessHelper->newOperationContext());
+    auto& ru = *shard_role_details::getRecoveryUnit(ctx.get());
 
     {
-        ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
-
-        ASSERT_EQ(insertBSONWithSize(opCtx.get(), rs.get(), Timestamp(1, 1), 100), RecordId(1, 1));
-        ASSERT_EQ(insertBSONWithSize(opCtx.get(), rs.get(), Timestamp(1, 2), 110), RecordId(1, 2));
-        ASSERT_EQ(insertBSONWithSize(opCtx.get(), rs.get(), Timestamp(1, 3), 120), RecordId(1, 3));
-
-        ASSERT_EQ(3, rs->numRecords(opCtx.get()));
-        ASSERT_EQ(330, rs->dataSize(opCtx.get()));
-        ASSERT_EQ(3U, oplogStones->numStones());
-        ASSERT_EQ(0, oplogStones->currentRecords());
-        ASSERT_EQ(0, oplogStones->currentBytes());
+        // Insert a single record with recordId 7.
+        StorageWriteTransaction txn(ru);
+        rid = rs->insertRecord(ctx.get(), RecordId(7), "a", 2, Timestamp()).getValue();
+        txn.commit();
     }
 
-    // Fail to truncate stone when cappedMaxSize is exceeded, but the persisted timestamp is
-    // before the truncation point (i.e: leaves a gap that replication recovery would rely on).
+    // The next recordId reserved is higher than 7.
+    rs->reserveRecordIds(ctx.get(), &reservedRids, 1);
+    ASSERT_GT(reservedRids[0].getLong(), RecordId(7).getLong());
+    ASSERT_EQ(1, rs->numRecords());
+
+    // Insert a few records at once, where the recordIds are not in order. And ensure that
+    // we still reserve recordIds from the right point afterwards.
+    std::vector<Record> recordsToInsert;
+    std::vector<Timestamp> timestamps{Timestamp(), Timestamp()};
+    recordsToInsert.push_back(Record{RecordId(14), RecordData()});
+    recordsToInsert.push_back(Record{RecordId(13), RecordData()});
     {
-        ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
-
-        wtrs->reclaimOplog(opCtx.get(), Timestamp(1, 0));
-
-        ASSERT_EQ(3, rs->numRecords(opCtx.get()));
-        ASSERT_EQ(330, rs->dataSize(opCtx.get()));
-        ASSERT_EQ(3U, oplogStones->numStones());
-        ASSERT_EQ(0, oplogStones->currentRecords());
-        ASSERT_EQ(0, oplogStones->currentBytes());
+        StorageWriteTransaction txn(ru);
+        ASSERT_OK(rs->insertRecords(ctx.get(), &recordsToInsert, timestamps));
+        txn.commit();
     }
 
-    // Truncate a stone when cappedMaxSize is exceeded.
+    // The next recordId reserved is higher than 14.
+    reservedRids.clear();
+    rs->reserveRecordIds(ctx.get(), &reservedRids, 1);
+    ASSERT_GT(reservedRids[0].getLong(), RecordId(14).getLong());
+    ASSERT_EQ(3, rs->numRecords());
+
+    // Insert a few records at once, where the recordIds are in order. And ensure that
+    // we still reserve recordIds from the right point afterwards.
+    recordsToInsert.clear();
+    recordsToInsert.push_back(Record{RecordId(19), RecordData()});
+    recordsToInsert.push_back(Record{RecordId(20), RecordData()});
     {
-        ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
-
-        wtrs->reclaimOplog(opCtx.get(), Timestamp(1, 3));
-
-        ASSERT_EQ(2, rs->numRecords(opCtx.get()));
-        ASSERT_EQ(230, rs->dataSize(opCtx.get()));
-        ASSERT_EQ(2U, oplogStones->numStones());
-        ASSERT_EQ(0, oplogStones->currentRecords());
-        ASSERT_EQ(0, oplogStones->currentBytes());
+        StorageWriteTransaction txn(ru);
+        ASSERT_OK(rs->insertRecords(ctx.get(), &recordsToInsert, timestamps));
+        txn.commit();
     }
 
-    {
-        ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
-
-        ASSERT_EQ(insertBSONWithSize(opCtx.get(), rs.get(), Timestamp(1, 4), 130), RecordId(1, 4));
-        ASSERT_EQ(insertBSONWithSize(opCtx.get(), rs.get(), Timestamp(1, 5), 140), RecordId(1, 5));
-        ASSERT_EQ(insertBSONWithSize(opCtx.get(), rs.get(), Timestamp(1, 6), 50), RecordId(1, 6));
-
-        ASSERT_EQ(5, rs->numRecords(opCtx.get()));
-        ASSERT_EQ(550, rs->dataSize(opCtx.get()));
-        ASSERT_EQ(4U, oplogStones->numStones());
-        ASSERT_EQ(1, oplogStones->currentRecords());
-        ASSERT_EQ(50, oplogStones->currentBytes());
-    }
-
-    // Truncate multiple stones if necessary.
-    {
-        ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
-
-        wtrs->reclaimOplog(opCtx.get(), Timestamp(1, 6));
-
-        ASSERT_EQ(2, rs->numRecords(opCtx.get()));
-        ASSERT_EQ(190, rs->dataSize(opCtx.get()));
-        ASSERT_EQ(1U, oplogStones->numStones());
-        ASSERT_EQ(1, oplogStones->currentRecords());
-        ASSERT_EQ(50, oplogStones->currentBytes());
-    }
-
-    // No-op if dataSize <= cappedMaxSize.
-    {
-        ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
-
-        wtrs->reclaimOplog(opCtx.get(), Timestamp(1, 6));
-
-        ASSERT_EQ(2, rs->numRecords(opCtx.get()));
-        ASSERT_EQ(190, rs->dataSize(opCtx.get()));
-        ASSERT_EQ(1U, oplogStones->numStones());
-        ASSERT_EQ(1, oplogStones->currentRecords());
-        ASSERT_EQ(50, oplogStones->currentBytes());
-    }
+    // The next recordId reserved is higher than 20.
+    reservedRids.clear();
+    rs->reserveRecordIds(ctx.get(), &reservedRids, 1);
+    ASSERT_GT(reservedRids[0].getLong(), RecordId(20).getLong());
+    ASSERT_EQ(5, rs->numRecords());
 }
 
-// Verify that an oplog stone isn't created if it would cause the logical representation of the
-// records to not be in increasing order.
-TEST(WiredTigerRecordStoreTest, OplogStones_AscendingOrder) {
-    std::unique_ptr<RecordStoreHarnessHelper> harnessHelper = newRecordStoreHarnessHelper();
+// Test WiredTiger fails to create a table, with the configuration string generated by
+// WiredTigerRecordStore::generateCreateString(), if a table already exists with the same ident and
+// same table configuration.
+TEST(WiredTigerRecordStoreTest, EnforceTableCreateExclusiveSameConfiguration) {
+    const std::unique_ptr<RecordStoreHarnessHelper> harnessHelper(newRecordStoreHarnessHelper());
+    const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
 
-    const int64_t cappedMaxSize = 10 * 1024;  // 10KB
-    unique_ptr<RecordStore> rs(
-        harnessHelper->newCappedRecordStore("local.oplog.stones", cappedMaxSize, -1));
+    const NamespaceString nss = NamespaceString::createNamespaceString_forTest("testRecordStore");
+    WiredTigerRecordStore::WiredTigerTableConfig wtTableConfig =
+        getWiredTigerTableConfigFromStartupOptions();
+    const auto config =
+        WiredTigerRecordStore::generateCreateString(nss.toString_forTest(), wtTableConfig);
+    const std::string ident = "uniqueIdentifierForTableFile";
+    const std::string uri = WiredTigerUtil::kTableUriPrefix + ident;
 
-    WiredTigerRecordStore* wtrs = static_cast<WiredTigerRecordStore*>(rs.get());
-    WiredTigerRecordStore::OplogStones* oplogStones = wtrs->oplogStones();
+    // First creation of table with the ident succeeds.
+    WiredTigerRecoveryUnit* ru =
+        checked_cast<WiredTigerRecoveryUnit*>(shard_role_details::getRecoveryUnit(opCtx.get()));
+    WiredTigerSession* s = ru->getSession();
+    invariantWTOK(s->create(uri.c_str(), config.c_str()), *s);
 
-    oplogStones->setMinBytesPerStone(100);
+    // Fail when trying to create the table that already exists.
+    const auto createRes = s->create(uri.c_str(), config.c_str());
+    ASSERT_EQ(EEXIST, createRes);
+}
 
-    {
-        ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+// Test WiredTiger fails to create a table, with the configuration string generated by
+// WiredTigerRecordStore::generateCreateString(), if a table already exists with the same ident and
+// different table configurations.
+TEST(WiredTigerRecordStoreTest, EnforceTableCreateExclusiveDifferentConfiguration) {
+    const std::unique_ptr<RecordStoreHarnessHelper> harnessHelper(newRecordStoreHarnessHelper());
+    const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
 
-        ASSERT_EQ(0U, oplogStones->numStones());
-        ASSERT_EQ(insertBSONWithSize(opCtx.get(), rs.get(), Timestamp(2, 2), 50), RecordId(2, 2));
-        ASSERT_EQ(0U, oplogStones->numStones());
-        ASSERT_EQ(1, oplogStones->currentRecords());
-        ASSERT_EQ(50, oplogStones->currentBytes());
+    const NamespaceString nss = NamespaceString::createNamespaceString_forTest("testRecordStore");
+    WiredTigerRecordStore::WiredTigerTableConfig wtTableConfig =
+        getWiredTigerTableConfigFromStartupOptions();
+    const std::string config =
+        WiredTigerRecordStore::generateCreateString(nss.toString_forTest(), wtTableConfig);
+    const std::string ident = "uniqueIdentifierForTableFile";
+    const std::string uri = WiredTigerUtil::kTableUriPrefix + ident;
 
-        // Inserting a record that has a smaller RecordId than the previously inserted record should
-        // be able to create a new stone when no stones already exist.
-        ASSERT_EQ(insertBSONWithSize(opCtx.get(), rs.get(), Timestamp(2, 1), 50), RecordId(2, 1));
-        ASSERT_EQ(1U, oplogStones->numStones());
-        ASSERT_EQ(0, oplogStones->currentRecords());
-        ASSERT_EQ(0, oplogStones->currentBytes());
+    // First creation of a table with the ident succeeds.
+    WiredTigerRecoveryUnit* ru =
+        checked_cast<WiredTigerRecoveryUnit*>(shard_role_details::getRecoveryUnit(opCtx.get()));
+    WiredTigerSession* s = ru->getSession();
+    invariantWTOK(s->create(uri.c_str(), config.c_str()), *s);
 
-        // However, inserting a record that has a smaller RecordId than most recently created
-        // stone's last record shouldn't cause a new stone to be created, even if the size of the
-        // inserted record exceeds 'minBytesPerStone'.
-        ASSERT_EQ(insertBSONWithSize(opCtx.get(), rs.get(), Timestamp(1, 1), 100), RecordId(1, 1));
-        ASSERT_EQ(1U, oplogStones->numStones());
-        ASSERT_EQ(1, oplogStones->currentRecords());
-        ASSERT_EQ(100, oplogStones->currentBytes());
+    // Generate a different table configuration than the original.
+    WiredTigerRecordStore::WiredTigerTableConfig newWtTableConfig = wtTableConfig;
+    newWtTableConfig.keyFormat = KeyFormat::String;
+    const std::string newConfig =
+        WiredTigerRecordStore::generateCreateString(nss.toString_forTest(), newWtTableConfig);
+    ASSERT_NE(newConfig, config);
 
-        // Inserting a record that has a larger RecordId than the most recently created stone's last
-        // record should then cause a new stone to be created.
-        ASSERT_EQ(insertBSONWithSize(opCtx.get(), rs.get(), Timestamp(2, 3), 50), RecordId(2, 3));
-        ASSERT_EQ(2U, oplogStones->numStones());
-        ASSERT_EQ(0, oplogStones->currentRecords());
-        ASSERT_EQ(0, oplogStones->currentBytes());
-    }
+    // The uri for the ident is occupied, fail to create a new table with the ident.
+    const auto createRes = s->create(uri.c_str(), newConfig.c_str());
+    ASSERT_EQ(EEXIST, createRes);
 }
 
 }  // namespace

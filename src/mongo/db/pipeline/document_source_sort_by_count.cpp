@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,24 +27,32 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/pipeline/document_source_sort_by_count.h"
 
-#include "mongo/db/jsobj.h"
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
 #include "mongo/db/pipeline/document_source_group.h"
 #include "mongo/db/pipeline/document_source_sort.h"
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/lite_parsed_document_source.h"
+#include "mongo/db/query/allowed_contexts.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
 using boost::intrusive_ptr;
 using std::list;
 
-REGISTER_MULTI_STAGE_ALIAS(sortByCount,
-                           LiteParsedDocumentSourceDefault::parse,
-                           DocumentSourceSortByCount::createFromBson);
+REGISTER_DOCUMENT_SOURCE(sortByCount,
+                         LiteParsedDocumentSourceDefault::parse,
+                         DocumentSourceSortByCount::createFromBson,
+                         AllowedWithApiStrict::kAlways);
 
 list<intrusive_ptr<DocumentSource>> DocumentSourceSortByCount::createFromBson(
     BSONElement elem, const intrusive_ptr<ExpressionContext>& pExpCtx) {
@@ -57,11 +64,13 @@ list<intrusive_ptr<DocumentSource>> DocumentSourceSortByCount::createFromBson(
                                  "expression inside an object",
                 innerObj.firstElementFieldName()[0] == '$');
     } else if (elem.type() == String) {
-        // Make sure that the sortByCount field is a $-prefixed path
+        // Make sure that the sortByCount field is a $-prefixed path.
         uassert(40148,
                 str::stream() << "the sortByCount field must be defined as a $-prefixed path or an "
                                  "expression inside an object",
-                (elem.valueStringData()[0] == '$'));
+                // The string length must be greater than 2 because we need a '$', at least one char
+                // for the field name and the final terminating 0.
+                (elem.valuestrsize() > 2 && elem.valueStringData()[0] == '$'));
     } else {
         uasserted(
             40149,

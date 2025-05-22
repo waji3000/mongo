@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -27,12 +26,16 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
-#include "mongo/platform/basic.h"
+#include <utility>
 
-#include "mongo/db/matcher/schema/expression_internal_schema_all_elem_match_from_index.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
 
+#include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/util/builder.h"
+#include "mongo/db/matcher/schema/expression_internal_schema_all_elem_match_from_index.h"
 
 namespace mongo {
 
@@ -40,20 +43,22 @@ constexpr StringData InternalSchemaAllElemMatchFromIndexMatchExpression::kName;
 
 InternalSchemaAllElemMatchFromIndexMatchExpression::
     InternalSchemaAllElemMatchFromIndexMatchExpression(
-        StringData path, long long index, std::unique_ptr<ExpressionWithPlaceholder> expression)
-    : ArrayMatchingMatchExpression(MatchExpression::INTERNAL_SCHEMA_ALL_ELEM_MATCH_FROM_INDEX,
-                                   path),
+        boost::optional<StringData> path,
+        long long index,
+        std::unique_ptr<ExpressionWithPlaceholder> expression,
+        clonable_ptr<ErrorAnnotation> annotation)
+    : ArrayMatchingMatchExpression(
+          MatchExpression::INTERNAL_SCHEMA_ALL_ELEM_MATCH_FROM_INDEX, path, std::move(annotation)),
       _index(index),
       _expression(std::move(expression)) {}
 
-std::unique_ptr<MatchExpression> InternalSchemaAllElemMatchFromIndexMatchExpression::shallowClone()
-    const {
-    auto clone = stdx::make_unique<InternalSchemaAllElemMatchFromIndexMatchExpression>(
-        path(), _index, _expression->shallowClone());
+std::unique_ptr<MatchExpression> InternalSchemaAllElemMatchFromIndexMatchExpression::clone() const {
+    auto clone = std::make_unique<InternalSchemaAllElemMatchFromIndexMatchExpression>(
+        path(), _index, _expression->clone(), _errorAnnotation);
     if (getTag()) {
         clone->setTag(getTag()->clone());
     }
-    return std::move(clone);
+    return clone;
 }
 
 bool InternalSchemaAllElemMatchFromIndexMatchExpression::equivalent(
@@ -67,24 +72,19 @@ bool InternalSchemaAllElemMatchFromIndexMatchExpression::equivalent(
 }
 
 void InternalSchemaAllElemMatchFromIndexMatchExpression::debugString(StringBuilder& debug,
-                                                                     int level) const {
-    _debugAddSpace(debug, level);
-    debug << kName << "\n";
+                                                                     int indentationLevel) const {
+    _debugAddSpace(debug, indentationLevel);
+    debug << kName;
+    _debugStringAttachTagInfo(&debug);
     debug << " index: " << _index << ", query:\n";
-    _expression->getFilter()->debugString(debug, level + 1);
+    _expression->getFilter()->debugString(debug, indentationLevel + 1);
 }
 
-void InternalSchemaAllElemMatchFromIndexMatchExpression::serialize(BSONObjBuilder* out) const {
-    BSONObjBuilder allElemMatchBob(out->subobjStart(path()));
-    BSONArrayBuilder subArray(allElemMatchBob.subarrayStart(kName));
-    subArray.append(_index);
-    {
-        BSONObjBuilder eBuilder(subArray.subobjStart());
-        _expression->getFilter()->serialize(&eBuilder);
-        eBuilder.doneFast();
-    }
-    subArray.doneFast();
-    allElemMatchBob.doneFast();
+void InternalSchemaAllElemMatchFromIndexMatchExpression::appendSerializedRightHandSide(
+    BSONObjBuilder* bob, const SerializationOptions& opts, bool includePath) const {
+    bob->append(kName,
+                BSON_ARRAY(opts.serializeLiteral(_index)
+                           << _expression->getFilter()->serialize(opts, includePath)));
 }
 
 MatchExpression::ExpressionOptimizerFunc

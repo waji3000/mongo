@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,31 +29,50 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
 #include <cstdint>
+#include <functional>
+#include <list>
+#include <memory>
+#include <string>
+#include <tuple>
+#include <utility>
+#include <vector>
 
+#include "mongo/base/error_codes.h"
 #include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/timestamp.h"
 #include "mongo/client/authenticate.h"
+#include "mongo/client/client_api_version_parameters_gen.h"
 #include "mongo/client/connection_string.h"
 #include "mongo/client/dbclient_cursor.h"
 #include "mongo/client/index_spec.h"
 #include "mongo/client/mongo_uri.h"
-#include "mongo/client/query.h"
 #include "mongo/client/read_preference.h"
+#include "mongo/config.h"  // IWYU pragma: keep
+#include "mongo/db/database_name.h"
 #include "mongo/db/dbmessage.h"
-#include "mongo/db/jsobj.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/query/find_command.h"
+#include "mongo/db/repl/read_concern_gen.h"
 #include "mongo/db/write_concern_options.h"
-#include "mongo/logger/log_severity.h"
+#include "mongo/logv2/log_severity.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/rpc/message.h"
 #include "mongo/rpc/metadata.h"
 #include "mongo/rpc/op_msg.h"
-#include "mongo/rpc/protocol.h"
 #include "mongo/rpc/unique_message.h"
-#include "mongo/stdx/functional.h"
 #include "mongo/transport/message_compressor_manager.h"
 #include "mongo/transport/session.h"
-#include "mongo/transport/transport_layer.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/net/ssl_types.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -62,134 +80,106 @@ namespace executor {
 struct RemoteCommandResponse;
 }
 
-// Useful utilities for namespaces
-/** @return the database name portion of an ns std::string */
+/**
+ * Returns the database name portion of an ns std::string.
+ */
 std::string nsGetDB(const std::string& ns);
 
-/** @return the collection name portion of an ns std::string */
+/**
+ * Returns the collection name portion of an ns std::string.
+ */
 std::string nsGetCollection(const std::string& ns);
 
 /**
- * This class pre-declares all the "query()" methods for DBClient so the subclasses can mark
- * them as "final" or "override" as appropriate.
+ * Allows callers of the internal client 'find()' API below to request an exhaust cursor.
+ *
+ * Such cursors use a special OP_MSG facility under the hood. When exhaust is requested, the server
+ * writes the full results of the query into the socket (split into getMore batches), without
+ * waiting for explicit getMore requests from the client.
  */
-class DBClientQueryInterface {
-    virtual std::unique_ptr<DBClientCursor> query(const NamespaceStringOrUUID& nsOrUuid,
-                                                  Query query,
-                                                  int nToReturn = 0,
-                                                  int nToSkip = 0,
-                                                  const BSONObj* fieldsToReturn = 0,
-                                                  int queryOptions = 0,
-                                                  int batchSize = 0) = 0;
-
-    virtual unsigned long long query(stdx::function<void(const BSONObj&)> f,
-                                     const NamespaceStringOrUUID& nsOrUuid,
-                                     Query query,
-                                     const BSONObj* fieldsToReturn = 0,
-                                     int queryOptions = 0,
-                                     int batchSize = 0) = 0;
-
-    virtual unsigned long long query(stdx::function<void(DBClientCursorBatchIterator&)> f,
-                                     const NamespaceStringOrUUID& nsOrUuid,
-                                     Query query,
-                                     const BSONObj* fieldsToReturn = 0,
-                                     int queryOptions = 0,
-                                     int batchSize = 0) = 0;
-};
+enum class ExhaustMode { kOn, kOff };
 
 /**
- abstract class that implements the core db operations
+ * Abstract class that implements the core db operations.
  */
-class DBClientBase : public DBClientQueryInterface {
-    MONGO_DISALLOW_COPYING(DBClientBase);
+class DBClientBase {
+    DBClientBase(const DBClientBase&) = delete;
+    DBClientBase& operator=(const DBClientBase&) = delete;
 
 public:
-    DBClientBase()
-        : _logLevel(logger::LogSeverity::Log()),
-          _connectionId(ConnectionIdSequence.fetchAndAdd(1)),
-          _cachedAvailableOptions((enum QueryOptions)0),
-          _haveCachedAvailableOptions(false) {}
+    static const uint64_t INVALID_SOCK_CREATION_TIME;
+
+    DBClientBase(const ClientAPIVersionParameters* apiParameters = nullptr)
+        : _logLevel(logv2::LogSeverity::Log()), _connectionId(ConnectionIdSequence.fetchAndAdd(1)) {
+        if (apiParameters) {
+            _apiParameters = *apiParameters;
+        }
+    }
 
     virtual ~DBClientBase() {}
 
-    /**
-       @return a single object that matches the query.  if none do, then the object is empty
-       @throws AssertionException
-    */
-    virtual BSONObj findOne(const std::string& ns,
-                            const Query& query,
-                            const BSONObj* fieldsToReturn = 0,
-                            int queryOptions = 0);
-
-    /** query N objects from the database into an array.  makes sense mostly when you want a small
-     * number of results.  if a huge number, use query() and iterate the cursor.
-    */
-    void findN(std::vector<BSONObj>& out,
-               const std::string& ns,
-               Query query,
-               int nToReturn,
-               int nToSkip = 0,
-               const BSONObj* fieldsToReturn = 0,
-               int queryOptions = 0);
-
-    /**
-     * @return a pair with a single object that matches the filter within the collection specified
-     * by the UUID and the namespace of that collection on the queried node.
-     *
-     * If the command fails, an assertion error is thrown. Otherwise, if no document matches
-     * the query, an empty BSONObj is returned.
-     * @throws AssertionException
-     */
-    virtual std::pair<BSONObj, NamespaceString> findOneByUUID(const std::string& db,
-                                                              UUID uuid,
-                                                              const BSONObj& filter);
+    virtual std::string toString() const = 0;
 
     virtual std::string getServerAddress() const = 0;
 
-    /** helper function.  run a simple command where the command expression is simply
-          { command : 1 }
-        @param info -- where to put result object.  may be null if caller doesn't need that info
-        @param command -- command name
-        @return true if the command returned "ok".
-     */
-    bool simpleCommand(const std::string& dbname, BSONObj* info, const std::string& command);
-
-    rpc::ProtocolSet getClientRPCProtocols() const;
-    rpc::ProtocolSet getServerRPCProtocols() const;
-
-    void setClientRPCProtocols(rpc::ProtocolSet clientProtocols);
+    virtual std::string getLocalAddress() const = 0;
 
     /**
-     * actualServer is set to the actual server where they call went if there was a choice (for
-     * example SlaveOk).
+     * Reconnect if needed and allowed.
      */
-    virtual bool call(Message& toSend,
-                      Message& response,
-                      bool assertOk = true,
-                      std::string* actualServer = nullptr) = 0;
+    virtual void ensureConnection() {}
 
-    virtual void say(Message& toSend,
-                     bool isRetry = false,
-                     std::string* actualServer = nullptr) = 0;
+    /**
+     * If not checked recently, checks whether the underlying socket/sockets are still valid.
+     */
+    virtual bool isStillConnected() = 0;
 
-    /* used by QueryOption_Exhaust.  To use that your subclass must implement this. */
-    virtual bool recv(Message& m, int lastRequestId) {
-        verify(false);
-        return false;
+    long long getConnectionId() const {
+        return _connectionId;
     }
 
-    // In general, for lazy queries, we'll need to say, recv, then checkResponse
-    virtual void checkResponse(const std::vector<BSONObj>& batch,
-                               bool networkError,
-                               bool* retry = nullptr,
-                               std::string* targetHost = nullptr) {
-        if (retry)
-            *retry = false;
-        if (targetHost)
-            *targetHost = "";
+    /**
+     * Returns true if this connection is currently in a failed state.
+     */
+    virtual bool isFailed() const = 0;
+
+    virtual ConnectionString::ConnectionType type() const = 0;
+
+    virtual double getSoTimeout() const = 0;
+
+    virtual uint64_t getSockCreationMicroSec() const {
+        return INVALID_SOCK_CREATION_TIME;
     }
 
-    virtual bool lazySupported() const = 0;
+    virtual void reset() {}
+
+    /**
+     * Returns true in isPrimary param if this db is the current primary of a replica pair.
+     *
+     * Pass in info for more details e.g.:
+     *   { "isprimary" : 1.0 , "msg" : "not paired" , "ok" : 1.0  }
+     *
+     * Returns true if command invoked successfully.
+     */
+    virtual bool isPrimary(bool& isPrimary, BSONObj* info = nullptr);
+
+    virtual bool isReplicaSetMember() const = 0;
+
+    virtual bool isMongos() const = 0;
+
+    virtual int getMinWireVersion() = 0;
+    virtual int getMaxWireVersion() = 0;
+
+    const std::vector<std::string>& getIsPrimarySaslMechanisms() const {
+        return _saslMechsForAuth;
+    }
+
+    /**
+     * Returns the latest operationTime tracked on this client.
+     */
+    Timestamp getOperationTime();
+
+    void setOperationTime(Timestamp operationTime);
 
     /**
      * Sets a RequestMetadataWriter on this connection.
@@ -199,9 +189,8 @@ public:
     virtual void setRequestMetadataWriter(rpc::RequestMetadataWriter writer);
 
     /**
-     * Gets the RequestMetadataWriter that is set on this connection. This may
-     * be an uninitialized stdx::function, so it should be checked for validity
-     * with operator bool() first.
+     * Gets the RequestMetadataWriter that is set on this connection. This may be an uninitialized
+     * std::function, so it should be checked for validity with operator bool() first.
      */
     const rpc::RequestMetadataWriter& getRequestMetadataWriter();
 
@@ -213,11 +202,17 @@ public:
     virtual void setReplyMetadataReader(rpc::ReplyMetadataReader reader);
 
     /**
-     * Gets the ReplyMetadataReader that is set on this connection. This may
-     * be an uninitialized stdx::function, so it should be checked for validity
-     * with operator bool() first.
+     * Gets the ReplyMetadataReader that is set on this connection. This may be an uninitialized
+     * std::function, so it should be checked for validity with operator bool() first.
      */
     const rpc::ReplyMetadataReader& getReplyMetadataReader();
+
+    /**
+     * Parses command replies and runs them through the metadata reader.
+     * This is virtual and non-const to allow subclasses to act on failures.
+     */
+    virtual rpc::UniqueReply parseCommandReplyMessage(const std::string& host,
+                                                      const Message& replyMsg);
 
     /**
      * Runs the specified command request.
@@ -226,7 +221,7 @@ public:
 
     /**
      * This shared_ptr overload is used to possibly return a shared_ptr to the replica set member
-     * that the command was dispatched to.  It's needed if the caller needs a lifetime for that
+     * that the command was dispatched to. It's needed if the caller needs a lifetime for that
      * connection that extends beyond the lifetime, or subsequent calls, against the top level
      * client.
      *
@@ -255,193 +250,118 @@ public:
      */
     virtual DBClientBase* runFireAndForgetCommand(OpMsgRequest request);
 
-    /** Run a database command.  Database commands are represented as BSON objects.  Common database
-        commands have prebuilt helper functions -- see below.  If a helper is not available you can
-        directly call runCommand.
-
-        @param dbname database name.  Use "admin" for global administrative commands.
-        @param cmd  the command object to execute.  For example, { ismaster : 1 }
-        @param info the result object the database returns. Typically has { ok : ..., errmsg : ... }
-                    fields set.
-        @param options see enum QueryOptions - normally not needed to run a command
-        @param auth if set, the BSONObj representation will be appended to the command object sent
-
-        @return true if the command returned "ok".
-    */
-    bool runCommand(const std::string& dbname, BSONObj cmd, BSONObj& info, int options = 0);
+    /**
+     * Runs a database command. Database commands are represented as BSON objects. Common database
+     * commands have prebuilt helper functions -- see below. If a helper is not available you can
+     * directly call runCommand.
+     *
+     *  'dbName': Database name. Use "admin" for global administrative commands.
+     *  'cmd': The command object to execute. For example, { hello : 1 }.
+     *  'info': The result object the database returns. Typically has { ok : ..., errmsg : ... }
+     *          fields set.
+     *  'options': See enum QueryOptions - normally not needed to run a command.
+     *  'vts': optional validated tenancy scope used to include tenancy information on a command
+     *
+     *  Returns true if the command returned "ok".
+     */
+    bool runCommand(const DatabaseName& dbName, BSONObj cmd, BSONObj& info, int options = 0);
 
     /*
-     * This wraps up the runCommand function avove, but returns the DBClient that actually ran
-     * the command. When called against a replica set, this will return the specific
-     * replica set member the command ran against.
+     * Wraps up the runCommand function avove, but returns the DBClient that actually ran the
+     * command. When called against a replica set, this will return the specific replica set member
+     * the command ran against.
      *
      * This is used in the shell so that cursors can send getMore through the correct connection.
      */
-    std::tuple<bool, DBClientBase*> runCommandWithTarget(const std::string& dbname,
+    std::tuple<bool, DBClientBase*> runCommandWithTarget(const DatabaseName& dbName,
                                                          BSONObj cmd,
                                                          BSONObj& info,
                                                          int options = 0);
 
     /**
-     * See the opMsg overload comment for why this function takes a shared_ptr ostensibly to this.
+     * Authenticates to another cluster member using appropriate authentication data.
+     * Throws an exception if authentication fails.
      */
-    std::tuple<bool, std::shared_ptr<DBClientBase>> runCommandWithTarget(
-        const std::string& dbname,
-        BSONObj cmd,
-        BSONObj& info,
-        std::shared_ptr<DBClientBase> me,
-        int options = 0);
+    virtual void authenticateInternalUser(
+        auth::StepDownBehavior stepDownBehavior = auth::StepDownBehavior::kKillConnection);
 
     /**
-    * Authenticates to another cluster member using appropriate authentication data.
-    * @return true if the authentication was successful
-    */
-    virtual Status authenticateInternalUser();
-
-    /**
-     * Authenticate a user.
+     * Authenticates a user.
      *
-     * The "params" BSONObj should be initialized with some of the fields below.  Which fields
+     * The 'params' BSONObj should be initialized with some of the fields below. Which fields
      * are required depends on the mechanism, which is mandatory.
      *
-     *     "mechanism": The std::string name of the sasl mechanism to use.  Mandatory.
-     *     "user": The std::string name of the user to authenticate.  Mandatory.
-     *     "db": The database target of the auth command, which identifies the location
-     *         of the credential information for the user.  May be "$external" if
-     *         credential information is stored outside of the mongo cluster.  Mandatory.
-     *     "pwd": The password data.
-     *     "digestPassword": Boolean, set to true if the "pwd" is undigested (default).
-     *     "serviceName": The GSSAPI service name to use.  Defaults to "mongodb".
-     *     "serviceHostname": The GSSAPI hostname to use.  Defaults to the name of the remote
-     *          host.
+     *  'mechanism': The std::string name of the sasl mechanism to use. Mandatory.
+     *  'user': The std::string name of the user to authenticate. Mandatory.
+     *  'db': The database target of the auth command, which identifies the location
+     *        of the credential information for the user. May be "$external" if
+     *        credential information is stored outside of the mongo cluster. Mandatory.
+     *  'pwd': The password data.
+     *  'serviceName': The GSSAPI service name to use. Defaults to "mongodb".
+     *  'serviceHostname': The GSSAPI hostname to use. Defaults to the name of the remote host.
      *
-     * Other fields in "params" are silently ignored.
-     *
-     * Returns normally on success, and throws on error.  Throws a DBException with getCode() ==
-     * ErrorCodes::AuthenticationFailed if authentication is rejected.  All other exceptions are
+     * Other fields in 'params' are silently ignored.
+     * Returns normally on success, and throws on error. Throws a DBException with getCode() ==
+     * ErrorCodes::AuthenticationFailed if authentication is rejected. All other exceptions are
      * tantamount to authentication failure, but may also indicate more serious problems.
      */
     void auth(const BSONObj& params);
 
-    /** Authorize access to a particular database.
-        Authentication is separate for each database on the server -- you may authenticate for any
-        number of databases on a single connection.
-        The "admin" database is special and once authenticated provides access to all databases on
-        the server.
-        @param      digestPassword  if password is plain text, set this to true.  otherwise assumed
-                                    to be pre-digested
-        @param[out] authLevel       level of authentication for the given user
-        @return true if successful
-    */
-    bool auth(const std::string& dbname,
-              const std::string& username,
-              const std::string& pwd,
-              std::string& errmsg,
-              bool digestPassword = true);
+    /**
+     * Authorizes access to a particular database.
+     *
+     * Authentication is separate for each database on the server -- you may authenticate for any
+     * number of databases on a single connection. The "admin" database is special and once
+     * authenticated provides access to all databases on the server.
+     */
+    void auth(const DatabaseName& dbname, StringData username, StringData pwd);
 
     /**
      * Logs out the connection for the given database.
      *
-     * @param dbname the database to logout from.
-     * @param info the result object for the logout command (provided for backwards
-     *     compatibility with mongo shell)
+     * 'dbname': The database to logout from.
+     * 'info': The result object for the logout command (provided for backwards compatibility with
+     *         mongo shell).
      */
-    virtual void logout(const std::string& dbname, BSONObj& info);
+    virtual void logout(const DatabaseName& dbname, BSONObj& info);
 
-    /** count number of objects in collection ns that match the query criteria specified
-        throws UserAssertion if database returns an error
-    */
-    virtual unsigned long long count(const std::string& ns,
-                                     const BSONObj& query = BSONObj(),
-                                     int options = 0,
-                                     int limit = 0,
-                                     int skip = 0);
-
-    static std::string createPasswordDigest(const std::string& username,
-                                            const std::string& clearTextPassword);
-
-    /** returns true in isMaster parm if this db is the current master
-       of a replica pair.
-
-       pass in info for more details e.g.:
-         { "ismaster" : 1.0 , "msg" : "not paired" , "ok" : 1.0  }
-
-       returns true if command invoked successfully.
-    */
-    virtual bool isMaster(bool& isMaster, BSONObj* info = 0);
+    virtual bool authenticatedDuringConnect() const {
+        return false;
+    }
 
     /**
-       Create a new collection in the database.  Normally, collection creation is automatic.  You
-       would use this function if you wish to specify special options on creation.
-
-       If the collection already exists, no action occurs.
-
-       @param ns     fully qualified collection name
-       @param size   desired initial extent size for the collection.
-                     Must be <= 1000000000 for normal collections.
-                     For fixed size (capped) collections, this size is the total/max size of the
-                     collection.
-       @param capped if true, this is a fixed size collection (where old data rolls out).
-       @param max    maximum number of objects if capped (optional).
-
-       returns true if successful.
-    */
-    bool createCollection(const std::string& ns,
+     * Creates a new collection in the database. Normally, collection creation is automatic. You
+     * would use this function if you wish to specify special options on creation.
+     *
+     *  If the collection already exists, no action occurs.
+     *
+     *  'nss': Fully qualified collection name.
+     *  'size': Desired initial extent size for the collection.
+     *          Must be <= 1000000000 for normal collections.
+     *          For fixed size (capped) collections, this size is the total/max size of the
+     *          collection.
+     *  'capped': If true, this is a fixed size collection (where old data rolls out).
+     *  'max': Maximum number of objects if capped (optional).
+     *
+     * Returns true if successful.
+     */
+    bool createCollection(const NamespaceString& nss,
                           long long size = 0,
                           bool capped = false,
                           int max = 0,
-                          BSONObj* info = 0);
+                          BSONObj* info = nullptr,
+                          boost::optional<BSONObj> writeConcernObj = boost::none);
 
-    /** Get error result from the last write operation (insert/update/delete) on this connection.
-        db doesn't change the command's behavior - it is just for auth checks.
-        @return error message text, or empty std::string if no error.
-    */
-    std::string getLastError(
-        const std::string& db, bool fsync = false, bool j = false, int w = 0, int wtimeout = 0);
     /**
-     * Same as the form of getLastError that takes a dbname, but just uses the admin DB.
+     * Deletes the specified collection.
+     *
+     *  'info': An optional output parameter that receives the result object the database returns
+     *          from the drop command. May be null if the caller doesn't need that info.
      */
-    std::string getLastError(bool fsync = false, bool j = false, int w = 0, int wtimeout = 0);
-
-    /** Get error result from the last write operation (insert/update/delete) on this connection.
-        db doesn't change the command's behavior - it is just for auth checks.
-        @return full error object.
-
-        If "w" is -1, wait for propagation to majority of nodes.
-        If "wtimeout" is 0, the operation will block indefinitely if needed.
-    */
-    virtual BSONObj getLastErrorDetailed(
-        const std::string& db, bool fsync = false, bool j = false, int w = 0, int wtimeout = 0);
-    /**
-     * Same as the form of getLastErrorDetailed that takes a dbname, but just uses the admin DB.
-     */
-    virtual BSONObj getLastErrorDetailed(bool fsync = false,
-                                         bool j = false,
-                                         int w = 0,
-                                         int wtimeout = 0);
-
-    /** Can be called with the returned value from getLastErrorDetailed to extract an error string.
-        If all you need is the string, just call getLastError() instead.
-    */
-    static std::string getLastErrorString(const BSONObj& res);
-
-    /** Return the last error which has occurred, even if not the very last operation.
-
-       @return { err : <error message>, nPrev : <how_many_ops_back_occurred>, ok : 1 }
-
-       result.err will be null if no error has occurred.
-    */
-    BSONObj getPrevError();
-
-    /** Delete the specified collection.
-     *  @param info An optional output parameter that receives the result object the database
-     *  returns from the drop command.  May be null if the caller doesn't need that info.
-     */
-    virtual bool dropCollection(const std::string& ns,
+    virtual bool dropCollection(const NamespaceString& nss,
                                 const WriteConcernOptions& writeConcern = WriteConcernOptions(),
                                 BSONObj* info = nullptr) {
-        std::string db = nsGetDB(ns);
-        std::string coll = nsGetCollection(ns);
+        auto coll = nss.coll();
         uassert(10011, "no collection name", coll.size());
 
         BSONObj temp;
@@ -450,17 +370,8 @@ public:
         }
 
         bool res = runCommand(
-            db.c_str(), BSON("drop" << coll << "writeConcern" << writeConcern.toBSON()), *info);
+            nss.dbName(), BSON("drop" << coll << "writeConcern" << writeConcern.toBSON()), *info);
         return res;
-    }
-
-    /** validate a collection, checking for errors and reporting back statistics.
-        this operation is slow and blocking.
-     */
-    bool validate(const std::string& ns, bool scandata = true) {
-        BSONObj cmd = BSON("validate" << nsGetCollection(ns) << "scandata" << scandata);
-        BSONObj info;
-        return runCommand(nsGetDB(ns).c_str(), cmd, info);
     }
 
     /**
@@ -468,274 +379,415 @@ public:
      *   options : { }
      * }
      */
-    std::list<BSONObj> getCollectionInfos(const std::string& db, const BSONObj& filter = BSONObj());
-
-    bool exists(const std::string& ns);
-
-    /** Create an index on the collection 'ns' as described by the given keys. If you wish
-     *  to specify options, see the more flexible overload of 'createIndex' which takes an
-     *  IndexSpec object. Failure to construct the index is reported by throwing a
-     *  AssertionException.
-     *
-     *  @param ns Namespace on which to create the index
-     *  @param keys Document describing keys and index types. You must provide at least one
-     *  field and its direction.
-     */
-    void createIndex(StringData ns, const BSONObj& keys) {
-        return createIndex(ns, IndexSpec().addKeys(keys));
-    }
-
-    /** Create an index on the collection 'ns' as described by the given
-     *  descriptor. Failure to construct the index is reported by throwing a
-     *  AssertionException.
-     *
-     *  @param ns Namespace on which to create the index
-     *  @param descriptor Configuration object describing the index to create. The
-     *  descriptor must describe at least one key and index type.
-     */
-    virtual void createIndex(StringData ns, const IndexSpec& descriptor) {
-        std::vector<const IndexSpec*> toBuild;
-        toBuild.push_back(&descriptor);
-        createIndexes(ns, toBuild);
-    }
-
-    virtual void createIndexes(StringData ns, const std::vector<const IndexSpec*>& descriptor);
+    std::list<BSONObj> getCollectionInfos(const DatabaseName& dbName,
+                                          const BSONObj& filter = BSONObj(),
+                                          bool secondaryOk = true);
 
     /**
-     * Creates indexes on the collection 'ns' as described by 'specs'.
-     *
-     * Failure to construct the indexes is reported by throwing an AssertionException.
+     * Drops an entire database.
      */
-    virtual void createIndexes(StringData ns, const std::vector<BSONObj>& specs);
-
-    virtual std::list<BSONObj> getIndexSpecs(const std::string& ns, int options = 0);
-
-    virtual void dropIndex(const std::string& ns, BSONObj keys);
-    virtual void dropIndex(const std::string& ns, const std::string& indexName);
-
-    /**
-       drops all indexes for the collection
-     */
-    virtual void dropIndexes(const std::string& ns);
-
-    virtual void reIndex(const std::string& ns);
-
-    static std::string genIndexName(const BSONObj& keys);
-
-    /** Erase / drop an entire database */
-    virtual bool dropDatabase(const std::string& dbname,
+    virtual bool dropDatabase(const DatabaseName& dbName,
                               const WriteConcernOptions& writeConcern = WriteConcernOptions(),
                               BSONObj* info = nullptr) {
         BSONObj o;
         if (info == nullptr)
             info = &o;
         return runCommand(
-            dbname, BSON("dropDatabase" << 1 << "writeConcern" << writeConcern.toBSON()), *info);
+            dbName, BSON("dropDatabase" << 1 << "writeConcern" << writeConcern.toBSON()), *info);
     }
 
-    virtual std::string toString() const = 0;
+    /**
+     * Lists databases available on the server.
+     *
+     * 'filter': A filter for the results
+     * 'nameOnly': Only return the names of the databases
+     * 'authorizedDatabases': Only return the databases the user is authorized on
+     * 'useListDatabasesForAllTenants': Use command listDatabasesForAllTenants
+     */
+    std::vector<BSONObj> getDatabaseInfos(const BSONObj& filter = BSONObj(),
+                                          bool nameOnly = false,
+                                          bool authorizedDatabases = false,
+                                          bool useListDatabasesForAllTenants = false);
 
     /**
-     * Run a pseudo-command such as sys.inprog/currentOp, sys.killop/killOp
-     * or sys.unlock/fsyncUnlock
+     * Creates an index on the collection 'nss' as described by the given keys. If you wish to
+     * specify options, see the more flexible overload of 'createIndex' which takes an IndexSpec
+     * object. Failure to construct the index is reported by throwing a AssertionException.
      *
-     * The real command will be tried first, and if the remote server does not
-     * implement the command, it will fall back to the pseudoCommand.
-     *
-     * The cmdArgs parameter should NOT include {<commandName>: 1}.
-     *
-     * TODO: remove after MongoDB 3.2 is released and replace all callers with
-     * a call to plain runCommand
+     *  'nss': NamespaceString on which to create the index
+     *  'keys': Document describing keys and index types. You must provide at least one field and
+     *          its direction.
      */
-    virtual bool runPseudoCommand(StringData db,
-                                  StringData realCommandName,
-                                  StringData pseudoCommandCol,
-                                  const BSONObj& cmdArgs,
-                                  BSONObj& info,
-                                  int options = 0);
-
-    /**
-     * Reconnect if needed and allowed.
-     */
-    virtual void checkConnection() {}
-
-    static const uint64_t INVALID_SOCK_CREATION_TIME;
-
-    long long getConnectionId() const {
-        return _connectionId;
+    void createIndex(const NamespaceString& nss,
+                     const BSONObj& keys,
+                     boost::optional<BSONObj> writeConcernObj = boost::none) {
+        return createIndex(nss, IndexSpec().addKeys(keys), writeConcernObj);
     }
 
-    virtual int getMinWireVersion() = 0;
-    virtual int getMaxWireVersion() = 0;
-
-    /** send a query to the database.
-     @param ns namespace to query, format is <dbname>.<collectname>[.<collectname>]*
-     @param query query to perform on the collection.  this is a BSONObj (binary JSON)
-     You may format as
-       { query: { ... }, orderby: { ... } }
-     to specify a sort order.
-     @param nToReturn n to return (i.e., limit).  0 = unlimited
-     @param nToSkip start with the nth item
-     @param fieldsToReturn optional template of which fields to select. if unspecified,
-            returns all fields
-     @param queryOptions see options enum at top of this file
-
-     @return    cursor.   0 if error (connection failure)
-     @throws AssertionException
-    */
-    std::unique_ptr<DBClientCursor> query(const NamespaceStringOrUUID& nsOrUuid,
-                                          Query query,
-                                          int nToReturn = 0,
-                                          int nToSkip = 0,
-                                          const BSONObj* fieldsToReturn = 0,
-                                          int queryOptions = 0,
-                                          int batchSize = 0) override;
-
-
-    /** Uses QueryOption_Exhaust, when available and specified in 'queryOptions'.
-
-        Exhaust mode sends back all data queries as fast as possible, with no back-and-forth for
-        OP_GETMORE.  If you are certain you will exhaust the query, it could be useful.  If
-        exhaust mode is not specified in 'queryOptions' or not available, this call transparently
-        falls back to using ordinary getMores.
-
-        Use the DBClientCursorBatchIterator version, below, if you want to do items in large
-        blocks, perhaps to avoid granular locking and such.
-
-        Note:
-        The version that takes a BSONObj cannot return the namespace queried when the query is
-        is done by UUID.  If this is required, use the DBClientBatchIterator version.
-     */
-    unsigned long long query(stdx::function<void(const BSONObj&)> f,
-                             const NamespaceStringOrUUID& nsOrUuid,
-                             Query query,
-                             const BSONObj* fieldsToReturn = 0,
-                             int queryOptions = QueryOption_Exhaust,
-                             int batchSize = 0) final;
-
-    unsigned long long query(stdx::function<void(DBClientCursorBatchIterator&)> f,
-                             const NamespaceStringOrUUID& nsOrUuid,
-                             Query query,
-                             const BSONObj* fieldsToReturn = 0,
-                             int queryOptions = QueryOption_Exhaust,
-                             int batchSize = 0) override;
-
-
-    /** don't use this - called automatically by DBClientCursor for you
-        @param cursorId id of cursor to retrieve
-        @return an handle to a previously allocated cursor
-        @throws AssertionException
-     */
-    virtual std::unique_ptr<DBClientCursor> getMore(const std::string& ns,
-                                                    long long cursorId,
-                                                    int nToReturn = 0,
-                                                    int options = 0);
-
     /**
-       insert an object into the database
+     * Creates an index on the collection 'nss' as described by the given descriptor. Failure to
+     * construct the index is reported by throwing a AssertionException.
+     *
+     *  'nss': NamespaceString on which to create the index
+     *  'descriptor': Configuration object describing the index to create. The descriptor must
+     *                describe at least one key and index type.
      */
-    virtual void insert(const std::string& ns, BSONObj obj, int flags = 0);
-
-    /**
-       insert a vector of objects into the database
-     */
-    virtual void insert(const std::string& ns, const std::vector<BSONObj>& v, int flags = 0);
-
-    /**
-       updates objects matching query
-     */
-    virtual void update(
-        const std::string& ns, Query query, BSONObj obj, bool upsert = false, bool multi = false);
-
-    virtual void update(const std::string& ns, Query query, BSONObj obj, int flags);
-
-    virtual void remove(const std::string& ns, Query query, int flags = 0);
-
-    virtual bool isFailed() const = 0;
-
-    /**
-     * if not checked recently, checks whether the underlying socket/sockets are still valid
-     */
-    virtual bool isStillConnected() = 0;
-
-    virtual void killCursor(const NamespaceString& ns, long long cursorID);
-
-    virtual ConnectionString::ConnectionType type() const = 0;
-
-    virtual double getSoTimeout() const = 0;
-
-    virtual uint64_t getSockCreationMicroSec() const {
-        return INVALID_SOCK_CREATION_TIME;
+    virtual void createIndex(const NamespaceString& nss,
+                             const IndexSpec& descriptor,
+                             boost::optional<BSONObj> writeConcernObj = boost::none) {
+        std::vector<const IndexSpec*> toBuild;
+        toBuild.push_back(&descriptor);
+        createIndexes(nss, toBuild, writeConcernObj);
     }
 
-    virtual void reset() {}
-
-    virtual bool isReplicaSetMember() const = 0;
-
-    virtual bool isMongos() const = 0;
+    virtual void createIndexes(const NamespaceString& nss,
+                               const std::vector<const IndexSpec*>& descriptor,
+                               boost::optional<BSONObj> writeConcernObj = boost::none);
 
     /**
-     * Parses command replies and runs them through the metadata reader.
-     * This is virtual and non-const to allow subclasses to act on failures.
+     * Creates indexes on the collection 'nss' as described by 'specs'.
+     *
+     * Failure to construct the indexes is reported by throwing an AssertionException.
      */
-    virtual rpc::UniqueReply parseCommandReplyMessage(const std::string& host,
-                                                      const Message& replyMsg);
+    virtual void createIndexes(const NamespaceString& nss,
+                               const std::vector<BSONObj>& specs,
+                               boost::optional<BSONObj> writeConcernObj = boost::none);
+
+    /**
+     * Lists indexes on the collection 'nsOrUuid'.
+     * Includes in-progress indexes.
+     *
+     * If 'includeBuildUUIDs' is true, in-progress index specs will have the following format:
+     * {
+     *     spec: <BSONObj>
+     *     buildUUID: <UUID>
+     * }
+     * and ready index specs will only list the spec.
+     *
+     * If 'includeBuildUUIDs' is false, only the index spec will be returned without a way to
+     * distinguish between ready and in-progress index specs.
+     */
+    virtual std::list<BSONObj> getIndexSpecs(const NamespaceStringOrUUID& nsOrUuid,
+                                             bool includeBuildUUIDs,
+                                             int options);
+
+    virtual void dropIndex(const NamespaceString& nss,
+                           BSONObj keys,
+                           boost::optional<BSONObj> writeConcernObj = boost::none);
+    virtual void dropIndex(const NamespaceString& nss,
+                           const std::string& indexName,
+                           boost::optional<BSONObj> writeConcernObj = boost::none);
+
+    /**
+     * Drops all indexes for the collection.
+     */
+    virtual void dropIndexes(const NamespaceString& nss,
+                             boost::optional<BSONObj> writeConcernObj = boost::none);
+
+    virtual void reIndex(const NamespaceString& nss);
+
+    static std::string genIndexName(const BSONObj& keys);
+
+    /**
+     * Sends the provided message, returning the server's reponse.
+     *
+     * 'actualServer' is set to the actual server where they call went if there was a choice (for
+     * example SecondaryOk).
+     */
+    Message call(Message& toSend, std::string* actualServer = nullptr) {
+        return _call(toSend, actualServer);
+    };
+
+    virtual void say(Message& toSend,
+                     bool isRetry = false,
+                     std::string* actualServer = nullptr) = 0;
+
+    /**
+     * Used by QueryOption_Exhaust. To use that your subclass must implement this.
+     */
+    virtual Message recv(int lastRequestId) {
+        MONGO_verify(false);
+        uasserted(ErrorCodes::NotImplemented, "recv() not implemented");
+    }
+
+    /**
+     * Issues a find command described by 'findRequest', and returns the resulting cursor.
+     */
+    virtual std::unique_ptr<DBClientCursor> find(FindCommandRequest findRequest,
+                                                 const ReadPreferenceSetting& readPref,
+                                                 ExhaustMode exhaustMode);
+
+    /**
+     * Convenience overloads. Identical to the 'find()' overload above, but default values of
+     * "primary" read preference and 'ExhaustMode::kOff' are used when not supplied by the caller.
+     */
+    std::unique_ptr<DBClientCursor> find(FindCommandRequest findRequest) {
+        ReadPreferenceSetting defaultReadPref{};
+        return find(std::move(findRequest), defaultReadPref, ExhaustMode::kOff);
+    }
+
+    std::unique_ptr<DBClientCursor> find(FindCommandRequest findRequest,
+                                         const ReadPreferenceSetting& readPref) {
+        return find(std::move(findRequest), readPref, ExhaustMode::kOff);
+    }
+
+    /**
+     * Issues a find command described by 'findRequest' and the given read preference. Rather than
+     * returning a cursor to the caller, iterates the cursor under the hood and calls the provided
+     * 'callback' function against each of the documents produced by the cursor.
+     */
+    void find(FindCommandRequest findRequest, std::function<void(const BSONObj&)> callback) {
+        find(std::move(findRequest),
+             ReadPreferenceSetting{},
+             ExhaustMode::kOff,
+             std::move(callback));
+    }
+
+    void find(FindCommandRequest findRequest,
+              const ReadPreferenceSetting& readPref,
+              ExhaustMode exhaustMode,
+              std::function<void(const BSONObj&)> callback);
+
+    /**
+     * Issues a find command describe by 'findRequest', but augments the request to have a limit of
+     * 1. It is illegal for the given 'findRequest' to have a limit already set.
+     *
+     * Returns the document resulting from the query, or an empty document if the query has no
+     * results.
+     */
+    BSONObj findOne(FindCommandRequest findRequest, const ReadPreferenceSetting& readPref);
+
+    /**
+     * Identical to the 'findOne()' overload above, but uses a default value of "primary" for the
+     * read preference.
+     */
+    BSONObj findOne(FindCommandRequest findRequest) {
+        ReadPreferenceSetting defaultReadPref{};
+        return findOne(std::move(findRequest), defaultReadPref);
+    }
+
+    /**
+     * Issues a find command against the given collection (passed in either by namespace or by UUID)
+     * with the given 'filter'. Also augments the find request to have a limit of 1.
+     *
+     * Returns the document resulting from the query, or an empty document if the query has no
+     * results.
+     */
+    BSONObj findOne(const NamespaceStringOrUUID& nssOrUuid, BSONObj filter);
+
+    /**
+     * Don't use this - called automatically by DBClientCursor for you.
+     *   'cursorId': Id of cursor to retrieve.
+     *   Returns an handle to a previously allocated cursor.
+     *   Throws AssertionException.
+     */
+    virtual std::unique_ptr<DBClientCursor> getMore(const NamespaceString& nss, long long cursorId);
+
+    /**
+     * Counts number of objects in collection ns that match the query criteria specified.
+     * Throws UserAssertion if database returns an error.
+     */
+    virtual long long count(
+        const NamespaceStringOrUUID& nsOrUuid,
+        const BSONObj& query = BSONObj(),
+        int options = 0,
+        int limit = 0,
+        int skip = 0,
+        const boost::optional<repl::ReadConcernArgs>& readConcern = boost::none);
+
+    /**
+     * Executes an acknowledged command to insert a vector of documents.
+     */
+    virtual BSONObj insertAcknowledged(const NamespaceString& nss,
+                                       const std::vector<BSONObj>& v,
+                                       bool ordered = true,
+                                       boost::optional<BSONObj> writeConcernObj = boost::none);
+
+    /**
+     * Executes a fire-and-forget command to insert a single document.
+     */
+    virtual void insert(const NamespaceString& nss,
+                        BSONObj obj,
+                        bool ordered = true,
+                        boost::optional<BSONObj> writeConcernObj = boost::none);
+
+    /**
+     * Executes a fire-and-forget command to insert a vector of documents.
+     */
+    virtual void insert(const NamespaceString& nss,
+                        const std::vector<BSONObj>& v,
+                        bool ordered = true,
+                        boost::optional<BSONObj> writeConcernObj = boost::none);
+
+    /**
+     * Executes an acknowledged command to update the objects that match the query.
+     */
+    virtual BSONObj updateAcknowledged(const NamespaceString& nss,
+                                       const BSONObj& filter,
+                                       BSONObj updateSpec,
+                                       bool upsert = false,
+                                       bool multi = false,
+                                       boost::optional<BSONObj> writeConcernObj = boost::none);
+
+    /**
+     * Executes a fire-and-forget command to update the objects that match the query.
+     */
+    virtual void update(const NamespaceString& nss,
+                        const BSONObj& filter,
+                        BSONObj updateSpec,
+                        bool upsert = false,
+                        bool multi = false,
+                        boost::optional<BSONObj> writeConcernObj = boost::none);
+
+    /**
+     * Executes an acknowledged command to remove the objects that match the query.
+     */
+    virtual BSONObj removeAcknowledged(const NamespaceString& nss,
+                                       const BSONObj& filter,
+                                       bool removeMany = true,
+                                       boost::optional<BSONObj> writeConcernObj = boost::none);
+
+    /**
+     * Executes a fire-and-forget command to remove the objects that match the query.
+     */
+    virtual void remove(const NamespaceString& nss,
+                        const BSONObj& filter,
+                        bool removeMany = true,
+                        boost::optional<BSONObj> writeConcernObj = boost::none);
+
+    virtual void killCursor(const NamespaceString& nss, long long cursorID);
 
     // This is only for DBClientCursor.
     static void (*withConnection_do_not_use)(std::string host, std::function<void(DBClientBase*)>);
 
-protected:
-    /** if the result of a command is ok*/
-    bool isOk(const BSONObj&);
-
-    /** if the element contains a not master error */
-    bool isNotMasterErrorString(const BSONElement& e);
-
-    BSONObj _countCmd(
-        const std::string& ns, const BSONObj& query, int options, int limit, int skip);
+#ifdef MONGO_CONFIG_SSL
+    /**
+     * Gets the SSL configuration of this client, if any.
+     */
+    virtual const SSLConfiguration* getSSLConfiguration() = 0;
 
     /**
-     * Look up the options available on this client.  Caches the answer from
-     * _lookupAvailableOptions(), below.
+     * Returns true if this client was connected using transient SSL parameters. May return
+     * false if this client was never connected.
      */
-    QueryOptions availableOptions();
+    virtual bool isUsingTransientSSLParams() const {
+        return false;
+    }
 
-    virtual QueryOptions _lookupAvailableOptions();
+    virtual bool isTLS() = 0;
+#else
+    virtual bool isTLS() {
+        return false;
+    }
+#endif
+
+    virtual bool isGRPC() {
+        return false;
+    }
+
+    const ClientAPIVersionParameters& getApiParameters() const {
+        return _apiParameters;
+    }
+
+    void setShouldThrowOnStaleConfigError(bool value) {
+        _shouldThrowOnStaleConfigError = value;
+    }
+
+protected:
+    /**
+     * Generates the validated tenancy scope for internal requests utilized within the server or
+     * across servers.
+     */
+    virtual auth::ValidatedTenancyScope _createInnerRequestVTS(
+        const boost::optional<TenantId>& tenantId) const;
+
+protected:
+    /**
+     * Returns true if the result of a command is ok.
+     */
+    bool isOk(const BSONObj&);
+
+    /**
+     * Returns true if the element contains a not primary error.
+     */
+    bool isNotPrimaryErrorString(const BSONElement& e);
+
+    BSONObj _countCmd(const NamespaceStringOrUUID& nsOrUuid,
+                      const BSONObj& query,
+                      int options,
+                      int limit,
+                      int skip,
+                      const boost::optional<repl::ReadConcernArgs>& readConcern);
 
     virtual void _auth(const BSONObj& params);
 
-    // should be set by subclasses during connection.
-    void _setServerRPCProtocols(rpc::ProtocolSet serverProtocols);
+    /**
+     * Controls how chatty the client is about network errors & such. See log.h.
+     */
+    const logv2::LogSeverity _logLevel;
 
-    /** controls how chatty the client is about network errors & such.  See log.h */
-    const logger::LogSeverity _logLevel;
-
-    static AtomicInt64 ConnectionIdSequence;
+    static AtomicWord<long long> ConnectionIdSequence;
     long long _connectionId;  // unique connection id for this connection
 
+    std::vector<std::string> _saslMechsForAuth;
+
+    // Unless explicitly opted out, a DBClientBase should throw on a StaleConfig error so that the
+    // error can be handled internally if applicable rather than propagated to the external client
+    // right away.
+    bool _shouldThrowOnStaleConfigError = true;
+
 private:
+    virtual Message _call(Message& toSend, std::string* actualServer) = 0;
+
+    /**
+     * Implementation for getIndexes() and getReadyIndexes().
+     */
+    std::list<BSONObj> _getIndexSpecs(const NamespaceStringOrUUID& nsOrUuid,
+                                      const BSONObj& cmd,
+                                      int options);
+
     auth::RunCommandHook _makeAuthRunCommandHook();
-
-    /**
-     * The rpc protocols this client supports.
-     *
-     */
-    rpc::ProtocolSet _clientRPCProtocols{rpc::supports::kAll};
-
-    /**
-     * The rpc protocol the remote server(s) support. We support 'opQueryOnly' by default unless
-     * we detect support for OP_MSG at connection time.
-     */
-    rpc::ProtocolSet _serverRPCProtocols{rpc::supports::kOpQueryOnly};
 
     rpc::RequestMetadataWriter _metadataWriter;
     rpc::ReplyMetadataReader _metadataReader;
 
-    enum QueryOptions _cachedAvailableOptions;
-    bool _haveCachedAvailableOptions;
+    // The operationTime associated with the last command handled by the client.
+    Timestamp _lastOperationTime;
+
+    ClientAPIVersionParameters _apiParameters;
 };  // DBClientBase
 
 BSONElement getErrField(const BSONObj& result);
 bool hasErrField(const BSONObj& result);
+
+/*
+ * RAII-style class to set new RequestMetadataWriter and ReplyMetadataReader on DBClientConnection
+ * "_conn". On object destruction, '_conn' is set back to it's old RequestsMetadataWriter and
+ * ReplyMetadataReader.
+ */
+class ScopedMetadataWriterAndReader {
+    ScopedMetadataWriterAndReader(const ScopedMetadataWriterAndReader&) = delete;
+    ScopedMetadataWriterAndReader& operator=(const ScopedMetadataWriterAndReader&) = delete;
+
+public:
+    ScopedMetadataWriterAndReader(DBClientBase* conn,
+                                  rpc::RequestMetadataWriter writer,
+                                  rpc::ReplyMetadataReader reader)
+        : _conn(conn),
+          _oldWriter(conn->getRequestMetadataWriter()),
+          _oldReader(conn->getReplyMetadataReader()) {
+        _conn->setRequestMetadataWriter(std::move(writer));
+        _conn->setReplyMetadataReader(std::move(reader));
+    }
+    ~ScopedMetadataWriterAndReader() {
+        _conn->setRequestMetadataWriter(std::move(_oldWriter));
+        _conn->setReplyMetadataReader(std::move(_oldReader));
+    }
+
+private:
+    DBClientBase* const _conn;  // not owned.
+    rpc::RequestMetadataWriter _oldWriter;
+    rpc::ReplyMetadataReader _oldReader;
+};
 
 }  // namespace mongo

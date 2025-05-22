@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,10 +29,26 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
+#include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+#include <string>
+
 #include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/profile_settings.h"
+#include "mongo/db/service_context.h"
 
 namespace mongo {
+
+class ProfileCmdRequest;
+
 /**
  * An abstract base class which implements all functionality common to the mongoD and mongoS
  * 'profile' command, and defines a number of virtual functions through which it delegates any
@@ -42,7 +57,7 @@ namespace mongo {
 class ProfileCmdBase : public BasicCommand {
 public:
     ProfileCmdBase() : BasicCommand("profile") {}
-    virtual ~ProfileCmdBase() {}
+    ~ProfileCmdBase() override {}
 
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const final {
         return AllowedOnSecondary::kAlways;
@@ -59,20 +74,29 @@ public:
         return false;
     }
 
-    Status checkAuthForCommand(Client* client,
-                               const std::string& dbname,
-                               const BSONObj& cmdObj) const final;
+    Status checkAuthForOperation(OperationContext*,
+                                 const DatabaseName&,
+                                 const BSONObj&) const final;
 
     bool run(OperationContext* opCtx,
-             const std::string& dbName,
+             const DatabaseName& dbName,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) final;
 
 protected:
-    // Applies the given profiling level, or throws if the profiling level could not be set. On
-    // success, returns an integer indicating the previous profiling level.
-    virtual int _applyProfilingLevel(OperationContext* opCtx,
-                                     const std::string& dbName,
-                                     int profilingLevel) const = 0;
+    // Applies the given profiling level and filter, or throws if the profiling level could not be
+    // set. On success, returns a struct indicating the previous profiling level and filter.
+    virtual ProfileSettings _applyProfilingLevel(OperationContext* opCtx,
+                                                 const DatabaseName& dbName,
+                                                 const ProfileCmdRequest& request) const = 0;
 };
+
+struct ObjectOrUnset {
+    boost::optional<BSONObj> obj;
+};
+ObjectOrUnset parseObjectOrUnset(const BSONElement& element);
+void serializeObjectOrUnset(const ObjectOrUnset& obj,
+                            StringData fieldName,
+                            BSONObjBuilder* builder);
+
 }  // namespace mongo

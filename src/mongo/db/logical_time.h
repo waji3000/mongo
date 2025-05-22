@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,6 +29,13 @@
 
 #pragma once
 
+#include <array>
+#include <cstdint>
+#include <iosfwd>
+#include <string>
+
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsontypes.h"
 #include "mongo/bson/timestamp.h"
 
 namespace mongo {
@@ -43,6 +49,8 @@ class BSONObjBuilder;
  */
 class LogicalTime {
 public:
+    static constexpr StringData kOperationTimeFieldName = "operationTime"_sd;
+
     LogicalTime() = default;
     explicit LogicalTime(Timestamp ts);
 
@@ -83,6 +91,12 @@ public:
      *  serialize into BSON object.
      */
     BSONObj toBSON() const;
+
+    /*
+     * These methods support IDL parsing of logical times.
+     */
+    static LogicalTime parseFromBSON(const BSONElement& elem);
+    void serializeToBSON(StringData fieldName, BSONObjBuilder* bob) const;
 
     /**
      * An uninitialized value of LogicalTime. Default constructed.

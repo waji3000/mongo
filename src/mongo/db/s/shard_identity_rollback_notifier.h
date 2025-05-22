@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,7 +29,6 @@
 
 #pragma once
 
-#include "mongo/base/disallow_copying.h"
 
 namespace mongo {
 
@@ -53,7 +51,8 @@ class ServiceContext;
  * exiting rollback, and there can only be one of those things happening at any given time.
  */
 class ShardIdentityRollbackNotifier {
-    MONGO_DISALLOW_COPYING(ShardIdentityRollbackNotifier);
+    ShardIdentityRollbackNotifier(const ShardIdentityRollbackNotifier&) = delete;
+    ShardIdentityRollbackNotifier& operator=(const ShardIdentityRollbackNotifier&) = delete;
 
 public:
     ShardIdentityRollbackNotifier();

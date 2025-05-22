@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,12 +29,12 @@
 
 #pragma once
 
+#include <functional>
 #include <map>
 #include <string>
 #include <vector>
 
 #include "mongo/base/status.h"
-#include "mongo/stdx/functional.h"
 #include "mongo/util/duration.h"
 
 namespace mongo {
@@ -46,6 +45,24 @@ constexpr Seconds kDefaultConfigExpandTimeout{30};
 class Environment;
 class OptionSection;
 class Value;
+
+
+/**
+ * Flags controlling whether or not __rest and/or __exec directives in a
+ * config file should be expanded via HttpClient/shellExec.
+ */
+struct ConfigExpand {
+    bool rest = false;
+    bool exec = false;
+    Seconds timeout = kDefaultConfigExpandTimeout;
+};
+
+/**
+ * Reads the contents of `filename` and puts the result in `outContents`.
+ */
+Status readRawFile(const std::string& filename,
+                   std::string* outContents,
+                   ConfigExpand configExpand);
 
 /** Handles parsing of the command line as well as YAML and INI config files.  Takes an
  *  OptionSection instance that describes the allowed options, parses argv (env not yet
@@ -67,7 +84,7 @@ class Value;
  *  Status ret = parser.run(options, argv, env, &environment);
  *  if (!ret.isOK()) {
  *      cerr << options.helpString() << std::endl;
- *      exit(EXIT_FAILURE);
+ *      exit(ExitCode::fail);
  *  }
  *
  *  bool displayHelp;
@@ -75,11 +92,11 @@ class Value;
  *  if (!ret.isOK()) {
  *      // Help is a switch, so it should always be set
  *      cout << "Should not get here" << std::endl;
- *      exit(EXIT_FAILURE);
+ *      exit(ExitCode::fail);
  *  }
  *  if (displayHelp) {
  *      cout << options.helpString() << std::endl;
- *      exit(EXIT_SUCCESS);
+ *      exit(ExitCode::clean);
  *  }
  *
  *  // Get the value of port from the environment
@@ -96,7 +113,7 @@ public:
      *  true - unknown config options will generate an error during parsing.
      *  false - unknow config options will be ignored during parsing.
      */
-    static stdx::function<bool()> useStrict;
+    static std::function<bool()> useStrict;
 
     OptionsParser() {}
     virtual ~OptionsParser() {}
@@ -111,29 +128,15 @@ public:
      *  file.  For binaries that do not support config files, the "config" option should not be
      *  registered in the OptionSection.
      */
-    Status run(const OptionSection&,
+    Status run(const OptionSection& options,
                const std::vector<std::string>& argv,
-               const std::map<std::string, std::string>& env,
-               Environment*);
+               Environment* env);
 
     /** Handles parsing of a YAML or INI formatted string. The
      *  OptionSection be a description of the allowed options.  This function populates the
      *  given Environment with the results but does not call validate on the Environment.
      */
-    Status runConfigFile(const OptionSection&,
-                         const std::string& config,
-                         const std::map<std::string, std::string>& env,
-                         Environment*);
-
-    /**
-     * Flags controlling whether or not __rest and/or __exec directives in a
-     * config file should be expanded via HttpClient/shellExec.
-     */
-    struct ConfigExpand {
-        bool rest = false;
-        bool exec = false;
-        Seconds timeout = kDefaultConfigExpandTimeout;
-    };
+    Status runConfigFile(const OptionSection& options, const std::string& config, Environment* env);
 
 private:
     /** Handles parsing of the command line and adds the results to the given Environment */
@@ -157,7 +160,9 @@ private:
 
     /** Reads the given config file into the output string.  This function is virtual for
      *  testing purposes only. */
-    virtual Status readConfigFile(const std::string& filename, std::string*);
+    virtual Status readConfigFile(const std::string& filename,
+                                  std::string*,
+                                  ConfigExpand configExpand);
 };
 
 }  // namespace optionenvironment

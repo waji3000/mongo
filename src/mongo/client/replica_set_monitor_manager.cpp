@@ -1,6 +1,5 @@
-
 /**
- *    Copyright (C) 2018-present MongoDB, Inc.
+ *    Copyright (C) 2020-present MongoDB, Inc.
  *
  *    This program is free software: you can redistribute it and/or modify
  *    it under the terms of the Server Side Public License, version 1,
@@ -28,49 +27,118 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
 
-#include "mongo/platform/basic.h"
+#include <absl/container/flat_hash_map.h>
+#include <boost/none.hpp>
+#include <memory>
+#include <mutex>
+#include <set>
+#include <utility>
 
-#include "mongo/client/replica_set_monitor_manager.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
 
+#include "mongo/base/checked_cast.h"
+#include "mongo/base/error_codes.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/client/connection_string.h"
 #include "mongo/client/mongo_uri.h"
 #include "mongo/client/replica_set_monitor.h"
+#include "mongo/client/replica_set_monitor_manager.h"
+#include "mongo/client/replica_set_monitor_server_parameters.h"
+#include "mongo/client/sdam/topology_listener.h"
+#include "mongo/client/streamable_replica_set_monitor.h"
+#include "mongo/db/service_context.h"
 #include "mongo/executor/network_connection_hook.h"
 #include "mongo/executor/network_interface_factory.h"
 #include "mongo/executor/network_interface_thread_pool.h"
 #include "mongo/executor/task_executor.h"
 #include "mongo/executor/task_executor_pool.h"
 #include "mongo/executor/thread_pool_task_executor.h"
+#include "mongo/logv2/log.h"
 #include "mongo/rpc/metadata/egress_metadata_hook_list.h"
-#include "mongo/stdx/memory.h"
+#include "mongo/rpc/metadata/metadata_hook.h"
 #include "mongo/stdx/mutex.h"
-#include "mongo/util/log.h"
-#include "mongo/util/map_util.h"
+#include "mongo/transport/transport_layer.h"
+#include "mongo/util/decorable.h"
+#include "mongo/util/str.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
+
 
 namespace mongo {
 
 using std::shared_ptr;
-using std::set;
 using std::string;
 using std::vector;
 
 using executor::NetworkInterface;
 using executor::NetworkInterfaceThreadPool;
-using executor::TaskExecutorPool;
 using executor::TaskExecutor;
 using executor::ThreadPoolTaskExecutor;
 
-ReplicaSetMonitorManager::ReplicaSetMonitorManager() {}
+namespace {
+const auto getGlobalRSMMonitorManager =
+    ServiceContext::declareDecoration<ReplicaSetMonitorManager>();
+}  // namespace
+
+Status ReplicaSetMonitorManagerNetworkConnectionHook::validateHost(
+    const HostAndPort& remoteHost,
+    const BSONObj& helloRequest,
+    const executor::RemoteCommandResponse& helloReply) {
+    auto monitor = ReplicaSetMonitorManager::get()->getMonitorForHost(remoteHost);
+    if (!monitor) {
+        return Status::OK();
+    }
+
+    if (auto streamableMonitor = checked_pointer_cast<StreamableReplicaSetMonitor>(
+            ReplicaSetMonitorManager::get()->getMonitorForHost(remoteHost))) {
+
+        auto publisher = streamableMonitor->getEventsPublisher();
+        if (publisher) {
+            try {
+                if (helloReply.status.isOK()) {
+                    publisher->onServerHandshakeCompleteEvent(
+                        *helloReply.elapsed, remoteHost, helloReply.data);
+                } else {
+                    publisher->onServerHandshakeFailedEvent(
+                        remoteHost, helloReply.status, helloReply.data);
+                }
+            } catch (const DBException& exception) {
+                LOGV2_ERROR(4712101,
+                            "An error occurred publishing a ReplicaSetMonitor handshake event",
+                            "error"_attr = exception.toStatus(),
+                            "replicaSet"_attr = monitor->getName(),
+                            "handshakeStatus"_attr = helloReply.status);
+                return exception.toStatus();
+            }
+        }
+    }
+
+    return Status::OK();
+}
+
+StatusWith<boost::optional<executor::RemoteCommandRequest>>
+ReplicaSetMonitorManagerNetworkConnectionHook::makeRequest(const HostAndPort& remoteHost) {
+    return {boost::none};
+}
+
+Status ReplicaSetMonitorManagerNetworkConnectionHook::handleReply(
+    const HostAndPort& remoteHost, executor::RemoteCommandResponse&& response) {
+    MONGO_UNREACHABLE;
+}
 
 ReplicaSetMonitorManager::~ReplicaSetMonitorManager() {
     shutdown();
 }
 
+ReplicaSetMonitorManager* ReplicaSetMonitorManager::get() {
+    return &getGlobalRSMMonitorManager(getGlobalServiceContext());
+}
+
 shared_ptr<ReplicaSetMonitor> ReplicaSetMonitorManager::getMonitor(StringData setName) {
     stdx::lock_guard<stdx::mutex> lk(_mutex);
+    _doGarbageCollectionLocked(lk);
 
     if (auto monitor = _monitors[setName].lock()) {
         return monitor;
@@ -79,75 +147,104 @@ shared_ptr<ReplicaSetMonitor> ReplicaSetMonitorManager::getMonitor(StringData se
     }
 }
 
-void ReplicaSetMonitorManager::_setupTaskExecutorInLock(const std::string& name) {
-    auto hookList = stdx::make_unique<rpc::EgressMetadataHookList>();
-
-    // do not restart taskExecutor if is in shutdown
-    if (!_taskExecutor && !_isShutdown) {
-        // construct task executor
-        auto net = executor::makeNetworkInterface(
-            "ReplicaSetMonitor-TaskExecutor", nullptr, std::move(hookList));
-        auto netPtr = net.get();
-        _taskExecutor = stdx::make_unique<ThreadPoolTaskExecutor>(
-            stdx::make_unique<NetworkInterfaceThreadPool>(netPtr), std::move(net));
-        LOG(1) << "Starting up task executor for monitoring replica sets in response to request to "
-                  "monitor set: "
-               << redact(name);
-        _taskExecutor->startup();
+void ReplicaSetMonitorManager::_setupTaskExecutorAndStats(WithLock) {
+    if (_isShutdown || _taskExecutor) {
+        // do not restart taskExecutor if is in shutdown
+        return;
     }
+
+    // construct task executor
+    auto hookList = std::make_unique<rpc::EgressMetadataHookList>();
+    auto networkConnectionHook = std::make_unique<ReplicaSetMonitorManagerNetworkConnectionHook>();
+
+    std::shared_ptr<NetworkInterface> networkInterface = executor::makeNetworkInterface(
+        "ReplicaSetMonitor-TaskExecutor", std::move(networkConnectionHook), std::move(hookList));
+    _connectionManager = std::make_unique<ReplicaSetMonitorConnectionManager>(networkInterface);
+
+    auto pool = std::make_unique<NetworkInterfaceThreadPool>(networkInterface.get());
+
+    _taskExecutor = ThreadPoolTaskExecutor::create(std::move(pool), networkInterface);
+    _taskExecutor->startup();
+}
+
+namespace {
+void uassertNotMixingSSL(transport::ConnectSSLMode a, transport::ConnectSSLMode b) {
+    uassert(51042, "Mixing ssl modes with a single replica set is disallowed", a == b);
+}
+}  // namespace
+
+shared_ptr<ReplicaSetMonitor> ReplicaSetMonitorManager::getOrCreateMonitor(
+    const ConnectionString& connStr, std::function<void()> cleanupCallback) {
+    return getOrCreateMonitor(MongoURI(connStr), cleanupCallback);
 }
 
 shared_ptr<ReplicaSetMonitor> ReplicaSetMonitorManager::getOrCreateMonitor(
-    const ConnectionString& connStr) {
-    invariant(connStr.type() == ConnectionString::SET);
-
+    const MongoURI& uri, std::function<void()> cleanupCallback) {
+    invariant(uri.type() == ConnectionString::ConnectionType::kReplicaSet);
     stdx::lock_guard<stdx::mutex> lk(_mutex);
-    _setupTaskExecutorInLock(connStr.toString());
-    auto setName = connStr.getSetName();
-    auto monitor = _monitors[setName].lock();
-    if (monitor) {
-        return monitor;
-    }
+    uassert(ErrorCodes::ShutdownInProgress,
+            str::stream() << "Unable to get monitor for '" << uri << "' due to shutdown",
+            !_isShutdown);
 
-    const std::set<HostAndPort> servers(connStr.getServers().begin(), connStr.getServers().end());
-
-    log() << "Starting new replica set monitor for " << connStr.toString();
-
-    auto newMonitor = std::make_shared<ReplicaSetMonitor>(setName, servers);
-    _monitors[setName] = newMonitor;
-    newMonitor->init();
-    return newMonitor;
-}
-
-shared_ptr<ReplicaSetMonitor> ReplicaSetMonitorManager::getOrCreateMonitor(const MongoURI& uri) {
-    invariant(uri.type() == ConnectionString::SET);
-
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
-    _setupTaskExecutorInLock(uri.toString());
+    _doGarbageCollectionLocked(lk);
+    _setupTaskExecutorAndStats(lk);
     const auto& setName = uri.getSetName();
     auto monitor = _monitors[setName].lock();
     if (monitor) {
+        uassertNotMixingSSL(monitor->getOriginalUri().getSSLMode(), uri.getSSLMode());
         return monitor;
     }
 
-    log() << "Starting new replica set monitor for " << uri.toString();
+    std::shared_ptr<ReplicaSetMonitor> newMonitor;
+    LOGV2(4603701,
+          "Starting Replica Set Monitor",
+          "protocol"_attr = toString(gReplicaSetMonitorProtocol),
+          "uri"_attr = uri.toString());
+    invariant(_taskExecutor);
 
-    auto newMonitor = std::make_shared<ReplicaSetMonitor>(uri);
+    newMonitor = StreamableReplicaSetMonitor::make(
+        uri, _taskExecutor, _getConnectionManager(), cleanupCallback, _stats);
+
     _monitors[setName] = newMonitor;
-    newMonitor->init();
+    _numMonitorsCreated++;
     return newMonitor;
 }
 
-vector<string> ReplicaSetMonitorManager::getAllSetNames() {
-    vector<string> allNames;
+shared_ptr<ReplicaSetMonitor> ReplicaSetMonitorManager::getMonitorForHost(const HostAndPort& host) {
+    // Hold the shared_ptrs for each of the ReplicaSetMonitors to extend the lifetime of the
+    // ReplicaSetMonitor objects to ensure that we do not call their destructors while still holding
+    // the mutex.
+    vector<shared_ptr<ReplicaSetMonitor>> rsmPtrs;
 
     stdx::lock_guard<stdx::mutex> lk(_mutex);
 
     for (const auto& entry : _monitors) {
-        allNames.push_back(entry.first);
+        auto monitor = entry.second.lock();
+        if (monitor && monitor->contains(host)) {
+            return monitor;
+        }
+        rsmPtrs.push_back(std::move(monitor));
+    }
+
+    return shared_ptr<ReplicaSetMonitor>();
+}
+
+vector<string> ReplicaSetMonitorManager::getAllSetNames() const {
+    vector<string> allNames;
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
+
+    for (const auto& entry : _monitors) {
+        if (entry.second.lock()) {
+            allNames.push_back(entry.first);
+        }
     }
 
     return allNames;
+}
+
+size_t ReplicaSetMonitorManager::getNumMonitors() const {
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    return _monitors.size();
 }
 
 void ReplicaSetMonitorManager::removeMonitor(StringData setName) {
@@ -155,42 +252,67 @@ void ReplicaSetMonitorManager::removeMonitor(StringData setName) {
     ReplicaSetMonitorsMap::const_iterator it = _monitors.find(setName);
     if (it != _monitors.end()) {
         if (auto monitor = it->second.lock()) {
-            monitor->markAsRemoved();
+            monitor->drop();
         }
         _monitors.erase(it);
-        log() << "Removed ReplicaSetMonitor for replica set " << setName;
+        LOGV2(20187, "Removed ReplicaSetMonitor for replica set", "replicaSet"_attr = setName);
+    }
+}
+
+void ReplicaSetMonitorManager::registerForGarbageCollection(StringData setName) {
+    stdx::lock_guard<stdx::mutex> lk(_gcMutex);
+    _gcQueue.emplace_back(setName);
+}
+
+void ReplicaSetMonitorManager::_doGarbageCollectionLocked(WithLock) {
+    if (_isShutdown) {
+        return;
+    }
+    stdx::lock_guard<stdx::mutex> lk(_gcMutex);
+
+    while (!_gcQueue.empty()) {
+        std::string setName = std::move(_gcQueue.front());
+        _gcQueue.pop_front();
+        ReplicaSetMonitorsMap::const_iterator it = _monitors.find(setName);
+        if (it != _monitors.end() && !it->second.lock()) {
+            _monitors.erase(it);
+            _monitorsGarbageCollected.increment();
+        }
     }
 }
 
 void ReplicaSetMonitorManager::shutdown() {
-
+    decltype(_monitors) monitors;
+    decltype(_taskExecutor) taskExecutor;
+    decltype(_connectionManager) connectionManager;
     {
         stdx::lock_guard<stdx::mutex> lk(_mutex);
-        if (!_taskExecutor || _isShutdown) {
+        if (std::exchange(_isShutdown, true)) {
             return;
         }
-        _isShutdown = true;
+
+        monitors = std::exchange(_monitors, {});
+        connectionManager = std::exchange(_connectionManager, {});
+        taskExecutor = std::exchange(_taskExecutor, {});
     }
 
-    LOG(1) << "Shutting down task executor used for monitoring replica sets";
-    _taskExecutor->shutdown();
-    _taskExecutor->join();
+    for (auto& [name, monitor] : monitors) {
+        auto anchor = monitor.lock();
+        if (!anchor) {
+            continue;
+        }
+        anchor->drop();
+    }
+
+    if (taskExecutor) {
+        LOGV2_DEBUG(20188, 1, "Shutting down task executor used for monitoring replica sets");
+        taskExecutor->shutdown();
+        taskExecutor->join();
+    }
 }
 
 void ReplicaSetMonitorManager::removeAllMonitors() {
-    {
-        stdx::lock_guard<stdx::mutex> lk(_mutex);
-        _monitors = ReplicaSetMonitorsMap();
-        if (!_taskExecutor || _isShutdown) {
-            return;
-        }
-        _isShutdown = true;
-    }
-
-    LOG(1) << "Shutting down task executor used for monitoring replica sets";
-    _taskExecutor->shutdown();
-    _taskExecutor->join();
-    _taskExecutor.reset();
+    shutdown();
 
     {
         stdx::lock_guard<stdx::mutex> lk(_mutex);
@@ -198,25 +320,61 @@ void ReplicaSetMonitorManager::removeAllMonitors() {
     }
 }
 
-void ReplicaSetMonitorManager::report(BSONObjBuilder* builder) {
-    // Don't hold _mutex the whole time to avoid ever taking a monitor's mutex while holding the
-    // manager's mutex.  Otherwise we could get a deadlock between the manager's, monitor's, and
-    // ShardRegistry's mutex due to the ReplicaSetMonitor's AsynchronousConfigChangeHook potentially
-    // calling ShardRegistry::updateConfigServerConnectionString.
-    auto setNames = getAllSetNames();
-    for (const auto& setName : setNames) {
-        auto monitor = getMonitor(setName);
-        if (!monitor) {
-            continue;
+void ReplicaSetMonitorManager::report(BSONObjBuilder* builder, bool forFTDC) {
+    std::vector<std::shared_ptr<ReplicaSetMonitor>> monitors;
+    int numMonitorsCreated;
+    // Gather relevant data under the lock. Separate out writing it to BSON.
+    {
+        stdx::lock_guard lk(_mutex);
+        _doGarbageCollectionLocked(lk);
+        for (const auto& [_, weakMonitor] : _monitors) {
+            if (auto monitor = weakMonitor.lock())
+                monitors.push_back(std::move(monitor));
         }
-        BSONObjBuilder monitorInfo(builder->subobjStart(setName));
-        monitor->appendInfo(monitorInfo);
+        numMonitorsCreated = _numMonitorsCreated;
     }
+    // Now write out the data.
+    builder->appendNumber("numReplicaSetMonitorsCreated", numMonitorsCreated);
+
+    {
+        BSONObjBuilder setStats(
+            builder->subobjStart(forFTDC ? "replicaSetPingTimesMillis" : "replicaSets"));
+
+        for (const auto& monitor : monitors) {
+            monitor->appendInfo(setStats, forFTDC);
+        }
+    }
+
+    _stats->report(builder, forFTDC);
 }
 
-TaskExecutor* ReplicaSetMonitorManager::getExecutor() {
-    invariant(_taskExecutor);
-    return _taskExecutor.get();
+std::shared_ptr<executor::TaskExecutor> ReplicaSetMonitorManager::getExecutor() {
+    auto lk = stdx::lock_guard(_mutex);
+    return _taskExecutor;
+}
+
+std::shared_ptr<executor::EgressConnectionCloser>
+ReplicaSetMonitorManager::_getConnectionManager() {
+    invariant(_connectionManager);
+    return _connectionManager;
+}
+
+ReplicaSetChangeNotifier& ReplicaSetMonitorManager::getNotifier() {
+    return _notifier;
+}
+
+bool ReplicaSetMonitorManager::isShutdown() const {
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    return _isShutdown;
+}
+
+void ReplicaSetMonitorConnectionManager::dropConnections(const HostAndPort& hostAndPort) {
+    _network->dropConnections(hostAndPort);
+}
+
+void ReplicaSetMonitorManager::installMonitor_forTests(std::shared_ptr<ReplicaSetMonitor> monitor) {
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    _monitors[monitor->getName()] = monitor;
 }
 
 }  // namespace mongo

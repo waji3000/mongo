@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,18 +27,30 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplicationElection
 
-#include "mongo/platform/basic.h"
+#include <absl/container/node_hash_map.h>
+#include <algorithm>
+#include <boost/move/utility_core.hpp>
+#include <boost/optional.hpp>
+#include <memory>
 
-#include "mongo/db/repl/vote_requester.h"
+#include <boost/optional/optional.hpp>
 
 #include "mongo/base/status.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/repl/member_config.h"
 #include "mongo/db/repl/repl_set_request_votes_args.h"
 #include "mongo/db/repl/scatter_gather_runner.h"
+#include "mongo/db/repl/vote_requester.h"
+#include "mongo/logv2/attribute_storage.h"
+#include "mongo/logv2/log.h"
 #include "mongo/rpc/get_status_from_command_result.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/util/log.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/scopeguard.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplicationElection
+
 
 namespace mongo {
 namespace repl {
@@ -57,13 +68,15 @@ VoteRequester::Algorithm::Algorithm(const ReplSetConfig& rsConfig,
                                     long long candidateIndex,
                                     long long term,
                                     bool dryRun,
-                                    OpTime lastDurableOpTime,
+                                    OpTime lastWrittenOpTime,
+                                    OpTime lastAppliedOpTime,
                                     int primaryIndex)
     : _rsConfig(rsConfig),
       _candidateIndex(candidateIndex),
       _term(term),
       _dryRun(dryRun),
-      _lastDurableOpTime(lastDurableOpTime) {
+      _lastWrittenOpTime(lastWrittenOpTime),
+      _lastAppliedOpTime(lastAppliedOpTime) {
     // populate targets with all voting members that aren't this node
     long long index = 0;
     for (auto member = _rsConfig.membersBegin(); member != _rsConfig.membersEnd(); member++) {
@@ -88,7 +101,12 @@ std::vector<RemoteCommandRequest> VoteRequester::Algorithm::getRequests() const 
     requestVotesCmdBuilder.append("candidateIndex", _candidateIndex);
     requestVotesCmdBuilder.append("configVersion", _rsConfig.getConfigVersion());
 
-    _lastDurableOpTime.append(&requestVotesCmdBuilder, "lastCommittedOp");
+    if (_rsConfig.getConfigTerm() != -1) {
+        requestVotesCmdBuilder.append("configTerm", _rsConfig.getConfigTerm());
+    }
+
+    _lastWrittenOpTime.append("lastWrittenOpTime", &requestVotesCmdBuilder);
+    _lastAppliedOpTime.append("lastAppliedOpTime", &requestVotesCmdBuilder);
 
     const BSONObj requestVotesCmd = requestVotesCmdBuilder.obj();
 
@@ -96,7 +114,7 @@ std::vector<RemoteCommandRequest> VoteRequester::Algorithm::getRequests() const 
     for (const auto& target : _targets) {
         requests.push_back(RemoteCommandRequest(
             target,
-            "admin",
+            DatabaseName::kAdmin,
             requestVotesCmd,
             nullptr,
             std::min(_rsConfig.getElectionTimeoutPeriod(), maximumVoteRequestTimeoutMS)));
@@ -107,11 +125,21 @@ std::vector<RemoteCommandRequest> VoteRequester::Algorithm::getRequests() const 
 
 void VoteRequester::Algorithm::processResponse(const RemoteCommandRequest& request,
                                                const RemoteCommandResponse& response) {
-    auto logLine = log();
-    logLine << "VoteRequester(term " << _term << (_dryRun ? " dry run" : "") << ") ";
+    ReplSetRequestVotesResponse voteResponse;
+    Status status = Status::OK();
+
+    // All local variables captured in logAttrs needs to be above the guard that logs.
+    logv2::DynamicAttributes logAttrs;
+    auto logAtExit =
+        ScopeGuard([&logAttrs]() { LOGV2(51799, "VoteRequester processResponse", logAttrs); });
+    logAttrs.add("term", _term);
+    logAttrs.add("dryRun", _dryRun);
+
     _responsesProcessed++;
     if (!response.isOK()) {  // failed response
-        logLine << "failed to receive response from " << request.target << ": " << response.status;
+        logAttrs.add("failReason", "failed to receive response"_sd);
+        logAttrs.add("error", response.status);
+        logAttrs.add("from", request.target);
         return;
     }
     _responders.insert(request.target);
@@ -120,32 +148,37 @@ void VoteRequester::Algorithm::processResponse(const RemoteCommandRequest& reque
     if (_primaryHost == request.target) {
         _primaryVote = PrimaryVote::No;
     }
-    ReplSetRequestVotesResponse voteResponse;
-    auto status = getStatusFromCommandResult(response.data);
+
+    status = getStatusFromCommandResult(response.data);
     if (status.isOK()) {
         status = voteResponse.initialize(response.data);
     }
     if (!status.isOK()) {
-        logLine << "received an invalid response from " << request.target << ": " << status;
-        logLine << "; response message: " << response.data;
+        logAttrs.add("failReason", "received an invalid response"_sd);
+        logAttrs.add("error", status);
+        logAttrs.add("from", request.target);
+        logAttrs.add("message", response.data);
         return;
     }
 
     if (voteResponse.getVoteGranted()) {
-        logLine << "received a yes vote from " << request.target;
+        logAttrs.add("vote", "yes"_sd);
+        logAttrs.add("from", request.target);
         if (_primaryHost == request.target) {
             _primaryVote = PrimaryVote::Yes;
         }
         _votes++;
     } else {
-        logLine << "received a no vote from " << request.target << " with reason \""
-                << voteResponse.getReason() << '"';
+        logAttrs.add("vote", "no"_sd);
+        logAttrs.add("from", request.target);
+        logAttrs.add("reason", voteResponse.getReason());
     }
 
     if (voteResponse.getTerm() > _term) {
         _staleTerm = true;
     }
-    logLine << "; response message: " << response.data;
+
+    logAttrs.add("message", response.data);
 }
 
 bool VoteRequester::Algorithm::hasReceivedSufficientResponses() const {
@@ -153,12 +186,18 @@ bool VoteRequester::Algorithm::hasReceivedSufficientResponses() const {
         return true;
     }
 
+    // We require the primary's response during catchup takeover. An error response from the primary
+    // is not a yes, no or pending, but is still a response. Therefore, we handle the case in which
+    // we have received some response (even if error) from all nodes first.
+    if (_responsesProcessed == static_cast<int>(_targets.size())) {
+        return true;
+    }
+
     if (_primaryHost && _primaryVote == PrimaryVote::Pending) {
         return false;
     }
 
-    return _staleTerm || _votes >= _rsConfig.getMajorityVoteCount() ||
-        _responsesProcessed == static_cast<int>(_targets.size());
+    return _staleTerm || _votes >= _rsConfig.getMajorityVoteCount();
 }
 
 VoteRequester::Result VoteRequester::Algorithm::getResult() const {
@@ -177,7 +216,7 @@ stdx::unordered_set<HostAndPort> VoteRequester::Algorithm::getResponders() const
     return _responders;
 }
 
-VoteRequester::VoteRequester() : _isCanceled(false) {}
+VoteRequester::VoteRequester() {}
 VoteRequester::~VoteRequester() {}
 
 StatusWith<executor::TaskExecutor::EventHandle> VoteRequester::start(
@@ -186,16 +225,16 @@ StatusWith<executor::TaskExecutor::EventHandle> VoteRequester::start(
     long long candidateIndex,
     long long term,
     bool dryRun,
-    OpTime lastDurableOpTime,
+    OpTime lastWrittenOpTime,
+    OpTime lastAppliedOpTime,
     int primaryIndex) {
     _algorithm = std::make_shared<Algorithm>(
-        rsConfig, candidateIndex, term, dryRun, lastDurableOpTime, primaryIndex);
-    _runner = stdx::make_unique<ScatterGatherRunner>(_algorithm, executor, "vote request");
+        rsConfig, candidateIndex, term, dryRun, lastWrittenOpTime, lastAppliedOpTime, primaryIndex);
+    _runner = std::make_unique<ScatterGatherRunner>(_algorithm, executor, "vote request");
     return _runner->start();
 }
 
 void VoteRequester::cancel() {
-    _isCanceled = true;
     _runner->cancel();
 }
 

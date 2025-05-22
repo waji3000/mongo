@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,66 +27,66 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kControl
-
-#include "mongo/platform/basic.h"
 
 #include <memory>
+#include <utility>
 
 #include "mongo/db/logical_session_cache_factory_mongod.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/s/sessions_collection_config_server.h"
+#include "mongo/db/session/logical_session_cache_impl.h"
+#include "mongo/db/session/service_liaison_impl.h"
+#include "mongo/db/session/service_liaison_shard.h"
+#include "mongo/db/session/session_catalog_mongod.h"
+#include "mongo/db/session/sessions_collection.h"
+#include "mongo/db/session/sessions_collection_rs.h"
+#include "mongo/db/session/sessions_collection_standalone.h"
+#include "mongo/s/session_catalog_router.h"
+#include "mongo/s/sessions_collection_sharded.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/time_support.h"
 
-#include "mongo/db/logical_session_cache_impl.h"
-#include "mongo/db/service_liaison_mongod.h"
-#include "mongo/db/sessions_collection_config_server.h"
-#include "mongo/db/sessions_collection_rs.h"
-#include "mongo/db/sessions_collection_sharded.h"
-#include "mongo/db/sessions_collection_standalone.h"
-#include "mongo/db/transaction_reaper.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/util/log.h"
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
+
 
 namespace mongo {
 
-namespace {
+std::unique_ptr<LogicalSessionCache> makeLogicalSessionCacheD(LogicalSessionCacheServer state,
+                                                              bool isRouterServer) {
+    auto liaison = std::make_unique<ServiceLiaisonImpl>(
+        service_liaison_shard_callbacks::getOpenCursorSessions,
+        service_liaison_shard_callbacks::killCursorsWithMatchingSessions);
 
-std::shared_ptr<SessionsCollection> makeSessionsCollection(LogicalSessionCacheServer state) {
-    switch (state) {
-        case LogicalSessionCacheServer::kSharded:
-            return std::make_shared<SessionsCollectionSharded>();
-        case LogicalSessionCacheServer::kConfigServer:
-            return std::make_shared<SessionsCollectionConfigServer>();
-        case LogicalSessionCacheServer::kReplicaSet:
-            return std::make_shared<SessionsCollectionRS>();
-        case LogicalSessionCacheServer::kStandalone:
-            return std::make_shared<SessionsCollectionStandalone>();
-        default:
-            MONGO_UNREACHABLE;
-    }
-}
-
-}  // namespace
-
-std::unique_ptr<LogicalSessionCache> makeLogicalSessionCacheD(LogicalSessionCacheServer state) {
-    auto liaison = stdx::make_unique<ServiceLiaisonMongod>();
-
-    // Set up the logical session cache
-    auto sessionsColl = makeSessionsCollection(state);
-
-    auto reaper = [&]() -> std::shared_ptr<TransactionReaper> {
+    auto sessionsColl = [&]() -> std::shared_ptr<SessionsCollection> {
         switch (state) {
             case LogicalSessionCacheServer::kSharded:
-                return TransactionReaper::make(TransactionReaper::Type::kSharded, sessionsColl);
+                return std::make_shared<SessionsCollectionSharded>();
+            case LogicalSessionCacheServer::kConfigServer:
+                return std::make_shared<SessionsCollectionConfigServer>();
             case LogicalSessionCacheServer::kReplicaSet:
-                return TransactionReaper::make(TransactionReaper::Type::kReplicaSet, sessionsColl);
-            default:
-                return nullptr;
+                return std::make_shared<SessionsCollectionRS>();
+            case LogicalSessionCacheServer::kStandalone:
+                return std::make_shared<SessionsCollectionStandalone>();
         }
+
+        MONGO_UNREACHABLE;
     }();
 
-    return stdx::make_unique<LogicalSessionCacheImpl>(std::move(liaison),
-                                                      std::move(sessionsColl),
-                                                      std::move(reaper),
-                                                      LogicalSessionCacheImpl::Options{});
+    auto reapSessionsOlderThanFn = [isRouterServer](OperationContext* opCtx,
+                                                    SessionsCollection& sessionsCollection,
+                                                    Date_t possiblyExpired) {
+        int shardReapedSessions = MongoDSessionCatalog::get(opCtx)->reapSessionsOlderThan(
+            opCtx, sessionsCollection, possiblyExpired);
+
+        int routerReapedSessions = isRouterServer ? RouterSessionCatalog::reapSessionsOlderThan(
+                                                        opCtx, sessionsCollection, possiblyExpired)
+                                                  : 0;
+
+        return shardReapedSessions + routerReapedSessions;
+    };
+
+    return std::make_unique<LogicalSessionCacheImpl>(
+        std::move(liaison), std::move(sessionsColl), std::move(reapSessionsOlderThanFn));
 }
 
 }  // namespace mongo

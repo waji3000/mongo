@@ -5,50 +5,46 @@
  * entries.
  */
 
-(function() {
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
-    "use strict";
+const testName = "rollback_time_limit_param";
 
-    const testName = "rollback_time_limit_param";
+// Make sure that we reject non-positive values for this parameter set on startup.
+let rstWithBadStartupOptions = new ReplSetTest(
+    {name: testName, nodes: 1, nodeOptions: {setParameter: "rollbackTimeLimitSecs=-50"}});
 
-    // Make sure that we reject non-positive values for this parameter set on startup.
-    let rstWithBadStartupOptions = new ReplSetTest(
-        {name: testName, nodes: 1, nodeOptions: {setParameter: "rollbackTimeLimitSecs=-50"}});
+assert.throws(function() {
+    rstWithBadStartupOptions.startSet();
+});
 
-    assert.throws(function() {
-        rstWithBadStartupOptions.startSet();
+assert(rawMongoProgramOutput("Bad value for parameter").match("\"rollbackTimeLimitSecs\""),
+       "failed to reject bad value for parameter");
 
-    });
+// Now initialize the same parameter correctly on startup.
+let rst = new ReplSetTest(
+    {name: testName, nodes: 1, nodeOptions: {setParameter: "rollbackTimeLimitSecs=1000"}});
+rst.startSet();
+rst.initiate();
 
-    assert(rawMongoProgramOutput().match("Bad value for parameter \"rollbackTimeLimitSecs\""),
-           "failed to reject bad value for parameter");
+let primary = rst.getPrimary();
 
-    // Now initialize the same parameter correctly on startup.
-    let rst = new ReplSetTest(
-        {name: testName, nodes: 1, nodeOptions: {setParameter: "rollbackTimeLimitSecs=1000"}});
-    rst.startSet();
-    rst.initiate();
+// Check that the value of 'rollbackTimeLimitSecs' was initialized correctly on startup.
+let valueSetOnStartup =
+    assert.commandWorked(primary.adminCommand({getParameter: 1, rollbackTimeLimitSecs: 1}))
+        .rollbackTimeLimitSecs;
+assert.eq(NumberLong(1000), valueSetOnStartup);
 
-    let primary = rst.getPrimary();
+// Check that the value of 'rollbackTimeLimitSecs' was set correctly at runtime.
+assert.commandWorked(primary.adminCommand({setParameter: 1, rollbackTimeLimitSecs: 2000}));
+let valueSetAtRuntime =
+    assert.commandWorked(primary.adminCommand({getParameter: 1, rollbackTimeLimitSecs: 1}))
+        .rollbackTimeLimitSecs;
+assert.eq(NumberLong(2000), valueSetAtRuntime);
 
-    // Check that the value of 'rollbackTimeLimitSecs' was initialized correctly on startup.
-    let valueSetOnStartup =
-        assert.commandWorked(primary.adminCommand({getParameter: 1, rollbackTimeLimitSecs: 1}))
-            .rollbackTimeLimitSecs;
-    assert.eq(NumberLong(1000), valueSetOnStartup);
+// Make sure that we reject non-positive values for this parameter set at runtime.
+assert.commandFailedWithCode(primary.adminCommand({setParameter: 1, rollbackTimeLimitSecs: -5}),
+                             ErrorCodes.BadValue);
+assert.commandFailedWithCode(primary.adminCommand({setParameter: 1, rollbackTimeLimitSecs: 0}),
+                             ErrorCodes.BadValue);
 
-    // Check that the value of 'rollbackTimeLimitSecs' was set correctly at runtime.
-    assert.commandWorked(primary.adminCommand({setParameter: 1, rollbackTimeLimitSecs: 2000}));
-    let valueSetAtRuntime =
-        assert.commandWorked(primary.adminCommand({getParameter: 1, rollbackTimeLimitSecs: 1}))
-            .rollbackTimeLimitSecs;
-    assert.eq(NumberLong(2000), valueSetAtRuntime);
-
-    // Make sure that we reject non-positive values for this parameter set at runtime.
-    assert.commandFailedWithCode(primary.adminCommand({setParameter: 1, rollbackTimeLimitSecs: -5}),
-                                 ErrorCodes.BadValue);
-    assert.commandFailedWithCode(primary.adminCommand({setParameter: 1, rollbackTimeLimitSecs: 0}),
-                                 ErrorCodes.BadValue);
-
-    rst.stopSet();
-})();
+rst.stopSet();

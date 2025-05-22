@@ -1,6 +1,3 @@
-// engine_none.cpp
-
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,14 +27,16 @@
  *    it in the license file.
  */
 
-#include "engine.h"
+#include <string>
+
+#include "mongo/scripting/engine.h"
 
 namespace mongo {
-void ScriptEngine::setup() {
+void ScriptEngine::setup(ExecutionEnvironment environment) {
     // noop
 }
 
 std::string ScriptEngine::getInterpreterVersionString() {
     return "";
 }
-}
+}  // namespace mongo

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,22 +27,38 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <boost/cstdint.hpp>
+#include <boost/move/utility_core.hpp>
+#include <boost/numeric/conversion/converter_policies.hpp>
+#include <boost/optional/optional.hpp>
+#include <js/ComparisonOperators.h>
+#include <js/Object.h>
+#include <js/PropertyDescriptor.h>
+#include <js/RootingAPI.h>
+#include <jsapi.h>
+#include <string>
 
-#include "mongo/scripting/mozjs/numberlong.h"
+#include <js/CallArgs.h>
+#include <js/PropertySpec.h>
+#include <js/TypeDecls.h>
 
-#include <boost/optional.hpp>
-#include <js/Conversions.h>
-
+#include "mongo/base/error_codes.h"
 #include "mongo/base/parse_number.h"
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/scripting/mozjs/implscope.h"
+#include "mongo/scripting/mozjs/internedstring.h"
+#include "mongo/scripting/mozjs/numberlong.h"
 #include "mongo/scripting/mozjs/objectwrapper.h"
 #include "mongo/scripting/mozjs/valuereader.h"
 #include "mongo/scripting/mozjs/valuewriter.h"
-#include "mongo/scripting/mozjs/wrapconstrainedmethod.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/scripting/mozjs/wrapconstrainedmethod.h"  // IWYU pragma: keep
+#include "mongo/util/assert_util.h"
 #include "mongo/util/represent_as.h"
-#include "mongo/util/text.h"
+#include "mongo/util/str.h"
+#include "mongo/util/text.h"  // IWYU pragma: keep
 
 namespace mongo {
 namespace mozjs {
@@ -58,20 +73,20 @@ const JSFunctionSpec NumberLongInfo::methods[6] = {
 
 const char* const NumberLongInfo::className = "NumberLong";
 
-void NumberLongInfo::finalize(JSFreeOp* fop, JSObject* obj) {
-    auto numLong = static_cast<int64_t*>(JS_GetPrivate(obj));
+void NumberLongInfo::finalize(JS::GCContext* gcCtx, JSObject* obj) {
+    auto numLong = JS::GetMaybePtrFromReservedSlot<int64_t>(obj, Int64Slot);
 
     if (numLong)
-        getScope(fop)->trackedDelete(numLong);
+        getScope(gcCtx)->trackedDelete(numLong);
 }
 
 int64_t NumberLongInfo::ToNumberLong(JSContext* cx, JS::HandleValue thisv) {
-    auto numLong = static_cast<int64_t*>(JS_GetPrivate(thisv.toObjectOrNull()));
+    auto numLong = JS::GetMaybePtrFromReservedSlot<int64_t>(thisv.toObjectOrNull(), Int64Slot);
     return numLong ? *numLong : 0;
 }
 
 int64_t NumberLongInfo::ToNumberLong(JSContext* cx, JS::HandleObject thisv) {
-    auto numLong = static_cast<int64_t*>(JS_GetPrivate(thisv));
+    auto numLong = JS::GetMaybePtrFromReservedSlot<int64_t>(thisv, Int64Slot);
     return numLong ? *numLong : 0;
 }
 
@@ -131,6 +146,13 @@ void NumberLongInfo::Functions::floatApprox::call(JSContext* cx, JS::CallArgs ar
     ValueReader(cx, args.rval()).fromDouble(numLong);
 }
 
+void NumberLongInfo::Functions::exactValueString::call(JSContext* cx, JS::CallArgs args) {
+    str::stream ss;
+    int64_t val = NumberLongInfo::ToNumberLong(cx, args.thisv());
+    ss << val;
+    ValueReader(cx, args.rval()).fromStringData(ss.operator std::string());
+}
+
 void NumberLongInfo::Functions::top::call(JSContext* cx, JS::CallArgs args) {
     auto numULong = static_cast<uint64_t>(NumberLongInfo::ToNumberLong(cx, args.thisv()));
     ValueReader(cx, args.rval()).fromDouble(numULong >> 32);
@@ -174,8 +196,8 @@ void NumberLongInfo::construct(JSContext* cx, JS::CallArgs args) {
             // values to fail rather than return 0 (which is the behavior of ToInt64).
             std::string str = ValueWriter(cx, arg).toString();
 
-            // Call parseNumberFromStringWithBase() function to convert string to a number
-            Status status = parseNumberFromStringWithBase(str, 10, &numLong);
+            // Call NumberParser() function to convert string to a number
+            Status status = NumberParser{}.base(10)(str, &numLong);
             uassert(ErrorCodes::BadValue, "could not convert string to long long", status.isOK());
         } else {
             numLong = ValueWriter(cx, arg).toInt64();
@@ -195,8 +217,7 @@ void NumberLongInfo::construct(JSContext* cx, JS::CallArgs args) {
 
         numLong = (top << 32) + bot;
     }
-
-    JS_SetPrivate(thisv, scope->trackedNew<int64_t>(numLong));
+    JS::SetReservedSlot(thisv, Int64Slot, JS::PrivateValue(scope->trackedNew<int64_t>(numLong)));
 
     args.rval().setObjectOrNull(thisv);
 }
@@ -210,10 +231,9 @@ void NumberLongInfo::postInstall(JSContext* cx, JS::HandleObject global, JS::Han
             cx,
             proto,
             getScope(cx)->getInternedStringId(InternedString::floatApprox),
-            undef,
-            JSPROP_ENUMERATE | JSPROP_SHARED,
             smUtils::wrapConstrainedMethod<Functions::floatApprox, false, NumberLongInfo>,
-            nullptr)) {
+            nullptr,
+            JSPROP_ENUMERATE)) {
         uasserted(ErrorCodes::JSInterpreterFailure, "Failed to JS_DefinePropertyById");
     }
 
@@ -222,10 +242,9 @@ void NumberLongInfo::postInstall(JSContext* cx, JS::HandleObject global, JS::Han
             cx,
             proto,
             getScope(cx)->getInternedStringId(InternedString::top),
-            undef,
-            JSPROP_ENUMERATE | JSPROP_SHARED,
             smUtils::wrapConstrainedMethod<Functions::top, false, NumberLongInfo>,
-            nullptr)) {
+            nullptr,
+            JSPROP_ENUMERATE)) {
         uasserted(ErrorCodes::JSInterpreterFailure, "Failed to JS_DefinePropertyById");
     }
 
@@ -234,10 +253,20 @@ void NumberLongInfo::postInstall(JSContext* cx, JS::HandleObject global, JS::Han
             cx,
             proto,
             getScope(cx)->getInternedStringId(InternedString::bottom),
-            undef,
-            JSPROP_ENUMERATE | JSPROP_SHARED,
             smUtils::wrapConstrainedMethod<Functions::bottom, false, NumberLongInfo>,
-            nullptr)) {
+            nullptr,
+            JSPROP_ENUMERATE)) {
+        uasserted(ErrorCodes::JSInterpreterFailure, "Failed to JS_DefinePropertyById");
+    }
+
+    // exactValueString
+    if (!JS_DefinePropertyById(
+            cx,
+            proto,
+            getScope(cx)->getInternedStringId(InternedString::exactValueString),
+            smUtils::wrapConstrainedMethod<Functions::exactValueString, false, NumberLongInfo>,
+            nullptr,
+            JSPROP_ENUMERATE)) {
         uasserted(ErrorCodes::JSInterpreterFailure, "Failed to JS_DefinePropertyById");
     }
 }

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -33,12 +32,13 @@
 #include <string>
 
 #include "mongo/db/commands.h"
+#include "mongo/db/database_name.h"
 #include "mongo/db/operation_context.h"
 
 namespace mongo {
 
 bool commandCanRunHere(OperationContext* opCtx,
-                       const std::string& dbname,
+                       const DatabaseName& dbName,
                        const Command* command,
                        bool inMultiDocumentTransaction);
 

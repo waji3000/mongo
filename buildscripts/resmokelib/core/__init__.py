@@ -1,6 +1,5 @@
 """Resmokelib core module."""
-from __future__ import absolute_import
 
-from . import process
-from . import programs
-from . import network
+from buildscripts.resmokelib.core import network, programs
+
+__all__ = ["network", "programs"]

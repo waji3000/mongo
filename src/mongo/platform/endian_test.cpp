@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -32,48 +31,14 @@
 
 #include <cstring>
 
-#include "mongo/config.h"
+#include "mongo/base/string_data.h"
+#include "mongo/config.h"  // IWYU pragma: keep
 #include "mongo/unittest/unittest.h"
 
-namespace mongo {
+namespace mongo::endian {
+namespace {
 
-using namespace endian;
-
-TEST(EndianTest, TestSlow16) {
-    uint8_t le_buf[] = {0x01, 0x02};
-    uint8_t be_buf[] = {0x02, 0x01};
-    uint16_t le;
-    uint16_t be;
-    std::memcpy(&le, le_buf, sizeof(le));
-    std::memcpy(&be, be_buf, sizeof(be));
-
-    ASSERT_EQUALS(be, endian::bswap_slow16(le));
-    ASSERT_EQUALS(le, endian::bswap_slow16(be));
-}
-
-TEST(EndianTest, TestSlow32) {
-    uint8_t le_buf[] = {0x01, 0x02, 0x03, 0x04};
-    uint8_t be_buf[] = {0x04, 0x03, 0x02, 0x01};
-    uint32_t le;
-    uint32_t be;
-    std::memcpy(&le, le_buf, sizeof(le));
-    std::memcpy(&be, be_buf, sizeof(be));
-
-    ASSERT_EQUALS(be, endian::bswap_slow32(le));
-    ASSERT_EQUALS(le, endian::bswap_slow32(be));
-}
-
-TEST(EndianTest, TestSlow64) {
-    uint8_t le_buf[] = {0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08};
-    uint8_t be_buf[] = {0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01};
-    uint64_t le;
-    uint64_t be;
-    std::memcpy(&le, le_buf, sizeof(le));
-    std::memcpy(&be, be_buf, sizeof(be));
-
-    ASSERT_EQUALS(be, endian::bswap_slow64(le));
-    ASSERT_EQUALS(le, endian::bswap_slow64(be));
-}
+const bool kNativeLittle = (endian::Order::kNative == endian::Order::kLittle);
 
 TEST(EndianTest, NativeToBig_uint16_t) {
     uint8_t le_buf[] = {0x01, 0x02};
@@ -83,11 +48,11 @@ TEST(EndianTest, NativeToBig_uint16_t) {
     std::memcpy(&le, le_buf, sizeof(le));
     std::memcpy(&be, be_buf, sizeof(be));
 
-#if MONGO_CONFIG_BYTE_ORDER == 1234
-    ASSERT_EQUALS(be, nativeToBig(le));
-#else
-    ASSERT_EQUALS(be, nativeToBig(be));
-#endif
+    if (kNativeLittle) {
+        ASSERT_EQUALS(be, nativeToBig(le));
+    } else {
+        ASSERT_EQUALS(be, nativeToBig(be));
+    }
 }
 
 TEST(EndianTest, NativeToBig_uint32_t) {
@@ -98,11 +63,11 @@ TEST(EndianTest, NativeToBig_uint32_t) {
     std::memcpy(&le, le_buf, sizeof(le));
     std::memcpy(&be, be_buf, sizeof(be));
 
-#if MONGO_CONFIG_BYTE_ORDER == 1234
-    ASSERT_EQUALS(be, nativeToBig(le));
-#else
-    ASSERT_EQUALS(be, nativeToBig(be));
-#endif
+    if (kNativeLittle) {
+        ASSERT_EQUALS(be, nativeToBig(le));
+    } else {
+        ASSERT_EQUALS(be, nativeToBig(be));
+    }
 }
 
 TEST(EndianTest, NativeToBig_uint64_t) {
@@ -113,11 +78,11 @@ TEST(EndianTest, NativeToBig_uint64_t) {
     std::memcpy(&le, le_buf, sizeof(le));
     std::memcpy(&be, be_buf, sizeof(be));
 
-#if MONGO_CONFIG_BYTE_ORDER == 1234
-    ASSERT_EQUALS(be, nativeToBig(le));
-#else
-    ASSERT_EQUALS(be, nativeToBig(be));
-#endif
+    if (kNativeLittle) {
+        ASSERT_EQUALS(be, nativeToBig(le));
+    } else {
+        ASSERT_EQUALS(be, nativeToBig(be));
+    }
 }
 
 TEST(EndianTest, NativeToBig_int16_t) {
@@ -128,11 +93,11 @@ TEST(EndianTest, NativeToBig_int16_t) {
     std::memcpy(&le, le_buf, sizeof(le));
     std::memcpy(&be, be_buf, sizeof(be));
 
-#if MONGO_CONFIG_BYTE_ORDER == 1234
-    ASSERT_EQUALS(be, nativeToBig(le));
-#else
-    ASSERT_EQUALS(be, nativeToBig(be));
-#endif
+    if (kNativeLittle) {
+        ASSERT_EQUALS(be, nativeToBig(le));
+    } else {
+        ASSERT_EQUALS(be, nativeToBig(be));
+    }
 }
 
 TEST(EndianTest, NativeToBig_int32_t) {
@@ -143,11 +108,11 @@ TEST(EndianTest, NativeToBig_int32_t) {
     std::memcpy(&le, le_buf, sizeof(le));
     std::memcpy(&be, be_buf, sizeof(be));
 
-#if MONGO_CONFIG_BYTE_ORDER == 1234
-    ASSERT_EQUALS(be, nativeToBig(le));
-#else
-    ASSERT_EQUALS(be, nativeToBig(be));
-#endif
+    if (kNativeLittle) {
+        ASSERT_EQUALS(be, nativeToBig(le));
+    } else {
+        ASSERT_EQUALS(be, nativeToBig(be));
+    }
 }
 
 TEST(EndianTest, NativeToBig_int64_t) {
@@ -158,11 +123,11 @@ TEST(EndianTest, NativeToBig_int64_t) {
     std::memcpy(&le, le_buf, sizeof(le));
     std::memcpy(&be, be_buf, sizeof(be));
 
-#if MONGO_CONFIG_BYTE_ORDER == 1234
-    ASSERT_EQUALS(be, nativeToBig(le));
-#else
-    ASSERT_EQUALS(be, nativeToBig(be));
-#endif
+    if (kNativeLittle) {
+        ASSERT_EQUALS(be, nativeToBig(le));
+    } else {
+        ASSERT_EQUALS(be, nativeToBig(be));
+    }
 }
 
 TEST(EndianTest, NativeToBig_float) {
@@ -173,11 +138,11 @@ TEST(EndianTest, NativeToBig_float) {
     std::memcpy(&le, le_buf, sizeof(le));
     std::memcpy(&be, be_buf, sizeof(be));
 
-#if MONGO_CONFIG_BYTE_ORDER == 1234
-    ASSERT_EQUALS(be, nativeToBig(le));
-#else
-    ASSERT_EQUALS(be, nativeToBig(be));
-#endif
+    if (kNativeLittle) {
+        ASSERT_EQUALS(be, nativeToBig(le));
+    } else {
+        ASSERT_EQUALS(be, nativeToBig(be));
+    }
 }
 
 TEST(EndianTest, NativeToBig_double) {
@@ -188,11 +153,11 @@ TEST(EndianTest, NativeToBig_double) {
     std::memcpy(&le, le_buf, sizeof(le));
     std::memcpy(&be, be_buf, sizeof(be));
 
-#if MONGO_CONFIG_BYTE_ORDER == 1234
-    ASSERT_EQUALS(be, nativeToBig(le));
-#else
-    ASSERT_EQUALS(be, nativeToBig(be));
-#endif
+    if (kNativeLittle) {
+        ASSERT_EQUALS(be, nativeToBig(le));
+    } else {
+        ASSERT_EQUALS(be, nativeToBig(be));
+    }
 }
 
 TEST(EndianTest, NativeToLittle_uint16_t) {
@@ -203,11 +168,11 @@ TEST(EndianTest, NativeToLittle_uint16_t) {
     std::memcpy(&le, le_buf, sizeof(le));
     std::memcpy(&be, be_buf, sizeof(be));
 
-#if MONGO_CONFIG_BYTE_ORDER == 1234
-    ASSERT_EQUALS(le, nativeToLittle(le));
-#else
-    ASSERT_EQUALS(le, nativeToLittle(be));
-#endif
+    if (kNativeLittle) {
+        ASSERT_EQUALS(le, nativeToLittle(le));
+    } else {
+        ASSERT_EQUALS(le, nativeToLittle(be));
+    }
 }
 
 TEST(EndianTest, NativeToLittle_uint32_t) {
@@ -218,11 +183,11 @@ TEST(EndianTest, NativeToLittle_uint32_t) {
     std::memcpy(&le, le_buf, sizeof(le));
     std::memcpy(&be, be_buf, sizeof(be));
 
-#if MONGO_CONFIG_BYTE_ORDER == 1234
-    ASSERT_EQUALS(le, nativeToLittle(le));
-#else
-    ASSERT_EQUALS(le, nativeToLittle(be));
-#endif
+    if (kNativeLittle) {
+        ASSERT_EQUALS(le, nativeToLittle(le));
+    } else {
+        ASSERT_EQUALS(le, nativeToLittle(be));
+    }
 }
 
 TEST(EndianTest, NativeToLittle_uint64_t) {
@@ -233,11 +198,11 @@ TEST(EndianTest, NativeToLittle_uint64_t) {
     std::memcpy(&le, le_buf, sizeof(le));
     std::memcpy(&be, be_buf, sizeof(be));
 
-#if MONGO_CONFIG_BYTE_ORDER == 1234
-    ASSERT_EQUALS(le, nativeToLittle(le));
-#else
-    ASSERT_EQUALS(le, nativeToLittle(be));
-#endif
+    if (kNativeLittle) {
+        ASSERT_EQUALS(le, nativeToLittle(le));
+    } else {
+        ASSERT_EQUALS(le, nativeToLittle(be));
+    }
 }
 
 TEST(EndianTest, NativeToLittle_int16_t) {
@@ -248,11 +213,11 @@ TEST(EndianTest, NativeToLittle_int16_t) {
     std::memcpy(&le, le_buf, sizeof(le));
     std::memcpy(&be, be_buf, sizeof(be));
 
-#if MONGO_CONFIG_BYTE_ORDER == 1234
-    ASSERT_EQUALS(le, nativeToLittle(le));
-#else
-    ASSERT_EQUALS(le, nativeToLittle(be));
-#endif
+    if (kNativeLittle) {
+        ASSERT_EQUALS(le, nativeToLittle(le));
+    } else {
+        ASSERT_EQUALS(le, nativeToLittle(be));
+    }
 }
 
 TEST(EndianTest, NativeToLittle_int32_t) {
@@ -263,11 +228,11 @@ TEST(EndianTest, NativeToLittle_int32_t) {
     std::memcpy(&le, le_buf, sizeof(le));
     std::memcpy(&be, be_buf, sizeof(be));
 
-#if MONGO_CONFIG_BYTE_ORDER == 1234
-    ASSERT_EQUALS(le, nativeToLittle(le));
-#else
-    ASSERT_EQUALS(le, nativeToLittle(be));
-#endif
+    if (kNativeLittle) {
+        ASSERT_EQUALS(le, nativeToLittle(le));
+    } else {
+        ASSERT_EQUALS(le, nativeToLittle(be));
+    }
 }
 
 TEST(EndianTest, NativeToLittle_int64_t) {
@@ -278,11 +243,11 @@ TEST(EndianTest, NativeToLittle_int64_t) {
     std::memcpy(&le, le_buf, sizeof(le));
     std::memcpy(&be, be_buf, sizeof(be));
 
-#if MONGO_CONFIG_BYTE_ORDER == 1234
-    ASSERT_EQUALS(le, nativeToLittle(le));
-#else
-    ASSERT_EQUALS(le, nativeToLittle(be));
-#endif
+    if (kNativeLittle) {
+        ASSERT_EQUALS(le, nativeToLittle(le));
+    } else {
+        ASSERT_EQUALS(le, nativeToLittle(be));
+    }
 }
 
 TEST(EndianTest, NativeToLittle_float) {
@@ -293,11 +258,11 @@ TEST(EndianTest, NativeToLittle_float) {
     std::memcpy(&le, le_buf, sizeof(le));
     std::memcpy(&be, be_buf, sizeof(be));
 
-#if MONGO_CONFIG_BYTE_ORDER == 1234
-    ASSERT_EQUALS(le, nativeToLittle(le));
-#else
-    ASSERT_EQUALS(le, nativeToLittle(be));
-#endif
+    if (kNativeLittle) {
+        ASSERT_EQUALS(le, nativeToLittle(le));
+    } else {
+        ASSERT_EQUALS(le, nativeToLittle(be));
+    }
 }
 
 TEST(EndianTest, NativeToLittle_double) {
@@ -308,11 +273,11 @@ TEST(EndianTest, NativeToLittle_double) {
     std::memcpy(&le, le_buf, sizeof(le));
     std::memcpy(&be, be_buf, sizeof(be));
 
-#if MONGO_CONFIG_BYTE_ORDER == 1234
-    ASSERT_EQUALS(le, nativeToLittle(le));
-#else
-    ASSERT_EQUALS(le, nativeToLittle(be));
-#endif
+    if (kNativeLittle) {
+        ASSERT_EQUALS(le, nativeToLittle(le));
+    } else {
+        ASSERT_EQUALS(le, nativeToLittle(be));
+    }
 }
 
 TEST(EndianTest, LittleToNative_uint16_t) {
@@ -323,11 +288,11 @@ TEST(EndianTest, LittleToNative_uint16_t) {
     std::memcpy(&le, le_buf, sizeof(le));
     std::memcpy(&be, be_buf, sizeof(be));
 
-#if MONGO_CONFIG_BYTE_ORDER == 1234
-    ASSERT_EQUALS(le, littleToNative(le));
-#else
-    ASSERT_EQUALS(be, littleToNative(le));
-#endif
+    if (kNativeLittle) {
+        ASSERT_EQUALS(le, littleToNative(le));
+    } else {
+        ASSERT_EQUALS(be, littleToNative(le));
+    }
 }
 
 TEST(EndianTest, LittleToNative_uint32_t) {
@@ -338,11 +303,11 @@ TEST(EndianTest, LittleToNative_uint32_t) {
     std::memcpy(&le, le_buf, sizeof(le));
     std::memcpy(&be, be_buf, sizeof(be));
 
-#if MONGO_CONFIG_BYTE_ORDER == 1234
-    ASSERT_EQUALS(le, littleToNative(le));
-#else
-    ASSERT_EQUALS(be, littleToNative(le));
-#endif
+    if (kNativeLittle) {
+        ASSERT_EQUALS(le, littleToNative(le));
+    } else {
+        ASSERT_EQUALS(be, littleToNative(le));
+    }
 }
 
 TEST(EndianTest, LittleToNative_uint64_t) {
@@ -353,11 +318,11 @@ TEST(EndianTest, LittleToNative_uint64_t) {
     std::memcpy(&le, le_buf, sizeof(le));
     std::memcpy(&be, be_buf, sizeof(be));
 
-#if MONGO_CONFIG_BYTE_ORDER == 1234
-    ASSERT_EQUALS(le, littleToNative(le));
-#else
-    ASSERT_EQUALS(be, littleToNative(le));
-#endif
+    if (kNativeLittle) {
+        ASSERT_EQUALS(le, littleToNative(le));
+    } else {
+        ASSERT_EQUALS(be, littleToNative(le));
+    }
 }
 
 TEST(EndianTest, LittleToNative_int16_t) {
@@ -368,11 +333,11 @@ TEST(EndianTest, LittleToNative_int16_t) {
     std::memcpy(&le, le_buf, sizeof(le));
     std::memcpy(&be, be_buf, sizeof(be));
 
-#if MONGO_CONFIG_BYTE_ORDER == 1234
-    ASSERT_EQUALS(le, littleToNative(le));
-#else
-    ASSERT_EQUALS(be, littleToNative(le));
-#endif
+    if (kNativeLittle) {
+        ASSERT_EQUALS(le, littleToNative(le));
+    } else {
+        ASSERT_EQUALS(be, littleToNative(le));
+    }
 }
 
 TEST(EndianTest, LittleToNative_int32_t) {
@@ -383,11 +348,11 @@ TEST(EndianTest, LittleToNative_int32_t) {
     std::memcpy(&le, le_buf, sizeof(le));
     std::memcpy(&be, be_buf, sizeof(be));
 
-#if MONGO_CONFIG_BYTE_ORDER == 1234
-    ASSERT_EQUALS(le, littleToNative(le));
-#else
-    ASSERT_EQUALS(be, littleToNative(le));
-#endif
+    if (kNativeLittle) {
+        ASSERT_EQUALS(le, littleToNative(le));
+    } else {
+        ASSERT_EQUALS(be, littleToNative(le));
+    }
 }
 
 TEST(EndianTest, LittleToNative_int64_t) {
@@ -398,11 +363,11 @@ TEST(EndianTest, LittleToNative_int64_t) {
     std::memcpy(&le, le_buf, sizeof(le));
     std::memcpy(&be, be_buf, sizeof(be));
 
-#if MONGO_CONFIG_BYTE_ORDER == 1234
-    ASSERT_EQUALS(le, littleToNative(le));
-#else
-    ASSERT_EQUALS(be, littleToNative(le));
-#endif
+    if (kNativeLittle) {
+        ASSERT_EQUALS(le, littleToNative(le));
+    } else {
+        ASSERT_EQUALS(be, littleToNative(le));
+    }
 }
 
 TEST(EndianTest, LittleToNative_float) {
@@ -413,11 +378,11 @@ TEST(EndianTest, LittleToNative_float) {
     std::memcpy(&le, le_buf, sizeof(le));
     std::memcpy(&be, be_buf, sizeof(be));
 
-#if MONGO_CONFIG_BYTE_ORDER == 1234
-    ASSERT_EQUALS(le, littleToNative(le));
-#else
-    ASSERT_EQUALS(be, littleToNative(le));
-#endif
+    if (kNativeLittle) {
+        ASSERT_EQUALS(le, littleToNative(le));
+    } else {
+        ASSERT_EQUALS(be, littleToNative(le));
+    }
 }
 
 TEST(EndianTest, LittleToNative_double) {
@@ -428,11 +393,11 @@ TEST(EndianTest, LittleToNative_double) {
     std::memcpy(&le, le_buf, sizeof(le));
     std::memcpy(&be, be_buf, sizeof(be));
 
-#if MONGO_CONFIG_BYTE_ORDER == 1234
-    ASSERT_EQUALS(le, littleToNative(le));
-#else
-    ASSERT_EQUALS(be, littleToNative(le));
-#endif
+    if (kNativeLittle) {
+        ASSERT_EQUALS(le, littleToNative(le));
+    } else {
+        ASSERT_EQUALS(be, littleToNative(le));
+    }
 }
 
 TEST(EndianTest, BigToNative_uint16_t) {
@@ -443,11 +408,11 @@ TEST(EndianTest, BigToNative_uint16_t) {
     std::memcpy(&le, le_buf, sizeof(le));
     std::memcpy(&be, be_buf, sizeof(be));
 
-#if MONGO_CONFIG_BYTE_ORDER == 1234
-    ASSERT_EQUALS(le, bigToNative(be));
-#else
-    ASSERT_EQUALS(be, bigToNative(be));
-#endif
+    if (kNativeLittle) {
+        ASSERT_EQUALS(le, bigToNative(be));
+    } else {
+        ASSERT_EQUALS(be, bigToNative(be));
+    }
 }
 
 TEST(EndianTest, BigToNative_uint32_t) {
@@ -458,11 +423,11 @@ TEST(EndianTest, BigToNative_uint32_t) {
     std::memcpy(&le, le_buf, sizeof(le));
     std::memcpy(&be, be_buf, sizeof(be));
 
-#if MONGO_CONFIG_BYTE_ORDER == 1234
-    ASSERT_EQUALS(le, bigToNative(be));
-#else
-    ASSERT_EQUALS(be, bigToNative(be));
-#endif
+    if (kNativeLittle) {
+        ASSERT_EQUALS(le, bigToNative(be));
+    } else {
+        ASSERT_EQUALS(be, bigToNative(be));
+    }
 }
 
 TEST(EndianTest, BigToNative_uint64_t) {
@@ -473,11 +438,11 @@ TEST(EndianTest, BigToNative_uint64_t) {
     std::memcpy(&le, le_buf, sizeof(le));
     std::memcpy(&be, be_buf, sizeof(be));
 
-#if MONGO_CONFIG_BYTE_ORDER == 1234
-    ASSERT_EQUALS(le, bigToNative(be));
-#else
-    ASSERT_EQUALS(be, bigToNative(be));
-#endif
+    if (kNativeLittle) {
+        ASSERT_EQUALS(le, bigToNative(be));
+    } else {
+        ASSERT_EQUALS(be, bigToNative(be));
+    }
 }
 
 TEST(EndianTest, BigToNative_int16_t) {
@@ -488,11 +453,11 @@ TEST(EndianTest, BigToNative_int16_t) {
     std::memcpy(&le, le_buf, sizeof(le));
     std::memcpy(&be, be_buf, sizeof(be));
 
-#if MONGO_CONFIG_BYTE_ORDER == 1234
-    ASSERT_EQUALS(le, bigToNative(be));
-#else
-    ASSERT_EQUALS(be, bigToNative(be));
-#endif
+    if (kNativeLittle) {
+        ASSERT_EQUALS(le, bigToNative(be));
+    } else {
+        ASSERT_EQUALS(be, bigToNative(be));
+    }
 }
 
 TEST(EndianTest, BigToNative_int32_t) {
@@ -503,11 +468,11 @@ TEST(EndianTest, BigToNative_int32_t) {
     std::memcpy(&le, le_buf, sizeof(le));
     std::memcpy(&be, be_buf, sizeof(be));
 
-#if MONGO_CONFIG_BYTE_ORDER == 1234
-    ASSERT_EQUALS(le, bigToNative(be));
-#else
-    ASSERT_EQUALS(be, bigToNative(be));
-#endif
+    if (kNativeLittle) {
+        ASSERT_EQUALS(le, bigToNative(be));
+    } else {
+        ASSERT_EQUALS(be, bigToNative(be));
+    }
 }
 
 TEST(EndianTest, BigToNative_int64_t) {
@@ -518,11 +483,11 @@ TEST(EndianTest, BigToNative_int64_t) {
     std::memcpy(&le, le_buf, sizeof(le));
     std::memcpy(&be, be_buf, sizeof(be));
 
-#if MONGO_CONFIG_BYTE_ORDER == 1234
-    ASSERT_EQUALS(le, bigToNative(be));
-#else
-    ASSERT_EQUALS(be, bigToNative(be));
-#endif
+    if (kNativeLittle) {
+        ASSERT_EQUALS(le, bigToNative(be));
+    } else {
+        ASSERT_EQUALS(be, bigToNative(be));
+    }
 }
 
 TEST(EndianTest, BigToNative_float) {
@@ -533,11 +498,11 @@ TEST(EndianTest, BigToNative_float) {
     std::memcpy(&le, le_buf, sizeof(le));
     std::memcpy(&be, be_buf, sizeof(be));
 
-#if MONGO_CONFIG_BYTE_ORDER == 1234
-    ASSERT_EQUALS(le, bigToNative(be));
-#else
-    ASSERT_EQUALS(be, bigToNative(be));
-#endif
+    if (kNativeLittle) {
+        ASSERT_EQUALS(le, bigToNative(be));
+    } else {
+        ASSERT_EQUALS(be, bigToNative(be));
+    }
 }
 
 TEST(EndianTest, BigToNative_double) {
@@ -548,11 +513,12 @@ TEST(EndianTest, BigToNative_double) {
     std::memcpy(&le, le_buf, sizeof(le));
     std::memcpy(&be, be_buf, sizeof(be));
 
-#if MONGO_CONFIG_BYTE_ORDER == 1234
-    ASSERT_EQUALS(le, bigToNative(be));
-#else
-    ASSERT_EQUALS(be, bigToNative(be));
-#endif
+    if (kNativeLittle) {
+        ASSERT_EQUALS(le, bigToNative(be));
+    } else {
+        ASSERT_EQUALS(be, bigToNative(be));
+    }
 }
 
-}  // namespace mongo
+}  // namespace
+}  // namespace mongo::endian

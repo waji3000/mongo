@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Public Domain 2014-2018 MongoDB, Inc.
+# Public Domain 2014-present MongoDB, Inc.
 # Public Domain 2008-2014 WiredTiger, Inc.
 #
 # This is free and unencumbered software released into the public domain.
@@ -31,23 +31,55 @@ from wiredtiger import stat
 from wtscenario import make_scenarios
 import test_cursor01, test_cursor02, test_cursor03
 import test_checkpoint01, test_checkpoint02
-from wtdataset import SimpleDataSet, ComplexDataSet, ComplexLSMDataSet
+from wtdataset import SimpleDataSet, ComplexDataSet
 from helper import confirm_does_not_exist
 from suite_random import suite_random
 
 # Cursor caching tests
+#
+# This test uses only row-store (key_format='S') but the cursor-caching code has been reviewed
+# for dependence on the access method and found to be access-method independent, so rearranging
+# it to also test column-store is not necessary.
 class test_cursor13_base(wttest.WiredTigerTestCase):
     conn_config = 'statistics=(fast)'
     stat_cursor_cache = 0
     stat_cursor_reopen = 0
 
     # Returns a list: [cursor_cached, cursor_reopened]
+    #
+    # We want the statistics for operations triggered from our program. The challenge is that
+    # eviction threads may cache history store cursors in the background. We address this by
+    # subtracting out operations from the history store file. This is tricky because we can't
+    # atomically check the connections stats and the history store stats.  So we look at the
+    # history store stats before and after the connection stats and only accept a result where
+    # the history store stats haven't changed.
     def caching_stats(self):
-        stat_cursor = self.session.open_cursor('statistics:', None, None)
-        cache = stat_cursor[stat.conn.cursor_cache][2]
-        reopen = stat_cursor[stat.conn.cursor_reopen][2]
-        stat_cursor.close()
-        return [cache, reopen]
+        hs_stats_uri = 'statistics:file:WiredTigerHS.wt'
+        max_tries = 100
+        for i in range(max_tries):
+            hs_stats_before = self.session.open_cursor(hs_stats_uri, None, None)
+            conn_stats = self.session.open_cursor('statistics:', None, None)
+            hs_stats_after = self.session.open_cursor(hs_stats_uri, None, None)
+
+            totals = [ conn_stats [stat.conn.cursor_cache][2],
+                         conn_stats [stat.conn.cursor_reopen][2] ]
+            hs_before = [ hs_stats_before[stat.dsrc.cursor_cache][2],
+                          hs_stats_before[stat.dsrc.cursor_reopen][2] ]
+            hs_after = [ hs_stats_after[stat.dsrc.cursor_cache][2],
+                         hs_stats_after[stat.dsrc.cursor_reopen][2] ]
+
+            hs_stats_before.close()
+            hs_stats_after.close()
+            conn_stats.close()
+
+            if hs_before[0] == hs_after[0] and hs_before[1] == hs_after[1]:
+                break
+
+            # Fail if we haven't been able to get stable history store stats after too many attempts.
+            # Seems impossible, but better to check than to have an accidental infinite loop.
+            self.assertNotEqual(i, max_tries - 1)
+
+        return [totals[0] - hs_after[0], totals[1] - hs_after[1]]
 
     # Returns a list: [cursor_sweep, cursor_sweep_buckets,
     #                  cursor_sweep_examined, cursor_sweep_closed]
@@ -91,34 +123,42 @@ class test_cursor13_02(test_cursor02.test_cursor02, test_cursor13_base):
 class test_cursor13_03(test_cursor03.test_cursor03, test_cursor13_base):
     pass
 
+@wttest.skip_for_hook("tiered", "uses cached cursors")
 class test_cursor13_ckpt01(test_checkpoint01.test_checkpoint,
                            test_cursor13_base):
     pass
 
+@wttest.skip_for_hook("tiered", "uses cached cursors")
 class test_cursor13_ckpt02(test_checkpoint01.test_checkpoint_cursor,
                            test_cursor13_base):
     pass
 
+@wttest.skip_for_hook("tiered", "uses cached cursors")
 class test_cursor13_ckpt03(test_checkpoint01.test_checkpoint_target,
                            test_cursor13_base):
     pass
 
+@wttest.skip_for_hook("tiered", "uses cached cursors")
 class test_cursor13_ckpt04(test_checkpoint01.test_checkpoint_cursor_update,
                            test_cursor13_base):
     pass
 
+@wttest.skip_for_hook("tiered", "uses cached cursors")
 class test_cursor13_ckpt05(test_checkpoint01.test_checkpoint_last,
                            test_cursor13_base):
     pass
 
+@wttest.skip_for_hook("tiered", "uses cached cursors")
 class test_cursor13_ckpt06(test_checkpoint01.test_checkpoint_empty,
                            test_cursor13_base):
     pass
 
+@wttest.skip_for_hook("tiered", "uses cached cursors")
 class test_cursor13_ckpt2(test_checkpoint02.test_checkpoint02,
                           test_cursor13_base):
     pass
 
+@wttest.skip_for_hook("tiered", "uses cached cursors")
 class test_cursor13_reopens(test_cursor13_base):
     # The SimpleDataSet uses simple tables, that have no column groups or
     # indices. Thus, these tables will be cached. The more complex data sets
@@ -183,8 +223,7 @@ class test_cursor13_reopens(test_cursor13_base):
             # create operation above or if this is the second or later
             # time through the loop.
             c = session.open_cursor(self.uri)
-            self.assert_cursor_reopened(caching_enabled and \
-                                        (opens != 0 or create))
+            self.assert_cursor_reopened(caching_enabled and (opens != 0 or create))
 
             # With one cursor for this URI already open, we'll only
             # get a reopened cursor if this is the second or later
@@ -253,13 +292,13 @@ class test_cursor13_reopens(test_cursor13_base):
                 # reopen the second cached cursor, see the data handle now
                 # open and will succeed the reopen.
                 #
-                # This test checks that reopens of cursor using a an
-                # already reopened data handle will work.
+                # This test checks that reopens of cursor using an already
+                # reopened data handle will work.
                 c = self.session.open_cursor(self.uri)
                 ds.check()
                 c.close()
                 s2 = self.conn.open_session()
-                s2.verify(self.uri)
+                self.verifyUntilSuccess(s2, self.uri)
                 s2.close()
 
 class test_cursor13_drops(test_cursor13_base):
@@ -271,7 +310,7 @@ class test_cursor13_drops(test_cursor13_base):
                 c.close()
             # The cursor cache is unaffected by the drop, and nothing
             # in the cache should prevent the drop from occurring.
-            drop_session.drop(uri)
+            self.dropUntilSuccess(drop_session, uri)
             confirm_does_not_exist(self, uri)
 
     def test_open_and_drop(self):
@@ -301,7 +340,7 @@ class test_cursor13_drops(test_cursor13_base):
         self.assertRaises(wiredtiger.WiredTigerError,
             lambda: session.drop(uri))
         c.close()
-        session.drop(uri)
+        self.dropUntilSuccess(session, uri)
         confirm_does_not_exist(self, uri)
 
         # Same test for indices, but with cursor held by another session.
@@ -315,7 +354,7 @@ class test_cursor13_drops(test_cursor13_base):
         self.assertRaises(wiredtiger.WiredTigerError,
             lambda: session.drop(uri))
         c.close()
-        session.drop(uri)
+        self.dropUntilSuccess(session, uri)
         confirm_does_not_exist(self, uri)
         session2.close()
 
@@ -327,7 +366,7 @@ class test_cursor13_drops(test_cursor13_base):
 
         for i in range(0, 2):
             session.create(uri, config)
-            session.drop(uri)
+            self.dropUntilSuccess(session, uri)
 
         for i in range(0, 2):
             session.create(uri, config)
@@ -336,7 +375,7 @@ class test_cursor13_drops(test_cursor13_base):
             self.assertRaises(wiredtiger.WiredTigerError,
                 lambda: session.drop(uri))
             cursor.close()
-            session.drop(uri)
+            self.dropUntilSuccess(session, uri)
 
         for i in range(0, 2):
             session.create(uri, config)
@@ -346,7 +385,7 @@ class test_cursor13_drops(test_cursor13_base):
             self.assertRaises(wiredtiger.WiredTigerError,
                 lambda: session.drop(uri))
             cursor.close()
-            session.drop(uri)
+            self.dropUntilSuccess(session, uri)
 
         for i in range(0, 2):
             session.create(uri, config)
@@ -358,7 +397,7 @@ class test_cursor13_drops(test_cursor13_base):
             self.assertRaises(wiredtiger.WiredTigerError,
                 lambda: session.drop(uri))
             cursor.close()
-            session.drop(uri)
+            self.dropUntilSuccess(session, uri)
 
 # Shared base class for some bigger tests.
 class test_cursor13_big_base(test_cursor13_base):
@@ -375,11 +414,11 @@ class test_cursor13_big_base(test_cursor13_base):
     # create some number (self.deep) of cached cursors.
     def create_uri_map(self, baseuri):
         uri_map = {}
-        for i in xrange(0, self.nuris):
+        for i in range(0, self.nuris):
             uri = self.uriname(i)
             cursors = []
             self.session.create(uri, None)
-            for j in xrange(0, self.deep):
+            for j in range(0, self.deep):
                 cursors.append(self.session.open_cursor(uri, None))
             for c in cursors:
                 c.close()
@@ -438,7 +477,7 @@ class test_cursor13_big(test_cursor13_big_base):
 
         # At this point, we'll randomly open/close lots of cursors, keeping
         # track of how many of each. As long as we don't have more than [deep]
-        # cursors open for each uri, we should always be taking then from
+        # cursors open for each uri, we should always be taking them from
         # the set of cached cursors.
         while self.opencount < self.nopens:
             self.open_or_close(uri_map, rand, 0, self.nuris)
@@ -448,8 +487,9 @@ class test_cursor13_big(test_cursor13_big_base):
         #self.tty('opens = ' + str(self.opencount) + \
         #         ', closes = ' + str(self.closecount))
         #self.tty('stats after = ' + str(end_stats))
-        self.assertEquals(end_stats[0] - begin_stats[0], self.closecount)
-        self.assertEquals(end_stats[1] - begin_stats[1], self.opencount)
+
+        self.assertEqual(end_stats[0] - begin_stats[0], self.closecount)
+        self.assertEqual(end_stats[1] - begin_stats[1], self.opencount)
 
 class test_cursor13_sweep(test_cursor13_big_base):
     # Set dhandle sweep configuration so that dhandles should be closed within
@@ -478,8 +518,8 @@ class test_cursor13_sweep(test_cursor13_big_base):
                 # Close cursors in half of the range, and don't
                 # use them during this round, so they will be
                 # closed by sweep.
-                half = self.nuris / 2
-                potential_dead += self.close_uris(uri_map, xrange(0, half))
+                half = self.nuris // 2
+                potential_dead += self.close_uris(uri_map, list(range(0, half)))
                 bottom_range = half
                 # Let the dhandle sweep run and find the closed cursors.
                 time.sleep(3.0)
@@ -489,7 +529,7 @@ class test_cursor13_sweep(test_cursor13_big_base):
             # The session cursor sweep runs at most once a second and
             # traverses a fraction of the cached cursors.  We'll run for
             # ten seconds with pauses to make sure we see sweep activity.
-            pause_point = self.opens_per_round / 100
+            pause_point = self.opens_per_round // 100
             if pause_point == 0:
                 pause_point = 1
             pause_duration = 0.1
@@ -508,7 +548,7 @@ class test_cursor13_sweep(test_cursor13_big_base):
         #         ', closes = ' + str(self.closecount))
         #self.tty('stats after = ' + str(end_stats))
         #self.tty('sweep stats after = ' + str(end_sweep_stats))
-        self.assertEquals(end_stats[0] - begin_stats[0], self.closecount)
+        self.assertEqual(end_stats[0] - begin_stats[0], self.closecount)
         swept = end_sweep_stats[3] - begin_sweep_stats[3]
 
         # Although this is subject to tuning parameters, we know that
@@ -522,7 +562,7 @@ class test_cursor13_sweep(test_cursor13_big_base):
         # We'll pass the test if we see at least 20% of the 'potentially
         # dead' cursors swept.  There may be more, since the 1% per second
         # is a minimum.
-        min_swept = 2 * potential_dead / 10
+        min_swept = 2 * potential_dead // 10
         self.assertGreaterEqual(swept, min_swept)
 
         # No strict equality test for the reopen stats. When we've swept
@@ -531,6 +571,7 @@ class test_cursor13_sweep(test_cursor13_big_base):
         # predictable.
         self.assertGreater(end_stats[1] - begin_stats[1], 0)
 
+@wttest.skip_for_hook("tiered", "uses cached cursors")
 class test_cursor13_dup(test_cursor13_base):
     def test_dup(self):
         self.cursor_stats_init()
@@ -546,7 +587,6 @@ class test_cursor13_dup(test_cursor13_base):
         c1.next()
 
         for notused in range(0, 100):
-            self.session.breakpoint()
             c2 = self.session.open_cursor(None, c1, None)
             c2.close()
         stats = self.caching_stats()

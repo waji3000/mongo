@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Public Domain 2014-2018 MongoDB, Inc.
+# Public Domain 2014-present MongoDB, Inc.
 # Public Domain 2008-2014 WiredTiger, Inc.
 #
 # This is free and unencumbered software released into the public domain.
@@ -34,15 +34,38 @@ from workgen import Key, Operation, OpList, Table, Transaction, Value
 # txn --
 #   Put the operation (and any suboperations) within a transaction.
 def txn(op, config=None):
-    t = Transaction(config)
-    op._transaction = t
+    t = Transaction()
+    if config != None:
+        t._begin_config = config
+    op.transaction = t
     return op
 
-# Check for a local build that contains the wt utility. First check in
-# current working directory, then in build_posix and finally in the disttop
-# directory. This isn't ideal - if a user has multiple builds in a tree we
-# could pick the wrong one.
+# sleep --
+#   Create an operation to sleep a given number of seconds.
+def sleep(seconds):
+    return Operation(Operation.OP_SLEEP, str(seconds))
+
+# timed --
+#   Configure the operation (and suboperations) to run until the time elapses.
+def timed(seconds, op):
+    if op._group == None:
+        result = Operation()
+        result._group = OpList([op])
+        result._repeatgroup = 1
+    else:
+        result = op
+    result._timed = seconds
+    return result
+
+# Check for a local build that contains the wt utility. First check for a
+# user supplied 'WT_BUILDDIR' environment variable, then the current working
+# directory, then finally in the disttop directory. This isn't
+# ideal - if a user has multiple builds in a tree we could pick the wrong one.
 def _wiredtiger_builddir():
+    env_builddir = os.getenv('WT_BUILDDIR')
+    if env_builddir and os.path.isfile(os.path.join(env_builddir, 'wt')):
+        return env_builddir
+
     if os.path.isfile(os.path.join(os.getcwd(), 'wt')):
         return os.getcwd()
 
@@ -52,15 +75,21 @@ def _wiredtiger_builddir():
         thisdir, os.pardir, os.pardir, os.pardir, os.pardir)
     if os.path.isfile(os.path.join(wt_disttop, 'wt')):
         return wt_disttop
-    if os.path.isfile(os.path.join(wt_disttop, 'build_posix', 'wt')):
-        return os.path.join(wt_disttop, 'build_posix')
     if os.path.isfile(os.path.join(wt_disttop, 'wt.exe')):
         return wt_disttop
     raise Exception('Unable to find useable WiredTiger build')
 
 # Return the wiredtiger_open extension argument for any needed shared library.
 # Called with a list of extensions, e.g.
-#    [ 'compressors/snappy', 'encryptors/rotn=config_string' ]
+# conn_config += extensions_config(['compressors/snappy',\
+#                                   'encryptors/rotn=config_string'])
+#
+# What compressors and encryptors are available, and the connection
+# configuration needed, depends on what compressors and encryptors have been
+# configured into the WiredTiger library linked by workgen. That is, arguments
+# given to the configure program when building WiredTiger influence what calls
+# to extensions_config must be made. Any compressors that are explicitly
+# 'built-in' to WiredTiger will not need an explicit extension parameter.
 def extensions_config(exts):
     result = ''
     extfiles = {}
@@ -97,7 +126,7 @@ def extensions_config(exts):
         else:
             extfiles[ext] = complete
     if len(extfiles) != 0:
-        result = ',extensions=[' + ','.join(extfiles.values()) + ']'
+        result = ',extensions=[' + ','.join(list(extfiles.values())) + ']'
     return result
 
 _PARETO_SHAPE = 1.5
@@ -134,13 +163,39 @@ def _op_get_group_list(op):
         result.extend(grouplist)
     return result
 
+# This function is used by op_copy to modify a "tree" of operations to change the table
+# and/or key for each operation to a given value.  It operates on the current operation,
+# and recursively on any in its groiup list.
+def _op_copy_mod(op, table, key):
+    if op._optype != Operation.OP_NONE:
+        if table != None:
+            op._table = table
+        if key != None:
+            op._key = key
+    if op._group != None:
+        newgroup = []
+        for subop in _op_get_group_list(op):
+            newgroup.append(_op_copy_mod(subop, table, key))
+        op._group = OpList(newgroup)
+    return op
+
+# This is a convenient function that copies an operation and all its
+# "sub-operations", as well as any attached transaction.
+def op_copy(src, table=None, key=None):
+    # Copy constructor does a deep copy, including subordinate
+    # operations and any attached transaction.
+    op = Operation(src)
+    if table != None or key != None:
+        _op_copy_mod(op, table, key)
+    return op
+
 def _op_multi_table_as_list(ops_arg, tables, pareto_tables, multiplier):
     result = []
     if ops_arg._optype != Operation.OP_NONE:
         if pareto_tables <= 0:
             for table in tables:
                 for i in range(0, multiplier):
-                    result.append(Operation(ops_arg._optype, table, ops_arg._key, ops_arg._value))
+                    result.append(op_copy(ops_arg, table=table))
         else:
             # Use the multiplier unless the length of the list will be large.
             # In any case, make sure there's at least a multiplier of 3, to
@@ -161,12 +216,21 @@ def _op_multi_table_as_list(ops_arg, tables, pareto_tables, multiplier):
                 key = Key(ops_arg._key)
                 key._pareto.range_low = (1.0 * i)/count
                 key._pareto.range_high = (1.0 * (i + 1))/count
-                result.append(Operation(ops_arg._optype, table, key, ops_arg._value))
+                result.append(op_copy(ops_arg, table=table, key=key))
     else:
-        for op in _op_get_group_list(ops_arg):
-            for o in _op_multi_table_as_list(op, tables, pareto_tables, \
-                                             multiplier):
-                result.append(Operation(o))
+        copy = op_copy(ops_arg, table=tables[1])
+        if ops_arg.transaction == None:
+            for op in _op_get_group_list(ops_arg):
+                for o in _op_multi_table_as_list(op, tables, pareto_tables, \
+                                                 multiplier):
+                    result.append(Operation(o))
+        elif pareto_tables <= 0:
+            entries = len(tables) * multiplier
+            for i in range(0, entries):
+                copy = op_copy(ops_arg, table=tables[i])
+                result.append(copy)
+        else:
+            raise Exception('(pareto, range partition, transaction) combination not supported')
     return result
 
 # A convenient way to build a list of operations
@@ -226,8 +290,8 @@ def op_multi_table(ops_arg, tables, range_partition = False):
         ops = op_append(ops, op)
     return ops
 
-# should be 8 bytes format 'Q'
-_logkey = Key(Key.KEYGEN_APPEND, 8)
+# should be 8 bytes format 'Q', but for 'S' it needs to be larger for workgen tests
+_logkey = Key(Key.KEYGEN_APPEND, 12)
 def _op_log_op(op, log_table):
     keysize = op._key._size
     if keysize == 0:
@@ -243,8 +307,14 @@ def _optype_is_write(optype):
         optype == Operation.OP_REMOVE
 
 # Emulate wtperf's log_like option.  For all operations, add a second
-# insert operation going to a log table.
+# insert operation going to a log table.  Ops_per_txn is only checked
+# for zero vs non-zero, non-zero says don't add new transactions.
+# If we have ops_per_txn, wtperf.py ensures that op_group_transactions was previous called
+# to insert needed transactions.
 def op_log_like(op, log_table, ops_per_txn):
+    if op.transaction != None:
+        # Any non-zero number indicates that we already have a transaction around this.
+        ops_per_txn = 1
     if op._optype != Operation.OP_NONE:
         if _optype_is_write(op._optype):
             op += _op_log_op(op, log_table)
@@ -254,10 +324,13 @@ def op_log_like(op, log_table, ops_per_txn):
         oplist = []
         for op2 in _op_get_group_list(op):
             if op2._optype == Operation.OP_NONE:
-                oplist.append(op_log_like(op2, log_table))
+                oplist.append(op_log_like(op2, log_table, ops_per_txn))
             elif ops_per_txn == 0 and _optype_is_write(op2._optype):
                 op2 += _op_log_op(op2, log_table)
-                oplist.append(txn(op2))       # txn for each action.
+                if op2.transaction == None:
+                    oplist.append(txn(op2))  # txn for each action.
+                else:
+                    oplist.append(op2)       # already have a txn
             else:
                 oplist.append(op2)
                 if _optype_is_write(op2._optype):
@@ -276,7 +349,7 @@ def _op_transaction_list(oplist, txn_config):
 def op_group_transaction(ops_arg, ops_per_txn, txn_config):
     if ops_arg != Operation.OP_NONE:
         return txn(ops_arg, txn_config)
-    if ops_arg._transaction != None:
+    if ops_arg.transaction != None:
         raise Exception('nested transactions not supported')
     if ops_arg._repeatgroup != None:
         raise Exception('grouping transactions with multipliers not supported')
@@ -305,7 +378,7 @@ def op_group_transaction(ops_arg, ops_per_txn, txn_config):
 # the regular part of the run.
 def op_populate_with_range(ops_arg, tables, icount, random_range, pop_threads):
     table_count = len(tables)
-    entries_per_table = (icount + random_range) / table_count
+    entries_per_table = (icount + random_range) // table_count
     if entries_per_table == 0:
         # This can happen if table_count is huge relative to
         # icount/random_range.  Not really worth handling.
@@ -319,8 +392,8 @@ def op_populate_with_range(ops_arg, tables, icount, random_range, pop_threads):
         # Another situation that is not handled exactly.
         raise Exception('(icount + random_range) is not evenly divisible by ' +
                         'populate_threads')
-    fill_tables = icount / entries_per_table
-    fill_per_thread = entries_per_table / pop_threads
+    fill_tables = icount // entries_per_table
+    fill_per_thread = entries_per_table // pop_threads
     ops = None
     for i in range(0, fill_tables):
         op = Operation(ops_arg)
@@ -328,7 +401,7 @@ def op_populate_with_range(ops_arg, tables, icount, random_range, pop_threads):
         ops = op_append(ops, op * fill_per_thread)
     partial_fill = icount % entries_per_table
     if partial_fill > 0:
-        fill_per_thread = partial_fill / pop_threads
+        fill_per_thread = partial_fill // pop_threads
         op = Operation(ops_arg)
         op._table = tables[fill_tables]
         ops = op_append(ops, op * fill_per_thread)

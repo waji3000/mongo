@@ -1,101 +1,112 @@
 // SERVER-5124
 // The puporse of this test is to test authentication when adding/removing a shard. The test sets
 // up a sharded system, then adds/removes a shard.
-(function() {
-    'use strict';
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {removeShard} from "jstests/sharding/libs/remove_shard_util.js";
 
-    // login method to login into the database
-    function login(userObj) {
-        var authResult = mongos.getDB(userObj.db).auth(userObj.username, userObj.password);
-        printjson(authResult);
-    }
+// TODO SERVER-50144 Remove this and allow orphan checking.
+// This test calls removeShard which can leave docs in config.rangeDeletions in state "pending",
+// therefore preventing orphans from being cleaned up.
+TestData.skipCheckOrphans = true;
 
-    // admin user object
-    var adminUser = {db: "admin", username: "foo", password: "bar"};
+// login method to login into the database
+function login(userObj) {
+    var authResult = mongos.getDB(userObj.db).auth(userObj.username, userObj.password);
+    printjson(authResult);
+}
 
-    // set up a 2 shard cluster with keyfile
-    // TODO: Remove 'shardAsReplicaSet: false' when SERVER-32672 is fixed.
-    var st = new ShardingTest(
-        {shards: 1, mongos: 1, other: {keyFile: 'jstests/libs/key1', shardAsReplicaSet: false}});
+// admin user object
+var adminUser = {db: "admin", username: "foo", password: "bar"};
 
-    var mongos = st.s0;
-    var admin = mongos.getDB("admin");
+// set up a 2 shard cluster with keyfile
+var st = new ShardingTest({shards: 1, mongos: 1, other: {keyFile: 'jstests/libs/key1'}});
 
-    print("1 shard system setup");
+var mongos = st.s0;
+var admin = mongos.getDB("admin");
 
-    // add the admin user
-    print("adding user");
-    mongos.getDB(adminUser.db).createUser({
-        user: adminUser.username,
-        pwd: adminUser.password,
-        roles: jsTest.adminUserRoles
-    });
+print("1 shard system setup");
 
-    // login as admin user
-    login(adminUser);
+// add the admin user
+print("adding user");
+mongos.getDB(adminUser.db)
+    .createUser({user: adminUser.username, pwd: adminUser.password, roles: jsTest.adminUserRoles});
 
-    assert.eq(1, st.config.shards.count(), "initial server count wrong");
+// login as admin user
+login(adminUser);
 
-    // start a mongod with NO keyfile
-    var conn = MongoRunner.runMongod({shardsvr: ""});
-    print(conn);
+assert.eq(1, st.config.shards.count(), "initial server count wrong");
 
-    // --------------- Test 1 --------------------
-    // Add shard to the existing cluster (should fail because it was added without a keyfile)
-    printjson(assert.commandFailed(admin.runCommand({addShard: conn.host})));
+// start a mongod with NO keyfile
+var rst = new ReplSetTest({nodes: 1});
+rst.startSet({shardsvr: ""});
+rst.initiate();
 
-    // stop mongod
-    MongoRunner.stopMongod(conn);
+// --------------- Test 1 --------------------
+// Add shard to the existing cluster (should fail because it was added without a keyfile)
+printjson(assert.commandFailed(admin.runCommand({addShard: rst.getURL()})));
 
-    //--------------- Test 2 --------------------
-    // start mongod again, this time with keyfile
-    var conn = MongoRunner.runMongod({keyFile: "jstests/libs/key1", shardsvr: ""});
-    // try adding the new shard
-    assert.commandWorked(admin.runCommand({addShard: conn.host}));
+// stop mongod
+rst.stopSet();
 
-    // Add some data
-    var db = mongos.getDB("foo");
-    var collA = mongos.getCollection("foo.bar");
+//--------------- Test 2 --------------------
+// start mongod again, this time with keyfile
+rst = new ReplSetTest({nodes: 1});
+rst.startSet({keyFile: "jstests/libs/key1", shardsvr: ""});
+rst.initiate();
 
-    // enable sharding on a collection
-    assert.commandWorked(admin.runCommand({enableSharding: "" + collA.getDB()}));
-    st.ensurePrimaryShard("foo", "shard0000");
+// try adding the new shard
+var addShardRes = admin.runCommand({addShard: rst.getURL()});
+assert.commandWorked(addShardRes);
 
-    assert.commandWorked(admin.runCommand({shardCollection: "" + collA, key: {_id: 1}}));
+// Add some data
+var db = mongos.getDB("foo");
+assert.commandWorked(
+    admin.runCommand({enableSharding: db.getName(), primaryShard: st.shard0.shardName}));
 
-    // add data to the sharded collection
-    for (var i = 0; i < 4; i++) {
-        db.bar.save({_id: i});
-        assert.commandWorked(admin.runCommand({split: "" + collA, middle: {_id: i}}));
-    }
+var collA = mongos.getCollection("foo.bar");
+assert.commandWorked(admin.runCommand({shardCollection: "" + collA, key: {_id: 1}}));
 
-    // move a chunk
-    assert.commandWorked(admin.runCommand({moveChunk: "foo.bar", find: {_id: 1}, to: "shard0001"}));
+// add data to the sharded collection
+for (var i = 0; i < 4; i++) {
+    db.bar.save({_id: i});
+    assert.commandWorked(admin.runCommand({split: "" + collA, middle: {_id: i}}));
+}
 
-    // verify the chunk was moved
-    admin.runCommand({flushRouterConfig: 1});
+// move a chunk
+// TODO (SERVER-60767): remove _waitForDelete param; removeShard() will sync on range deletion.
+assert.commandWorked(admin.runCommand(
+    {moveChunk: "foo.bar", find: {_id: 1}, to: addShardRes.shardAdded, _waitForDelete: true}));
 
-    var config = mongos.getDB("config");
-    st.printShardingStatus(true);
+// verify the chunk was moved
+admin.runCommand({flushRouterConfig: 1});
 
-    // start balancer before removing the shard
-    st.startBalancer();
+var config = mongos.getDB("config");
+st.printShardingStatus(true);
 
-    //--------------- Test 3 --------------------
-    // now drain the shard
-    assert.commandWorked(admin.runCommand({removeShard: conn.host}));
+// start balancer before removing the shard
+st.startBalancer();
 
-    // give it some time to drain
-    assert.soon(function() {
-        var result = admin.runCommand({removeShard: conn.host});
-        printjson(result);
+//--------------- Test 3 --------------------
+// now drain the shard
+removeShard(st, rst.getURL());
 
-        return result.ok && result.state == "completed";
-    }, "failed to drain shard completely", 5 * 60 * 1000);
+// create user directly on new shard to allow direct reads from config.migrationCoordinators
+rst.getPrimary()
+    .getDB(adminUser.db)
+    .createUser({user: adminUser.username, pwd: adminUser.password, roles: jsTest.adminUserRoles});
+rst.getPrimary().getDB(adminUser.db).auth(adminUser.username, adminUser.password);
 
-    assert.eq(1, st.config.shards.count(), "removed server still appears in count");
+// wait until migration coordinator is finished
+assert.soon(function() {
+    let migrationCoordinatorDocs =
+        rst.getPrimary().getDB('config').migrationCoordinators.find().toArray();
 
-    MongoRunner.stopMongod(conn);
+    return migrationCoordinatorDocs.length === 0;
+}, "failed to remove migration coordinator", 5 * 60 * 1000);
 
-    st.stop();
-})();
+assert.eq(1, st.config.shards.count(), "removed server still appears in count");
+
+rst.stopSet();
+
+st.stop();

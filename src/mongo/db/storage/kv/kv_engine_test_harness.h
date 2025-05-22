@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,10 +29,11 @@
 
 #pragma once
 
+#include <functional>
 #include <memory>
 
+#include "mongo/db/service_context.h"
 #include "mongo/db/storage/kv/kv_engine.h"
-#include "mongo/stdx/functional.h"
 
 namespace mongo {
 
@@ -56,8 +56,9 @@ public:
 
     virtual KVEngine* restartEngine() = 0;
 
-    static std::unique_ptr<KVHarnessHelper> create();
-    static void registerFactory(stdx::function<std::unique_ptr<KVHarnessHelper>()> factory);
+    static std::unique_ptr<KVHarnessHelper> create(ServiceContext* svcCtx);
+    static void registerFactory(
+        std::function<std::unique_ptr<KVHarnessHelper>(ServiceContext*)> factory);
 };
 
 }  // namespace mongo

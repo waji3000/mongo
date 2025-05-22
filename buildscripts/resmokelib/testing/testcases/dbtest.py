@@ -1,14 +1,12 @@
 """The unittest.TestCase for dbtests."""
 
-from __future__ import absolute_import
-
 import os
 import os.path
+import shutil
+from typing import Optional
 
-from . import interface
-from ... import config
-from ... import core
-from ... import utils
+from buildscripts.resmokelib import config, core, logging, utils
+from buildscripts.resmokelib.testing.testcases import interface
 
 
 class DBTestCase(interface.ProcessTestCase):
@@ -16,15 +14,22 @@ class DBTestCase(interface.ProcessTestCase):
 
     REGISTERED_NAME = "db_test"
 
-    def __init__(self, logger, dbtest_suite, dbtest_executable=None, dbtest_options=None):
+    def __init__(
+        self,
+        logger: logging.Logger,
+        dbtest_suites: list[str],
+        dbtest_executable: Optional[str] = None,
+        dbtest_options: Optional[dict] = None,
+    ):
         """Initialize the DBTestCase with the dbtest suite to run."""
 
-        interface.ProcessTestCase.__init__(self, logger, "dbtest suite", dbtest_suite)
+        assert len(dbtest_suites) == 1
+        interface.ProcessTestCase.__init__(self, logger, "dbtest suite", dbtest_suites[0])
 
         # Command line options override the YAML configuration.
         self.dbtest_executable = utils.default_if_none(config.DBTEST_EXECUTABLE, dbtest_executable)
 
-        self.dbtest_suite = dbtest_suite
+        self.dbtest_suite = dbtest_suites[0]
         self.dbtest_options = utils.default_if_none(dbtest_options, {}).copy()
 
     def configure(self, fixture, *args, **kwargs):
@@ -49,11 +54,15 @@ class DBTestCase(interface.ProcessTestCase):
         self._clear_dbpath()
 
     def _clear_dbpath(self):
-        utils.rmtree(self.dbtest_options["dbpath"], ignore_errors=True)
+        shutil.rmtree(self.dbtest_options["dbpath"], ignore_errors=True)
 
     def _make_process(self):
-        return core.programs.dbtest_program(self.logger, executable=self.dbtest_executable,
-                                            suites=[self.dbtest_suite], **self.dbtest_options)
+        return core.programs.dbtest_program(
+            self.logger,
+            executable=self.dbtest_executable,
+            suites=[self.dbtest_suite],
+            **self.dbtest_options,
+        )
 
     @staticmethod
     def _get_dbpath_prefix():

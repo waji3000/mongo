@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -33,59 +32,85 @@
  * fetch so we cannot test it outside of a dbtest.
  */
 
+#include <cstddef>
+#include <memory>
+#include <set>
+#include <string>
+#include <utility>
+#include <vector>
 
-#include "mongo/platform/basic.h"
+#include <boost/container/small_vector.hpp>
+// IWYU pragma: no_include "boost/intrusive/detail/iterator.hpp"
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
 
-#include "mongo/client/dbclient_cursor.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/json.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/client.h"
-#include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/exec/and_hash.h"
 #include "mongo/db/exec/and_sorted.h"
+#include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/exec/fetch.h"
 #include "mongo/db/exec/index_scan.h"
+#include "mongo/db/exec/mock_stage.h"
 #include "mongo/db/exec/plan_stage.h"
-#include "mongo/db/exec/queued_data_stage.h"
-#include "mongo/db/json.h"
-#include "mongo/db/matcher/expression_parser.h"
-#include "mongo/dbtests/dbtests.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/db/exec/working_set.h"
+#include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/query/index_bounds.h"
+#include "mongo/db/record_id.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/storage/record_store.h"
+#include "mongo/db/storage/snapshot.h"
+#include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/dbtests/dbtests.h"  // IWYU pragma: keep
+#include "mongo/unittest/unittest.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/intrusive_counter.h"
+#include "mongo/util/str.h"
 
+namespace mongo {
 namespace QueryStageAnd {
-
-using std::set;
-using std::shared_ptr;
-using std::unique_ptr;
-using stdx::make_unique;
 
 class QueryStageAndBase {
 public:
     QueryStageAndBase() : _client(&_opCtx) {}
 
     virtual ~QueryStageAndBase() {
-        _client.dropCollection(ns());
+        _client.dropCollection(nss());
     }
 
     void addIndex(const BSONObj& obj) {
         ASSERT_OK(dbtests::createIndex(&_opCtx, ns(), obj));
     }
 
-    IndexDescriptor* getIndex(const BSONObj& obj, Collection* coll) {
-        std::vector<IndexDescriptor*> indexes;
-        coll->getIndexCatalog()->findIndexesByKeyPattern(&_opCtx, obj, false, &indexes);
+    const IndexDescriptor* getIndex(const BSONObj& obj, const CollectionAcquisition& coll) {
+        std::vector<const IndexDescriptor*> indexes;
+        coll.getCollectionPtr()->getIndexCatalog()->findIndexesByKeyPattern(
+            &_opCtx, obj, IndexCatalog::InclusionPolicy::kReady, &indexes);
         if (indexes.empty()) {
-            FAIL(mongoutils::str::stream() << "Unable to find index with key pattern " << obj);
+            FAIL(str::stream() << "Unable to find index with key pattern " << obj);
         }
         return indexes[0];
     }
 
     IndexScanParams makeIndexScanParams(OperationContext* opCtx,
+                                        const CollectionAcquisition& collection,
                                         const IndexDescriptor* descriptor) {
-        IndexScanParams params(opCtx, *descriptor);
+        IndexScanParams params(opCtx, collection.getCollectionPtr(), descriptor);
         params.bounds.isSimpleRange = true;
         params.bounds.endKey = BSONObj();
         params.bounds.boundInclusion = BoundInclusion::kIncludeBothStartAndEndKeys;
@@ -93,34 +118,30 @@ public:
         return params;
     }
 
-    void getRecordIds(set<RecordId>* out, Collection* coll) {
-        auto cursor = coll->getCursor(&_opCtx);
+    void getRecordIds(std::set<RecordId>* out, const CollectionAcquisition& coll) {
+        auto cursor = coll.getCollectionPtr()->getCursor(&_opCtx);
         while (auto record = cursor->next()) {
             out->insert(record->id);
         }
     }
 
     void insert(const BSONObj& obj) {
-        _client.insert(ns(), obj);
+        _client.insert(nss(), obj);
     }
 
     void remove(const BSONObj& obj) {
-        _client.remove(ns(), obj);
+        _client.remove(nss(), obj);
     }
 
     /**
-     * Executes plan stage until EOF.
-     * Returns number of results seen if execution reaches EOF successfully.
-     * Otherwise, returns -1 on stage failure.
+     * Executes plan stage until EOF.  Returns number of results seen if execution reaches EOF
+     * successfully. Throws on stage failure.
      */
     int countResults(PlanStage* stage) {
         int count = 0;
         while (!stage->isEOF()) {
             WorkingSetID id = WorkingSet::INVALID_ID;
             PlanStage::StageState status = stage->work(&id);
-            if (PlanStage::FAILURE == status) {
-                return -1;
-            }
             if (PlanStage::ADVANCED != status) {
                 continue;
             }
@@ -130,19 +151,13 @@ public:
     }
 
     /**
-     * Gets the next result from 'stage'.
-     *
-     * Fails if the stage fails or returns DEAD, if the returned working
-     * set member is not fetched, or if there are no more results.
+     * Gets the next result from 'stage'. Asserts that the returned working set member is fetched,
+     * and that there are more results.
      */
     BSONObj getNext(PlanStage* stage, WorkingSet* ws) {
         while (!stage->isEOF()) {
             WorkingSetID id = WorkingSet::INVALID_ID;
             PlanStage::StageState status = stage->work(&id);
-
-            // We shouldn't fail or be dead.
-            ASSERT(PlanStage::FAILURE != status);
-            ASSERT(PlanStage::DEAD != status);
 
             if (PlanStage::ADVANCED != status) {
                 continue;
@@ -150,7 +165,7 @@ public:
 
             WorkingSetMember* member = ws->get(id);
             ASSERT(member->hasObj());
-            return member->obj.value();
+            return member->doc.value().toBson();
         }
 
         // We failed to produce a result.
@@ -158,13 +173,23 @@ public:
         return BSONObj();
     }
 
-    static const char* ns() {
-        return "unittests.QueryStageAnd";
+    StringData ns() {
+        return _nss.ns_forTest();
     }
+    const NamespaceString& nss() {
+        return _nss;
+    }
+
+private:
+    const NamespaceString _nss =
+        NamespaceString::createNamespaceString_forTest("unittests.QueryStageAnd");
 
 protected:
     const ServiceContext::UniqueOperationContext _txnPtr = cc().makeOperationContext();
     OperationContext& _opCtx = *_txnPtr;
+
+    boost::intrusive_ptr<ExpressionContext> _expCtx =
+        ExpressionContextBuilder{}.opCtx(&_opCtx).ns(_nss).build();
 
 private:
     DBDirectClient _client;
@@ -183,10 +208,10 @@ public:
     void run() {
         dbtests::WriteContextForTests ctx(&_opCtx, ns());
         Database* db = ctx.db();
-        Collection* coll = ctx.getCollection();
-        if (!coll) {
+
+        if (!ctx.getCollection().exists()) {
             WriteUnitOfWork wuow(&_opCtx);
-            coll = db->createCollection(&_opCtx, ns());
+            db->createCollection(&_opCtx, nss());
             wuow.commit();
         }
 
@@ -197,19 +222,21 @@ public:
         addIndex(BSON("foo" << 1));
         addIndex(BSON("bar" << 1));
 
+        const auto coll = ctx.getCollection();
+
         WorkingSet ws;
-        auto ah = make_unique<AndHashStage>(&_opCtx, &ws);
+        auto ah = std::make_unique<AndHashStage>(_expCtx.get(), &ws);
 
         // Foo <= 20.
-        auto params = makeIndexScanParams(&_opCtx, getIndex(BSON("foo" << 1), coll));
+        auto params = makeIndexScanParams(&_opCtx, coll, getIndex(BSON("foo" << 1), coll));
         params.bounds.startKey = BSON("" << 20);
         params.direction = -1;
-        ah->addChild(new IndexScan(&_opCtx, params, &ws, NULL));
+        ah->addChild(std::make_unique<IndexScan>(_expCtx.get(), coll, params, &ws, nullptr));
 
         // Bar >= 10.
-        params = makeIndexScanParams(&_opCtx, getIndex(BSON("bar" << 1), coll));
+        params = makeIndexScanParams(&_opCtx, coll, getIndex(BSON("bar" << 1), coll));
         params.bounds.startKey = BSON("" << 10);
-        ah->addChild(new IndexScan(&_opCtx, params, &ws, NULL));
+        ah->addChild(std::make_unique<IndexScan>(_expCtx.get(), coll, params, &ws, nullptr));
 
         // 'ah' reads the first child into its hash table: foo=20, foo=19, ..., foo=0
         // in that order. Read half of them.
@@ -221,17 +248,18 @@ public:
 
         // Save state and delete one of the read objects.
         ah->saveState();
-        set<RecordId> data;
+        std::set<RecordId> data;
         getRecordIds(&data, coll);
         size_t memUsageBefore = ah->getMemUsage();
-        for (set<RecordId>::const_iterator it = data.begin(); it != data.end(); ++it) {
-            if (coll->docFor(&_opCtx, *it).value()["foo"].numberInt() == 15) {
-                remove(coll->docFor(&_opCtx, *it).value());
+        const auto& collPtr = coll.getCollectionPtr();
+        for (std::set<RecordId>::const_iterator it = data.begin(); it != data.end(); ++it) {
+            if (collPtr->docFor(&_opCtx, *it).value()["foo"].numberInt() == 15) {
+                remove(collPtr->docFor(&_opCtx, *it).value());
                 break;
             }
         }
         size_t memUsageAfter = ah->getMemUsage();
-        ah->restoreState();
+        ah->restoreState(RestoreContext(nullptr));
 
         // The deleted result should still be buffered inside the AND_HASH stage, so there should be
         // no change in memory consumption.
@@ -268,11 +296,9 @@ class QueryStageAndHashDeleteLookaheadDuringYield : public QueryStageAndBase {
 public:
     void run() {
         dbtests::WriteContextForTests ctx(&_opCtx, ns());
-        Database* db = ctx.db();
-        Collection* coll = ctx.getCollection();
-        if (!coll) {
+        if (!ctx.getCollection().exists()) {
             WriteUnitOfWork wuow(&_opCtx);
-            coll = db->createCollection(&_opCtx, ns());
+            ctx.db()->createCollection(&_opCtx, nss());
             wuow.commit();
         }
 
@@ -283,21 +309,22 @@ public:
         addIndex(BSON("foo" << 1));
         addIndex(BSON("bar" << 1));
         addIndex(BSON("baz" << 1));
+        const auto coll = ctx.getCollection();
 
         WorkingSet ws;
-        auto ah = make_unique<AndHashStage>(&_opCtx, &ws);
+        auto ah = std::make_unique<AndHashStage>(_expCtx.get(), &ws);
 
         // Foo <= 20 (descending).
-        auto params = makeIndexScanParams(&_opCtx, getIndex(BSON("foo" << 1), coll));
+        auto params = makeIndexScanParams(&_opCtx, coll, getIndex(BSON("foo" << 1), coll));
         params.bounds.startKey = BSON("" << 20);
         params.direction = -1;
-        ah->addChild(new IndexScan(&_opCtx, params, &ws, NULL));
+        ah->addChild(std::make_unique<IndexScan>(_expCtx.get(), coll, params, &ws, nullptr));
 
         // Bar <= 19 (descending).
-        params = makeIndexScanParams(&_opCtx, getIndex(BSON("bar" << 1), coll));
+        params = makeIndexScanParams(&_opCtx, coll, getIndex(BSON("bar" << 1), coll));
         params.bounds.startKey = BSON("" << 19);
         params.direction = -1;
-        ah->addChild(new IndexScan(&_opCtx, params, &ws, NULL));
+        ah->addChild(std::make_unique<IndexScan>(_expCtx.get(), coll, params, &ws, nullptr));
 
         // First call to work reads the first result from the children. The first result for the
         // first scan over foo is {foo: 20, bar: 20, baz: 20}. The first result for the second scan
@@ -309,13 +336,14 @@ public:
         // Delete 'deletedObj' from the collection.
         BSONObj deletedObj = BSON("_id" << 20 << "foo" << 20 << "bar" << 20 << "baz" << 20);
         ah->saveState();
-        set<RecordId> data;
+        std::set<RecordId> data;
         getRecordIds(&data, coll);
 
         size_t memUsageBefore = ah->getMemUsage();
+        const auto& collPtr = coll.getCollectionPtr();
         for (auto&& recordId : data) {
-            if (0 == deletedObj.woCompare(coll->docFor(&_opCtx, recordId).value())) {
-                remove(coll->docFor(&_opCtx, recordId).value());
+            if (0 == deletedObj.woCompare(collPtr->docFor(&_opCtx, recordId).value())) {
+                remove(collPtr->docFor(&_opCtx, recordId).value());
                 break;
             }
         }
@@ -324,7 +352,7 @@ public:
         size_t memUsageAfter = ah->getMemUsage();
         ASSERT_EQUALS(memUsageBefore, memUsageAfter);
 
-        ah->restoreState();
+        ah->restoreState(RestoreContext(nullptr));
 
         // We expect that the deleted document doers not appear in our result set.
         int count = 0;
@@ -336,7 +364,8 @@ public:
             }
             WorkingSetMember* wsm = ws.get(id);
             ASSERT_NOT_EQUALS(0,
-                              deletedObj.woCompare(coll->docFor(&_opCtx, wsm->recordId).value()));
+                              deletedObj.woCompare(
+                                  coll.getCollectionPtr()->docFor(&_opCtx, wsm->recordId).value()));
             ++count;
         }
 
@@ -349,11 +378,10 @@ class QueryStageAndHashTwoLeaf : public QueryStageAndBase {
 public:
     void run() {
         dbtests::WriteContextForTests ctx(&_opCtx, ns());
-        Database* db = ctx.db();
-        Collection* coll = ctx.getCollection();
-        if (!coll) {
+
+        if (!ctx.getCollection().exists()) {
             WriteUnitOfWork wuow(&_opCtx);
-            coll = db->createCollection(&_opCtx, ns());
+            ctx.db()->createCollection(&_opCtx, nss());
             wuow.commit();
         }
 
@@ -363,21 +391,22 @@ public:
 
         addIndex(BSON("foo" << 1));
         addIndex(BSON("bar" << 1));
+        const auto coll = ctx.getCollection();
 
         WorkingSet ws;
-        auto ah = make_unique<AndHashStage>(&_opCtx, &ws);
+        auto ah = std::make_unique<AndHashStage>(_expCtx.get(), &ws);
 
         // Foo <= 20
-        auto params = makeIndexScanParams(&_opCtx, getIndex(BSON("foo" << 1), coll));
+        auto params = makeIndexScanParams(&_opCtx, coll, getIndex(BSON("foo" << 1), coll));
         params.bounds.startKey = BSON("" << 20);
         params.direction = -1;
-        ah->addChild(new IndexScan(&_opCtx, params, &ws, NULL));
+        ah->addChild(std::make_unique<IndexScan>(_expCtx.get(), coll, params, &ws, nullptr));
 
         // Bar >= 10
-        params = makeIndexScanParams(&_opCtx, getIndex(BSON("bar" << 1), coll));
+        params = makeIndexScanParams(&_opCtx, coll, getIndex(BSON("bar" << 1), coll));
         params.bounds.startKey = BSON("" << 10);
         params.direction = -1;
-        ah->addChild(new IndexScan(&_opCtx, params, &ws, NULL));
+        ah->addChild(std::make_unique<IndexScan>(_expCtx.get(), coll, params, &ws, nullptr));
 
         // foo == bar == baz, and foo<=20, bar>=10, so our values are:
         // foo == 10, 11, 12, 13, 14, 15. 16, 17, 18, 19, 20
@@ -393,11 +422,9 @@ class QueryStageAndHashTwoLeafFirstChildLargeKeys : public QueryStageAndBase {
 public:
     void run() {
         dbtests::WriteContextForTests ctx(&_opCtx, ns());
-        Database* db = ctx.db();
-        Collection* coll = ctx.getCollection();
-        if (!coll) {
+        if (!ctx.getCollection().exists()) {
             WriteUnitOfWork wuow(&_opCtx);
-            coll = db->createCollection(&_opCtx, ns());
+            ctx.db()->createCollection(&_opCtx, nss());
             wuow.commit();
         }
 
@@ -409,27 +436,30 @@ public:
 
         addIndex(BSON("foo" << 1 << "big" << 1));
         addIndex(BSON("bar" << 1));
+        const auto coll = ctx.getCollection();
 
         // Lower buffer limit to 20 * sizeof(big) to force memory error
         // before hashed AND is done reading the first child (stage has to
         // hold 21 keys in buffer for Foo <= 20).
         WorkingSet ws;
-        auto ah = make_unique<AndHashStage>(&_opCtx, &ws, 20 * big.size());
+        auto ah = std::make_unique<AndHashStage>(_expCtx.get(), &ws, 20 * big.size());
 
         // Foo <= 20
-        auto params = makeIndexScanParams(&_opCtx, getIndex(BSON("foo" << 1 << "big" << 1), coll));
+        auto params =
+            makeIndexScanParams(&_opCtx, coll, getIndex(BSON("foo" << 1 << "big" << 1), coll));
         params.bounds.startKey = BSON("" << 20 << "" << big);
         params.direction = -1;
-        ah->addChild(new IndexScan(&_opCtx, params, &ws, NULL));
+        ah->addChild(std::make_unique<IndexScan>(_expCtx.get(), coll, params, &ws, nullptr));
 
         // Bar >= 10
-        params = makeIndexScanParams(&_opCtx, getIndex(BSON("bar" << 1), coll));
+        params = makeIndexScanParams(&_opCtx, coll, getIndex(BSON("bar" << 1), coll));
         params.bounds.startKey = BSON("" << 10);
         params.direction = -1;
-        ah->addChild(new IndexScan(&_opCtx, params, &ws, NULL));
+        ah->addChild(std::make_unique<IndexScan>(_expCtx.get(), coll, params, &ws, nullptr));
 
-        // Stage execution should fail.
-        ASSERT_EQUALS(-1, countResults(ah.get()));
+        ASSERT_THROWS_CODE(countResults(ah.get()),
+                           DBException,
+                           ErrorCodes::QueryExceededMemoryLimitNoDiskUseAllowed);
     }
 };
 
@@ -440,11 +470,9 @@ class QueryStageAndHashTwoLeafLastChildLargeKeys : public QueryStageAndBase {
 public:
     void run() {
         dbtests::WriteContextForTests ctx(&_opCtx, ns());
-        Database* db = ctx.db();
-        Collection* coll = ctx.getCollection();
-        if (!coll) {
+        if (!ctx.getCollection().exists()) {
             WriteUnitOfWork wuow(&_opCtx);
-            coll = db->createCollection(&_opCtx, ns());
+            ctx.db()->createCollection(&_opCtx, nss());
             wuow.commit();
         }
 
@@ -456,24 +484,25 @@ public:
 
         addIndex(BSON("foo" << 1));
         addIndex(BSON("bar" << 1 << "big" << 1));
+        const auto coll = ctx.getCollection();
 
         // Lower buffer limit to 5 * sizeof(big) to ensure that
         // keys in last child's index are not buffered. There are 6 keys
         // that satisfy the criteria Foo <= 20 and Bar >= 10 and 5 <= baz <= 15.
         WorkingSet ws;
-        auto ah = make_unique<AndHashStage>(&_opCtx, &ws, 5 * big.size());
+        auto ah = std::make_unique<AndHashStage>(_expCtx.get(), &ws, 5 * big.size());
 
         // Foo <= 20
-        auto params = makeIndexScanParams(&_opCtx, getIndex(BSON("foo" << 1), coll));
+        auto params = makeIndexScanParams(&_opCtx, coll, getIndex(BSON("foo" << 1), coll));
         params.bounds.startKey = BSON("" << 20);
         params.direction = -1;
-        ah->addChild(new IndexScan(&_opCtx, params, &ws, NULL));
+        ah->addChild(std::make_unique<IndexScan>(_expCtx.get(), coll, params, &ws, nullptr));
 
         // Bar >= 10
-        params = makeIndexScanParams(&_opCtx, getIndex(BSON("bar" << 1 << "big" << 1), coll));
+        params = makeIndexScanParams(&_opCtx, coll, getIndex(BSON("bar" << 1 << "big" << 1), coll));
         params.bounds.startKey = BSON("" << 10 << "" << big);
         params.direction = -1;
-        ah->addChild(new IndexScan(&_opCtx, params, &ws, NULL));
+        ah->addChild(std::make_unique<IndexScan>(_expCtx.get(), coll, params, &ws, nullptr));
 
         // foo == bar == baz, and foo<=20, bar>=10, so our values are:
         // foo == 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20.
@@ -486,11 +515,9 @@ class QueryStageAndHashThreeLeaf : public QueryStageAndBase {
 public:
     void run() {
         dbtests::WriteContextForTests ctx(&_opCtx, ns());
-        Database* db = ctx.db();
-        Collection* coll = ctx.getCollection();
-        if (!coll) {
+        if (!ctx.getCollection().exists()) {
             WriteUnitOfWork wuow(&_opCtx);
-            coll = db->createCollection(&_opCtx, ns());
+            ctx.db()->createCollection(&_opCtx, nss());
             wuow.commit();
         }
 
@@ -501,26 +528,27 @@ public:
         addIndex(BSON("foo" << 1));
         addIndex(BSON("bar" << 1));
         addIndex(BSON("baz" << 1));
+        const auto coll = ctx.getCollection();
 
         WorkingSet ws;
-        auto ah = make_unique<AndHashStage>(&_opCtx, &ws);
+        auto ah = std::make_unique<AndHashStage>(_expCtx.get(), &ws);
 
         // Foo <= 20
-        auto params = makeIndexScanParams(&_opCtx, getIndex(BSON("foo" << 1), coll));
+        auto params = makeIndexScanParams(&_opCtx, coll, getIndex(BSON("foo" << 1), coll));
         params.bounds.startKey = BSON("" << 20);
         params.direction = -1;
-        ah->addChild(new IndexScan(&_opCtx, params, &ws, NULL));
+        ah->addChild(std::make_unique<IndexScan>(_expCtx.get(), coll, params, &ws, nullptr));
 
         // Bar >= 10
-        params = makeIndexScanParams(&_opCtx, getIndex(BSON("bar" << 1), coll));
+        params = makeIndexScanParams(&_opCtx, coll, getIndex(BSON("bar" << 1), coll));
         params.bounds.startKey = BSON("" << 10);
-        ah->addChild(new IndexScan(&_opCtx, params, &ws, NULL));
+        ah->addChild(std::make_unique<IndexScan>(_expCtx.get(), coll, params, &ws, nullptr));
 
         // 5 <= baz <= 15
-        params = makeIndexScanParams(&_opCtx, getIndex(BSON("baz" << 1), coll));
+        params = makeIndexScanParams(&_opCtx, coll, getIndex(BSON("baz" << 1), coll));
         params.bounds.startKey = BSON("" << 5);
         params.bounds.endKey = BSON("" << 15);
-        ah->addChild(new IndexScan(&_opCtx, params, &ws, NULL));
+        ah->addChild(std::make_unique<IndexScan>(_expCtx.get(), coll, params, &ws, nullptr));
 
         // foo == bar == baz, and foo<=20, bar>=10, 5<=baz<=15, so our values are:
         // foo == 10, 11, 12, 13, 14, 15.
@@ -539,11 +567,10 @@ class QueryStageAndHashThreeLeafMiddleChildLargeKeys : public QueryStageAndBase 
 public:
     void run() {
         dbtests::WriteContextForTests ctx(&_opCtx, ns());
-        Database* db = ctx.db();
-        Collection* coll = ctx.getCollection();
-        if (!coll) {
+
+        if (!ctx.getCollection().exists()) {
             WriteUnitOfWork wuow(&_opCtx);
-            coll = db->createCollection(&_opCtx, ns());
+            ctx.db()->createCollection(&_opCtx, nss());
             wuow.commit();
         }
 
@@ -556,32 +583,35 @@ public:
         addIndex(BSON("foo" << 1));
         addIndex(BSON("bar" << 1 << "big" << 1));
         addIndex(BSON("baz" << 1));
+        const auto coll = ctx.getCollection();
 
         // Lower buffer limit to 10 * sizeof(big) to force memory error
         // before hashed AND is done reading the second child (stage has to
         // hold 11 keys in buffer for Foo <= 20 and Bar >= 10).
         WorkingSet ws;
-        auto ah = make_unique<AndHashStage>(&_opCtx, &ws, 10 * big.size());
+        auto ah = std::make_unique<AndHashStage>(_expCtx.get(), &ws, 10 * big.size());
 
         // Foo <= 20
-        auto params = makeIndexScanParams(&_opCtx, getIndex(BSON("foo" << 1), coll));
+        auto params = makeIndexScanParams(&_opCtx, coll, getIndex(BSON("foo" << 1), coll));
         params.bounds.startKey = BSON("" << 20);
         params.direction = -1;
-        ah->addChild(new IndexScan(&_opCtx, params, &ws, NULL));
+        ah->addChild(std::make_unique<IndexScan>(_expCtx.get(), coll, params, &ws, nullptr));
 
         // Bar >= 10
-        params = makeIndexScanParams(&_opCtx, getIndex(BSON("bar" << 1 << "big" << 1), coll));
+        params = makeIndexScanParams(&_opCtx, coll, getIndex(BSON("bar" << 1 << "big" << 1), coll));
         params.bounds.startKey = BSON("" << 10 << "" << big);
-        ah->addChild(new IndexScan(&_opCtx, params, &ws, NULL));
+        ah->addChild(std::make_unique<IndexScan>(_expCtx.get(), coll, params, &ws, nullptr));
 
         // 5 <= baz <= 15
-        params = makeIndexScanParams(&_opCtx, getIndex(BSON("baz" << 1), coll));
+        params = makeIndexScanParams(&_opCtx, coll, getIndex(BSON("baz" << 1), coll));
         params.bounds.startKey = BSON("" << 5);
         params.bounds.endKey = BSON("" << 15);
-        ah->addChild(new IndexScan(&_opCtx, params, &ws, NULL));
+        ah->addChild(std::make_unique<IndexScan>(_expCtx.get(), coll, params, &ws, nullptr));
 
         // Stage execution should fail.
-        ASSERT_EQUALS(-1, countResults(ah.get()));
+        ASSERT_THROWS_CODE(countResults(ah.get()),
+                           DBException,
+                           ErrorCodes::QueryExceededMemoryLimitNoDiskUseAllowed);
     }
 };
 
@@ -590,11 +620,10 @@ class QueryStageAndHashWithNothing : public QueryStageAndBase {
 public:
     void run() {
         dbtests::WriteContextForTests ctx(&_opCtx, ns());
-        Database* db = ctx.db();
-        Collection* coll = ctx.getCollection();
-        if (!coll) {
+
+        if (!ctx.getCollection().exists()) {
             WriteUnitOfWork wuow(&_opCtx);
-            coll = db->createCollection(&_opCtx, ns());
+            ctx.db()->createCollection(&_opCtx, nss());
             wuow.commit();
         }
 
@@ -604,21 +633,22 @@ public:
 
         addIndex(BSON("foo" << 1));
         addIndex(BSON("bar" << 1));
+        const auto coll = ctx.getCollection();
 
         WorkingSet ws;
-        auto ah = make_unique<AndHashStage>(&_opCtx, &ws);
+        auto ah = std::make_unique<AndHashStage>(_expCtx.get(), &ws);
 
         // Foo <= 20
-        auto params = makeIndexScanParams(&_opCtx, getIndex(BSON("foo" << 1), coll));
+        auto params = makeIndexScanParams(&_opCtx, coll, getIndex(BSON("foo" << 1), coll));
         params.bounds.startKey = BSON("" << 20);
         params.direction = -1;
-        ah->addChild(new IndexScan(&_opCtx, params, &ws, NULL));
+        ah->addChild(std::make_unique<IndexScan>(_expCtx.get(), coll, params, &ws, nullptr));
 
         // Bar == 5.  Index scan should be eof.
-        params = makeIndexScanParams(&_opCtx, getIndex(BSON("bar" << 1), coll));
+        params = makeIndexScanParams(&_opCtx, coll, getIndex(BSON("bar" << 1), coll));
         params.bounds.startKey = BSON("" << 5);
         params.bounds.endKey = BSON("" << 5);
-        ah->addChild(new IndexScan(&_opCtx, params, &ws, NULL));
+        ah->addChild(std::make_unique<IndexScan>(_expCtx.get(), coll, params, &ws, nullptr));
 
         int count = 0;
         int works = 0;
@@ -646,11 +676,9 @@ class QueryStageAndHashProducesNothing : public QueryStageAndBase {
 public:
     void run() {
         dbtests::WriteContextForTests ctx(&_opCtx, ns());
-        Database* db = ctx.db();
-        Collection* coll = ctx.getCollection();
-        if (!coll) {
+        if (!ctx.getCollection().exists()) {
             WriteUnitOfWork wuow(&_opCtx);
-            coll = db->createCollection(&_opCtx, ns());
+            ctx.db()->createCollection(&_opCtx, nss());
             wuow.commit();
         }
 
@@ -661,26 +689,26 @@ public:
 
         addIndex(BSON("foo" << 1));
         addIndex(BSON("bar" << 1));
+        const auto coll = ctx.getCollection();
 
         WorkingSet ws;
-        auto ah = make_unique<AndHashStage>(&_opCtx, &ws);
+        auto ah = std::make_unique<AndHashStage>(_expCtx.get(), &ws);
 
         // Foo >= 100
-        auto params = makeIndexScanParams(&_opCtx, getIndex(BSON("foo" << 1), coll));
+        auto params = makeIndexScanParams(&_opCtx, coll, getIndex(BSON("foo" << 1), coll));
         params.bounds.startKey = BSON("" << 100);
-        ah->addChild(new IndexScan(&_opCtx, params, &ws, NULL));
+        ah->addChild(std::make_unique<IndexScan>(_expCtx.get(), coll, params, &ws, nullptr));
 
         // Bar <= 100
-        params = makeIndexScanParams(&_opCtx, getIndex(BSON("bar" << 1), coll));
+        params = makeIndexScanParams(&_opCtx, coll, getIndex(BSON("bar" << 1), coll));
         params.bounds.startKey = BSON("" << 100);
         // This is subtle and confusing.  We couldn't extract any keys from the elements with
         // 'foo' in them so we would normally index them with the "nothing found" key.  We don't
         // want to include that in our scan.
-        params.bounds.endKey = BSON(""
-                                    << "");
+        params.bounds.endKey = BSON("" << "");
         params.bounds.boundInclusion = BoundInclusion::kIncludeStartKeyOnly;
         params.direction = -1;
-        ah->addChild(new IndexScan(&_opCtx, params, &ws, NULL));
+        ah->addChild(std::make_unique<IndexScan>(_expCtx.get(), coll, params, &ws, nullptr));
 
         ASSERT_EQUALS(0, countResults(ah.get()));
     }
@@ -694,11 +722,10 @@ class QueryStageAndHashFirstChildFetched : public QueryStageAndBase {
 public:
     void run() {
         dbtests::WriteContextForTests ctx(&_opCtx, ns());
-        Database* db = ctx.db();
-        Collection* coll = ctx.getCollection();
-        if (!coll) {
+
+        if (!ctx.getCollection().exists()) {
             WriteUnitOfWork wuow(&_opCtx);
-            coll = db->createCollection(&_opCtx, ns());
+            ctx.db()->createCollection(&_opCtx, nss());
             wuow.commit();
         }
 
@@ -708,25 +735,27 @@ public:
 
         addIndex(BSON("foo" << 1));
         addIndex(BSON("bar" << 1));
+        const auto coll = ctx.getCollection();
 
         WorkingSet ws;
-        auto ah = make_unique<AndHashStage>(&_opCtx, &ws);
+        auto ah = std::make_unique<AndHashStage>(_expCtx.get(), &ws);
 
         // Foo <= 20
-        auto params = makeIndexScanParams(&_opCtx, getIndex(BSON("foo" << 1), coll));
+        auto params = makeIndexScanParams(&_opCtx, coll, getIndex(BSON("foo" << 1), coll));
         params.bounds.startKey = BSON("" << 20);
         params.direction = -1;
-        IndexScan* firstScan = new IndexScan(&_opCtx, params, &ws, NULL);
+        auto firstScan = std::make_unique<IndexScan>(_expCtx.get(), coll, params, &ws, nullptr);
 
         // First child of the AND_HASH stage is a Fetch. The NULL in the
         // constructor means there is no filter.
-        FetchStage* fetch = new FetchStage(&_opCtx, &ws, firstScan, NULL, coll);
-        ah->addChild(fetch);
+        auto fetch =
+            std::make_unique<FetchStage>(_expCtx.get(), &ws, std::move(firstScan), nullptr, coll);
+        ah->addChild(std::move(fetch));
 
         // Bar >= 10
-        params = makeIndexScanParams(&_opCtx, getIndex(BSON("bar" << 1), coll));
+        params = makeIndexScanParams(&_opCtx, coll, getIndex(BSON("bar" << 1), coll));
         params.bounds.startKey = BSON("" << 10);
-        ah->addChild(new IndexScan(&_opCtx, params, &ws, NULL));
+        ah->addChild(std::make_unique<IndexScan>(_expCtx.get(), coll, params, &ws, nullptr));
 
         // Check that the AndHash stage returns docs {foo: 10, bar: 10}
         // through {foo: 20, bar: 20}.
@@ -746,11 +775,10 @@ class QueryStageAndHashSecondChildFetched : public QueryStageAndBase {
 public:
     void run() {
         dbtests::WriteContextForTests ctx(&_opCtx, ns());
-        Database* db = ctx.db();
-        Collection* coll = ctx.getCollection();
-        if (!coll) {
+
+        if (!ctx.getCollection().exists()) {
             WriteUnitOfWork wuow(&_opCtx);
-            coll = db->createCollection(&_opCtx, ns());
+            ctx.db()->createCollection(&_opCtx, nss());
             wuow.commit();
         }
 
@@ -760,25 +788,27 @@ public:
 
         addIndex(BSON("foo" << 1));
         addIndex(BSON("bar" << 1));
+        const auto coll = ctx.getCollection();
 
         WorkingSet ws;
-        auto ah = make_unique<AndHashStage>(&_opCtx, &ws);
+        auto ah = std::make_unique<AndHashStage>(_expCtx.get(), &ws);
 
         // Foo <= 20
-        auto params = makeIndexScanParams(&_opCtx, getIndex(BSON("foo" << 1), coll));
+        auto params = makeIndexScanParams(&_opCtx, coll, getIndex(BSON("foo" << 1), coll));
         params.bounds.startKey = BSON("" << 20);
         params.direction = -1;
-        ah->addChild(new IndexScan(&_opCtx, params, &ws, NULL));
+        ah->addChild(std::make_unique<IndexScan>(_expCtx.get(), coll, params, &ws, nullptr));
 
         // Bar >= 10
-        params = makeIndexScanParams(&_opCtx, getIndex(BSON("bar" << 1), coll));
+        params = makeIndexScanParams(&_opCtx, coll, getIndex(BSON("bar" << 1), coll));
         params.bounds.startKey = BSON("" << 10);
-        IndexScan* secondScan = new IndexScan(&_opCtx, params, &ws, NULL);
+        auto secondScan = std::make_unique<IndexScan>(_expCtx.get(), coll, params, &ws, nullptr);
 
         // Second child of the AND_HASH stage is a Fetch. The NULL in the
         // constructor means there is no filter.
-        FetchStage* fetch = new FetchStage(&_opCtx, &ws, secondScan, NULL, coll);
-        ah->addChild(fetch);
+        auto fetch =
+            std::make_unique<FetchStage>(_expCtx.get(), &ws, std::move(secondScan), nullptr, coll);
+        ah->addChild(std::move(fetch));
 
         // Check that the AndHash stage returns docs {foo: 10, bar: 10}
         // through {foo: 20, bar: 20}.
@@ -796,127 +826,113 @@ public:
     void run() {
         dbtests::WriteContextForTests ctx(&_opCtx, ns());
         Database* db = ctx.db();
-        Collection* coll = ctx.getCollection();
-        if (!coll) {
+        auto coll = ctx.getCollection();
+        if (!coll.exists()) {
             WriteUnitOfWork wuow(&_opCtx);
-            coll = db->createCollection(&_opCtx, ns());
+            db->createCollection(&_opCtx, nss());
             wuow.commit();
         }
 
+        coll = ctx.getCollection();
         const BSONObj dataObj = fromjson("{'foo': 'bar'}");
 
-        // Confirm PlanStage::DEAD when children contain the following WorkingSetMembers:
+        // Confirm exception is thrown when children contain the following WorkingSetMembers:
         //     Child1:  Data
-        //     Child2:  NEED_TIME, DEAD
+        //     Child2:  NEED_TIME, FAILURE
         {
             WorkingSet ws;
-            const auto andHashStage = make_unique<AndHashStage>(&_opCtx, &ws);
+            const auto andHashStage = std::make_unique<AndHashStage>(_expCtx.get(), &ws);
 
-            auto childStage1 = make_unique<QueuedDataStage>(&_opCtx, &ws);
+            auto childStage1 = std::make_unique<MockStage>(_expCtx.get(), &ws);
             {
                 WorkingSetID id = ws.allocate();
                 WorkingSetMember* wsm = ws.get(id);
                 wsm->recordId = RecordId(1);
-                wsm->obj = Snapshotted<BSONObj>(SnapshotId(), dataObj);
+                wsm->doc = {SnapshotId(), Document{dataObj}};
                 ws.transitionToRecordIdAndObj(id);
-                childStage1->pushBack(id);
+                childStage1->enqueueAdvanced(id);
             }
 
-            auto childStage2 = make_unique<QueuedDataStage>(&_opCtx, &ws);
-            childStage2->pushBack(PlanStage::NEED_TIME);
-            childStage2->pushBack(PlanStage::DEAD);
+            auto childStage2 = std::make_unique<MockStage>(_expCtx.get(), &ws);
+            childStage2->enqueueStateCode(PlanStage::NEED_TIME);
+            childStage2->enqueueError(Status{ErrorCodes::InternalError, "mock error"});
 
-            andHashStage->addChild(childStage1.release());
-            andHashStage->addChild(childStage2.release());
+            andHashStage->addChild(std::move(childStage1));
+            andHashStage->addChild(std::move(childStage2));
 
-            WorkingSetID id = WorkingSet::INVALID_ID;
-            PlanStage::StageState state = PlanStage::NEED_TIME;
-            while (PlanStage::NEED_TIME == state) {
-                state = andHashStage->work(&id);
-            }
-
-            ASSERT_EQ(PlanStage::DEAD, state);
+            ASSERT_THROWS_CODE(
+                getNext(andHashStage.get(), &ws), DBException, ErrorCodes::InternalError);
         }
 
-        // Confirm PlanStage::DEAD when children contain the following WorkingSetMembers:
-        //     Child1:  Data, DEAD
+        // Confirm exception is thrown when children contain the following WorkingSetMembers:
+        //     Child1:  Data, FAILURE
         //     Child2:  Data
         {
             WorkingSet ws;
-            const auto andHashStage = make_unique<AndHashStage>(&_opCtx, &ws);
+            const auto andHashStage = std::make_unique<AndHashStage>(_expCtx.get(), &ws);
 
-            auto childStage1 = make_unique<QueuedDataStage>(&_opCtx, &ws);
+            auto childStage1 = std::make_unique<MockStage>(_expCtx.get(), &ws);
 
             {
                 WorkingSetID id = ws.allocate();
                 WorkingSetMember* wsm = ws.get(id);
                 wsm->recordId = RecordId(1);
-                wsm->obj = Snapshotted<BSONObj>(SnapshotId(), dataObj);
+                wsm->doc = {SnapshotId(), Document{dataObj}};
                 ws.transitionToRecordIdAndObj(id);
-                childStage1->pushBack(id);
+                childStage1->enqueueAdvanced(id);
             }
-            childStage1->pushBack(PlanStage::DEAD);
+            childStage1->enqueueError(Status{ErrorCodes::InternalError, "mock error"});
 
-            auto childStage2 = make_unique<QueuedDataStage>(&_opCtx, &ws);
+            auto childStage2 = std::make_unique<MockStage>(_expCtx.get(), &ws);
             {
                 WorkingSetID id = ws.allocate();
                 WorkingSetMember* wsm = ws.get(id);
                 wsm->recordId = RecordId(2);
-                wsm->obj = Snapshotted<BSONObj>(SnapshotId(), dataObj);
+                wsm->doc = {SnapshotId(), Document{dataObj}};
                 ws.transitionToRecordIdAndObj(id);
-                childStage2->pushBack(id);
+                childStage2->enqueueAdvanced(id);
             }
 
-            andHashStage->addChild(childStage1.release());
-            andHashStage->addChild(childStage2.release());
+            andHashStage->addChild(std::move(childStage1));
+            andHashStage->addChild(std::move(childStage2));
 
-            WorkingSetID id = WorkingSet::INVALID_ID;
-            PlanStage::StageState state = PlanStage::NEED_TIME;
-            while (PlanStage::NEED_TIME == state) {
-                state = andHashStage->work(&id);
-            }
-
-            ASSERT_EQ(PlanStage::DEAD, state);
+            ASSERT_THROWS_CODE(
+                getNext(andHashStage.get(), &ws), DBException, ErrorCodes::InternalError);
         }
 
-        // Confirm PlanStage::DEAD when children contain the following WorkingSetMembers:
+        // Confirm throws exception when children contain the following WorkingSetMembers:
         //     Child1:  Data
-        //     Child2:  Data, DEAD
+        //     Child2:  Data, FAILURE
         {
             WorkingSet ws;
-            const auto andHashStage = make_unique<AndHashStage>(&_opCtx, &ws);
+            const auto andHashStage = std::make_unique<AndHashStage>(_expCtx.get(), &ws);
 
-            auto childStage1 = make_unique<QueuedDataStage>(&_opCtx, &ws);
+            auto childStage1 = std::make_unique<MockStage>(_expCtx.get(), &ws);
             {
                 WorkingSetID id = ws.allocate();
                 WorkingSetMember* wsm = ws.get(id);
                 wsm->recordId = RecordId(1);
-                wsm->obj = Snapshotted<BSONObj>(SnapshotId(), dataObj);
+                wsm->doc = {SnapshotId(), Document{dataObj}};
                 ws.transitionToRecordIdAndObj(id);
-                childStage1->pushBack(id);
+                childStage1->enqueueAdvanced(id);
             }
 
-            auto childStage2 = make_unique<QueuedDataStage>(&_opCtx, &ws);
+            auto childStage2 = std::make_unique<MockStage>(_expCtx.get(), &ws);
             {
                 WorkingSetID id = ws.allocate();
                 WorkingSetMember* wsm = ws.get(id);
                 wsm->recordId = RecordId(2);
-                wsm->obj = Snapshotted<BSONObj>(SnapshotId(), dataObj);
+                wsm->doc = {SnapshotId(), Document{dataObj}};
                 ws.transitionToRecordIdAndObj(id);
-                childStage2->pushBack(id);
+                childStage2->enqueueAdvanced(id);
             }
-            childStage2->pushBack(PlanStage::DEAD);
+            childStage2->enqueueError(Status{ErrorCodes::InternalError, "internal error"});
 
-            andHashStage->addChild(childStage1.release());
-            andHashStage->addChild(childStage2.release());
+            andHashStage->addChild(std::move(childStage1));
+            andHashStage->addChild(std::move(childStage2));
 
-            WorkingSetID id = WorkingSet::INVALID_ID;
-            PlanStage::StageState state = PlanStage::NEED_TIME;
-            while (PlanStage::NEED_TIME == state) {
-                state = andHashStage->work(&id);
-            }
-
-            ASSERT_EQ(PlanStage::DEAD, state);
+            ASSERT_THROWS_CODE(
+                getNext(andHashStage.get(), &ws), DBException, ErrorCodes::InternalError);
         }
     }
 };
@@ -932,11 +948,9 @@ class QueryStageAndSortedDeleteDuringYield : public QueryStageAndBase {
 public:
     void run() {
         dbtests::WriteContextForTests ctx(&_opCtx, ns());
-        Database* db = ctx.db();
-        Collection* coll = ctx.getCollection();
-        if (!coll) {
+        if (!ctx.getCollection().exists()) {
             WriteUnitOfWork wuow(&_opCtx);
-            coll = db->createCollection(&_opCtx, ns());
+            ctx.db()->createCollection(&_opCtx, nss());
             wuow.commit();
         }
 
@@ -946,24 +960,25 @@ public:
         }
         addIndex(BSON("foo" << 1));
         addIndex(BSON("bar" << 1));
+        const auto coll = ctx.getCollection();
 
         WorkingSet ws;
-        auto ah = make_unique<AndSortedStage>(&_opCtx, &ws);
+        auto ah = std::make_unique<AndSortedStage>(_expCtx.get(), &ws);
 
         // Scan over foo == 1.
-        auto params = makeIndexScanParams(&_opCtx, getIndex(BSON("foo" << 1), coll));
+        auto params = makeIndexScanParams(&_opCtx, coll, getIndex(BSON("foo" << 1), coll));
         params.bounds.startKey = BSON("" << 1);
         params.bounds.endKey = BSON("" << 1);
-        ah->addChild(new IndexScan(&_opCtx, params, &ws, NULL));
+        ah->addChild(std::make_unique<IndexScan>(_expCtx.get(), coll, params, &ws, nullptr));
 
         // Scan over bar == 1.
-        params = makeIndexScanParams(&_opCtx, getIndex(BSON("bar" << 1), coll));
+        params = makeIndexScanParams(&_opCtx, coll, getIndex(BSON("bar" << 1), coll));
         params.bounds.startKey = BSON("" << 1);
         params.bounds.endKey = BSON("" << 1);
-        ah->addChild(new IndexScan(&_opCtx, params, &ws, NULL));
+        ah->addChild(std::make_unique<IndexScan>(_expCtx.get(), coll, params, &ws, nullptr));
 
         // Get the set of RecordIds in our collection to use later.
-        set<RecordId> data;
+        std::set<RecordId> data;
         getRecordIds(&data, coll);
 
         // We're making an assumption here that happens to be true because we clear out the
@@ -977,8 +992,8 @@ public:
         // The first thing that the index scan returns (due to increasing RecordId trick) is the
         // very first insert, which should be the very first thing in data. Delete it.
         ah->saveState();
-        remove(coll->docFor(&_opCtx, *data.begin()).value());
-        ah->restoreState();
+        remove(coll.getCollectionPtr()->docFor(&_opCtx, *data.begin()).value());
+        ah->restoreState(RestoreContext(nullptr));
 
         auto it = data.begin();
 
@@ -1009,8 +1024,8 @@ public:
         }
         // Remove a result that's coming up.
         ah->saveState();
-        remove(coll->docFor(&_opCtx, *it).value());
-        ah->restoreState();
+        remove(coll.getCollectionPtr()->docFor(&_opCtx, *it).value());
+        ah->restoreState(RestoreContext(nullptr));
 
         // Get all results aside from the two we deleted.
         while (!ah->isEOF()) {
@@ -1040,11 +1055,10 @@ class QueryStageAndSortedThreeLeaf : public QueryStageAndBase {
 public:
     void run() {
         dbtests::WriteContextForTests ctx(&_opCtx, ns());
-        Database* db = ctx.db();
-        Collection* coll = ctx.getCollection();
-        if (!coll) {
+
+        if (!ctx.getCollection().exists()) {
             WriteUnitOfWork wuow(&_opCtx);
-            coll = db->createCollection(&_opCtx, ns());
+            ctx.db()->createCollection(&_opCtx, nss());
             wuow.commit();
         }
 
@@ -1063,27 +1077,28 @@ public:
         addIndex(BSON("foo" << 1));
         addIndex(BSON("bar" << 1));
         addIndex(BSON("baz" << 1));
+        const auto coll = ctx.getCollection();
 
         WorkingSet ws;
-        auto ah = make_unique<AndSortedStage>(&_opCtx, &ws);
+        auto ah = std::make_unique<AndSortedStage>(_expCtx.get(), &ws);
 
         // Scan over foo == 1
-        auto params = makeIndexScanParams(&_opCtx, getIndex(BSON("foo" << 1), coll));
+        auto params = makeIndexScanParams(&_opCtx, coll, getIndex(BSON("foo" << 1), coll));
         params.bounds.startKey = BSON("" << 1);
         params.bounds.endKey = BSON("" << 1);
-        ah->addChild(new IndexScan(&_opCtx, params, &ws, NULL));
+        ah->addChild(std::make_unique<IndexScan>(_expCtx.get(), coll, params, &ws, nullptr));
 
         // bar == 1
-        params = makeIndexScanParams(&_opCtx, getIndex(BSON("bar" << 1), coll));
+        params = makeIndexScanParams(&_opCtx, coll, getIndex(BSON("bar" << 1), coll));
         params.bounds.startKey = BSON("" << 1);
         params.bounds.endKey = BSON("" << 1);
-        ah->addChild(new IndexScan(&_opCtx, params, &ws, NULL));
+        ah->addChild(std::make_unique<IndexScan>(_expCtx.get(), coll, params, &ws, nullptr));
 
         // baz == 1
-        params = makeIndexScanParams(&_opCtx, getIndex(BSON("baz" << 1), coll));
+        params = makeIndexScanParams(&_opCtx, coll, getIndex(BSON("baz" << 1), coll));
         params.bounds.startKey = BSON("" << 1);
         params.bounds.endKey = BSON("" << 1);
-        ah->addChild(new IndexScan(&_opCtx, params, &ws, NULL));
+        ah->addChild(std::make_unique<IndexScan>(_expCtx.get(), coll, params, &ws, nullptr));
 
         ASSERT_EQUALS(50, countResults(ah.get()));
     }
@@ -1094,11 +1109,10 @@ class QueryStageAndSortedWithNothing : public QueryStageAndBase {
 public:
     void run() {
         dbtests::WriteContextForTests ctx(&_opCtx, ns());
-        Database* db = ctx.db();
-        Collection* coll = ctx.getCollection();
-        if (!coll) {
+
+        if (!ctx.getCollection().exists()) {
             WriteUnitOfWork wuow(&_opCtx);
-            coll = db->createCollection(&_opCtx, ns());
+            ctx.db()->createCollection(&_opCtx, nss());
             wuow.commit();
         }
 
@@ -1108,21 +1122,22 @@ public:
 
         addIndex(BSON("foo" << 1));
         addIndex(BSON("bar" << 1));
+        const auto coll = ctx.getCollection();
 
         WorkingSet ws;
-        auto ah = make_unique<AndSortedStage>(&_opCtx, &ws);
+        auto ah = std::make_unique<AndSortedStage>(_expCtx.get(), &ws);
 
         // Foo == 7.  Should be EOF.
-        auto params = makeIndexScanParams(&_opCtx, getIndex(BSON("foo" << 1), coll));
+        auto params = makeIndexScanParams(&_opCtx, coll, getIndex(BSON("foo" << 1), coll));
         params.bounds.startKey = BSON("" << 7);
         params.bounds.endKey = BSON("" << 7);
-        ah->addChild(new IndexScan(&_opCtx, params, &ws, NULL));
+        ah->addChild(std::make_unique<IndexScan>(_expCtx.get(), coll, params, &ws, nullptr));
 
         // Bar == 20, not EOF.
-        params = makeIndexScanParams(&_opCtx, getIndex(BSON("bar" << 1), coll));
+        params = makeIndexScanParams(&_opCtx, coll, getIndex(BSON("bar" << 1), coll));
         params.bounds.startKey = BSON("" << 20);
         params.bounds.endKey = BSON("" << 20);
-        ah->addChild(new IndexScan(&_opCtx, params, &ws, NULL));
+        ah->addChild(std::make_unique<IndexScan>(_expCtx.get(), coll, params, &ws, nullptr));
 
         ASSERT_EQUALS(0, countResults(ah.get()));
     }
@@ -1133,11 +1148,10 @@ class QueryStageAndSortedProducesNothing : public QueryStageAndBase {
 public:
     void run() {
         dbtests::WriteContextForTests ctx(&_opCtx, ns());
-        Database* db = ctx.db();
-        Collection* coll = ctx.getCollection();
-        if (!coll) {
+
+        if (!ctx.getCollection().exists()) {
             WriteUnitOfWork wuow(&_opCtx);
-            coll = db->createCollection(&_opCtx, ns());
+            ctx.db()->createCollection(&_opCtx, nss());
             wuow.commit();
         }
 
@@ -1151,21 +1165,22 @@ public:
 
         addIndex(BSON("foo" << 1));
         addIndex(BSON("bar" << 1));
+        const auto coll = ctx.getCollection();
 
         WorkingSet ws;
-        auto ah = make_unique<AndSortedStage>(&_opCtx, &ws);
+        auto ah = std::make_unique<AndSortedStage>(_expCtx.get(), &ws);
 
         // foo == 7.
-        auto params = makeIndexScanParams(&_opCtx, getIndex(BSON("foo" << 1), coll));
+        auto params = makeIndexScanParams(&_opCtx, coll, getIndex(BSON("foo" << 1), coll));
         params.bounds.startKey = BSON("" << 7);
         params.bounds.endKey = BSON("" << 7);
-        ah->addChild(new IndexScan(&_opCtx, params, &ws, NULL));
+        ah->addChild(std::make_unique<IndexScan>(_expCtx.get(), coll, params, &ws, nullptr));
 
         // bar == 20.
-        params = makeIndexScanParams(&_opCtx, getIndex(BSON("bar" << 1), coll));
+        params = makeIndexScanParams(&_opCtx, coll, getIndex(BSON("bar" << 1), coll));
         params.bounds.startKey = BSON("" << 20);
         params.bounds.endKey = BSON("" << 20);
-        ah->addChild(new IndexScan(&_opCtx, params, &ws, NULL));
+        ah->addChild(std::make_unique<IndexScan>(_expCtx.get(), coll, params, &ws, nullptr));
 
         ASSERT_EQUALS(0, countResults(ah.get()));
     }
@@ -1176,11 +1191,10 @@ class QueryStageAndSortedByLastChild : public QueryStageAndBase {
 public:
     void run() {
         dbtests::WriteContextForTests ctx(&_opCtx, ns());
-        Database* db = ctx.db();
-        Collection* coll = ctx.getCollection();
-        if (!coll) {
+
+        if (!ctx.getCollection().exists()) {
             WriteUnitOfWork wuow(&_opCtx);
-            coll = db->createCollection(&_opCtx, ns());
+            ctx.db()->createCollection(&_opCtx, nss());
             wuow.commit();
         }
 
@@ -1190,23 +1204,25 @@ public:
 
         addIndex(BSON("foo" << 1));
         addIndex(BSON("bar" << 1));
+        const auto coll = ctx.getCollection();
 
         WorkingSet ws;
-        auto ah = make_unique<AndHashStage>(&_opCtx, &ws);
+        auto ah = std::make_unique<AndHashStage>(_expCtx.get(), &ws);
 
         // Scan over foo == 1
-        auto params = makeIndexScanParams(&_opCtx, getIndex(BSON("foo" << 1), coll));
+        auto params = makeIndexScanParams(&_opCtx, coll, getIndex(BSON("foo" << 1), coll));
         params.bounds.startKey = BSON("" << 1);
         params.bounds.endKey = BSON("" << 1);
-        ah->addChild(new IndexScan(&_opCtx, params, &ws, NULL));
+        ah->addChild(std::make_unique<IndexScan>(_expCtx.get(), coll, params, &ws, nullptr));
 
         // Intersect with 7 <= bar < 10000
-        params = makeIndexScanParams(&_opCtx, getIndex(BSON("bar" << 1), coll));
+        params = makeIndexScanParams(&_opCtx, coll, getIndex(BSON("bar" << 1), coll));
         params.bounds.startKey = BSON("" << 7);
         params.bounds.endKey = BSON("" << 10000);
-        ah->addChild(new IndexScan(&_opCtx, params, &ws, NULL));
+        ah->addChild(std::make_unique<IndexScan>(_expCtx.get(), coll, params, &ws, nullptr));
 
         WorkingSetID lastId = WorkingSet::INVALID_ID;
+        const auto& collPtr = coll.getCollectionPtr();
 
         int count = 0;
         while (!ah->isEOF()) {
@@ -1215,11 +1231,11 @@ public:
             if (PlanStage::ADVANCED != status) {
                 continue;
             }
-            BSONObj thisObj = coll->docFor(&_opCtx, ws.get(id)->recordId).value();
+            BSONObj thisObj = collPtr->docFor(&_opCtx, ws.get(id)->recordId).value();
             ASSERT_EQUALS(7 + count, thisObj["bar"].numberInt());
             ++count;
             if (WorkingSet::INVALID_ID != lastId) {
-                BSONObj lastObj = coll->docFor(&_opCtx, ws.get(lastId)->recordId).value();
+                BSONObj lastObj = collPtr->docFor(&_opCtx, ws.get(lastId)->recordId).value();
                 ASSERT_LESS_THAN(lastObj["bar"].woCompare(thisObj["bar"]), 0);
             }
             lastId = id;
@@ -1237,11 +1253,10 @@ class QueryStageAndSortedFirstChildFetched : public QueryStageAndBase {
 public:
     void run() {
         dbtests::WriteContextForTests ctx(&_opCtx, ns());
-        Database* db = ctx.db();
-        Collection* coll = ctx.getCollection();
-        if (!coll) {
+
+        if (!ctx.getCollection().exists()) {
             WriteUnitOfWork wuow(&_opCtx);
-            coll = db->createCollection(&_opCtx, ns());
+            ctx.db()->createCollection(&_opCtx, nss());
             wuow.commit();
         }
 
@@ -1252,26 +1267,28 @@ public:
 
         addIndex(BSON("foo" << 1));
         addIndex(BSON("bar" << 1));
+        const auto coll = ctx.getCollection();
 
         WorkingSet ws;
-        unique_ptr<AndSortedStage> as = make_unique<AndSortedStage>(&_opCtx, &ws);
+        std::unique_ptr<AndSortedStage> as = std::make_unique<AndSortedStage>(_expCtx.get(), &ws);
 
         // Scan over foo == 1
-        auto params = makeIndexScanParams(&_opCtx, getIndex(BSON("foo" << 1), coll));
+        auto params = makeIndexScanParams(&_opCtx, coll, getIndex(BSON("foo" << 1), coll));
         params.bounds.startKey = BSON("" << 1);
         params.bounds.endKey = BSON("" << 1);
-        IndexScan* firstScan = new IndexScan(&_opCtx, params, &ws, NULL);
+        auto firstScan = std::make_unique<IndexScan>(_expCtx.get(), coll, params, &ws, nullptr);
 
         // First child of the AND_SORTED stage is a Fetch. The NULL in the
         // constructor means there is no filter.
-        FetchStage* fetch = new FetchStage(&_opCtx, &ws, firstScan, NULL, coll);
-        as->addChild(fetch);
+        auto fetch =
+            std::make_unique<FetchStage>(_expCtx.get(), &ws, std::move(firstScan), nullptr, coll);
+        as->addChild(std::move(fetch));
 
         // bar == 1
-        params = makeIndexScanParams(&_opCtx, getIndex(BSON("bar" << 1), coll));
+        params = makeIndexScanParams(&_opCtx, coll, getIndex(BSON("bar" << 1), coll));
         params.bounds.startKey = BSON("" << 1);
         params.bounds.endKey = BSON("" << 1);
-        as->addChild(new IndexScan(&_opCtx, params, &ws, NULL));
+        as->addChild(std::make_unique<IndexScan>(_expCtx.get(), coll, params, &ws, nullptr));
 
         for (int i = 0; i < 50; i++) {
             BSONObj obj = getNext(as.get(), &ws);
@@ -1289,11 +1306,10 @@ class QueryStageAndSortedSecondChildFetched : public QueryStageAndBase {
 public:
     void run() {
         dbtests::WriteContextForTests ctx(&_opCtx, ns());
-        Database* db = ctx.db();
-        Collection* coll = ctx.getCollection();
-        if (!coll) {
+
+        if (!ctx.getCollection().exists()) {
             WriteUnitOfWork wuow(&_opCtx);
-            coll = db->createCollection(&_opCtx, ns());
+            ctx.db()->createCollection(&_opCtx, nss());
             wuow.commit();
         }
 
@@ -1304,26 +1320,28 @@ public:
 
         addIndex(BSON("foo" << 1));
         addIndex(BSON("bar" << 1));
+        const auto coll = ctx.getCollection();
 
         WorkingSet ws;
-        unique_ptr<AndSortedStage> as = make_unique<AndSortedStage>(&_opCtx, &ws);
+        std::unique_ptr<AndSortedStage> as = std::make_unique<AndSortedStage>(_expCtx.get(), &ws);
 
         // Scan over foo == 1
-        auto params = makeIndexScanParams(&_opCtx, getIndex(BSON("foo" << 1), coll));
+        auto params = makeIndexScanParams(&_opCtx, coll, getIndex(BSON("foo" << 1), coll));
         params.bounds.startKey = BSON("" << 1);
         params.bounds.endKey = BSON("" << 1);
-        as->addChild(new IndexScan(&_opCtx, params, &ws, NULL));
+        as->addChild(std::make_unique<IndexScan>(_expCtx.get(), coll, params, &ws, nullptr));
 
         // bar == 1
-        params = makeIndexScanParams(&_opCtx, getIndex(BSON("bar" << 1), coll));
+        params = makeIndexScanParams(&_opCtx, coll, getIndex(BSON("bar" << 1), coll));
         params.bounds.startKey = BSON("" << 1);
         params.bounds.endKey = BSON("" << 1);
-        IndexScan* secondScan = new IndexScan(&_opCtx, params, &ws, NULL);
+        auto secondScan = std::make_unique<IndexScan>(_expCtx.get(), coll, params, &ws, nullptr);
 
         // Second child of the AND_SORTED stage is a Fetch. The NULL in the
         // constructor means there is no filter.
-        FetchStage* fetch = new FetchStage(&_opCtx, &ws, secondScan, NULL, coll);
-        as->addChild(fetch);
+        auto fetch =
+            std::make_unique<FetchStage>(_expCtx.get(), &ws, std::move(secondScan), nullptr, coll);
+        as->addChild(std::move(fetch));
 
         for (int i = 0; i < 50; i++) {
             BSONObj obj = getNext(as.get(), &ws);
@@ -1334,11 +1352,11 @@ public:
 };
 
 
-class All : public Suite {
+class All : public unittest::OldStyleSuiteSpecification {
 public:
-    All() : Suite("query_stage_and") {}
+    All() : OldStyleSuiteSpecification("query_stage_and") {}
 
-    void setupTests() {
+    void setupTests() override {
         add<QueryStageAndHashDeleteDuringYield>();
         add<QueryStageAndHashTwoLeaf>();
         add<QueryStageAndHashTwoLeafFirstChildLargeKeys>();
@@ -1361,6 +1379,7 @@ public:
     }
 };
 
-SuiteInstance<All> queryStageAndAll;
+unittest::OldStyleSuiteInitializer<All> queryStageAndAll;
 
 }  // namespace QueryStageAnd
+}  // namespace mongo

@@ -1,6 +1,3 @@
-// @file background.cpp
-
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,33 +27,43 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
 
-#include "mongo/platform/basic.h"
+// IWYU pragma: no_include "cxxabi.h"
+#include <cstddef>
+#include <exception>
+#include <mutex>
+#include <vector>
 
-#include "mongo/util/background.h"
-
-#include "mongo/config.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/base/string_data.h"
+#include "mongo/config.h"  // IWYU pragma: keep
+#include "mongo/logv2/log.h"
 #include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/functional.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/stdx/thread.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/background.h"
 #include "mongo/util/concurrency/idle_thread_block.h"
-#include "mongo/util/concurrency/mutex.h"
-#include "mongo/util/concurrency/spin_lock.h"
 #include "mongo/util/concurrency/thread_name.h"
 #include "mongo/util/debug_util.h"
-#include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/str.h"
+#include "mongo/util/time_support.h"
 #include "mongo/util/timer.h"
 
-using namespace std;
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
+
+
 namespace mongo {
 
 namespace {
 
 class PeriodicTaskRunner : public BackgroundJob {
 public:
+    // Tasks are expected to finish reasonably quickly, so when a task run takes longer
+    // than `kMinLog`, the verbosity of its summary log statement is upgraded from 3 to 0.
+    static constexpr auto kMinLog = Milliseconds(100);
+
     PeriodicTaskRunner() : _shutdownRequested(false) {}
 
     void add(PeriodicTask* task);
@@ -65,11 +72,11 @@ public:
     Status stop(int gracePeriodMillis);
 
 private:
-    virtual std::string name() const {
+    std::string name() const override {
         return "PeriodicTaskRunner";
     }
 
-    virtual void run();
+    void run() override;
 
     // Returns true if shutdown has been requested.  You must hold _mutex to call this
     // function.
@@ -99,15 +106,15 @@ private:
     std::vector<PeriodicTask*> _tasks;
 };
 
-SimpleMutex* runnerMutex() {
-    static SimpleMutex mutex;
+stdx::mutex* runnerMutex() {
+    static stdx::mutex mutex;
     return &mutex;
 }
 
 // A scoped lock like object that only locks/unlocks the mutex if it exists.
 class ConditionalScopedLock {
 public:
-    ConditionalScopedLock(SimpleMutex* mutex) : _mutex(mutex) {
+    ConditionalScopedLock(stdx::mutex* mutex) : _mutex(mutex) {
         if (_mutex)
             _mutex->lock();
     }
@@ -117,7 +124,7 @@ public:
     }
 
 private:
-    SimpleMutex* const _mutex;
+    stdx::mutex* const _mutex;
 };
 
 // The unique PeriodicTaskRunner, also zero-initialized.
@@ -142,19 +149,14 @@ BackgroundJob::BackgroundJob(bool selfDelete) : _selfDelete(selfDelete), _status
 BackgroundJob::~BackgroundJob() {}
 
 void BackgroundJob::jobBody() {
-    const string threadName = name();
+    const std::string threadName = name();
     if (!threadName.empty()) {
         setThreadName(threadName);
     }
 
-    LOG(1) << "BackgroundJob starting: " << threadName;
+    LOGV2_DEBUG(23098, 1, "BackgroundJob starting", "threadName"_attr = threadName);
 
-    try {
-        run();
-    } catch (const std::exception& e) {
-        error() << "backgroundjob " << threadName << " exception: " << redact(e.what());
-        throw;
-    }
+    run();
 
     // We must cache this value so that we can use it after we leave the following scope.
     const bool selfDelete = _selfDelete;
@@ -174,13 +176,15 @@ void BackgroundJob::jobBody() {
 void BackgroundJob::go() {
     stdx::unique_lock<stdx::mutex> l(_status->mutex);
     massert(17234,
-            mongoutils::str::stream() << "backgroundJob already running: " << name(),
+            str::stream() << "backgroundJob already running: " << name(),
             _status->state != Running);
 
     // If the job is already 'done', for instance because it was cancelled or already
     // finished, ignore additional requests to run the job.
     if (_status->state == NotStarted) {
-        stdx::thread{[this] { jobBody(); }}.detach();
+        stdx::thread{[this] {
+            jobBody();
+        }}.detach();
         _status->state = Running;
     }
 }
@@ -200,7 +204,7 @@ Status BackgroundJob::cancel() {
 }
 
 bool BackgroundJob::wait(unsigned msTimeOut) {
-    verify(!_selfDelete);  // you cannot call wait on a self-deleting job
+    MONGO_verify(!_selfDelete);  // you cannot call wait on a self-deleting job
     const auto deadline = Date_t::now() + Milliseconds(msTimeOut);
     stdx::unique_lock<stdx::mutex> l(_status->mutex);
     while (_status->state != Done) {
@@ -284,7 +288,7 @@ void PeriodicTaskRunner::remove(PeriodicTask* task) {
     stdx::lock_guard<stdx::mutex> lock(_mutex);
     for (size_t i = 0; i != _tasks.size(); i++) {
         if (_tasks[i] == task) {
-            _tasks[i] = NULL;
+            _tasks[i] = nullptr;
             break;
         }
     }
@@ -338,14 +342,19 @@ void PeriodicTaskRunner::_runTask(PeriodicTask* const task) {
     try {
         task->taskDoWork();
     } catch (const std::exception& e) {
-        error() << "task: " << taskName << " failed: " << redact(e.what());
+        LOGV2_ERROR(
+            23100, "Task failed", "taskName"_attr = taskName, "error"_attr = redact(e.what()));
     } catch (...) {
-        error() << "task: " << taskName << " failed with unknown error";
+        LOGV2_ERROR(23101, "Task failed with unknown error", "taskName"_attr = taskName);
     }
 
-    const int ms = timer.millis();
-    const int kMinLogMs = 100;
-    LOG(ms <= kMinLogMs ? 3 : 0) << "task: " << taskName << " took: " << ms << "ms";
+    const auto duration = timer.elapsed();
+
+    LOGV2_DEBUG(23099,
+                duration <= kMinLog ? 3 : 0,
+                "Task finished",
+                "taskName"_attr = taskName,
+                "duration"_attr = duration_cast<Milliseconds>(duration));
 }
 
 }  // namespace mongo

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,20 +29,42 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <cstddef>
+#include <functional>
+#include <list>
 #include <memory>
+#include <mutex>
 #include <queue>
+#include <string>
 #include <utility>
 #include <vector>
 
-#include "mongo/base/disallow_copying.h"
+#include "mongo/base/status.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/baton.h"
+#include "mongo/executor/network_connection_hook.h"
 #include "mongo/executor/network_interface.h"
+#include "mongo/executor/remote_command_request.h"
+#include "mongo/executor/remote_command_response.h"
+#include "mongo/executor/task_executor.h"
+#include "mongo/platform/atomic_word.h"
 #include "mongo/rpc/metadata/metadata_hook.h"
 #include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/list.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/stdx/unordered_map.h"
 #include "mongo/stdx/unordered_set.h"
+#include "mongo/transport/transport_layer.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/cancellation.h"
 #include "mongo/util/clock_source.h"
+#include "mongo/util/clock_source_mock.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/functional.h"
+#include "mongo/util/future.h"
+#include "mongo/util/net/hostandport.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
@@ -52,7 +73,6 @@ class BSONObj;
 
 namespace executor {
 
-using ResponseStatus = TaskExecutor::ResponseStatus;
 class NetworkConnectionHook;
 
 /**
@@ -66,7 +86,7 @@ class NetworkConnectionHook;
  *
  * The mock has a fully virtualized notion of time and the the network.  When the
  * executor under test schedules a network operation, the startCommand
- * method of this class adds an entry to the _unscheduled queue for immediate consideration.
+ * method of this class adds an entry to the _operations queue for immediate consideration.
  * The test driver loop, when it examines the request, may schedule a response, ask the
  * interface to redeliver the request at a later virtual time, or to swallow the virtual
  * request until the end of the simulation.  The test driver loop can also instruct the
@@ -75,25 +95,37 @@ class NetworkConnectionHook;
  *
  * The thread acting as the "network" and the executor run thread are highly synchronized
  * by this code, allowing for deterministic control of operation interleaving.
+ *
+ * There are three descriptors used in the NetworkInterfaceMock for an operation:
+ *  1) A "ready request" refers to an operation that has been enqueued in the _operations
+ * queue, but does not have a corresponding response associated with it yet.
+ *
+ *  2) A "ready network operation" refers to an operation that has been enqueued in the _operation
+ * queue and has an associated response in the _responses queue. That response has not yet been
+ * processed by the network thread, and so the request is not yet complete.
+ *
+ * 3) An "unfinished network operation" refers to an operation that has not been finished. It may
+ * be waiting for a response to become available, or for the network thread to move forward and
+ * process that response.
  */
 class NetworkInterfaceMock : public NetworkInterface {
 public:
     class NetworkOperation;
-    using NetworkOperationList = stdx::list<NetworkOperation>;
+    using NetworkOperationList = std::list<NetworkOperation>;
     using NetworkOperationIterator = NetworkOperationList::iterator;
 
-    NetworkInterfaceMock();
-    virtual ~NetworkInterfaceMock();
-    virtual void appendConnectionStats(ConnectionPoolStats* stats) const;
-    virtual std::string getDiagnosticString();
-    Counters getCounters() const override {
-        return Counters();
-    }
-
     /**
-     * Logs the contents of the queues for diagnostics.
+     * This struct encapsulates the original Request as well as response data and metadata.
      */
-    virtual void logQueues();
+    struct NetworkResponse {
+        NetworkOperationIterator noi;
+        Date_t when;
+        TaskExecutor::ResponseStatus response;
+    };
+    using NetworkResponseList = std::list<NetworkResponse>;
+
+    NetworkInterfaceMock();
+    ~NetworkInterfaceMock() override;
 
     ////////////////////////////////////////////////////////////////////////////////
     //
@@ -101,41 +133,90 @@ public:
     //
     ////////////////////////////////////////////////////////////////////////////////
 
-    virtual void startup();
-    virtual void shutdown();
-    virtual bool inShutdown() const;
-    virtual void waitForWork();
-    virtual void waitForWorkUntil(Date_t when);
-    virtual void setConnectionHook(std::unique_ptr<NetworkConnectionHook> hook);
-    virtual void setEgressMetadataHook(std::unique_ptr<rpc::EgressMetadataHook> metadataHook);
-    virtual void signalWorkAvailable();
-    virtual Date_t now();
-    virtual std::string getHostName();
-    virtual Status startCommand(const TaskExecutor::CallbackHandle& cbHandle,
-                                RemoteCommandRequest& request,
-                                RemoteCommandCompletionFn&& onFinish,
-                                const transport::BatonHandle& baton = nullptr);
+    void appendConnectionStats(ConnectionPoolStats* stats) const override {}
+    void appendStats(BSONObjBuilder&) const override {}
+
+    std::string getDiagnosticString() override;
+
+    Counters getCounters() const override {
+        return _counters;
+    }
+
+    void startup() override;
+    void shutdown() override;
+    bool inShutdown() const override;
+    void waitForWork() override;
+    void waitForWorkUntil(Date_t when) override;
+    void signalWorkAvailable() override;
+    Date_t now() override;
+    std::string getHostName() override;
+    SemiFuture<TaskExecutor::ResponseStatus> startCommand(
+        const TaskExecutor::CallbackHandle& cbHandle,
+        RemoteCommandRequest& request,
+        const BatonHandle& baton = nullptr,
+        const CancellationToken& token = CancellationToken::uncancelable()) override;
+
+    class ExhaustResponseReaderMock : public NetworkInterface::ExhaustResponseReader {
+    public:
+        ExhaustResponseReaderMock(NetworkInterfaceMock* interface,
+                                  TaskExecutor::CallbackHandle cbHandle,
+                                  RemoteCommandRequest request,
+                                  std::shared_ptr<Baton> baton,
+                                  const CancellationToken& token)
+            : _interface(interface),
+              _cbHandle(cbHandle),
+              _initialRequest(request),
+              _baton(baton),
+              _cancelSource(token) {}
+
+        SemiFuture<RemoteCommandResponse> next() override;
+
+    private:
+        enum class State { kInitialRequest, kExhaust, kDone };
+
+        NetworkInterfaceMock* _interface;
+        TaskExecutor::CallbackHandle _cbHandle;
+        RemoteCommandRequest _initialRequest;
+        std::shared_ptr<Baton> _baton;
+        CancellationSource _cancelSource;
+        State _state{State::kInitialRequest};
+    };
+
+    SemiFuture<std::shared_ptr<NetworkInterface::ExhaustResponseReader>> startExhaustCommand(
+        const TaskExecutor::CallbackHandle& cbHandle,
+        RemoteCommandRequest& request,
+        const BatonHandle& baton = nullptr,
+        const CancellationToken& = CancellationToken::uncancelable()) override;
 
     /**
-     * If the network operation is in the _unscheduled or _processing queues, moves the operation
-     * into the _scheduled queue with ErrorCodes::CallbackCanceled. If the operation is already in
-     * the _scheduled queue, does nothing. The latter simulates the case where cancelCommand() is
-     * called after the task has already completed, but its callback has not yet been run.
+     * Cancels the token associated with the passed in callback handle.
      */
-    virtual void cancelCommand(const TaskExecutor::CallbackHandle& cbHandle,
-                               const transport::BatonHandle& baton = nullptr);
+    void cancelCommand(const TaskExecutor::CallbackHandle& cbHandle,
+                       const BatonHandle& baton = nullptr) override;
 
-    /**
-     * Not implemented.
-     */
-    virtual Status setAlarm(Date_t when,
-                            unique_function<void()> action,
-                            const transport::BatonHandle& baton = nullptr);
+    SemiFuture<void> setAlarm(
+        Date_t when, const CancellationToken& token = CancellationToken::uncancelable()) override;
 
-    virtual bool onNetworkThread();
+    Status schedule(unique_function<void(Status)> action) override;
+
+    bool onNetworkThread() override;
 
     void dropConnections(const HostAndPort&) override {}
 
+    void testEgress(const HostAndPort&, transport::ConnectSSLMode, Milliseconds, Status) override {}
+
+    using LeasedStreamMaker =
+        std::function<std::unique_ptr<NetworkInterface::LeasedStream>(HostAndPort)>;
+    void setLeasedStreamMaker(LeasedStreamMaker lsm) {
+        _leasedStreamMaker = std::move(lsm);
+    }
+
+    SemiFuture<std::unique_ptr<NetworkInterface::LeasedStream>> leaseStream(
+        const HostAndPort& hp, transport::ConnectSSLMode, Milliseconds) override {
+        invariant(_leasedStreamMaker,
+                  "Tried to lease a stream from NetworkInterfaceMock without providing one");
+        return (*_leasedStreamMaker)(hp);
+    }
 
     ////////////////////////////////////////////////////////////////////////////////
     //
@@ -150,6 +231,10 @@ public:
      * RAII-style class for entering and exiting network.
      */
     class InNetworkGuard;
+
+    void setConnectionHook(std::unique_ptr<NetworkConnectionHook> hook);
+
+    void setEgressMetadataHook(std::unique_ptr<rpc::EgressMetadataHook> metadataHook);
 
     /**
      * Causes the currently running (non-executor) thread to assume the mantle of the network
@@ -171,35 +256,52 @@ public:
     void exitNetwork();
 
     /**
-     * Returns true if there are unscheduled network requests to be processed.
+     * Returns true if there are requests that do not yet have responses in the _responses queue
+     * associated with them.
+     *
+     * This will not notice exhaust operations that have not yet finished but have processed all of
+     * their available responses.
      */
     bool hasReadyRequests();
 
     /**
-     * Gets the next unscheduled request to process, blocking until one is available.
+     * Returns the current number of requests that do not yet have responses in the _responses queue
+     * associated with them.
+     */
+    size_t getNumReadyRequests();
+
+    /**
+     * Returns true if the given iterator points to the end of the network operation list.
+     */
+    bool isNetworkOperationIteratorAtEnd(const NetworkInterfaceMock::NetworkOperationIterator& itr);
+
+    /**
+     * Gets the next request that does have an associated response, blocking until one is available.
+     *
+     * It will also process any ready network operations while it is blocking.
      *
      * Will not return until the executor thread is blocked in waitForWorkUntil or waitForWork.
      */
     NetworkOperationIterator getNextReadyRequest();
 
     /**
-     * Gets the first unscheduled request. There must be at least one unscheduled request in the
-     * queue. Equivalent to getNthUnscheduledRequest(0).
+     * Gets the first request without an associated response. There must be at least one such
+     * request in the queue. Equivalent to getNthReadyRequest(0).
      */
-    NetworkOperationIterator getFrontOfUnscheduledQueue();
+    NetworkOperationIterator getFrontOfReadyQueue();
 
     /**
-     * Get the nth (starting at 0) unscheduled request. Assumes there are at least n+1 unscheduled
-     * requests in the queue.
+     * Get the nth (starting at 0) request without an associated response. Assumes there are at
+     * least n+1 such requests in the queue.
      */
-    NetworkOperationIterator getNthUnscheduledRequest(size_t n);
+    NetworkOperationIterator getNthReadyRequest(size_t n);
 
     /**
      * Schedules "response" in response to "noi" at virtual time "when".
      */
     void scheduleResponse(NetworkOperationIterator noi,
                           Date_t when,
-                          const ResponseStatus& response);
+                          const TaskExecutor::ResponseStatus& response);
 
     /**
      * Schedules a successful "response" to "noi" at virtual time "when".
@@ -221,26 +323,18 @@ public:
      * "when" defaults to now().
      */
     RemoteCommandRequest scheduleErrorResponse(const Status& response);
-    RemoteCommandRequest scheduleErrorResponse(const ResponseStatus response);
+    RemoteCommandRequest scheduleErrorResponse(TaskExecutor::ResponseStatus response);
     RemoteCommandRequest scheduleErrorResponse(NetworkOperationIterator noi,
                                                const Status& response);
     RemoteCommandRequest scheduleErrorResponse(NetworkOperationIterator noi,
                                                Date_t when,
                                                const Status& response);
 
-
     /**
      * Swallows "noi", causing the network interface to not respond to it until
      * shutdown() is called.
      */
     void blackHole(NetworkOperationIterator noi);
-
-    /**
-     * Defers decision making on "noi" until virtual time "dontAskUntil".  Use
-     * this when getNextReadyRequest() returns a request you want to deal with
-     * after looking at other requests.
-     */
-    void requeueAt(NetworkOperationIterator noi, Date_t dontAskUntil);
 
     /**
      * Runs the simulator forward until now() == until or hasReadyRequests() is true.
@@ -251,16 +345,35 @@ public:
     Date_t runUntil(Date_t until);
 
     /**
-     * Processes all ready, scheduled network operations.
+     * Runs the simulator forward until now() == until.
+     */
+    void advanceTime(Date_t newTime);
+
+    /**
+     * Processes all ready network operations (meaning requests with associated responses in the
+     * _responses queue).
+     *
+     * The caller must have assumed the role of the network thread through enterNetwork.
      *
      * Will not return until the executor thread is blocked in waitForWorkUntil or waitForWork.
      */
     void runReadyNetworkOperations();
 
     /**
-     * Sets the reply of the 'isMaster' handshake for a specific host. This reply will only
+     * Blocks until all requests have been marked as _isFinished, and processes responses as they
+     * become available.
+     *
+     * The caller must have assumed the role of the network thread through enterNetwork.
+     *
+     * Other threads must schedule responses for or cancel outstanding requests to unblock this
+     * function.
+     */
+    void drainUnfinishedNetworkOperations();
+
+    /**
+     * Sets the reply of the 'hello' handshake for a specific host. This reply will only
      * be given to the 'validateHost' method of the ConnectionHook set on this object - NOT
-     * to the completion handlers of any 'isMaster' commands scheduled with 'startCommand'.
+     * to the completion handlers of any 'hello' commands scheduled with 'startCommand'.
      *
      * This reply will persist until it is changed again using this method.
      *
@@ -271,28 +384,31 @@ public:
     void setHandshakeReplyForHost(const HostAndPort& host, RemoteCommandResponse&& reply);
 
     /**
-     * Deliver the response to the callback handle if the handle is present in queuesToCheck.
-     * This represents interrupting the regular flow with, for example, a NetworkTimeout or
-     * CallbackCanceled error.
+     * Returns false if there is no scheduled work (i.e. alarms and scheduled responses) for the
+     * network thread to process.
      */
-    void _interruptWithResponse_inlock(const TaskExecutor::CallbackHandle& cbHandle,
-                                       const std::vector<NetworkOperationList*> queuesToCheck,
-                                       const ResponseStatus& response);
+    bool hasReadyNetworkOperations();
+
+    size_t getNumResponses() {
+        return _responses.size();
+    }
 
 private:
     /**
      * Information describing a scheduled alarm.
      */
     struct AlarmInfo {
-        using AlarmAction = unique_function<void()>;
-        AlarmInfo(Date_t inWhen, AlarmAction inAction)
-            : when(inWhen), action(std::move(inAction)) {}
+        AlarmInfo(std::uint64_t inId, Date_t inWhen, Promise<void> inPromise)
+            : id(inId), when(inWhen), promise(std::move(inPromise)) {}
         bool operator>(const AlarmInfo& rhs) const {
             return when > rhs.when;
         }
 
+        void cancel();
+
+        std::uint64_t id;
         Date_t when;
-        mutable AlarmAction action;
+        Promise<void> promise;
     };
 
     /**
@@ -305,65 +421,99 @@ private:
     /**
      * Implementation of startup behavior.
      */
-    void _startup_inlock();
+    void _startup_inlock(stdx::unique_lock<stdx::mutex>& lk);
 
-    /**
-     * Returns information about the state of this mock for diagnostic purposes.
-     */
-    std::string _getDiagnosticString_inlock() const;
-
-    /**
-     * Logs the contents of the queues for diagnostics.
-     */
-    void _logQueues_inlock() const;
     /**
      * Returns the current virtualized time.
      */
-    Date_t _now_inlock() const {
-        return _now;
+    Date_t _now_inlock(stdx::unique_lock<stdx::mutex>& lk) const {
+        return _clkSource->now();
     }
 
     /**
      * Implementation of waitForWork*.
      */
-    void _waitForWork_inlock(stdx::unique_lock<stdx::mutex>* lk);
+    void _waitForWork_inlock(stdx::unique_lock<stdx::mutex>& lk);
 
     /**
-     * Returns true if there are ready requests for the network thread to service.
+     * Returns the current number of ready requests.
      */
-    bool _hasReadyRequests_inlock();
+    size_t _getNumReadyRequests_inlock(stdx::unique_lock<stdx::mutex>& lk);
 
     /**
      * Returns true if the network thread could run right now.
      */
-    bool _isNetworkThreadRunnable_inlock();
+    bool _isNetworkThreadRunnable_inlock(stdx::unique_lock<stdx::mutex>& lk);
 
     /**
      * Returns true if the executor thread could run right now.
      */
-    bool _isExecutorThreadRunnable_inlock();
+    bool _isExecutorThreadRunnable_inlock(stdx::unique_lock<stdx::mutex>& lk);
 
     /**
      * Enqueues a network operation to run in order of 'consideration date'.
      */
-    void _enqueueOperation_inlock(NetworkOperation&& op);
+    void _enqueueOperation_inlock(stdx::unique_lock<stdx::mutex>& lk, NetworkOperation&& op);
 
     /**
      * "Connects" to a remote host, and then enqueues the provided operation.
      */
-    void _connectThenEnqueueOperation_inlock(const HostAndPort& target, NetworkOperation&& op);
+    void _connectThenEnqueueOperation_inlock(stdx::unique_lock<stdx::mutex>& lk,
+                                             const HostAndPort& target,
+                                             NetworkOperation&& op);
+
+    /**
+     * Enqueues a response to be processed the next time we runReadyNetworkOperations.
+     *
+     * Note that interruption and timeout also invoke this function.
+     */
+    void _scheduleResponse_inlock(stdx::unique_lock<stdx::mutex>& lk,
+                                  NetworkOperationIterator noi,
+                                  Date_t when,
+                                  const TaskExecutor::ResponseStatus& response);
+
+    /**
+     * Deliver the response to the callback handle if the handle is present.
+     * This represents interrupting the regular flow with, for example, a NetworkTimeout or
+     * CallbackCanceled error.
+     */
+    void _interruptWithResponse_inlock(stdx::unique_lock<stdx::mutex>& lk,
+                                       const TaskExecutor::CallbackHandle& cbHandle,
+                                       const TaskExecutor::ResponseStatus& response);
 
     /**
      * Runs all ready network operations, called while holding "lk".  May drop and
      * reaquire "lk" several times, but will not return until the executor has blocked
      * in waitFor*.
      */
-    void _runReadyNetworkOperations_inlock(stdx::unique_lock<stdx::mutex>* lk);
+    void _runReadyNetworkOperations_inlock(stdx::unique_lock<stdx::mutex>& lk);
+
+    /**
+     * Returns true if there are operations that have not yet been marked as isFinished().
+     */
+    bool _hasUnfinishedNetworkOperations();
+
+    SemiFuture<TaskExecutor::ResponseStatus> _startOperation(
+        const TaskExecutor::CallbackHandle& cbHandle,
+        RemoteCommandRequest& request,
+        bool awaitExhaust,
+        const BatonHandle& baton = nullptr,
+        const CancellationToken& token = CancellationToken::uncancelable());
+
+    /**
+     * Returns an iterator pointing to the first unfinished NetworkOperation associated with the
+     * provided cbHandle. Returns _operations->end() if no such operation exists.
+     */
+    NetworkOperationIterator _getNetworkOperation_inlock(
+        WithLock, const TaskExecutor::CallbackHandle& cbHandle);
 
     // Mutex that synchronizes access to mutable data in this class and its subclasses.
     // Fields guarded by the mutex are labled (M), below, and those that are read-only
     // in multi-threaded execution, and so unsynchronized, are labeled (R).
     stdx::mutex _mutex;
+
+    // A mocked clock source.
+    std::unique_ptr<ClockSourceMock> _clkSource;  // (M)
 
     // Condition signaled to indicate that the network processing thread should wake up.
     stdx::condition_variable _shouldWakeNetworkCondition;  // (M)
@@ -377,9 +527,6 @@ private:
     // Indicator of which thread, if any, is currently running.
     ThreadType _currentlyRunning;  // (M)
 
-    // The current time reported by this instance of NetworkInterfaceMock.
-    Date_t _now;  // (M)
-
     // Set to true by "startUp()"
     bool _hasStarted;  // (M)
 
@@ -389,26 +536,23 @@ private:
     // Next date that the executor expects to wake up at (due to a scheduleWorkAt() call).
     Date_t _executorNextWakeupDate;  // (M)
 
-    // List of network operations whose responses haven't been scheduled or blackholed.  This is
-    // where network requests are first queued.  It is sorted by
-    // NetworkOperation::_nextConsiderationDate, which is set to now() when startCommand() is
-    // called, and adjusted by requeueAt().
-    NetworkOperationList _unscheduled;  // (M)
+    // The list of operations that have been submitted via startCommand. Operations are never
+    // deleted from this list, thus NetworkOperationIterators are valid for the lifetime of the
+    // NetworkInterfaceMock.
+    NetworkOperationList _operations;  // (M)
 
-    // List of network operations that have been returned by getNextReadyRequest() but not
-    // yet scheudled, black-holed or requeued.
-    NetworkOperationList _processing;  // (M)
+    // The list of responses that have been enqueued from scheduleResponse(), cancellation, or
+    // timeout. This list is ordered by NetworkResponse::when and is drained front to back by
+    // runReadyNetworkOperations().
+    NetworkResponseList _responses;  // (M)
 
-    // List of network operations whose responses have been scheduled but not delivered, sorted
-    // by NetworkOperation::_responseDate.  These operations will have their responses delivered
-    // when now() == getResponseDate().
-    NetworkOperationList _scheduled;  // (M)
+    // Next alarm ID
+    std::uint64_t _nextAlarmId{0};  // (M)
 
-    // List of network operations that will not be responded to until shutdown() is called.
-    NetworkOperationList _blackHoled;  // (M)
-
-    // Heap of alarms, with the next alarm always on top.
-    std::priority_queue<AlarmInfo, std::vector<AlarmInfo>, std::greater<AlarmInfo>> _alarms;  // (M)
+    // Sorted map of target to alarms, with the next alarm always first.
+    std::multimap<Date_t, AlarmInfo> _alarms;                              // (M)
+    stdx::unordered_map<size_t, decltype(_alarms)::iterator> _alarmsById;  // (M)
+    stdx::unordered_set<size_t> _canceledAlarms;                           // (M)
 
     // The connection hook.
     std::unique_ptr<NetworkConnectionHook> _hook;  // (R)
@@ -424,29 +568,50 @@ private:
 
     // The handshake replies set for each host.
     stdx::unordered_map<HostAndPort, RemoteCommandResponse> _handshakeReplies;  // (M)
+
+    // Track statistics about processed responses. Right now, the mock tracks the total responses
+    // processed with sent, the number of OK responses with succeeded, non-OK responses with failed,
+    // and cancellation errors with canceled. It does not track the timedOut or failedRemotely
+    // statistics.
+    Counters _counters;
+
+    boost::optional<LeasedStreamMaker> _leasedStreamMaker;
 };
 
 /**
  * Representation of an in-progress network operation.
  */
 class NetworkInterfaceMock::NetworkOperation {
+    using ResponseCallback = unique_function<void(const TaskExecutor::ResponseStatus&)>;
+
 public:
     NetworkOperation();
     NetworkOperation(const TaskExecutor::CallbackHandle& cbHandle,
                      const RemoteCommandRequest& theRequest,
                      Date_t theRequestDate,
-                     RemoteCommandCompletionFn onFinish);
+                     const CancellationToken& token,
+                     Promise<TaskExecutor::ResponseStatus> promise);
 
     /**
-     * Adjusts the stored virtual time at which this entry will be subject to consideration
-     * by the test harness.
+     * Mark the operation as observed by the networking thread. This is equivalent to a remote node
+     * processing the operation.
      */
-    void setNextConsiderationDate(Date_t nextConsiderationDate);
+    void markAsProcessing() {
+        _isProcessing = true;
+    }
 
     /**
-     * Sets the response and thet virtual time at which it will be delivered.
+     * Mark the operation as blackholed by the networking thread.
      */
-    void setResponse(Date_t responseDate, const ResponseStatus& response);
+    void markAsBlackholed() {
+        _isProcessing = true;
+        _isBlackholed = true;
+    }
+
+    /**
+     * Fulfills a response to an ongoing operation.
+     */
+    bool fulfillResponse_inlock(stdx::unique_lock<stdx::mutex>& lk, NetworkResponse response);
 
     /**
      * Predicate that returns true if cbHandle equals the executor's handle for this network
@@ -467,6 +632,29 @@ public:
         return _request;
     }
 
+    CancellationSource& getCancellationSource() {
+        return _cancelSource;
+    }
+
+    /**
+     * Returns true if this operation has not been observed via getNextReadyRequest(), been
+     * canceled, or timed out.
+     */
+    bool hasReadyRequest() const {
+        return !_isProcessing && !_isFinished;
+    }
+
+    bool isFinished() const {
+        return _isFinished;
+    }
+
+    /**
+     * Assert that this operation has not been blackholed.
+     */
+    void assertNotBlackholed() {
+        uassert(5440603, "Response scheduled for a blackholed operation", !_isBlackholed);
+    }
+
     /**
      * Gets the virtual time at which the operation was started.
      */
@@ -475,39 +663,21 @@ public:
     }
 
     /**
-     * Gets the virtual time at which the test harness should next consider what to do
-     * with this request.
-     */
-    Date_t getNextConsiderationDate() const {
-        return _nextConsiderationDate;
-    }
-
-    /**
-     * After setResponse() has been called, returns the virtual time at which
-     * the response should be delivered.
-     */
-    Date_t getResponseDate() const {
-        return _responseDate;
-    }
-
-    /**
-     * Delivers the response, by invoking the onFinish callback passed into the constructor.
-     */
-    void finishResponse();
-
-    /**
      * Returns a printable diagnostic string.
      */
     std::string getDiagnosticString() const;
 
 private:
     Date_t _requestDate;
-    Date_t _nextConsiderationDate;
-    Date_t _responseDate;
     TaskExecutor::CallbackHandle _cbHandle;
     RemoteCommandRequest _request;
-    ResponseStatus _response;
-    RemoteCommandCompletionFn _onFinish;
+    CancellationSource _cancelSource;
+
+    bool _isProcessing = false;
+    bool _isBlackholed = false;
+    bool _isFinished = false;
+
+    Promise<TaskExecutor::ResponseStatus> _respPromise;
 };
 
 /**
@@ -519,7 +689,8 @@ private:
  * Not thread-safe.
  */
 class NetworkInterfaceMock::InNetworkGuard {
-    MONGO_DISALLOW_COPYING(InNetworkGuard);
+    InNetworkGuard(const InNetworkGuard&) = delete;
+    InNetworkGuard& operator=(const InNetworkGuard&) = delete;
 
 public:
     /**
@@ -543,24 +714,6 @@ public:
 private:
     NetworkInterfaceMock* _net;
     bool _callExitNetwork = true;
-};
-
-class NetworkInterfaceMockClockSource : public ClockSource {
-public:
-    explicit NetworkInterfaceMockClockSource(NetworkInterfaceMock* net);
-
-    Milliseconds getPrecision() override {
-        return Milliseconds{1};
-    }
-    Date_t now() override {
-        return _net->now();
-    }
-    Status setAlarm(Date_t when, unique_function<void()> action) override {
-        return _net->setAlarm(when, std::move(action));
-    }
-
-private:
-    NetworkInterfaceMock* _net;
 };
 
 }  // namespace executor

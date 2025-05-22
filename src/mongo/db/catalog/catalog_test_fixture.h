@@ -29,8 +29,11 @@
 
 #pragma once
 
+#include <utility>
+
 #include "mongo/db/operation_context.h"
-#include "mongo/db/repl/storage_interface_impl.h"
+#include "mongo/db/repl/storage_interface.h"
+#include "mongo/db/service_context.h"
 #include "mongo/db/service_context_d_test_fixture.h"
 
 namespace mongo {
@@ -41,17 +44,33 @@ namespace mongo {
  * Sets up and provides a repl::StorageInterface and OperationContext. Database data are cleared
  * between test runs.
  */
-class CatalogTestFixture : public ServiceContextMongoDTest {
+class CatalogScopedGlobalServiceContextForTest : public MongoDScopedGlobalServiceContextForTest {
 public:
-    OperationContext* operationContext();
-    repl::StorageInterface* storageInterface();
+    CatalogScopedGlobalServiceContextForTest(Options options, bool shouldSetupTL);
+};
 
-protected:
+class CatalogTestFixture : public ServiceContextTest {
+public:
+    using Options = MongoDScopedGlobalServiceContextForTest::Options;
+
+    CatalogTestFixture() : CatalogTestFixture(Options{}) {}
+
+    explicit CatalogTestFixture(Options options)
+        : ServiceContextTest(std::make_unique<CatalogScopedGlobalServiceContextForTest>(
+              std::move(options), shouldSetupTL)) {}
+
+    OperationContext* operationContext() const;
+
     void setUp() override;
     void tearDown() override;
 
+    repl::StorageInterface* storageInterface() const;
+
+    ConsistentCollection makeConsistentCollection(const Collection*) const;
+    ConsistentCollection makeConsistentCollection(OperationContext* opCtx, const Collection*) const;
+    int getReferenceCount(const ConsistentCollection& coll) const;
+
 private:
-    std::unique_ptr<repl::StorageInterface> _storage;
     ServiceContext::UniqueOperationContext _opCtx;
 };
 

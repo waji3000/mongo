@@ -1,0 +1,79 @@
+# Copyright (C) 2023-present MongoDB, Inc.
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the Server Side Public License, version 1,
+# as published by MongoDB, Inc.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# Server Side Public License for more details.
+#
+# You should have received a copy of the Server Side Public License
+# along with this program. If not, see
+# <http://www.mongodb.com/licensing/server-side-public-license>.
+#
+# As a special exception, the copyright holders give permission to link the
+# code of portions of this program with the OpenSSL library under certain
+# conditions as described in each individual source file and distribute
+# linked combinations including the program with the OpenSSL library. You
+# must comply with the Server Side Public License in all respects for
+# all of the code used other than as permitted herein. If you modify file(s)
+# with this exception, you may extend this exception to your version of the
+# file(s), but you are not obligated to do so. If you do not wish to do so,
+# delete this exception statement from your version. If you delete this
+# exception statement from all source files in the program, then also delete
+# it in the license file.
+#
+
+global:
+    cpp_namespace: mongo
+imports:
+    - mongo/db/basic_types.idl
+structs:
+    MongotQueryViewSpec:
+        description: >-
+            If the search query is on a view, this struct defines the view information
+            required to be serialized into the RemoteCommandRequest before sending it
+            to mongot. 
+            NOTE: this struct is similar to SearchQueryViewSpec except for
+            that it holds only the view's *name*, not the *NSS*. When working with
+            commands on views, mongot requires just the name of the view while  the
+            server-side code needs the NSS in order to add the corresponding view
+            pipeline to the resolvedNamespaces dict on the expression context.
+        strict: true
+        fields:
+            name:
+                description: Mongot requires just the name of the view.
+                type: string
+                optional: false
+            effectivePipeline:
+                description: >-
+                    An array of agg stages gathered from the current and associated views.
+                    This field is only required for  createSearchIndexes commands, though
+                    it is being added to all search index command requests for easier
+                    debugability.
+                type: array<object>
+                optional: false
+    ManageSearchIndexRequest:
+        description: Command request for search index management host
+        strict: false
+        fields:
+            manageSearchIndex:
+                description: Command name field that holds the collection name value
+                type: string
+                optional: false
+            collectionUUID:
+                description: The collection UUID
+                type: uuid
+                optional: false
+            userCommand:
+                description: The original user search index command request
+                type: object
+                optional: false
+            view:
+                description: >-
+                    If the command is being run on a view namespace, this field must be
+                    set to MongotQueryViewSpec
+                type: MongotQueryViewSpec
+                optional: true

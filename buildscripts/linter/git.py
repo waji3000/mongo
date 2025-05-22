@@ -1,18 +1,16 @@
 """Git Utility functions."""
-from __future__ import absolute_import
-from __future__ import print_function
+
+from __future__ import annotations
 
 import itertools
 import os
 import re
-from typing import Any, Callable, List, Tuple
+from pathlib import Path
+from typing import Callable, List
 
-from buildscripts import git as _git
-from buildscripts import moduleconfig
-from buildscripts.resmokelib.utils import globstar
+from buildscripts.linter import git_base as _git
 
 # Path to the modules in the mongodb source tree
-# Has to match the string in SConstruct
 MODULE_DIR = "src/mongo/db/modules"
 
 
@@ -31,21 +29,9 @@ def get_base_dir():
         return os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 
 
-def get_repos():
-    # type: () -> List[Repo]
+def get_repos() -> List[Repo]:
     """Get a list of Repos to check linters for."""
-    base_dir = get_base_dir()
-
-    # Get a list of modules
-    # TODO: how do we filter rocks, does it matter?
-    mongo_modules = moduleconfig.discover_module_directories(
-        os.path.join(base_dir, MODULE_DIR), None)
-
-    paths = [os.path.join(base_dir, MODULE_DIR, m) for m in mongo_modules]
-
-    paths.append(base_dir)
-
-    return [Repo(p) for p in paths]
+    return [Repo(get_base_dir())]
 
 
 class Repo(_git.Repository):
@@ -69,10 +55,11 @@ class Repo(_git.Repository):
 
         Returns the full path to the file for clang-format to consume.
         """
-        if candidates is not None and len(candidates) > 0:  # pylint: disable=len-as-condition
+        if candidates is not None and len(candidates) > 0:
             candidates = [self._get_local_dir(f) for f in candidates]
             valid_files = list(
-                set(candidates).intersection(self.get_candidate_files(filter_function)))
+                set(candidates).intersection(self.get_candidate_files(filter_function))
+            )
         else:
             valid_files = list(self.get_candidate_files(filter_function))
 
@@ -105,22 +92,22 @@ class Repo(_git.Repository):
         # 2. Cached/Staged files (--cached)
         # 3. Working Tree files git tracks
 
-        fork_point = self.get_merge_base(origin_branch)
+        fork_point = self.get_merge_base(["HEAD", origin_branch])
 
         diff_files = self.git_diff(["--name-only", "%s..HEAD" % (fork_point)])
         diff_files += self.git_diff(["--name-only", "--cached"])
         diff_files += self.git_diff(["--name-only"])
 
         file_set = {
-            line.rstrip()
-            for line in diff_files.splitlines() if filter_function(line.rstrip())
+            os.path.normpath(os.path.join(self.directory, line.rstrip()))
+            for line in diff_files.splitlines()
+            if filter_function(line.rstrip())
         }
 
         return list(file_set)
 
     def get_working_tree_candidate_files(self, filter_function):
         # type: (Callable[[str], bool]) -> List[str]
-        # pylint: disable=invalid-name
         """Query git to get a list of all files in the working tree to consider for analysis."""
         return self._git_ls_files(["--cached", "--others"], filter_function)
 
@@ -145,7 +132,9 @@ class Repo(_git.Repository):
 def expand_file_string(glob_pattern):
     # type: (str) -> List[str]
     """Expand a string that represents a set of files."""
-    return [os.path.abspath(f) for f in globstar.iglob(glob_pattern)]
+    current_path = Path(".")
+    glob_pattern = os.path.relpath(glob_pattern)
+    return [str(glob_match.resolve()) for glob_match in current_path.glob(glob_pattern)]
 
 
 def get_files_to_check_working_tree(filter_function):
@@ -159,7 +148,26 @@ def get_files_to_check_working_tree(filter_function):
 
     valid_files = list(
         itertools.chain.from_iterable(
-            [r.get_working_tree_candidates(filter_function) for r in repos]))
+            [r.get_working_tree_candidates(filter_function) for r in repos]
+        )
+    )
+
+    return valid_files
+
+
+def get_valid_files_from_candidates(candidates, filter_fn: Callable[[str], bool]):
+    """
+    Get the valid files from the list of candidate files.
+
+    :param candidates: List of candidate files.
+    :param filter_fn: Function to filter files.
+    :return: List of valid files.
+    """
+    repos = get_repos()
+
+    valid_files = list(
+        itertools.chain.from_iterable([r.get_candidates(candidates, filter_fn) for r in repos])
+    )
 
     return valid_files
 
@@ -174,11 +182,7 @@ def get_files_to_check(files, filter_function):
     if files and not candidates:
         raise ValueError("Globs '%s' did not find any files with glob." % (files))
 
-    repos = get_repos()
-
-    valid_files = list(
-        itertools.chain.from_iterable(
-            [r.get_candidates(candidates, filter_function) for r in repos]))
+    valid_files = get_valid_files_from_candidates(candidates, filter_function)
 
     if files and not valid_files:
         raise ValueError("Globs '%s' did not find any files with glob in git." % (files))
@@ -196,17 +200,12 @@ def get_files_to_check_from_patch(patches, filter_function):
 
     lines = []  # type: List[str]
     for patch in patches:
-        with open(patch, "rb") as infile:
+        with open(patch, "r", encoding="utf-8") as infile:
             lines += infile.readlines()
 
     candidates = [check.match(line).group(1) for line in lines if check.match(line)]
 
-    repos = get_repos()
-
-    valid_files = list(
-        itertools.chain.from_iterable(
-            [r.get_candidates(candidates, filter_function) for r in repos]))
-
+    valid_files = get_valid_files_from_candidates(candidates, filter_function)
     return valid_files
 
 
@@ -218,6 +217,8 @@ def get_my_files_to_check(filter_function, origin_branch):
 
     valid_files = list(
         itertools.chain.from_iterable(
-            [r.get_my_candidate_files(filter_function, origin_branch) for r in repos]))
+            [r.get_my_candidate_files(filter_function, origin_branch) for r in repos]
+        )
+    )
 
     return valid_files

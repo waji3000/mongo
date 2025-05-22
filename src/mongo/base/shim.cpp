@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,9 +29,13 @@
 
 #include "mongo/base/shim.h"
 
-
 namespace mongo {
-namespace {
-MONGO_INITIALIZER_GROUP(ShimHooks, MONGO_NO_PREREQUISITES, ("default"));
-}  // namespace
+
+WeakFunctionRegistry::BasicSlot::~BasicSlot() = default;
+
+WeakFunctionRegistry& globalWeakFunctionRegistry() {
+    static auto& p = *new WeakFunctionRegistry();
+    return p;
+}
+
 }  // namespace mongo

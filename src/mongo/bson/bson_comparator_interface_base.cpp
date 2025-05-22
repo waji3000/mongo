@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,16 +27,19 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/bson/bson_comparator_interface_base.h"
-
 #include <boost/functional/hash.hpp>
+#include <cmath>
+#include <limits>
 
-#include "mongo/base/simple_string_data_comparator.h"
+#include "mongo/base/string_data_comparator.h"
+#include "mongo/bson/bson_comparator_interface_base.h"
 #include "mongo/bson/bsonelement.h"
 #include "mongo/bson/bsonobj.h"
-#include "mongo/bson/simple_bsonobj_comparator.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/bson/oid.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/platform/decimal128.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo {
 
@@ -46,7 +48,7 @@ void BSONComparatorInterfaceBase<T>::hashCombineBSONObj(
     size_t& seed,
     const BSONObj& objToHash,
     ComparisonRulesSet rules,
-    const StringData::ComparatorInterface* stringComparator) {
+    const StringDataComparator* stringComparator) {
 
     if (rules & ComparisonRules::kIgnoreFieldOrder) {
         BSONObjIteratorSorted iter(objToHash);
@@ -65,12 +67,12 @@ void BSONComparatorInterfaceBase<T>::hashCombineBSONElement(
     size_t& hash,
     BSONElement elemToHash,
     ComparisonRulesSet rules,
-    const StringData::ComparatorInterface* stringComparator) {
+    const StringDataComparator* stringComparator) {
     boost::hash_combine(hash, elemToHash.canonicalType());
 
     const StringData fieldName = elemToHash.fieldNameStringData();
     if ((rules & ComparisonRules::kConsiderFieldName) && !fieldName.empty()) {
-        SimpleStringDataComparator::kInstance.hash_combine(hash, fieldName);
+        simpleStringDataComparator.hash_combine(hash, fieldName);
     }
 
     switch (elemToHash.type()) {
@@ -110,6 +112,7 @@ void BSONComparatorInterfaceBase<T>::hashCombineBSONElement(
             // Else, fall through and convert the decimal to a double and hash.
             // At this point the decimal fits into the range of doubles, is infinity, or is NaN,
             // which doubles have a cheaper representation for.
+            [[fallthrough]];
         }
         case mongo::NumberDouble:
         case mongo::NumberLong:
@@ -138,15 +141,14 @@ void BSONComparatorInterfaceBase<T>::hashCombineBSONElement(
             if (stringComparator) {
                 stringComparator->hash_combine(hash, elemToHash.valueStringData());
             } else {
-                SimpleStringDataComparator::kInstance.hash_combine(hash,
-                                                                   elemToHash.valueStringData());
+                simpleStringDataComparator.hash_combine(hash, elemToHash.valueStringData());
             }
             break;
         }
 
         case mongo::Code:
         case mongo::Symbol:
-            SimpleStringDataComparator::kInstance.hash_combine(hash, elemToHash.valueStringData());
+            simpleStringDataComparator.hash_combine(hash, elemToHash.valueStringData());
             break;
 
         case mongo::Object:
@@ -160,22 +162,22 @@ void BSONComparatorInterfaceBase<T>::hashCombineBSONElement(
         case mongo::DBRef:
         case mongo::BinData:
             // All bytes of the value are required to be identical.
-            SimpleStringDataComparator::kInstance.hash_combine(
+            simpleStringDataComparator.hash_combine(
                 hash, StringData(elemToHash.value(), elemToHash.valuesize()));
             break;
 
         case mongo::RegEx:
-            SimpleStringDataComparator::kInstance.hash_combine(hash, elemToHash.regex());
-            SimpleStringDataComparator::kInstance.hash_combine(hash, elemToHash.regexFlags());
+            simpleStringDataComparator.hash_combine(hash, elemToHash.regex());
+            simpleStringDataComparator.hash_combine(hash, elemToHash.regexFlags());
             break;
 
         case mongo::CodeWScope: {
-            SimpleStringDataComparator::kInstance.hash_combine(
+            simpleStringDataComparator.hash_combine(
                 hash, StringData(elemToHash.codeWScopeCode(), elemToHash.codeWScopeCodeLen()));
             hashCombineBSONObj(hash,
                                elemToHash.codeWScopeObject(),
                                rules | ComparisonRules::kConsiderFieldName,
-                               &SimpleStringDataComparator::kInstance);
+                               &simpleStringDataComparator);
             break;
         }
     }

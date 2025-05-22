@@ -1,4 +1,4 @@
-load("jstests/replsets/rslib.js");
+import {awaitRSClientHosts} from "jstests/replsets/rslib.js";
 
 /**
  * High level test scenario:
@@ -6,13 +6,18 @@ load("jstests/replsets/rslib.js");
  * 2. Perform writes.
  * 3. Migrate only chunk to other shard.
  * 4. Retry writes.
- * 5. Step down primary and wait for new primary.
+ * 5. Step up secondary and wait for new primary.
  * 6. Retry writes.
  * 7. Migrate only chunk back to original shard.
  * 8. Retry writes.
  */
-var testMoveChunkWithSession = function(
-    st, collName, cmdObj, setupFunc, checkRetryResultFunc, checkDocumentsFunc) {
+export var testMoveChunkWithSession = function(st,
+                                               collName,
+                                               cmdObj,
+                                               setupFunc,
+                                               checkRetryResultFunc,
+                                               checkDocumentsFunc,
+                                               useAdminCommand = false) {
     var ns = 'test.' + collName;
     var testDB = st.s.getDB('test');
     var coll = testDB.getCollection(collName);
@@ -20,25 +25,28 @@ var testMoveChunkWithSession = function(
     assert.commandWorked(st.s.adminCommand({shardCollection: ns, key: {x: 1}}));
 
     setupFunc(coll);
-    var result = assert.commandWorked(testDB.runCommand(cmdObj));
+    var result = assert.commandWorked(useAdminCommand ? st.s.adminCommand(cmdObj)
+                                                      : testDB.runCommand(cmdObj));
 
+    jsTestLog("MOVECHUNK");
     assert.commandWorked(st.s.adminCommand({moveChunk: ns, find: {x: 0}, to: st.shard1.shardName}));
 
-    checkRetryResultFunc(result, assert.commandWorked(testDB.runCommand(cmdObj)));
+    checkRetryResultFunc(result,
+                         assert.commandWorked(useAdminCommand ? st.s.adminCommand(cmdObj)
+                                                              : testDB.runCommand(cmdObj)));
     checkDocumentsFunc(coll);
 
-    try {
-        st.rs1.getPrimary().adminCommand({replSetStepDown: 60, secondaryCatchUpPeriodSecs: 30});
-    } catch (excep) {
-        print('Expected exception due to step down: ' + tojson(excep));
-    }
+    const secondary = st.rs1.getSecondary();
+    st.rs1.stepUp(secondary);
 
     st.rs1.awaitNodesAgreeOnPrimary();
     st.configRS.nodes.concat([st.s]).forEach(function awaitNode(conn) {
         awaitRSClientHosts(conn, {host: st.rs1.getPrimary().host}, {ok: true, ismaster: true});
     });
 
-    checkRetryResultFunc(result, assert.commandWorked(testDB.runCommand(cmdObj)));
+    checkRetryResultFunc(result,
+                         assert.commandWorked(useAdminCommand ? st.s.adminCommand(cmdObj)
+                                                              : testDB.runCommand(cmdObj)));
     checkDocumentsFunc(coll);
 
     // Make sure that the other shard knows about the latest primary.
@@ -46,6 +54,8 @@ var testMoveChunkWithSession = function(
         st.rs0.getPrimary(), {host: st.rs1.getPrimary().host}, {ok: true, ismaster: true});
     assert.commandWorked(st.s.adminCommand({moveChunk: ns, find: {x: 0}, to: st.shard0.shardName}));
 
-    checkRetryResultFunc(result, assert.commandWorked(testDB.runCommand(cmdObj)));
+    checkRetryResultFunc(result,
+                         assert.commandWorked(useAdminCommand ? st.s.adminCommand(cmdObj)
+                                                              : testDB.runCommand(cmdObj)));
     checkDocumentsFunc(coll);
 };

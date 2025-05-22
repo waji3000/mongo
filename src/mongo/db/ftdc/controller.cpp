@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,26 +27,38 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kFTDC
 
-#include "mongo/platform/basic.h"
+#include <boost/filesystem/path.hpp>
+#include <boost/move/utility_core.hpp>
+// IWYU pragma: no_include "cxxabi.h"
+#include <memory>
+#include <mutex>
+#include <tuple>
 
-#include "mongo/db/ftdc/controller.h"
-
+#include "mongo/base/error_codes.h"
 #include "mongo/db/client.h"
 #include "mongo/db/ftdc/collector.h"
+#include "mongo/db/ftdc/controller.h"
 #include "mongo/db/ftdc/util.h"
-#include "mongo/db/jsobj.h"
+#include "mongo/db/service_context.h"
+#include "mongo/logv2/log.h"
 #include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/stdx/thread.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/clock_source.h"
 #include "mongo/util/concurrency/idle_thread_block.h"
-#include "mongo/util/exit.h"
-#include "mongo/util/log.h"
+#include "mongo/util/str.h"
 #include "mongo/util/time_support.h"
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kFTDC
+
+
 namespace mongo {
+
+long long FTDCController::getNumAsyncPeriodicCollectors() {
+    return _numAsyncPeriodicCollectors.get();
+}
 
 Status FTDCController::setEnabled(bool enabled) {
     stdx::lock_guard<stdx::mutex> lock(_mutex);
@@ -64,10 +75,82 @@ Status FTDCController::setEnabled(bool enabled) {
     return Status::OK();
 }
 
+void FTDCController::setMetadataCaptureFrequency(std::uint64_t freq) {
+    stdx::lock_guard<stdx::mutex> lock(_mutex);
+    _configTemp.metadataCaptureFrequency = freq;
+    _condvar.notify_one();
+}
+
+Milliseconds FTDCController::getPeriod() {
+    stdx::lock_guard<stdx::mutex> lock(_mutex);
+    return _configTemp.period;
+}
+
 void FTDCController::setPeriod(Milliseconds millis) {
     stdx::lock_guard<stdx::mutex> lock(_mutex);
     _configTemp.period = millis;
     _condvar.notify_one();
+}
+
+Status FTDCController::setSampleTimeout(Milliseconds newValue) {
+    if (!feature_flags::gFeatureFlagGaplessFTDC.isEnabled()) {
+        return Status(
+            ErrorCodes::InvalidOptions,
+            "The diagnosticDataCollectionSampleTimeoutMillis parameter is not available with "
+            "featureFlagGaplessFTDC disabled.");
+    }
+
+    stdx::lock_guard<stdx::mutex> lock(_mutex);
+    _configTemp.sampleTimeout = newValue;
+    _asyncPeriodicCollectors->updateSampleTimeout(newValue);
+    _condvar.notify_one();
+    return Status::OK();
+}
+
+Status FTDCController::setMinThreads(size_t newValue) {
+    if (!feature_flags::gFeatureFlagGaplessFTDC.isEnabled()) {
+        return Status(ErrorCodes::InvalidOptions,
+                      "The diagnosticDataCollectionMinThreads parameter is not available with "
+                      "featureFlagGaplessFTDC disabled.");
+    }
+
+    stdx::lock_guard<stdx::mutex> lock(_mutex);
+    if (newValue > _configTemp.maxThreads) {
+        return Status(
+            ErrorCodes::BadValue,
+            fmt::format("Cannot set diagnosticDataCollectionMinThreads to {}. The value must not "
+                        "exceed diagnosticDataCollectionMaxThreads, currently set to {}.",
+                        newValue,
+                        _configTemp.maxThreads));
+    }
+
+    _configTemp.minThreads = newValue;
+    _asyncPeriodicCollectors->updateMinThreads(newValue);
+    _condvar.notify_one();
+    return Status::OK();
+}
+
+Status FTDCController::setMaxThreads(size_t newValue) {
+    if (!feature_flags::gFeatureFlagGaplessFTDC.isEnabled()) {
+        return Status(ErrorCodes::InvalidOptions,
+                      "The diagnosticDataCollectionMaxThreads parameter is not available with "
+                      "featureFlagGaplessFTDC disabled.");
+    }
+
+    stdx::lock_guard<stdx::mutex> lock(_mutex);
+    if (newValue < _configTemp.minThreads) {
+        return Status(
+            ErrorCodes::BadValue,
+            fmt::format("Cannot set diagnosticDataCollectionMaxThreads to {}. The value must not "
+                        "fall below diagnosticDataCollectionMinThreads, currently set to {}.",
+                        newValue,
+                        _configTemp.minThreads));
+    }
+
+    _configTemp.maxThreads = newValue;
+    _asyncPeriodicCollectors->updateMaxThreads(newValue);
+    _condvar.notify_one();
+    return Status::OK();
 }
 
 void FTDCController::setMaxDirectorySizeBytes(std::uint64_t size) {
@@ -111,22 +194,34 @@ Status FTDCController::setDirectory(const boost::filesystem::path& path) {
 }
 
 
-void FTDCController::addPeriodicCollector(std::unique_ptr<FTDCCollectorInterface> collector) {
-    {
-        stdx::lock_guard<stdx::mutex> lock(_mutex);
-        invariant(_state == State::kNotStarted);
+void FTDCController::addPeriodicMetadataCollector(std::unique_ptr<FTDCCollectorInterface> collector,
+                                                  ClusterRole role) {
+    stdx::lock_guard<stdx::mutex> lock(_mutex);
+    invariant(_state == State::kNotStarted);
 
-        _periodicCollectors.add(std::move(collector));
-    }
+    _periodicMetadataCollectors.add(std::move(collector), role);
 }
 
-void FTDCController::addOnRotateCollector(std::unique_ptr<FTDCCollectorInterface> collector) {
-    {
-        stdx::lock_guard<stdx::mutex> lock(_mutex);
-        invariant(_state == State::kNotStarted);
+void FTDCController::addPeriodicCollector(std::unique_ptr<FTDCCollectorInterface> collector,
+                                          ClusterRole role) {
+    stdx::lock_guard<stdx::mutex> lock(_mutex);
+    invariant(_state == State::kNotStarted);
 
-        _rotateCollectors.add(std::move(collector));
+    if (feature_flags::gFeatureFlagGaplessFTDC.isEnabled()) {
+        _asyncPeriodicCollectors->add(std::move(collector), role);
+        _numAsyncPeriodicCollectors.increment();
+        return;
     }
+
+    _periodicCollectors.add(std::move(collector), role);
+}
+
+void FTDCController::addOnRotateCollector(std::unique_ptr<FTDCCollectorInterface> collector,
+                                          ClusterRole role) {
+    stdx::lock_guard<stdx::mutex> lock(_mutex);
+    invariant(_state == State::kNotStarted);
+
+    _rotateCollectors.add(std::move(collector), role);
 }
 
 BSONObj FTDCController::getMostRecentPeriodicDocument() {
@@ -136,12 +231,17 @@ BSONObj FTDCController::getMostRecentPeriodicDocument() {
     }
 }
 
-void FTDCController::start() {
-    log() << "Initializing full-time diagnostic data capture with directory '"
-          << _path.generic_string() << "'";
+void FTDCController::triggerRotate() {
+    _shouldRotateBeforeNextSample.store(true);
+}
+
+void FTDCController::start(Service* service) {
+    LOGV2(20625,
+          "Initializing full-time diagnostic data capture",
+          "dataDirectory"_attr = _path.generic_string());
 
     // Start the thread
-    _thread = stdx::thread([this] { doLoop(); });
+    _thread = stdx::thread([this, service] { doLoop(service); });
 
     {
         stdx::lock_guard<stdx::mutex> lock(_mutex);
@@ -152,7 +252,7 @@ void FTDCController::start() {
 }
 
 void FTDCController::stop() {
-    log() << "Shutting down full-time diagnostic data capture";
+    LOGV2(20626, "Shutting down full-time diagnostic data capture");
 
     {
         stdx::lock_guard<stdx::mutex> lock(_mutex);
@@ -180,88 +280,116 @@ void FTDCController::stop() {
     if (_mgr) {
         auto s = _mgr->close();
         if (!s.isOK()) {
-            log() << "Failed to close full-time diagnostic data capture file manager: " << s;
+            LOGV2(20627,
+                  "Failed to close full-time diagnostic data capture file manager",
+                  "error"_attr = s);
         }
     }
 }
 
-void FTDCController::doLoop() {
-    try {
-        // Update config
+void FTDCController::doLoop(Service* service) try {
+    // Note: All exceptions thrown in this loop are considered process fatal.
+    //
+    // TODO(SERVER-74659): Please revisit if this thread could be made killable.
+    Client::initThread(
+        kFTDCThreadName, service, Client::noSession(), ClientOperationKillableByStepdown{false});
+    Client* client = &cc();
+
+    // Update config
+    {
+        stdx::lock_guard<stdx::mutex> lock(_mutex);
+        _config = _configTemp;
+    }
+
+    // Periodic metadata is collected when metadataCaptureFrequencyCountdown hits 0 (which will
+    // always include the first iteration). Then, the value of metadataCaptureFrequencyCountdown is
+    // reset to _config.metadataCaptureFrequency and countdown starts again.
+    std::uint64_t metadataCaptureFrequencyCountdown = 1;
+
+    while (true) {
+        _env->onStartLoop();
+
+        // Compute the next interval to run regardless of how we were woken up
+        // Skipping an interval due to a race condition with a config signal is harmless.
+        auto now = getGlobalServiceContext()->getPreciseClockSource()->now();
+
+        // Get next time to run at
+        auto next_time = FTDCUtil::roundTime(now, _config.period);
+
+        // Wait for the next run or signal to shutdown
+        {
+            stdx::unique_lock<stdx::mutex> lock(_mutex);
+            MONGO_IDLE_THREAD_BLOCK;
+
+            // We ignore spurious wakeups by just doing an iteration of the loop
+            auto status = _condvar.wait_until(lock, next_time.toSystemTimePoint());
+
+            // Are we done running?
+            if (_state == State::kStopRequested) {
+                break;
+            }
+
+            // Update the current configuration settings always
+            // In unit tests, we may never get a signal when the timeout is 1ms on Windows since
+            // MSVC 2013 converts wait_until(now() + 1ms) into ~ wait_for(0) which means it will
+            // not wait for the condition variable to be signaled because it uses
+            // GetFileSystemTime for now which has ~10 ms granularity.
+            _config = _configTemp;
+
+            // if we hit a timeout on the condvar, we need to do another collection
+            // if we were signalled, then we have a config update only or were asked to stop
+            if (status == stdx::cv_status::no_timeout) {
+                continue;
+            }
+        }
+
+        // TODO: consider only running this thread if we are enabled
+        // for now, we just keep an idle thread as it is simpler
+        if (!_config.enabled) {
+            continue;
+        }
+
+        // Delay initialization of FTDCFileManager until we are sure the user has enabled
+        // FTDC
+        if (!_mgr) {
+            auto swMgr = FTDCFileManager::create(
+                &_config, _path, &_rotateCollectors, client, _multiServiceSchema);
+
+            _mgr = uassertStatusOK(std::move(swMgr));
+        }
+
+        if (bool req = true; _shouldRotateBeforeNextSample.compareAndSwap(&req, false)) {
+            iassert(_mgr->rotate(client));
+        }
+
+        auto collectSample = feature_flags::gFeatureFlagGaplessFTDC.isEnabled()
+            ? _asyncPeriodicCollectors->collect(client, _multiServiceSchema)
+            : _periodicCollectors.collect(client, _multiServiceSchema);
+
+        Status s = _mgr->writeSampleAndRotateIfNeeded(
+            client, std::get<0>(collectSample), std::get<1>(collectSample));
+
+        uassertStatusOK(s);
+
+        // Store a reference to the most recent document from the periodic collectors
         {
             stdx::lock_guard<stdx::mutex> lock(_mutex);
-            _config = _configTemp;
+            _mostRecentPeriodicDocument = std::get<0>(collectSample);
         }
 
-        Client::initThread("ftdc");
-        Client* client = &cc();
-
-        while (true) {
-            // Compute the next interval to run regardless of how we were woken up
-            // Skipping an interval due to a race condition with a config signal is harmless.
-            auto now = getGlobalServiceContext()->getPreciseClockSource()->now();
-
-            // Get next time to run at
-            auto next_time = FTDCUtil::roundTime(now, _config.period);
-
-            // Wait for the next run or signal to shutdown
-            {
-                stdx::unique_lock<stdx::mutex> lock(_mutex);
-                MONGO_IDLE_THREAD_BLOCK;
-
-                // We ignore spurious wakeups by just doing an iteration of the loop
-                auto status = _condvar.wait_until(lock, next_time.toSystemTimePoint());
-
-                // Are we done running?
-                if (_state == State::kStopRequested) {
-                    break;
-                }
-
-                // Update the current configuration settings always
-                // In unit tests, we may never get a signal when the timeout is 1ms on Windows since
-                // MSVC 2013 converts wait_until(now() + 1ms) into ~ wait_for(0) which means it will
-                // not wait for the condition variable to be signaled because it uses
-                // GetFileSystemTime for now which has ~10 ms granularity.
-                _config = _configTemp;
-
-                // if we hit a timeout on the condvar, we need to do another collection
-                // if we were signalled, then we have a config update only or were asked to stop
-                if (status == stdx::cv_status::no_timeout) {
-                    continue;
-                }
-            }
-
-            // TODO: consider only running this thread if we are enabled
-            // for now, we just keep an idle thread as it is simpler
-            if (_config.enabled) {
-                // Delay initialization of FTDCFileManager until we are sure the user has enabled
-                // FTDC
-                if (!_mgr) {
-                    auto swMgr =
-                        FTDCFileManager::create(&_config, _path, &_rotateCollectors, client);
-
-                    _mgr = uassertStatusOK(std::move(swMgr));
-                }
-
-                auto collectSample = _periodicCollectors.collect(client);
-
-                Status s = _mgr->writeSampleAndRotateIfNeeded(
-                    client, std::get<0>(collectSample), std::get<1>(collectSample));
-
-                uassertStatusOK(s);
-
-                // Store a reference to the most recent document from the periodic collectors
-                {
-                    stdx::lock_guard<stdx::mutex> lock(_mutex);
-                    _mostRecentPeriodicDocument = std::get<0>(collectSample);
-                }
-            }
+        if (--metadataCaptureFrequencyCountdown == 0) {
+            metadataCaptureFrequencyCountdown = _config.metadataCaptureFrequency;
+            auto collectSample = _periodicMetadataCollectors.collect(client, _multiServiceSchema);
+            Status s = _mgr->writePeriodicMetadataSampleAndRotateIfNeeded(
+                client, std::get<0>(collectSample), std::get<1>(collectSample));
+            iassert(s);
         }
-    } catch (...) {
-        warning() << "Uncaught exception in '" << exceptionToStatus()
-                  << "' in full-time diagnostic data capture subsystem. Shutting down the "
-                     "full-time diagnostic data capture subsystem.";
     }
+} catch (...) {
+    LOGV2_FATAL(9399800,
+                "Exception thrown in full-time diagnostic data capture subsystem. Terminating the "
+                "process because diagnostics cannot be captured.",
+                "exception"_attr = exceptionToStatus());
 }
 
 }  // namespace mongo

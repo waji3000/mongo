@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,40 +27,51 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#include <memory>
+#include <string>
 
-#include "mongo/platform/basic.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
 
-#include "mongo/db/auth/action_set.h"
+#include "mongo/base/error_codes.h"
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
-#include "mongo/db/auth/privilege.h"
-#include "mongo/db/catalog_raii.h"
+#include "mongo/db/auth/resource_pattern.h"
+#include "mongo/db/catalog_shard_feature_flag_gen.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/concurrency/d_concurrency.h"
+#include "mongo/db/concurrency/lock_manager_defs.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/repl_client_info.h"
-#include "mongo/db/s/migration_source_manager.h"
-#include "mongo/db/s/operation_sharding_state.h"
+#include "mongo/db/s/collection_sharding_runtime.h"
 #include "mongo/db/s/shard_filtering_metadata_refresh.h"
-#include "mongo/db/s/sharding_state.h"
-#include "mongo/s/catalog_cache_loader.h"
+#include "mongo/db/s/sharding_migration_critical_section.h"
+#include "mongo/db/service_context.h"
+#include "mongo/logv2/log.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/flush_routing_table_cache_updates_gen.h"
-#include "mongo/util/log.h"
+#include "mongo/s/sharding_feature_flags_gen.h"
+#include "mongo/s/sharding_state.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/decorable.h"
+#include "mongo/util/future.h"
+#include "mongo/util/str.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 namespace mongo {
 namespace {
 
-class FlushRoutingTableCacheUpdatesCmd final
-    : public TypedCommand<FlushRoutingTableCacheUpdatesCmd> {
+template <typename Derived>
+class FlushRoutingTableCacheUpdatesCmdBase : public TypedCommand<Derived> {
 public:
-    using Request = _flushRoutingTableCacheUpdates;
-
-    // Support deprecated name 'forceRoutingTableRefresh' for backwards compatibility with 3.6.0.
-    FlushRoutingTableCacheUpdatesCmd()
-        : TypedCommand<FlushRoutingTableCacheUpdatesCmd>(Request::kCommandName,
-                                                         "forceRoutingTableRefresh") {}
+    bool skipApiVersionCheck() const override {
+        // Internal command (server to server).
+        return true;
+    }
 
     std::string help() const override {
         return "Internal command which waits for any pending routing table cache updates for a "
@@ -76,73 +86,104 @@ public:
         return true;
     }
 
-    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
-        return AllowedOnSecondary::kNever;
+    Command::AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return Command::AllowedOnSecondary::kNever;
     }
 
-    class Invocation final : public InvocationBase {
+    class Invocation final : public TypedCommand<Derived>::InvocationBase {
     public:
-        using InvocationBase::InvocationBase;
+        using Base = typename TypedCommand<Derived>::InvocationBase;
+        using Base::Base;
 
         bool supportsWriteConcern() const override {
-            return false;
+            return Derived::supportsWriteConcern();
         }
 
         NamespaceString ns() const override {
-            return request().getCommandParameter();
+            return Base::request().getCommandParameter();
         }
 
         void doCheckAuthorization(OperationContext* opCtx) const override {
-            uassert(ErrorCodes::Unauthorized,
-                    "Unauthorized",
-                    AuthorizationSession::get(opCtx->getClient())
-                        ->isAuthorizedForActionsOnResource(ResourcePattern::forClusterResource(),
-                                                           ActionType::internal));
+            uassert(
+                ErrorCodes::Unauthorized,
+                "Unauthorized",
+                AuthorizationSession::get(opCtx->getClient())
+                    ->isAuthorizedForActionsOnResource(
+                        ResourcePattern::forClusterResource(Base::request().getDbName().tenantId()),
+                        ActionType::internal));
         }
 
         void typedRun(OperationContext* opCtx) {
             auto const shardingState = ShardingState::get(opCtx);
-            uassertStatusOK(shardingState->canAcceptShardedCommands());
+            shardingState->assertCanAcceptShardedCommands();
 
             uassert(ErrorCodes::IllegalOperation,
-                    "Can't issue _flushRoutingTableCacheUpdates from 'eval'",
+                    str::stream() << "Can't issue " << Derived::Request::kCommandName
+                                  << " from 'eval'",
                     !opCtx->getClient()->isInDirectClient());
 
             uassert(ErrorCodes::IllegalOperation,
-                    "Can't call _flushRoutingTableCacheUpdates if in read-only mode",
-                    !storageGlobalParams.readOnly);
+                    str::stream() << "Can't call " << Derived::Request::kCommandName
+                                  << " if in read-only mode",
+                    !opCtx->readOnly());
 
-            auto& oss = OperationShardingState::get(opCtx);
+            uassert(ErrorCodes::IllegalOperation,
+                    str::stream() << "Can only call " << Derived::Request::kCommandName
+                                  << " on collections",
+                    !ns().coll().empty());
+
+            boost::optional<SharedSemiFuture<void>> criticalSectionSignal;
 
             {
-                AutoGetCollection autoColl(opCtx, ns(), MODE_IS);
-
                 // If the primary is in the critical section, secondaries must wait for the commit
                 // to finish on the primary in case a secondary's caller has an afterClusterTime
                 // inclusive of the commit (and new writes to the committed chunk) that hasn't yet
                 // propagated back to this shard. This ensures the read your own writes causal
                 // consistency guarantee.
-                auto const css = CollectionShardingState::get(opCtx, ns());
-                auto criticalSectionSignal =
-                    css->getCriticalSectionSignal(ShardingMigrationCriticalSection::kRead);
-                if (criticalSectionSignal) {
-                    oss.setMigrationCriticalSectionSignal(criticalSectionSignal);
-                }
+                const auto scopedCsr = CollectionShardingRuntime::acquireShared(opCtx, ns());
+                criticalSectionSignal =
+                    scopedCsr->getCriticalSectionSignal(ShardingMigrationCriticalSection::kWrite);
             }
 
-            oss.waitForMigrationCriticalSectionSignal(opCtx);
+            if (criticalSectionSignal)
+                criticalSectionSignal->get(opCtx);
 
-            if (request().getSyncFromConfig()) {
-                LOG(1) << "Forcing remote routing table refresh for " << ns();
-                forceShardFilteringMetadataRefresh(opCtx, ns());
+            if (Base::request().getSyncFromConfig()) {
+                LOGV2_DEBUG(21982, 1, "Forcing remote routing table refresh", logAttrs(ns()));
+                uassertStatusOK(
+                    FilteringMetadataCache::get(opCtx)->onCollectionPlacementVersionMismatch(
+                        opCtx, ns(), boost::none));
             }
 
-            CatalogCacheLoader::get(opCtx).waitForCollectionFlush(opCtx, ns());
+            FilteringMetadataCache::get(opCtx)->waitForCollectionFlush(opCtx, ns());
 
             repl::ReplClientInfo::forClient(opCtx->getClient()).setLastOpToSystemLastOpTime(opCtx);
         }
     };
-} _flushRoutingTableCacheUpdatesCmd;
+};
+
+class FlushRoutingTableCacheUpdatesCmd
+    : public FlushRoutingTableCacheUpdatesCmdBase<FlushRoutingTableCacheUpdatesCmd> {
+public:
+    using Request = FlushRoutingTableCacheUpdates;
+
+    static bool supportsWriteConcern() {
+        return false;
+    }
+};
+MONGO_REGISTER_COMMAND(FlushRoutingTableCacheUpdatesCmd).forShard();
+
+class FlushRoutingTableCacheUpdatesCmdWithWriteConcern
+    : public FlushRoutingTableCacheUpdatesCmdBase<
+          FlushRoutingTableCacheUpdatesCmdWithWriteConcern> {
+public:
+    using Request = FlushRoutingTableCacheUpdatesWithWriteConcern;
+
+    static bool supportsWriteConcern() {
+        return true;
+    }
+};
+MONGO_REGISTER_COMMAND(FlushRoutingTableCacheUpdatesCmdWithWriteConcern).forShard();
 
 }  // namespace
 }  // namespace mongo

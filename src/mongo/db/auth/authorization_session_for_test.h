@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -33,26 +32,22 @@
 #include <memory>
 #include <vector>
 
+#include "mongo/base/string_data.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/authorization_session_impl.h"
+#include "mongo/db/auth/privilege.h"
+#include "mongo/db/auth/role_name.h"
 #include "mongo/db/auth/user.h"
+#include "mongo/db/database_name.h"
 
 namespace mongo {
 
 class AuthorizationSessionForTest : public AuthorizationSessionImpl {
-    MONGO_DISALLOW_COPYING(AuthorizationSessionForTest);
+    AuthorizationSessionForTest(const AuthorizationSessionForTest&) = delete;
+    AuthorizationSessionForTest& operator=(const AuthorizationSessionForTest&) = delete;
 
 public:
     using AuthorizationSessionImpl::AuthorizationSessionImpl;
-
-    // A database name used for testing purposes, deliberately named to minimize collisions with
-    // other test users.
-    static constexpr StringData kTestDBName = "authorizationSessionForTestDB"_sd;
-
-    /**
-     * Cleans up any privileges granted via assumePrivilegesForDB().
-     */
-    ~AuthorizationSessionForTest();
 
     /**
      * Grants this session all privileges in 'privileges' for the database named 'dbName'. Any prior
@@ -60,24 +55,12 @@ public:
      *
      * Do not use this method if also adding users via addAndAuthorizeUser() in the same database.
      */
-    void assumePrivilegesForDB(PrivilegeVector privilege, StringData dbName = kTestDBName);
-    void assumePrivilegesForDB(Privilege privilege, StringData dbName = kTestDBName);
+    void assumePrivilegesForDB(PrivilegeVector privileges, const DatabaseName& dbName);
+    void assumePrivilegesForDB(Privilege privilege, const DatabaseName& dbName);
 
     /**
-     * Revoke all privileges granted via assumePrivilegesForDB() on the database named 'dbName'.
-     *
-     * Do not use this method if also adding users via addAndAuthorizeUser() in the same database.
+     * Grants this session all privileges for the given builtin role. Do not mix with other methods.
      */
-    void revokePrivilegesForDB(StringData dbName);
-
-    /**
-     * Revokes all privileges granted via assumePrivilegesForDB() on every database.
-     *
-     * Do not use this method if also adding users via addAndAuthorizeUser() in the same database.
-     */
-    void revokeAllPrivileges();
-
-private:
-    std::vector<UserHandle> _testUsers;
+    void assumePrivilegesForBuiltinRole(const RoleName& roleName);
 };
 }  // namespace mongo

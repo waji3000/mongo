@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,48 +27,21 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kAccessControl
-
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/auth/authorization_manager.h"
 
-#include <memory>
 #include <string>
-#include <vector>
 
-#include "mongo/base/init.h"
-#include "mongo/base/status.h"
-#include "mongo/bson/mutable/document.h"
-#include "mongo/bson/mutable/element.h"
-#include "mongo/bson/util/bson_extract.h"
-#include "mongo/crypto/mechanism_scram.h"
-#include "mongo/db/auth/action_set.h"
-#include "mongo/db/auth/address_restriction.h"
-#include "mongo/db/auth/authorization_session.h"
-#include "mongo/db/auth/authz_manager_external_state.h"
-#include "mongo/db/auth/privilege.h"
-#include "mongo/db/auth/privilege_parser.h"
-#include "mongo/db/auth/role_graph.h"
-#include "mongo/db/auth/sasl_options.h"
-#include "mongo/db/auth/user.h"
-#include "mongo/db/auth/user_document_parser.h"
-#include "mongo/db/auth/user_name.h"
-#include "mongo/db/auth/user_name_hash.h"
-#include "mongo/db/global_settings.h"
-#include "mongo/db/jsobj.h"
-#include "mongo/platform/compiler.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/stdx/mutex.h"
-#include "mongo/stdx/unordered_map.h"
-#include "mongo/util/assert_util.h"
-#include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
-
-mongo::AuthInfo mongo::internalSecurity;
+#include "mongo/base/error_codes.h"
+#include "mongo/base/init.h"  // IWYU pragma: keep
+#include "mongo/base/shim.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
 
 namespace mongo {
 
+SystemAuthInfo internalSecurity;
+
+constexpr StringData AuthorizationManager::USERID_FIELD_NAME;
 constexpr StringData AuthorizationManager::USER_NAME_FIELD_NAME;
 constexpr StringData AuthorizationManager::USER_DB_FIELD_NAME;
 constexpr StringData AuthorizationManager::ROLE_NAME_FIELD_NAME;
@@ -78,30 +50,9 @@ constexpr StringData AuthorizationManager::PASSWORD_FIELD_NAME;
 constexpr StringData AuthorizationManager::V1_USER_NAME_FIELD_NAME;
 constexpr StringData AuthorizationManager::V1_USER_SOURCE_FIELD_NAME;
 
-
-const NamespaceString AuthorizationManager::adminCommandNamespace("admin.$cmd");
-const NamespaceString AuthorizationManager::rolesCollectionNamespace("admin.system.roles");
-const NamespaceString AuthorizationManager::usersAltCollectionNamespace("admin.system.new_users");
-const NamespaceString AuthorizationManager::usersBackupCollectionNamespace(
-    "admin.system.backup_users");
-const NamespaceString AuthorizationManager::usersCollectionNamespace("admin.system.users");
-const NamespaceString AuthorizationManager::versionCollectionNamespace("admin.system.version");
-const NamespaceString AuthorizationManager::defaultTempUsersCollectionNamespace("admin.tempusers");
-const NamespaceString AuthorizationManager::defaultTempRolesCollectionNamespace("admin.temproles");
-
 const Status AuthorizationManager::authenticationFailedStatus(ErrorCodes::AuthenticationFailed,
                                                               "Authentication failed.");
 
-const BSONObj AuthorizationManager::versionDocumentQuery = BSON("_id"
-                                                                << "authSchema");
-
-constexpr StringData AuthorizationManager::schemaVersionFieldName;
-
-const int AuthorizationManager::schemaVersion24;
-const int AuthorizationManager::schemaVersion26Upgrade;
-const int AuthorizationManager::schemaVersion26Final;
-const int AuthorizationManager::schemaVersion28SCRAM;
-
-MONGO_DEFINE_SHIM(AuthorizationManager::create);
+const BSONObj AuthorizationManager::versionDocumentQuery = BSON("_id" << "authSchema");
 
 }  // namespace mongo

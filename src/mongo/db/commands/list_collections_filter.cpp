@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,24 +27,21 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/commands/list_collections_filter.h"
-
-#include "mongo/db/jsobj.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
 
 namespace mongo {
 
 // TODO SERVER-25493: Remove $exists clause once MongoDB versions <= 3.2 are no longer supported.
 BSONObj ListCollectionsFilter::makeTypeCollectionFilter() {
-    return BSON("$or" << BSON_ARRAY(BSON("type"
-                                         << "collection")
+    return BSON("$or" << BSON_ARRAY(BSON("type" << "collection")
                                     << BSON("type" << BSON("$exists" << false))));
 }
 
 BSONObj ListCollectionsFilter::makeTypeViewFilter() {
-    return BSON("type"
-                << "view");
+    return BSON("type" << "view");
 }
 
 BSONObj ListCollectionsFilter::addTypeCollectionFilter(const BSONObj& filter) {

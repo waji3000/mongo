@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,13 +27,23 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <boost/move/utility_core.hpp>
 
-#include "mongo/db/s/type_shard_identity.h"
-
+#include "mongo/base/error_codes.h"
+#include "mongo/base/string_data.h"
 #include "mongo/bson/bsonobjbuilder.h"
-#include "mongo/bson/util/bson_extract.h"
+#include "mongo/client/connection_string.h"
+#include "mongo/db/cluster_role.h"
+#include "mongo/db/s/type_shard_identity.h"
+#include "mongo/db/server_feature_flags_gen.h"
+#include "mongo/db/server_options.h"
+#include "mongo/db/shard_id.h"
+#include "mongo/idl/idl_parser.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 namespace mongo {
 
@@ -50,10 +59,10 @@ StatusWith<ShardIdentityType> ShardIdentityType::fromShardIdentityDocument(const
 
     try {
         ShardIdentityType shardIdentity =
-            ShardIdentity::parse(IDLParserErrorContext("ShardIdentity"), shardIdentityBSON);
+            ShardIdentity::parse(IDLParserContext("ShardIdentity"), shardIdentityBSON);
 
         const auto& configsvrConnStr = shardIdentity.getConfigsvrConnectionString();
-        if (configsvrConnStr.type() != ConnectionString::SET) {
+        if (configsvrConnStr.type() != ConnectionString::ConnectionType::kReplicaSet) {
             return Status(ErrorCodes::UnsupportedFormat,
                           str::stream()
                               << "config server connection string can only be replica sets: "
@@ -66,13 +75,51 @@ StatusWith<ShardIdentityType> ShardIdentityType::fromShardIdentityDocument(const
     }
 }
 
-Status ShardIdentityType::validate() const {
+Status ShardIdentityType::validate(bool fassert) const {
     const auto& configsvrConnStr = getConfigsvrConnectionString();
-    if (configsvrConnStr.type() != ConnectionString::SET) {
+    if (configsvrConnStr.type() != ConnectionString::ConnectionType::kReplicaSet) {
         return {ErrorCodes::UnsupportedFormat,
                 str::stream() << "config connection string can only be replica sets, got "
                               << ConnectionString::typeToString(configsvrConnStr.type())};
     }
+
+    // (Ignore FCV check): Auto-bootstrapping happens irrespective of the FCV when
+    // gFeatureFlagAllMongodsAreSharded is enabled.
+    if (gFeatureFlagAllMongodsAreSharded.isEnabledAndIgnoreFCVUnsafe() && fassert) {
+        // With auto-bootstrapping, we rely on detecting a discrepancy between a server's cluster
+        // role and the shard identity document to prevent a replica set from running with mixed
+        // cluster roles. See SERVER-80249 for more information.
+        const bool isShardIdConfigServer = getShardName() == ShardId::kConfigServerId;
+        if (!isShardIdConfigServer &&
+            serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer)) {
+            LOGV2_FATAL_NOTRACE(8024901,
+                                "Shard identity document for a shard server was detected, but the "
+                                "server is not a dedicated shard server. To fix this, restart this "
+                                "server with --shardsvr.");
+        } else if (isShardIdConfigServer && serverGlobalParams.clusterRole.isShardOnly()) {
+            LOGV2_FATAL_NOTRACE(8024902,
+                                "Shard identity document for a config server was detected, but the "
+                                "server is not a config server. To fix this, restart this server "
+                                "without a cluster role or with --configsvr.");
+        }
+    } else {
+        if (getShardName() == ShardId::kConfigServerId &&
+            !serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer)) {
+            return {ErrorCodes::UnsupportedFormat,
+                    str::stream() << "Invalid shard identity document: the shard name for a shard "
+                                     "server cannot be \""
+                                  << ShardId::kConfigServerId.toString() << "\""};
+        }
+
+        if (getShardName() != ShardId::kConfigServerId &&
+            serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer)) {
+            return {ErrorCodes::UnsupportedFormat,
+                    str::stream() << "Invalid shard identity document: the shard name for a config "
+                                     "server cannot be \""
+                                  << getShardName() << "\""};
+        }
+    }
+
     return Status::OK();
 }
 

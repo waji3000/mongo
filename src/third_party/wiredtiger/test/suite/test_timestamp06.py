@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Public Domain 2014-2018 MongoDB, Inc.
+# Public Domain 2014-present MongoDB, Inc.
 # Public Domain 2008-2014 WiredTiger, Inc.
 #
 # This is free and unencumbered software released into the public domain.
@@ -33,11 +33,8 @@
 from helper import copy_wiredtiger_home
 import random
 from suite_subprocess import suite_subprocess
-import wiredtiger, wttest
+import wttest
 from wtscenario import make_scenarios
-
-def timestamp_str(t):
-    return '%x' % t
 
 class test_timestamp06(wttest.WiredTigerTestCase, suite_subprocess):
     table_ts_log     = 'table:ts06_ts_logged'
@@ -46,7 +43,6 @@ class test_timestamp06(wttest.WiredTigerTestCase, suite_subprocess):
     types = [
         ('col_fix', dict(empty=1, extra_config=',key_format=r,value_format=8t')),
         ('col_var', dict(empty=0, extra_config=',key_format=r')),
-        ('lsm', dict(empty=0, extra_config=',type=lsm')),
         ('row', dict(empty=0, extra_config='',)),
     ]
     ckpt = [
@@ -56,9 +52,9 @@ class test_timestamp06(wttest.WiredTigerTestCase, suite_subprocess):
     ]
 
     conncfg = [
-        ('nolog', dict(conn_config='create', using_log=False)),
-        ('V1', dict(conn_config='create,log=(archive=false,enabled),compatibility=(release="2.9")', using_log=True)),
-        ('V2', dict(conn_config='create,log=(archive=false,enabled)', using_log=True)),
+        ('V1',
+            dict(conn_config='create,log=(enabled,remove=false),compatibility=(release="2.9")')),
+        ('V2', dict(conn_config='create,log=(enabled,remove=false)')),
     ]
 
     scenarios = make_scenarios(conncfg, types, ckpt)
@@ -72,11 +68,11 @@ class test_timestamp06(wttest.WiredTigerTestCase, suite_subprocess):
         cur = session.open_cursor(tablename, None)
         actual = dict((k, v) for k, v in cur if v != 0)
         if actual != expected:
-            print "missing: ", sorted(set(expected.items()) - set(actual.items()))
-            print "extras: ", sorted(set(actual.items()) - set(expected.items()))
+            print("missing: ", sorted(set(expected.items()) - set(actual.items())))
+            print("extras: ", sorted(set(actual.items()) - set(expected.items())))
         self.assertTrue(actual == expected)
         # Search for the expected items as well as iterating
-        for k, v in expected.iteritems():
+        for k, v in expected.items():
             self.assertEqual(cur[k], v, "for key " + str(k))
         cur.close()
         if txn_config:
@@ -86,7 +82,7 @@ class test_timestamp06(wttest.WiredTigerTestCase, suite_subprocess):
     # check exists in the tables the expected number of times.
     def backup_check(self, check_value, expected_ts_log, expected_ts_nolog):
         newdir = "BACKUP"
-        copy_wiredtiger_home('.', newdir, True)
+        copy_wiredtiger_home(self, '.', newdir, True)
 
         conn = self.setUpConnectionOpen(newdir)
         session = self.setUpSessionOpen(conn)
@@ -121,78 +117,72 @@ class test_timestamp06(wttest.WiredTigerTestCase, suite_subprocess):
         self.backup_check(check_value, valcnt_ts_log, valcnt_ts_nolog)
 
     def test_timestamp06(self):
-        # Open two timestamp tables:
-        # 1. Table is logged and uses timestamps.
+        # Open two tables:
+        # 1. Table is logged and so timestamps are ignored.
         # 2. Table is not logged and uses timestamps.
-        self.session.create(self.table_ts_log, 'key_format=i,value_format=i')
+        self.session.create(self.table_ts_log, 'key_format=i,value_format=i' + self.extra_config)
         cur_ts_log = self.session.open_cursor(self.table_ts_log)
-        self.session.create(self.table_ts_nolog, 'key_format=i,value_format=i,log=(enabled=false)')
+        self.session.create(self.table_ts_nolog,
+            'key_format=i,value_format=i,log=(enabled=false)' + self.extra_config)
         cur_ts_nolog = self.session.open_cursor(self.table_ts_nolog)
 
         # Insert keys 1..100
         nkeys = 100
-        orig_keys = range(1, nkeys+1)
+        orig_keys = list(range(1, nkeys+1))
         keys = orig_keys[:]
         random.shuffle(keys)
 
         self.session.begin_transaction()
         # Make three updates with different timestamps.
-        self.session.timestamp_transaction('commit_timestamp=' + timestamp_str(1))
+        self.session.timestamp_transaction('commit_timestamp=' + self.timestamp_str(1))
         for k in keys:
             cur_ts_log[k] = 1
             cur_ts_nolog[k] = 1
 
-        self.session.timestamp_transaction('commit_timestamp=' + timestamp_str(101))
+        self.session.timestamp_transaction('commit_timestamp=' + self.timestamp_str(101))
         for k in keys:
             cur_ts_log[k] = 2
             cur_ts_nolog[k] = 2
 
-        self.session.timestamp_transaction('commit_timestamp=' + timestamp_str(201))
+        self.session.timestamp_transaction('commit_timestamp=' + self.timestamp_str(201))
         for k in keys:
             cur_ts_log[k] = 3
             cur_ts_nolog[k] = 3
 
-        self.session.commit_transaction('commit_timestamp=' + timestamp_str(301))
+        self.session.commit_transaction('commit_timestamp=' + self.timestamp_str(301))
+        cur_ts_log.close()
+        cur_ts_nolog.close()
 
         # Scenario: 1
-        # Check that we see all the latest values (i.e. 3) as per transaction
-        # visibility when reading with out the read timestamp.
-        # All tables should see all the values.
+        # Check that we see all the latest values (i.e. 3) as per transaction visibility when
+        # reading without the read timestamp. All tables should see all the values.
         self.check(self.session, "", self.table_ts_log,
             dict((k, 3) for k in orig_keys))
         self.check(self.session, "", self.table_ts_nolog,
             dict((k, 3) for k in orig_keys))
 
         # Scenario: 2
-        # Check that we see the values till correctly from checkpointed data
-        # files in case of multistep transactions.
+        # Check that we see the values correctly from checkpointed data files in case of multistep
+        # transactions.
         # Set oldest and stable timestamps
-        old_ts = timestamp_str(100)
+        old_ts = self.timestamp_str(100)
         # Set the stable timestamp such that last update is beyond it.
-        stable_ts = timestamp_str(200)
+        stable_ts = self.timestamp_str(200)
         self.conn.set_timestamp('oldest_timestamp=' + old_ts)
         self.conn.set_timestamp('stable_timestamp=' + stable_ts)
 
-        # Check that we see the values correctly till stable timestamp.
+        # Logged tables always see the latest value, non-logged tables should see values at the
+        # specified timestamp.
         self.check(self.session, 'read_timestamp=' + stable_ts,
-            self.table_ts_log, dict((k, 2) for k in orig_keys))
+            self.table_ts_log, dict((k, 3) for k in orig_keys))
         self.check(self.session, 'read_timestamp=' + stable_ts,
             self.table_ts_nolog, dict((k, 2) for k in orig_keys))
 
-        # For logged table we should see latest values (i.e. 3) when logging
-        # is enabled.
-        if self.using_log == True:
-            valcnt_ts_log = nkeys
-        else:
-            # When logging is disabled, we should not see the values beyond the
-            # stable timestamp with timestamped checkpoints.
-            if self.ckpt_ts == True:
-                valcnt_ts_log = 0
-            else:
-                valcnt_ts_log = nkeys
+        # For logged table we should see latest values.
+        valcnt_ts_log = nkeys
 
-        # For non-logged table we should not see the values beyond the
-        # stable timestamp with timestamped checkpoints.
+        # For non-logged table we should not see the values beyond the stable timestamp with
+        # timestamped checkpoints.
         if self.ckpt_ts == True:
             valcnt_ts_nolog = 0
         else:
@@ -203,41 +193,22 @@ class test_timestamp06(wttest.WiredTigerTestCase, suite_subprocess):
         self.ckpt_backup(2, (nkeys - valcnt_ts_log), (nkeys - valcnt_ts_nolog))
 
         # Scenario: 3
-        # Check that we see all the data values correctly after rollback
+        # Check we see all the data values correctly after rollback. Skip the case where the most
+        # recent checkpoint wasn't based on the last stable timestamp, those can't be rolled back.
+        if self.ckpt_ts == False:
+                return
         self.conn.rollback_to_stable()
-        # All tables should see the values correctly when read with
-        # read timestamp as stable timestamp.
+
+        # Logged tables see the latest value, non-logged tables should see the values as of the
+        # specified timestamp.
+        self.check(self.session, 'read_timestamp=' + stable_ts,
+            self.table_ts_log, dict((k, 3) for k in orig_keys))
         self.check(self.session, 'read_timestamp=' + stable_ts,
             self.table_ts_nolog, dict((k, 2) for k in orig_keys))
-        self.check(self.session, 'read_timestamp=' + stable_ts,
-            self.table_ts_log, dict((k, 2) for k in orig_keys))
 
         # Scenario: 4
-        # Check that we see the values correctly when read with out any
-        # timestamp.
-        if self.using_log == True:
-            # For logged table we should see latest values (i.e. 3) when logging
-            # is enabled.
-            self.check(self.session, "",
-                self.table_ts_log, dict((k, 3) for k in orig_keys))
-        else:
-            # When logging is disabled, we should not see the values beyond the
-            # stable timestamp with timestamped checkpoints.
-            if self.ckpt_ts == True:
-                self.check(self.session, "",
-                    self.table_ts_log, dict((k, 2) for k in orig_keys))
-            else:
-                self.check(self.session, "",
-                    self.table_ts_log, dict((k, 3) for k in orig_keys))
-
-        # For non-logged table we should not see the values beyond the
+        # Check that we see the values correctly when read without any timestamp. Logged tables
+        # always see the latest value, non-logged tables should not see the values beyond the
         # stable timestamp with timestamped checkpoints.
-        if self.ckpt_ts == True:
-            self.check(self.session, "",
-                self.table_ts_nolog, dict((k, 2) for k in orig_keys))
-        else:
-            self.check(self.session, "",
-                self.table_ts_nolog, dict((k, 3) for k in orig_keys))
-
-if __name__ == '__main__':
-    wttest.run()
+        self.check(self.session, "", self.table_ts_log, dict((k, 3) for k in orig_keys))
+        self.check(self.session, "", self.table_ts_nolog, dict((k, 2) for k in orig_keys))

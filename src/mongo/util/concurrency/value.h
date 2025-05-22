@@ -1,8 +1,3 @@
-/* @file value.h
-   concurrency helpers DiagStr
-*/
-
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -34,7 +29,11 @@
 
 #pragma once
 
-#include "spin_lock.h"
+/**
+ * DiagStr concurrency helper
+ */
+
+#include "mongo/util/concurrency/spin_lock.h"
 
 namespace mongo {
 
@@ -80,4 +79,5 @@ public:
     // multiple operations
     bool operator==(const std::string& s) const;
 };
-}
+
+}  // namespace mongo

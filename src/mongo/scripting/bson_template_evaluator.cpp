@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,12 +29,15 @@
 
 #include "mongo/scripting/bson_template_evaluator.h"
 
-#include <cstddef>
-#include <cstdlib>
+#include <cstring>
+#include <utility>
+#include <vector>
 
 #include "mongo/base/static_assert.h"
-#include "mongo/util/map_util.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/bson/util/builder_fwd.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo {
 
@@ -72,7 +74,8 @@ void BsonTemplateEvaluator::addOperator(const std::string& name, const OperatorF
 
 BsonTemplateEvaluator::OperatorFn BsonTemplateEvaluator::operatorEvaluator(
     const std::string& op) const {
-    return mapFindWithDefault(_operatorFunctions, op, OperatorFn());
+    auto iter = _operatorFunctions.find(op);
+    return iter == _operatorFunctions.end() ? nullptr : iter->second;
 }
 
 /* This is the top level method for using this library. It takes a BSON Object as input,
@@ -81,7 +84,7 @@ BsonTemplateEvaluator::OperatorFn BsonTemplateEvaluator::operatorEvaluator(
  */
 BsonTemplateEvaluator::Status BsonTemplateEvaluator::evaluate(const BSONObj& in,
                                                               BSONObjBuilder& builder) {
-    BSONForEach(e, in) {
+    for (auto&& e : in) {
         Status st = _evalElem(e, builder);
         if (st != StatusSuccess)
             return st;
@@ -150,7 +153,7 @@ BsonTemplateEvaluator::Status BsonTemplateEvaluator::_evalElem(const BSONElement
 
 BsonTemplateEvaluator::Status BsonTemplateEvaluator::_evalObj(const BSONObj& in,
                                                               BSONObjBuilder& out) {
-    BSONForEach(e, in) {
+    for (auto&& e : in) {
         Status st = _evalElem(e, out);
         if (st != StatusSuccess)
             return st;
@@ -297,7 +300,7 @@ BsonTemplateEvaluator::Status BsonTemplateEvaluator::evalConcat(BsonTemplateEval
     if (parts.nFields() <= 1)
         return StatusOpEvaluationError;
     StringBuilder stringBuilder;
-    BSONForEach(part, parts) {
+    for (auto&& part : parts) {
         if (part.type() == String)
             stringBuilder << part.String();
         else
@@ -312,7 +315,7 @@ BsonTemplateEvaluator::Status BsonTemplateEvaluator::evalObjId(BsonTemplateEvalu
                                                                const BSONObj& in,
                                                                BSONObjBuilder& out) {
     // in = { #OID: 1 }
-    if (!mongoutils::str::equals(fieldName, "_id"))
+    if (strcmp(fieldName, "_id") != 0)
         // Error: must be generating a value for the _id field.
         return StatusOpEvaluationError;
     out.genOID();

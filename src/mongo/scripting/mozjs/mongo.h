@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,10 +29,36 @@
 
 #pragma once
 
+#include <memory>
+
+#include <js/CallArgs.h>
+#include <js/Class.h>
+#include <js/PropertySpec.h>
+#include <js/RootingAPI.h>
+#include <js/TracingAPI.h>
+#include <js/TypeDecls.h>
+
+#include "mongo/client/dbclient_base.h"
+#include "mongo/scripting/mozjs/base.h"
+#include "mongo/scripting/mozjs/objectwrapper.h"
 #include "mongo/scripting/mozjs/wraptype.h"
 
 namespace mongo {
 namespace mozjs {
+
+using EncryptedDBClientCallback = std::shared_ptr<DBClientBase>(std::shared_ptr<DBClientBase>,
+                                                                JS::HandleValue,
+                                                                JS::HandleObject,
+                                                                JSContext*);
+
+using EncryptedDBClientFromExistingCallback = std::shared_ptr<DBClientBase>(
+    std::shared_ptr<DBClientBase>, std::shared_ptr<DBClientBase>, JSContext*);
+
+using GetNestedConnectionCallback = DBClientBase*(DBClientBase*);
+
+void setEncryptedDBClientCallbacks(EncryptedDBClientCallback* encCallback,
+                                   EncryptedDBClientFromExistingCallback* encFromExistingCallback,
+                                   GetNestedConnectionCallback* getCallback);
 
 /**
  * Shared code for the "Mongo" javascript object.
@@ -43,37 +68,53 @@ namespace mozjs {
  * info type with common code and differentiate with varying constructors.
  */
 struct MongoBase : public BaseInfo {
-    static void finalize(JSFreeOp* fop, JSObject* obj);
+    enum Slots { DBClientWithAutoEncryptionSlot, MongoBaseSlotCount };
+    static void finalize(JS::GCContext* gcCtx, JSObject* obj);
+    static void trace(JSTracer* trc, JSObject* obj);
 
     struct Functions {
         MONGO_DECLARE_JS_FUNCTION(auth);
-        MONGO_DECLARE_JS_FUNCTION(copyDatabaseWithSCRAM);
         MONGO_DECLARE_JS_FUNCTION(close);
-        MONGO_DECLARE_JS_FUNCTION(cursorFromId);
+        MONGO_DECLARE_JS_FUNCTION(cleanup);
+        MONGO_DECLARE_JS_FUNCTION(compact);
+
+        MONGO_DECLARE_JS_FUNCTION(setAutoEncryption);
+        MONGO_DECLARE_JS_FUNCTION(getAutoEncryptionOptions);
+        MONGO_DECLARE_JS_FUNCTION(unsetAutoEncryption);
+        MONGO_DECLARE_JS_FUNCTION(toggleAutoEncryption);
+        MONGO_DECLARE_JS_FUNCTION(isAutoEncryptionEnabled);
         MONGO_DECLARE_JS_FUNCTION(cursorHandleFromId);
         MONGO_DECLARE_JS_FUNCTION(find);
-        MONGO_DECLARE_JS_FUNCTION(getClientRPCProtocols);
-        MONGO_DECLARE_JS_FUNCTION(getServerRPCProtocols);
+        MONGO_DECLARE_JS_FUNCTION(generateDataKey);
+        MONGO_DECLARE_JS_FUNCTION(getDataKeyCollection);
+        MONGO_DECLARE_JS_FUNCTION(encrypt);
+        MONGO_DECLARE_JS_FUNCTION(decrypt);
         MONGO_DECLARE_JS_FUNCTION(insert);
         MONGO_DECLARE_JS_FUNCTION(isReplicaSetConnection);
         MONGO_DECLARE_JS_FUNCTION(_markNodeAsFailed);
         MONGO_DECLARE_JS_FUNCTION(logout);
         MONGO_DECLARE_JS_FUNCTION(remove);
-        MONGO_DECLARE_JS_FUNCTION(runCommand);
-        MONGO_DECLARE_JS_FUNCTION(runCommandWithMetadata);
-        MONGO_DECLARE_JS_FUNCTION(setClientRPCProtocols);
         MONGO_DECLARE_JS_FUNCTION(update);
         MONGO_DECLARE_JS_FUNCTION(getMinWireVersion);
         MONGO_DECLARE_JS_FUNCTION(getMaxWireVersion);
         MONGO_DECLARE_JS_FUNCTION(isReplicaSetMember);
         MONGO_DECLARE_JS_FUNCTION(isMongos);
+        MONGO_DECLARE_JS_FUNCTION(isTLS);
+        MONGO_DECLARE_JS_FUNCTION(isGRPC);
+        MONGO_DECLARE_JS_FUNCTION(getApiParameters);
+        MONGO_DECLARE_JS_FUNCTION(_getCompactionTokens);
+        MONGO_DECLARE_JS_FUNCTION(_runCommandImpl);
         MONGO_DECLARE_JS_FUNCTION(_startSession);
+        MONGO_DECLARE_JS_FUNCTION(_setOIDCIdPAuthCallback);
+        MONGO_DECLARE_JS_FUNCTION(_refreshAccessToken);
+        MONGO_DECLARE_JS_FUNCTION(getShellPort);
     };
 
-    static const JSFunctionSpec methods[23];
+    static const JSFunctionSpec methods[32];
 
     static const char* const className;
-    static const unsigned classFlags = JSCLASS_HAS_PRIVATE;
+    static const unsigned classFlags =
+        JSCLASS_HAS_RESERVED_SLOTS(MongoBaseSlotCount) | BaseInfo::finalizeFlag;
 };
 
 /**
@@ -90,6 +131,21 @@ struct MongoExternalInfo : public MongoBase {
 
     static const JSFunctionSpec freeFunctions[4];
 };
+
+class EncryptionCallbacks {
+public:
+    virtual void generateDataKey(JSContext* cx, JS::CallArgs args) = 0;
+    virtual void getDataKeyCollection(JSContext* cx, JS::CallArgs args) = 0;
+    virtual void encrypt(MozJSImplScope* scope, JSContext* cx, JS::CallArgs args) = 0;
+    virtual void decrypt(MozJSImplScope* scope, JSContext* cx, JS::CallArgs args) = 0;
+    virtual void cleanup(JSContext* cx, JS::CallArgs args) = 0;
+    virtual void compact(JSContext* cx, JS::CallArgs args) = 0;
+    virtual void trace(JSTracer* trc) = 0;
+    virtual void getEncryptionOptions(JSContext* cx, JS::CallArgs args) = 0;
+    virtual void _getCompactionTokens(JSContext* cx, JS::CallArgs args) = 0;
+};
+
+void setEncryptionCallbacks(DBClientBase* conn, EncryptionCallbacks* callbacks);
 
 }  // namespace mozjs
 }  // namespace mongo

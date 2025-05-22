@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,9 +29,11 @@
 #pragma once
 
 #include <boost/filesystem.hpp>
+#include <boost/filesystem/path.hpp>
 #include <memory>
 
 #include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
 
 namespace mongo {
 

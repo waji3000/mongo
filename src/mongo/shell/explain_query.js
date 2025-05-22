@@ -4,41 +4,9 @@
 //
 
 var DBExplainQuery = (function() {
-
     //
     // Private methods.
     //
-
-    /**
-     * In 2.6 and before, .explain(), .explain(false), or .explain(<falsy value>) instructed the
-     * shell to reduce the explain verbosity by removing certain fields from the output. This
-     * is implemented here for backwards compatibility.
-     */
-    function removeVerboseFields(obj) {
-        if (typeof(obj) !== "object") {
-            return;
-        }
-
-        delete obj.allPlans;
-        delete obj.oldPlan;
-        delete obj.stats;
-
-        if (typeof(obj.length) === "number") {
-            for (var i = 0; i < obj.length; i++) {
-                removeVerboseFields(obj[i]);
-            }
-        }
-
-        if (obj.shards) {
-            for (var key in obj.shards) {
-                removeVerboseFields(obj.shards[key]);
-            }
-        }
-
-        if (obj.clauses) {
-            removeVerboseFields(obj.clauses);
-        }
-    }
 
     /**
      * Many of the methods of an explain query just pass through to the underlying
@@ -50,28 +18,6 @@ var DBExplainQuery = (function() {
             dbQuery[name].apply(dbQuery, arguments);
             return explainQuery;
         };
-    }
-
-    /**
-     * Where possible, the explain query will be sent to the server as an explain command.
-     * However, if one of the nodes we are talking to (either a standalone or a shard in
-     * a sharded cluster) is of a version that doesn't have the explain command, we will
-     * use this function to fall back on the $explain query option.
-     */
-    function explainWithLegacyQueryOption(explainQuery) {
-        // The wire protocol version indicates that the server does not have the explain
-        // command. Add $explain to the query and send it to the server.
-        var clone = explainQuery._query.clone();
-        clone._addSpecial("$explain", true);
-        var result = clone.next();
-
-        // Remove some fields from the explain if verbosity is
-        // just "queryPlanner".
-        if ("queryPlanner" === explainQuery._verbosity) {
-            removeVerboseFields(result);
-        }
-
-        return Explainable.throwOrReturn(result);
     }
 
     function constructor(query, verbosity) {
@@ -95,6 +41,7 @@ var DBExplainQuery = (function() {
 
         var delegationFuncNames = [
             "addOption",
+            "allowDiskUse",
             "batchSize",
             "collation",
             "comment",
@@ -103,6 +50,7 @@ var DBExplainQuery = (function() {
             "max",
             "maxTimeMS",
             "min",
+            "rawData",
             "readPref",
             "showDiskLoc",
             "skip",
@@ -136,42 +84,32 @@ var DBExplainQuery = (function() {
             // Explain always gets pretty printed.
             this._query._prettyShell = true;
 
-            if (this._mongo.hasExplainCommand()) {
-                // The wire protocol version indicates that the server has the explain command.
-                // Convert this explain query into an explain command, and send the command to
-                // the server.
-                var innerCmd;
-                if (this._isCount) {
-                    // True means to always apply the skip and limit values.
-                    innerCmd = this._query._convertToCountCmd(this._applySkipLimit);
-                } else {
-                    var canAttachReadPref = false;
-                    innerCmd = this._query._convertToCommand(canAttachReadPref);
-                }
-
-                var explainCmd = {explain: innerCmd};
-                explainCmd["verbosity"] = this._verbosity;
-
-                var explainDb = this._query._db;
-
-                if ("$readPreference" in this._query._query) {
-                    var prefObj = this._query._query.$readPreference;
-                    explainCmd = explainDb._attachReadPreferenceToCommand(explainCmd, prefObj);
-                }
-
-                var explainResult =
-                    explainDb.runReadCommand(explainCmd, null, this._query._options);
-
-                if (!explainResult.ok && explainResult.code === ErrorCodes.CommandNotFound) {
-                    // One of the shards doesn't have the explain command available. Retry using
-                    // the legacy $explain format, which should be supported by all shards.
-                    return explainWithLegacyQueryOption(this);
-                }
-
-                return Explainable.throwOrReturn(explainResult);
+            // Convert this explain query into an explain command, and send the command to
+            // the server.
+            var innerCmd;
+            if (this._isCount) {
+                // True means to always apply the skip and limit values.
+                innerCmd = this._query._convertToCountCmd(this._applySkipLimit);
             } else {
-                return explainWithLegacyQueryOption(this);
+                innerCmd = this._query._convertToCommand();
             }
+
+            var explainCmd = {explain: innerCmd};
+            explainCmd["verbosity"] = this._verbosity;
+
+            // If "maxTimeMS" or "$readPreference" are  set on 'innerCmd', they need to be
+            // propagated to the top-level of 'explainCmd' in order to have the intended effect.
+            if (innerCmd.hasOwnProperty("maxTimeMS")) {
+                explainCmd.maxTimeMS = innerCmd.maxTimeMS;
+            }
+            if (innerCmd.hasOwnProperty("$readPreference")) {
+                explainCmd["$readPreference"] = innerCmd["$readPreference"];
+            }
+
+            var explainDb = this._query._db;
+            var explainResult = explainDb.runReadCommand(explainCmd, null, this._query._options);
+
+            return Explainable.throwOrReturn(explainResult);
         };
 
         this.next = function() {

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,25 +27,22 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <boost/move/utility_core.hpp>
+#include <fstream>  // IWYU pragma: keep
 
-#include <boost/filesystem.hpp>
-#include <boost/optional.hpp>
-#include <boost/optional/optional_io.hpp>
-#include <fstream>
-#include <ios>
-#include <ostream>
+#include <boost/optional/optional.hpp>
 
+#include "mongo/base/error_codes.h"
 #include "mongo/bson/bsonobj.h"
-#include "mongo/db/json.h"
+#include "mongo/bson/json.h"
 #include "mongo/db/storage/storage_engine_metadata.h"
 #include "mongo/unittest/temp_dir.h"
 #include "mongo/unittest/unittest.h"
 
 namespace {
 
-using std::string;
 using mongo::unittest::TempDir;
+using std::string;
 
 using namespace mongo;
 
@@ -254,18 +250,6 @@ TEST(StorageEngineMetadataTest, StorageEngineForPath_NoDataFilesExist) {
     }
     auto storageEngine = StorageEngineMetadata::getStorageEngineForPath(tempDir.path());
     ASSERT_FALSE(storageEngine);
-}
-
-// Override the active storage engine with "mmapv1" when the metadata file specifies "mmapv1".
-TEST(StorageEngineMetadataTest, StorageEngineForPath_MetadataFile_mmapv1) {
-    TempDir tempDir("StorageEngineMetadataTest_StorageEngineForPath_MetadataFile_mmapv1");
-    {
-        StorageEngineMetadata metadata(tempDir.path());
-        metadata.setStorageEngine("mmapv1");
-        ASSERT_OK(metadata.write());
-    }
-    ASSERT_EQUALS(std::string("mmapv1"),
-                  StorageEngineMetadata::getStorageEngineForPath(tempDir.path()));
 }
 
 // Override the active storage engine whatever the metadata file specifies.

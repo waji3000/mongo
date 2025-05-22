@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,22 +27,27 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <memory>
+#include <utility>
 
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/string_data.h"
 #include "mongo/bson/timestamp.h"
 #include "mongo/db/keys_collection_client_sharded.h"
 #include "mongo/db/keys_collection_manager.h"
-#include "mongo/db/logical_clock.h"
 #include "mongo/db/logical_time.h"
 #include "mongo/db/logical_time_validator.h"
-#include "mongo/db/server_options.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/s/config/config_server_test_fixture.h"
+#include "mongo/db/service_context_d_test_fixture.h"
 #include "mongo/db/signed_logical_time.h"
 #include "mongo/db/time_proof_service.h"
-#include "mongo/s/catalog/dist_lock_manager_mock.h"
-#include "mongo/s/config_server_test_fixture.h"
-#include "mongo/stdx/memory.h"
+#include "mongo/db/vector_clock_mutable.h"
+#include "mongo/s/grid.h"
 #include "mongo/unittest/unittest.h"
-#include "mongo/util/clock_source_mock.h"
+#include "mongo/util/duration.h"
 
 namespace mongo {
 namespace {
@@ -55,35 +59,26 @@ public:
     }
 
 protected:
+    LogicalTimeValidatorTest() : ConfigServerTestFixture(Options{}.useMockClock(true)) {}
+
     void setUp() override {
         ConfigServerTestFixture::setUp();
 
-        auto clockSource = stdx::make_unique<ClockSourceMock>();
-        operationContext()->getServiceContext()->setFastClockSource(std::move(clockSource));
-        auto catalogClient = stdx::make_unique<KeysCollectionClientSharded>(
+        auto catalogClient = std::make_unique<KeysCollectionClientSharded>(
             Grid::get(operationContext())->catalogClient());
 
         const LogicalTime currentTime(LogicalTime(Timestamp(1, 0)));
-        LogicalClock::get(operationContext())->setClusterTimeFromTrustedSource(currentTime);
+        VectorClockMutable::get(operationContext())->tickClusterTimeTo(currentTime);
 
         _keyManager = std::make_shared<KeysCollectionManager>(
             "dummy", std::move(catalogClient), Seconds(1000));
-        _validator = stdx::make_unique<LogicalTimeValidator>(_keyManager);
+        _validator = std::make_unique<LogicalTimeValidator>(_keyManager);
         _validator->init(operationContext()->getServiceContext());
     }
 
     void tearDown() override {
         _validator->shutDown();
         ConfigServerTestFixture::tearDown();
-    }
-
-    /**
-     * Intentionally create a DistLockManagerMock, even though this is a config serfver test in
-     * order to avoid the lock pinger thread from executing and accessing uninitialized state.
-     */
-    std::unique_ptr<DistLockManager> makeDistLockManager(
-        std::unique_ptr<DistLockCatalog> distLockCatalog) override {
-        return stdx::make_unique<DistLockManagerMock>(std::move(distLockCatalog));
     }
 
     /**

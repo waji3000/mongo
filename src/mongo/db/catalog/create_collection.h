@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,15 +27,26 @@
  *    it in the license file.
  */
 
+#pragma once
+
+#include <boost/none.hpp>
+#include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
 #include <string>
 
 #include "mongo/base/status.h"
 #include "mongo/bson/bsonobj.h"
+#include "mongo/db/catalog/collection_options.h"
+#include "mongo/db/catalog/virtual_collection_options.h"
+#include "mongo/db/commands/create_gen.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/util/uuid.h"
 
 namespace mongo {
-class BSONObj;
+
 class OperationContext;
-class BSONElement;
 
 /**
  * Creates a collection as described in "cmdObj" on the database "dbName". Creates the collection's
@@ -44,20 +54,51 @@ class BSONElement;
  * default _id index.
  */
 Status createCollection(OperationContext* opCtx,
-                        const std::string& dbName,
+                        const DatabaseName& dbName,
                         const BSONObj& cmdObj,
                         const BSONObj& idIndex = BSONObj());
 
 /**
+ * Creates a collection as parsed in 'cmd'.
+ */
+Status createCollection(OperationContext* opCtx, const CreateCommand& cmd);
+
+/**
+ * Creates the collection or the view as described by 'options'.
+ */
+Status createCollection(OperationContext* opCtx,
+                        const NamespaceString& ns,
+                        const CollectionOptions& options,
+                        const boost::optional<BSONObj>& idIndex);
+
+/**
+ * Creates a virtual collection as described by 'vopts'.
+ */
+Status createVirtualCollection(OperationContext* opCtx,
+                               const NamespaceString& ns,
+                               const VirtualCollectionOptions& vopts);
+
+/**
  * As above, but only used by replication to apply operations. This allows recreating collections
- * with specific UUIDs (if ui is given), and in that case will rename any existing collections with
- * the same name and a UUID to a temporary name. If ui is not given, an existing collection will
- * result in an error.
+ * with specific UUIDs (if ui is given). If ui is given and and a collection exists with the same
+ * name, the existing collection will be renamed to a temporary name if allowRenameOutOfTheWay is
+ * true. This function will invariant if there is an existing collection with the same name and
+ * allowRenameOutOfTheWay is false. If ui is not given, an existing collection will result in an
+ * error.
  */
 Status createCollectionForApplyOps(OperationContext* opCtx,
-                                   const std::string& dbName,
-                                   const BSONElement& ui,
+                                   const DatabaseName& dbName,
+                                   const boost::optional<UUID>& ui,
                                    const BSONObj& cmdObj,
-                                   const BSONObj& idIndex = BSONObj());
+                                   bool allowRenameOutOfTheWay,
+                                   const boost::optional<BSONObj>& idIndex = boost::none);
+
+/**
+ * Updates collection options if collections must be clustered by default.
+ */
+CollectionOptions translateOptionsIfClusterByDefault(
+    const NamespaceString& nss,
+    CollectionOptions collectionOptions,
+    const boost::optional<BSONObj>& idIndex = boost::none);
 
 }  // namespace mongo

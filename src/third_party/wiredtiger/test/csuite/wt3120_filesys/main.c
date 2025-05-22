@@ -1,5 +1,5 @@
 /*-
- * Public Domain 2014-2018 MongoDB, Inc.
+ * Public Domain 2014-present MongoDB, Inc.
  * Public Domain 2008-2014 WiredTiger, Inc.
  *
  * This is free and unencumbered software released into the public domain.
@@ -28,72 +28,72 @@
 #include "test_util.h"
 
 /*
- * JIRA ticket reference: WT-3120
- * Test case description: A simple file system extension built into
- * a shared library.
- * Failure mode: Loading the file system and closing the connection
- * is enough to evoke the failure.  This test does slightly more
- * than that.
+ * JIRA ticket reference: WT-3120 Test case description: A simple file system extension built into a
+ * shared library. Failure mode: Loading the file system and closing the connection is enough to
+ * evoke the failure. This test does slightly more than that.
  */
 
-#define	WT_FAIL_FS_LIB	"../../ext/test/fail_fs/.libs/libwiredtiger_fail_fs.so"
-
+/*
+ * main --
+ *     TODO: Add a comment describing this function.
+ */
 int
 main(int argc, char *argv[])
 {
-	TEST_OPTS *opts, _opts;
-	WT_CURSOR *cursor;
-	WT_SESSION *session;
-	char buf[1024];
-	char *kstr, *vstr;
+    TEST_OPTS *opts, _opts;
+    WT_CURSOR *cursor;
+    WT_SESSION *session;
+    char *kstr, *vstr, buf[1024], config[1024];
 
-	opts = &_opts;
-	memset(opts, 0, sizeof(*opts));
-	testutil_check(testutil_parse_opts(argc, argv, opts));
-	testutil_make_work_dir(opts->home);
+    opts = &_opts;
+    memset(opts, 0, sizeof(*opts));
+    testutil_check(testutil_parse_opts(argc, argv, opts));
+    testutil_recreate_dir(opts->home);
 
-	testutil_check(__wt_snprintf(buf, sizeof(buf),
-	    "create,extensions=(" WT_FAIL_FS_LIB "=(early_load=true))"));
-	testutil_check(wiredtiger_open(opts->home, NULL, buf, &opts->conn));
-	testutil_check(
-	    opts->conn->open_session(opts->conn, NULL, NULL, &session));
-	testutil_check(session->create(session, opts->uri,
-	    "key_format=S,value_format=S"));
+#ifndef WT_FAIL_FS_LIB
+#define WT_FAIL_FS_LIB "ext/test/fail_fs/.libs/libwiredtiger_fail_fs.so"
+#endif
+    testutil_build_dir(opts, buf, 1024);
+    testutil_snprintf(config, sizeof(config),
+      "create,extensions=(%s/"
+      "%s=(early_load=true)),statistics=(all),statistics_log=(json,on_close,wait=1)",
+      buf, WT_FAIL_FS_LIB);
+    testutil_check(wiredtiger_open(opts->home, NULL, config, &opts->conn));
+    testutil_check(opts->conn->open_session(opts->conn, NULL, NULL, &session));
+    testutil_check(session->create(session, opts->uri, "key_format=S,value_format=S"));
 
-	testutil_check(session->open_cursor(session, opts->uri, NULL, NULL,
-	    &cursor));
-	cursor->set_key(cursor, "a");
-	cursor->set_value(cursor, "0");
-	testutil_check(cursor->insert(cursor));
-	cursor->set_key(cursor, "b");
-	cursor->set_value(cursor, "1");
-	testutil_check(cursor->insert(cursor));
-	testutil_check(cursor->close(cursor));
-	testutil_check(session->close(session, NULL));
+    testutil_check(session->open_cursor(session, opts->uri, NULL, NULL, &cursor));
+    cursor->set_key(cursor, "a");
+    cursor->set_value(cursor, "0");
+    testutil_check(cursor->insert(cursor));
+    cursor->set_key(cursor, "b");
+    cursor->set_value(cursor, "1");
+    testutil_check(cursor->insert(cursor));
+    testutil_check(cursor->close(cursor));
+    testutil_check(session->close(session, NULL));
 
-	/* Force to disk and re-open. */
-	testutil_check(opts->conn->close(opts->conn, NULL));
-	testutil_check(wiredtiger_open(opts->home, NULL, NULL, &opts->conn));
+    /* Force to disk and re-open. */
+    testutil_check(opts->conn->close(opts->conn, NULL));
+    testutil_check(wiredtiger_open(
+      opts->home, NULL, "statistics=(all),statistics_log=(json,on_close,wait=1)", &opts->conn));
 
-	testutil_check(
-	    opts->conn->open_session(opts->conn, NULL, NULL, &session));
-	testutil_check(session->open_cursor(session, opts->uri, NULL, NULL,
-	    &cursor));
-	testutil_check(cursor->next(cursor));
-	testutil_check(cursor->get_key(cursor, &kstr));
-	testutil_check(cursor->get_value(cursor, &vstr));
-	testutil_assert(strcmp(kstr, "a") == 0);
-	testutil_assert(strcmp(vstr, "0") == 0);
-	testutil_check(cursor->next(cursor));
-	testutil_check(cursor->get_key(cursor, &kstr));
-	testutil_check(cursor->get_value(cursor, &vstr));
-	testutil_assert(strcmp(kstr, "b") == 0);
-	testutil_assert(strcmp(vstr, "1") == 0);
-	testutil_assert(cursor->next(cursor) == WT_NOTFOUND);
-	testutil_check(cursor->close(cursor));
-	testutil_check(session->close(session, NULL));
-	printf("Success\n");
+    testutil_check(opts->conn->open_session(opts->conn, NULL, NULL, &session));
+    testutil_check(session->open_cursor(session, opts->uri, NULL, NULL, &cursor));
+    testutil_check(cursor->next(cursor));
+    testutil_check(cursor->get_key(cursor, &kstr));
+    testutil_check(cursor->get_value(cursor, &vstr));
+    testutil_assert(strcmp(kstr, "a") == 0);
+    testutil_assert(strcmp(vstr, "0") == 0);
+    testutil_check(cursor->next(cursor));
+    testutil_check(cursor->get_key(cursor, &kstr));
+    testutil_check(cursor->get_value(cursor, &vstr));
+    testutil_assert(strcmp(kstr, "b") == 0);
+    testutil_assert(strcmp(vstr, "1") == 0);
+    testutil_assert(cursor->next(cursor) == WT_NOTFOUND);
+    testutil_check(cursor->close(cursor));
+    testutil_check(session->close(session, NULL));
+    printf("Success\n");
 
-	testutil_cleanup(opts);
-	return (EXIT_SUCCESS);
+    testutil_cleanup(opts);
+    return (EXIT_SUCCESS);
 }

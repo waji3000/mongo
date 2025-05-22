@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,82 +27,19 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <boost/smart_ptr/intrusive_ptr.hpp>
 
+#include "mongo/base/status_with.h"
 #include "mongo/bson/json.h"
 #include "mongo/db/matcher/expression_parser.h"
 #include "mongo/db/matcher/schema/expression_internal_schema_allowed_properties.h"
+#include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/expression_context_for_test.h"
 #include "mongo/unittest/death_test.h"
 #include "mongo/unittest/unittest.h"
+#include "mongo/util/intrusive_counter.h"
 
 namespace mongo {
-
-TEST(InternalSchemaAllowedPropertiesMatchExpression, MatchesObjectsWithListedProperties) {
-    auto filter = fromjson(
-        "{$_internalSchemaAllowedProperties: {properties: ['a', 'b'],"
-        "namePlaceholder: 'i', patternProperties: [], otherwise: {i: 0}}}");
-    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    auto expr = MatchExpressionParser::parse(filter, expCtx);
-    ASSERT_OK(expr.getStatus());
-
-    ASSERT_TRUE(expr.getValue()->matchesBSON(fromjson("{a: 1, b: 1}")));
-    ASSERT_TRUE(expr.getValue()->matchesBSON(fromjson("{a: 1}")));
-    ASSERT_TRUE(expr.getValue()->matchesBSON(fromjson("{b: 1}")));
-}
-
-TEST(InternalSchemaAllowedPropertiesMatchExpression, MatchesObjectsWithMatchingPatternProperties) {
-    auto filter = fromjson(R"(
-        {$_internalSchemaAllowedProperties: {
-            properties: [],
-            namePlaceholder: 'i',
-            patternProperties: [
-                {regex: /s$/, expression: {i: {$gt: 0}}},
-                {regex: /[nN]um/, expression: {i: {$type: 'number'}}}
-            ],
-            otherwise: {i: {$type: 'string'}}
-        }})");
-    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    auto expr = MatchExpressionParser::parse(filter, expCtx);
-    ASSERT_OK(expr.getStatus());
-
-    ASSERT_TRUE(expr.getValue()->matchesBSON(fromjson("{puppies: 2, kittens: 3, phoneNum: 1234}")));
-    ASSERT_TRUE(expr.getValue()->matchesBSON(fromjson("{puppies: 2}")));
-    ASSERT_TRUE(expr.getValue()->matchesBSON(fromjson("{phoneNum: 1234}")));
-}
-
-TEST(InternalSchemaAllowedPropertiesMatchExpression,
-     PatternPropertiesStillEnforcedEvenIfFieldListedInProperties) {
-    auto filter = fromjson(
-        "{$_internalSchemaAllowedProperties: {properties: ['a'], namePlaceholder: 'a',"
-        "patternProperties: [{regex: /a/, expression: {a: {$gt: 5}}}], otherwise: {a: 0}}}");
-    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    auto expr = MatchExpressionParser::parse(filter, expCtx);
-    ASSERT_OK(expr.getStatus());
-
-    ASSERT_TRUE(expr.getValue()->matchesBSON(fromjson("{a: 6}")));
-    ASSERT_FALSE(expr.getValue()->matchesBSON(fromjson("{a: 5}")));
-    ASSERT_FALSE(expr.getValue()->matchesBSON(fromjson("{a: 4}")));
-}
-
-TEST(InternalSchemaAllowedPropertiesMatchExpression, OtherwiseEnforcedWhenAppropriate) {
-    auto filter = fromjson(R"(
-        {$_internalSchemaAllowedProperties: {
-            properties: [],
-            namePlaceholder: 'i',
-            patternProperties: [
-                {regex: /s$/, expression: {i: {$gt: 0}}},
-                {regex: /[nN]um/, expression: {i: {$type: 'number'}}}
-            ],
-            otherwise: {i: {$type: 'string'}}
-        }})");
-    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    auto expr = MatchExpressionParser::parse(filter, expCtx);
-    ASSERT_OK(expr.getStatus());
-
-    ASSERT_TRUE(expr.getValue()->matchesBSON(fromjson("{foo: 'bar'}")));
-    ASSERT_FALSE(expr.getValue()->matchesBSON(fromjson("{foo: 7}")));
-}
 
 TEST(InternalSchemaAllowedPropertiesMatchExpression, EquivalentToClone) {
     auto filter = fromjson(
@@ -112,7 +48,7 @@ TEST(InternalSchemaAllowedPropertiesMatchExpression, EquivalentToClone) {
     boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
     auto expr = MatchExpressionParser::parse(filter, expCtx);
     ASSERT_OK(expr.getStatus());
-    auto clone = expr.getValue()->shallowClone();
+    auto clone = expr.getValue()->clone();
     ASSERT_TRUE(expr.getValue()->equivalent(clone.get()));
 
     filter = fromjson(
@@ -120,7 +56,7 @@ TEST(InternalSchemaAllowedPropertiesMatchExpression, EquivalentToClone) {
         "patternProperties: [], otherwise: {}}}");
     expr = MatchExpressionParser::parse(filter, expCtx);
     ASSERT_OK(expr.getStatus());
-    clone = expr.getValue()->shallowClone();
+    clone = expr.getValue()->clone();
     ASSERT_TRUE(expr.getValue()->equivalent(clone.get()));
 }
 
@@ -136,9 +72,9 @@ TEST(InternalSchemaAllowedPropertiesMatchExpression, HasCorrectNumberOfChilden) 
     ASSERT(objMatch.getValue()->getChild(0));
 }
 
-DEATH_TEST(InternalSchemaAllowedPropertiesMatchExpression,
-           GetChildFailsOnIndexLargerThanChildSet,
-           "i < numChildren()") {
+DEATH_TEST_REGEX(InternalSchemaAllowedPropertiesMatchExpression,
+                 GetChildFailsOnIndexLargerThanChildSet,
+                 "Tripwire assertion.*6400212") {
     auto query = fromjson(
         "{$_internalSchemaAllowedProperties: {properties: ['a'], namePlaceholder: 'i',"
         "patternProperties: [{regex: /a/, expression: {i: 1}}], otherwise: {i: 7}}}");
@@ -147,6 +83,7 @@ DEATH_TEST(InternalSchemaAllowedPropertiesMatchExpression,
     ASSERT_OK(objMatch.getStatus());
 
     const size_t numChildren = 2;
-    objMatch.getValue()->getChild(numChildren);
+    ASSERT_EQ(objMatch.getValue()->numChildren(), numChildren);
+    ASSERT_THROWS_CODE(objMatch.getValue()->getChild(numChildren), AssertionException, 6400212);
 }
 }  // namespace mongo

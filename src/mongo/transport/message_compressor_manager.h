@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,22 +29,29 @@
 
 #pragma once
 
-#include "mongo/base/disallow_copying.h"
+#include <boost/optional/optional.hpp>
+#include <memory>
+#include <vector>
+
 #include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/rpc/message.h"
 #include "mongo/transport/message_compressor_base.h"
 #include "mongo/transport/session.h"
-
-#include <vector>
 
 namespace mongo {
 
 class BSONObj;
 class BSONObjBuilder;
 class Message;
+
 class MessageCompressorRegistry;
 
 class MessageCompressorManager {
-    MONGO_DISALLOW_COPYING(MessageCompressorManager);
+    MessageCompressorManager(const MessageCompressorManager&) = delete;
+    MessageCompressorManager& operator=(const MessageCompressorManager&) = delete;
 
 public:
     /*
@@ -63,14 +69,14 @@ public:
     MessageCompressorManager& operator=(MessageCompressorManager&&) = default;
 
     /*
-     * Called by a client constructing an isMaster request. This function will append the result
+     * Called by a client constructing a "hello" request. This function will append the result
      * of _registry->getCompressorNames() to the BSONObjBuilder as a BSON array. If no compressors
      * are configured, it won't append anything.
      */
     void clientBegin(BSONObjBuilder* output);
 
     /*
-     * Called by a client that has received an isMaster response (received after calling
+     * Called by a client that has received a "hello" response (received after calling
      * clientBegin) and wants to finish negotiating compression.
      *
      * This looks for a BSON array called "compression" with the server's list of
@@ -80,16 +86,13 @@ public:
     void clientFinish(const BSONObj& input);
 
     /*
-     * Called by a server that has received an isMaster request.
-     *
-     * This looks for a BSON array called "compression" in input and appends the union of that
-     * array and the result of _registry->getCompressorNames(). The first name in the compression
-     * array in input will be used in subsequent calls to compressMessage
+     * Called by a server that has received a "hello" request.
      *
      * If no compressors are configured that match those requested by the client, then it will
      * not append anything to the BSONObjBuilder output.
      */
-    void serverNegotiate(const BSONObj& input, BSONObjBuilder* output);
+    void serverNegotiate(const boost::optional<std::vector<StringData>>& clientCompressors,
+                         BSONObjBuilder*);
 
     /*
      * Returns a new Message containing the compressed contentx of 'msg'. If compressorId is null,
@@ -125,7 +128,9 @@ public:
     StatusWith<Message> decompressMessage(const Message& msg,
                                           MessageCompressorId* compressorId = nullptr);
 
-    static MessageCompressorManager& forSession(const transport::SessionHandle& session);
+    const std::vector<MessageCompressorBase*>& getNegotiatedCompressors() const;
+
+    static MessageCompressorManager& forSession(const std::shared_ptr<transport::Session>& session);
 
 private:
     std::vector<MessageCompressorBase*> _negotiated;

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,16 +27,29 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+// IWYU pragma: no_include "cxxabi.h"
+#include <system_error>
 
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/db/index/index_constants.h"
 #include "mongo/db/s/migration_destination_manager.h"
-#include "mongo/s/shard_server_test_fixture.h"
+#include "mongo/db/s/shard_server_test_fixture.h"
+#include "mongo/executor/network_test_env.h"
+#include "mongo/executor/remote_command_request.h"
+#include "mongo/s/catalog_cache_test_fixture.h"
 #include "mongo/unittest/unittest.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/net/hostandport.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 namespace {
 
-using unittest::assertGet;
 
 class MigrationDestinationManagerTest : public ShardServerTestFixture {
 protected:
@@ -71,7 +83,7 @@ protected:
 TEST_F(MigrationDestinationManagerTest, CloneDocumentsFromDonorWorksCorrectly) {
     bool ranOnce = false;
 
-    auto fetchBatchFn = [&](OperationContext* opCtx) {
+    auto fetchBatchFn = [&](OperationContext* opCtx, BSONObj* nextBatch) {
         BSONObjBuilder fetchBatchResultBuilder;
 
         if (ranOnce) {
@@ -81,18 +93,23 @@ TEST_F(MigrationDestinationManagerTest, CloneDocumentsFromDonorWorksCorrectly) {
             fetchBatchResultBuilder.append("objects", createDocumentsToCloneArray());
         }
 
-        return fetchBatchResultBuilder.obj();
+        *nextBatch = fetchBatchResultBuilder.obj();
+        return nextBatch->getField("objects").Obj().isEmpty();
     };
 
     std::vector<BSONObj> resultDocs;
 
     auto insertBatchFn = [&](OperationContext* opCtx, BSONObj docs) {
-        for (auto&& docToClone : docs) {
+        auto arr = docs["objects"].Obj();
+        if (arr.isEmpty())
+            return false;
+        for (auto&& docToClone : arr) {
             resultDocs.push_back(docToClone.Obj().getOwned());
         }
+        return true;
     };
 
-    MigrationDestinationManager::cloneDocumentsFromDonor(
+    MigrationDestinationManager::fetchAndApplyBatch(
         operationContext(), insertBatchFn, fetchBatchFn);
 
     std::vector<BSONObj> originalDocs = createDocumentsToClone();
@@ -111,7 +128,7 @@ TEST_F(MigrationDestinationManagerTest, CloneDocumentsFromDonorWorksCorrectly) {
 TEST_F(MigrationDestinationManagerTest, CloneDocumentsThrowsFetchErrors) {
     bool ranOnce = false;
 
-    auto fetchBatchFn = [&](OperationContext* opCtx) {
+    auto fetchBatchFn = [&](OperationContext* opCtx, BSONObj* nextBatch) {
         BSONObjBuilder fetchBatchResultBuilder;
 
         if (ranOnce) {
@@ -121,12 +138,15 @@ TEST_F(MigrationDestinationManagerTest, CloneDocumentsThrowsFetchErrors) {
         ranOnce = true;
         fetchBatchResultBuilder.append("objects", createDocumentsToCloneArray());
 
-        return fetchBatchResultBuilder.obj();
+        *nextBatch = fetchBatchResultBuilder.obj();
+        return nextBatch->getField("objects").Obj().isEmpty();
     };
 
-    auto insertBatchFn = [&](OperationContext* opCtx, BSONObj docs) {};
+    auto insertBatchFn = [&](OperationContext* opCtx, BSONObj docs) {
+        return true;
+    };
 
-    ASSERT_THROWS_CODE_AND_WHAT(MigrationDestinationManager::cloneDocumentsFromDonor(
+    ASSERT_THROWS_CODE_AND_WHAT(MigrationDestinationManager::fetchAndApplyBatch(
                                     operationContext(), insertBatchFn, fetchBatchFn),
                                 DBException,
                                 ErrorCodes::NetworkTimeout,
@@ -136,26 +156,90 @@ TEST_F(MigrationDestinationManagerTest, CloneDocumentsThrowsFetchErrors) {
 // Tests that an exception in the insertion logic will successfully throw an exception on the
 // main thread.
 TEST_F(MigrationDestinationManagerTest, CloneDocumentsCatchesInsertErrors) {
-    auto fetchBatchFn = [&](OperationContext* opCtx) {
+    auto fetchBatchFn = [&](OperationContext* opCtx, BSONObj* nextBatch) {
         BSONObjBuilder fetchBatchResultBuilder;
         fetchBatchResultBuilder.append("objects", createDocumentsToCloneArray());
-        return fetchBatchResultBuilder.obj();
+        *nextBatch = fetchBatchResultBuilder.obj();
+        return nextBatch->getField("objects").Obj().isEmpty();
     };
 
     auto insertBatchFn = [&](OperationContext* opCtx, BSONObj docs) {
         uasserted(ErrorCodes::FailedToParse, "insertion error");
+        return false;
     };
 
     // Since the error is thrown on another thread, the message becomes "operation was interrupted"
     // on the main thread.
 
-    ASSERT_THROWS_CODE_AND_WHAT(MigrationDestinationManager::cloneDocumentsFromDonor(
+    ASSERT_THROWS_CODE_AND_WHAT(MigrationDestinationManager::fetchAndApplyBatch(
                                     operationContext(), insertBatchFn, fetchBatchFn),
                                 DBException,
                                 51008,
                                 "operation was interrupted");
 
     ASSERT_EQ(operationContext()->getKillStatus(), 51008);
+}
+
+using MigrationDestinationManagerNetworkTest = RouterCatalogCacheTestFixture;
+
+// Verifies MigrationDestinationManager::getCollectionOptions() and
+// MigrationDestinationManager::getCollectionIndexes() won't use shard/db versioning without a chunk
+// manager and won't include a read concern without afterClusterTime.
+TEST_F(MigrationDestinationManagerNetworkTest,
+       MigrationDestinationManagerGetIndexesAndCollectionsNoVersionsOrReadConcern) {
+    const NamespaceString nss = NamespaceString::createNamespaceString_forTest("db.foo");
+
+    // Shard nss by _id with chunks [minKey, 0), [0, maxKey] on shards "0" and "1" respectively.
+    // ShardId("1") is the primary shard for the database.
+    auto shards = setupNShards(2);
+    auto cm = loadRoutingTableWithTwoChunksAndTwoShardsImpl(
+        nss, BSON("_id" << 1), boost::optional<std::string>("1"));
+
+    auto future = launchAsync([&] {
+        onCommand([&](const executor::RemoteCommandRequest& request) {
+            ASSERT_EQ(request.cmdObj.firstElementFieldName(), "listCollections"_sd);
+            ASSERT_EQUALS(request.target, HostAndPort("Host0:12345"));
+            ASSERT_FALSE(request.cmdObj.hasField("readConcern"));
+            ASSERT_FALSE(request.cmdObj.hasField("databaseVersion"));
+            ASSERT_BSONOBJ_EQ(request.cmdObj["filter"].Obj(), BSON("name" << nss.coll()));
+
+            const std::vector<BSONObj> colls = {
+                BSON("name" << nss.coll() << "options" << BSONObj() << "info"
+                            << BSON("readOnly" << false << "uuid" << UUID::gen()) << "idIndex"
+                            << BSON("v" << 2 << "key" << BSON("_id" << 1) << "name"
+                                        << IndexConstants::kIdIndexName))};
+
+            std::string listCollectionsNs = str::stream()
+                << nss.db_forTest() << "$cmd.listCollections";
+            return BSON(
+                "ok" << 1 << "cursor"
+                     << BSON("id" << 0LL << "ns" << listCollectionsNs << "firstBatch" << colls));
+        });
+    });
+
+    MigrationDestinationManager::getCollectionOptions(
+        operationContext(), nss, ShardId("0"), boost::none, boost::none);
+
+    future.default_timed_get();
+
+    future = launchAsync([&] {
+        onCommand([&](const executor::RemoteCommandRequest& request) {
+            ASSERT_EQ(request.cmdObj.firstElementFieldName(), "listIndexes"_sd);
+            ASSERT_EQUALS(request.target, HostAndPort("Host0:12345"));
+            ASSERT_FALSE(request.cmdObj.hasField("readConcern"));
+            ASSERT_FALSE(request.cmdObj.hasField("shardVersion"));
+
+            const std::vector<BSONObj> indexes = {BSON(
+                "v" << 2 << "key" << BSON("_id" << 1) << "name" << IndexConstants::kIdIndexName)};
+            return BSON(
+                "ok" << 1 << "cursor"
+                     << BSON("id" << 0LL << "ns" << nss.ns_forTest() << "firstBatch" << indexes));
+        });
+    });
+
+    MigrationDestinationManager::getCollectionIndexes(
+        operationContext(), nss, ShardId("0"), boost::none, boost::none);
+    future.default_timed_get();
 }
 
 }  // namespace

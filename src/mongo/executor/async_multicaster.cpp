@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,29 +27,31 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
-
-#include "mongo/platform/basic.h"
-
-#include "mongo/executor/async_multicaster.h"
 
 #include <memory>
+#include <mutex>
+#include <utility>
 
-#include "mongo/base/status.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/executor/async_multicaster.h"
+#include "mongo/executor/remote_command_request.h"
 #include "mongo/stdx/condition_variable.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/util/assert_util.h"
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
+
+
 namespace mongo {
 namespace executor {
 
-AsyncMulticaster::AsyncMulticaster(executor::TaskExecutor* executor, Options options)
-    : _options(options), _executor(executor) {}
+AsyncMulticaster::AsyncMulticaster(std::shared_ptr<executor::TaskExecutor> executor,
+                                   Options options)
+    : _options(options), _executor(std::move(executor)) {}
 
 std::vector<AsyncMulticaster::Reply> AsyncMulticaster::multicast(
     const std::vector<HostAndPort> servers,
-    const std::string& theDbName,
+    const DatabaseName& theDbName,
     const BSONObj& theCmdObj,
     OperationContext* opCtx,
     Milliseconds timeoutMillis) {

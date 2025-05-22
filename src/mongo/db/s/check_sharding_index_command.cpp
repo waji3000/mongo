@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,33 +27,33 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#include <string>
 
-#include "mongo/platform/basic.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
 
-#include "mongo/bson/bsonelement_comparator.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
-#include "mongo/db/auth/privilege.h"
-#include "mongo/db/bson/dotted_path_support.h"
-#include "mongo/db/catalog/index_catalog.h"
-#include "mongo/db/catalog_raii.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/dbhelpers.h"
-#include "mongo/db/exec/working_set_common.h"
-#include "mongo/db/index/index_descriptor.h"
-#include "mongo/db/index_legacy.h"
-#include "mongo/db/keypattern.h"
-#include "mongo/db/query/internal_plans.h"
-#include "mongo/util/log.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/db_raii.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/s/shard_key_index_util.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/tenant_id.h"
+#include "mongo/util/database_name_util.h"
+#include "mongo/util/namespace_string_util.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 namespace mongo {
-
-using std::string;
-using std::unique_ptr;
-
-namespace dps = ::mongo::dotted_path_support;
-
 namespace {
 
 class CheckShardingIndex : public ErrmsgCommandDeprecated {
@@ -65,7 +64,7 @@ public:
         return "Internal command.\n";
     }
 
-    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+    bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
 
@@ -73,24 +72,30 @@ public:
         return AllowedOnSecondary::kNever;
     }
 
-    virtual void addRequiredPrivileges(const std::string& dbname,
-                                       const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) const {
-        ActionSet actions;
-        actions.addAction(ActionType::find);
-        out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
+    Status checkAuthForOperation(OperationContext* opCtx,
+                                 const DatabaseName& dbName,
+                                 const BSONObj& cmdObj) const override {
+        auto* as = AuthorizationSession::get(opCtx->getClient());
+        if (!as->isAuthorizedForActionsOnResource(parseResourcePattern(dbName, cmdObj),
+                                                  ActionType::find)) {
+            return {ErrorCodes::Unauthorized, "unauthorized"};
+        }
+
+        return Status::OK();
     }
 
-    virtual std::string parseNs(const std::string& dbname, const BSONObj& cmdObj) const {
-        return CommandHelpers::parseNsFullyQualified(cmdObj);
+    NamespaceString parseNs(const DatabaseName& dbName, const BSONObj& cmdObj) const override {
+        return NamespaceStringUtil::deserialize(dbName.tenantId(),
+                                                CommandHelpers::parseNsFullyQualified(cmdObj),
+                                                SerializationContext::stateDefault());
     }
 
     bool errmsgRun(OperationContext* opCtx,
-                   const std::string& dbname,
+                   const DatabaseName& dbName,
                    const BSONObj& jsobj,
                    std::string& errmsg,
-                   BSONObjBuilder& result) {
-        const NamespaceString nss = NamespaceString(parseNs(dbname, jsobj));
+                   BSONObjBuilder& result) override {
+        const NamespaceString nss(parseNs(dbName, jsobj));
 
         BSONObj keyPattern = jsobj.getObjectField("keyPattern");
         if (keyPattern.isEmpty()) {
@@ -98,119 +103,30 @@ public:
             return false;
         }
 
-        if (keyPattern.nFields() == 1 && str::equals("_id", keyPattern.firstElementFieldName())) {
+        if (keyPattern.nFields() == 1 && keyPattern.firstElementFieldNameStringData() == "_id") {
             result.appendBool("idskip", true);
             return true;
         }
 
-        BSONObj min = jsobj.getObjectField("min");
-        BSONObj max = jsobj.getObjectField("max");
-        if (min.isEmpty() != max.isEmpty()) {
-            errmsg = "either provide both min and max or leave both empty";
-            return false;
-        }
-
-        AutoGetCollection autoColl(opCtx, nss, MODE_IS);
-
-        Collection* const collection = autoColl.getCollection();
+        AutoGetCollectionForReadCommand collection(opCtx, nss);
         if (!collection) {
             errmsg = "ns not found";
             return false;
         }
 
-        IndexDescriptor* idx =
-            collection->getIndexCatalog()->findShardKeyPrefixedIndex(opCtx,
-                                                                     keyPattern,
-                                                                     true);  // requireSingleKey
-        if (idx == NULL) {
-            errmsg = "couldn't find valid index for shard key";
-            return false;
-        }
-        // extend min to get (min, MinKey, MinKey, ....)
-        KeyPattern kp(idx->keyPattern());
-        min = Helpers::toKeyFormat(kp.extendRangeBound(min, false));
-        if (max.isEmpty()) {
-            // if max not specified, make it (MaxKey, Maxkey, MaxKey...)
-            max = Helpers::toKeyFormat(kp.extendRangeBound(max, true));
-        } else {
-            // otherwise make it (max,MinKey,MinKey...) so that bound is non-inclusive
-            max = Helpers::toKeyFormat(kp.extendRangeBound(max, false));
-        }
+        std::string tmpErrMsg = "couldn't find valid index for shard key";
+        const auto shardKeyIdx = findShardKeyPrefixedIndex(opCtx,
+                                                           *collection,
+                                                           keyPattern,
+                                                           /*requireSingleKey=*/true,
+                                                           &tmpErrMsg);
 
-        auto exec = InternalPlanner::indexScan(opCtx,
-                                               collection,
-                                               idx,
-                                               min,
-                                               max,
-                                               BoundInclusion::kIncludeStartKeyOnly,
-                                               PlanExecutor::YIELD_AUTO,
-                                               InternalPlanner::FORWARD);
-
-        // Find the 'missingField' value used to represent a missing document field in a key of
-        // this index.
-        // NOTE A local copy of 'missingField' is made because indices may be
-        // invalidated during a db lock yield.
-        BSONObj missingFieldObj = IndexLegacy::getMissingField(collection, idx->infoObj());
-        BSONElement missingField = missingFieldObj.firstElement();
-
-        // for now, the only check is that all shard keys are filled
-        // a 'missingField' valued index key is ok if the field is present in the document,
-        // TODO if $exist for nulls were picking the index, it could be used instead efficiently
-        int keyPatternLength = keyPattern.nFields();
-
-        RecordId loc;
-        BSONObj currKey;
-        PlanExecutor::ExecState state;
-        while (PlanExecutor::ADVANCED == (state = exec->getNext(&currKey, &loc))) {
-            // check that current key contains non missing elements for all fields in keyPattern
-            BSONObjIterator i(currKey);
-            for (int k = 0; k < keyPatternLength; k++) {
-                if (!i.more()) {
-                    errmsg = str::stream() << "index key " << currKey << " too short for pattern "
-                                           << keyPattern;
-                    return false;
-                }
-                BSONElement currKeyElt = i.next();
-
-                const StringData::ComparatorInterface* stringComparator = nullptr;
-                BSONElementComparator eltCmp(BSONElementComparator::FieldNamesMode::kIgnore,
-                                             stringComparator);
-                if (!currKeyElt.eoo() && eltCmp.evaluate(currKeyElt != missingField))
-                    continue;
-
-                // This is a fetch, but it's OK.  The underlying code won't throw a page fault
-                // exception.
-                BSONObj obj = collection->docFor(opCtx, loc).value();
-                BSONObjIterator j(keyPattern);
-                BSONElement real;
-                for (int x = 0; x <= k; x++)
-                    real = j.next();
-
-                real = dps::extractElementAtPath(obj, real.fieldName());
-
-                if (real.type())
-                    continue;
-
-                const string msg = str::stream()
-                    << "There are documents which have missing or incomplete shard key fields ("
-                    << redact(currKey) << "). Please ensure that all documents in the collection "
-                                          "include all fields from the shard key.";
-                log() << "checkShardingIndex for '" << nss.toString() << "' failed: " << msg;
-
-                errmsg = msg;
-                return false;
-            }
-        }
-
-        if (PlanExecutor::DEAD == state || PlanExecutor::FAILURE == state) {
-            uassertStatusOK(WorkingSetCommon::getMemberObjectStatus(currKey).withContext(
-                "Executor error while checking sharding index"));
-        }
+        uassert(ErrorCodes::InvalidOptions, str::stream() << tmpErrMsg, shardKeyIdx);
 
         return true;
     }
-
-} cmdCheckShardingIndex;
+};
+MONGO_REGISTER_COMMAND(CheckShardingIndex).forShard();
 
 }  // namespace
 }  // namespace mongo

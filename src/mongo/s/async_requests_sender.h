@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,17 +29,29 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
 #include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+#include <cstddef>
+#include <memory>
+#include <string>
+#include <utility>
 #include <vector>
 
-#include "mongo/base/disallow_copying.h"
+#include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/client/read_preference.h"
+#include "mongo/db/baton.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/resource_yielder.h"
+#include "mongo/db/shard_id.h"
 #include "mongo/executor/remote_command_response.h"
+#include "mongo/executor/scoped_task_executor.h"
 #include "mongo/executor/task_executor.h"
 #include "mongo/s/client/shard.h"
-#include "mongo/s/shard_id.h"
+#include "mongo/util/future.h"
 #include "mongo/util/interruptible.h"
 #include "mongo/util/net/hostandport.h"
 #include "mongo/util/producer_consumer_queue.h"
@@ -74,80 +85,96 @@ namespace mongo {
  *         continue;
  *
  *         // If partial results are not tolerable and you don't care about dispatched requests,
- *         // safe to destroy the ARS. It will automatically cancel pending I/O and wait for the
- *         // outstanding callbacks to complete on destruction.
+ *         // safe to destroy the ARS. It will automatically cancel pending I/O.
  *     }
  * }
  *
  * Does not throw exceptions.
  */
 class AsyncRequestsSender {
-    MONGO_DISALLOW_COPYING(AsyncRequestsSender);
+    AsyncRequestsSender(const AsyncRequestsSender&) = delete;
+    AsyncRequestsSender& operator=(const AsyncRequestsSender&) = delete;
 
 public:
     /**
      * Defines a request to a remote shard that can be run by the ARS.
      */
     struct Request {
-        Request(ShardId shardId, BSONObj cmdObj);
+        Request(ShardId shardId, BSONObj cmdObj, std::shared_ptr<Shard> shard = nullptr);
 
         // ShardId of the shard to which the command will be sent.
         const ShardId shardId;
 
         // The command object to send to the remote host.
         const BSONObj cmdObj;
+
+        // Optional. The shard registry type to send the request to. Cleared for retries.
+        const std::shared_ptr<Shard> shard;
     };
 
     /**
      * Defines a response for a request to a remote shard.
      */
     struct Response {
-        // Constructor for a response that was successfully received.
-        Response(ShardId shardId, executor::RemoteCommandResponse response, HostAndPort hp);
-
-        // Constructor that specifies the reason the response was not successfully received.
-        Response(ShardId shardId, Status status, boost::optional<HostAndPort> hp);
-
         // The shard to which the request was sent.
         ShardId shardId;
 
         // The response or error from the remote.
+        //
+        // The mapping between the RemoteCommandResponse returned by the task executor and this
+        // field is fairly specific:
+        //
+        // Status is set when:
+        //   * An error is returned when scheduling the task
+        //   * A status is returned in the response.status field
+        //
+        // The value is set when:
+        //   * There are no errors
+        //   * Errors exist only remotely (I.e. by reading response.data for ok:0 or write errors
+        //
+        // I.e. if a value is set, swResponse.getValue().status.isOK()
         StatusWith<executor::RemoteCommandResponse> swResponse;
 
         // The exact host on which the remote command was run. Is unset if the shard could not be
         // found or no shard hosts matching the readPreference could be found.
         boost::optional<HostAndPort> shardHostAndPort;
+
+        /**
+         * Returns the effective status of the response sent by the server.
+         */
+        static Status getEffectiveStatus(const AsyncRequestsSender::Response& response);
     };
+
+    typedef stdx::unordered_map<ShardId, HostAndPort> ShardHostMap;
 
     /**
      * Constructs a new AsyncRequestsSender. The OperationContext* and TaskExecutor* must remain
      * valid for the lifetime of the ARS.
+     *
+     * The designatedHostsMap overrides the read preference for the shards specified, and requires
+     * those shards target only the host in the map.
      */
     AsyncRequestsSender(OperationContext* opCtx,
-                        executor::TaskExecutor* executor,
-                        StringData dbName,
+                        std::shared_ptr<executor::TaskExecutor> executor,
+                        const DatabaseName& dbName,
                         const std::vector<AsyncRequestsSender::Request>& requests,
                         const ReadPreferenceSetting& readPreference,
-                        Shard::RetryPolicy retryPolicy);
-
-    /**
-     * Ensures pending network I/O for any outstanding requests has been canceled and waits for
-     * outstanding callbacks to complete.
-     */
-    ~AsyncRequestsSender();
+                        Shard::RetryPolicy retryPolicy,
+                        std::unique_ptr<ResourceYielder> resourceYielder,
+                        const ShardHostMap& designatedHostsMap);
 
     /**
      * Returns true if responses for all requests have been returned via next().
      */
-    bool done();
+    bool done() const noexcept;
 
     /**
      * Returns the next available response or error.
      *
      * If the operation is interrupted, the status of some responses may be CallbackCanceled.
      *
-     * If neither cancelPendingRequests() nor stopRetrying() have been called, schedules retries for
-     * any remotes that have had a retriable error and have not exhausted their retries.
+     * If stopRetrying() has not been called, schedules retries for any remotes that have had a
+     * retriable error and have not exhausted their retries.
      *
      * Note: Must only be called from one thread at a time, and invalid to call if done() is true.
      */
@@ -159,146 +186,125 @@ public:
      * Use this if you no longer care about getting success responses, but need to do cleanup based
      * on responses for requests that have already been dispatched.
      */
-    void stopRetrying();
+    void stopRetrying() noexcept;
 
 private:
     /**
      * We instantiate one of these per remote host.
      */
-    struct RemoteData {
+    class RemoteData {
+    public:
+        using RemoteCommandCallbackArgs = executor::TaskExecutor::RemoteCommandCallbackArgs;
+
         /**
          * Creates a new uninitialized remote state with a command to send.
          */
-        RemoteData(ShardId shardId, BSONObj cmdObj);
+        RemoteData(AsyncRequestsSender* ars,
+                   ShardId shardId,
+                   BSONObj cmdObj,
+                   HostAndPort designatedHost,
+                   std::shared_ptr<Shard> shard = nullptr);
 
         /**
-         * Given a read preference, selects a host on which the command should be run.
+         * Returns a SemiFuture containing a shard object associated with this remote.
+         *
+         * This will return a SemiFuture with a ShardNotFound error status in case the shard is not
+         * found.
+         *
+         * Additionally this call can trigger a refresh of the ShardRegistry so it could possibly
+         * return other network error status related to the refresh.
          */
-        Status resolveShardIdToHostAndPort(AsyncRequestsSender* ars,
-                                           const ReadPreferenceSetting& readPref);
+        SemiFuture<std::shared_ptr<Shard>> getShard();
 
         /**
-         * Returns the Shard object associated with this remote.
+         * Returns true if we've already queued a response from the remote.
          */
-        std::shared_ptr<Shard> getShard();
+        explicit operator bool() const {
+            return _done;
+        }
+
+        /**
+         * Extracts a failed response from the remote, given an interruption status.
+         */
+        Response makeFailedResponse(Status status) && {
+            return {std::move(_shardId), std::move(status), std::move(_shardHostAndPort)};
+        }
+
+        /**
+         * Executes the request for the given shard, this includes any necessary retries and ends
+         * with a Response getting written to the response queue.
+         *
+         * This is implemented by calling scheduleRequest, which handles retries internally in its
+         * future chain.
+         */
+        void executeRequest();
+
+        /**
+         * Executes a single attempt to:
+         *
+         * 1. resolveShardIdToHostAndPort
+         * 2. scheduleRemoteCommand
+         * 3. handlResponse
+         *
+         * for the given shard.
+         */
+        SemiFuture<RemoteCommandCallbackArgs> scheduleRequest();
+
+        /**
+         * Given a read preference, selects a lists of hosts on which the command can run.
+         */
+        SemiFuture<std::vector<HostAndPort>> resolveShardIdToHostAndPorts(
+            const ReadPreferenceSetting& readPref);
+
+        /**
+         * Schedules the remote command on the ARS's TaskExecutor
+         */
+        SemiFuture<RemoteCommandCallbackArgs> scheduleRemoteCommand(
+            std::vector<HostAndPort>&& hostAndPort);
+
+        /**
+         * Handles the remote response
+         */
+        SemiFuture<RemoteCommandCallbackArgs> handleResponse(RemoteCommandCallbackArgs&& rcr);
+
+    private:
+        bool _done = false;
+
+        AsyncRequestsSender* const _ars;
 
         // ShardId of the shard to which the command will be sent.
-        ShardId shardId;
+        ShardId _shardId;
 
         // The command object to send to the remote host.
-        BSONObj cmdObj;
+        BSONObj _cmdObj;
 
-        // The response or error from the remote. Is unset until a response or error has been
-        // received.
-        boost::optional<StatusWith<executor::RemoteCommandResponse>> swResponse;
+        // The designated host and port to send the command to, if provided.  Otherwise is empty().
+        HostAndPort _designatedHostAndPort;
+
+        // Optional shard from shard registry for given shard id.
+        std::shared_ptr<Shard> _shard;
 
         // The exact host on which the remote command was run. Is unset until a request has been
         // sent.
-        boost::optional<HostAndPort> shardHostAndPort;
+        boost::optional<HostAndPort> _shardHostAndPort;
 
         // The number of times we've retried sending the command to this remote.
-        int retryCount = 0;
+        int _retryCount = 0;
 
-        // The callback handle to an outstanding request for this remote.
-        executor::TaskExecutor::CallbackHandle cbHandle;
-
-        // Whether this remote's result has been returned.
-        bool done = false;
+        // Record the last writeConcernError received during any retry attempt and return this
+        // response if a further retry attempt results in an error signaling a write was not
+        // performed.
+        boost::optional<RemoteCommandCallbackArgs> _writeConcernErrorRCR;
     };
-
-    /**
-     * Job for _makeProgress. We use a producer consumer queue to coordinate with TaskExecutors
-     * off thread, and this wraps up the arguments for that call.
-     */
-    struct Job {
-        executor::TaskExecutor::RemoteCommandCallbackArgs cbData;
-        size_t remoteIndex;
-    };
-
-    /**
-     * We have to make sure to detach the baton if we throw in construction.  We also need a baton
-     * that lives longer than this type (because it can end up in callbacks that won't actually
-     * modify it).
-     *
-     * TODO: work out actual lifetime semantics for a baton.  For now, leaving this as a wort in ARS
-     */
-    class BatonDetacher {
-    public:
-        explicit BatonDetacher(OperationContext* opCtx);
-        ~BatonDetacher();
-
-        transport::Baton& operator*() const {
-            return *_baton;
-        }
-
-        transport::Baton* operator->() const noexcept {
-            return _baton.get();
-        }
-
-        operator transport::BatonHandle() const {
-            return _baton;
-        }
-
-        explicit operator bool() const noexcept {
-            return static_cast<bool>(_baton);
-        }
-
-    private:
-        transport::BatonHandle _baton;
-    };
-
-    /**
-     * Cancels all outstanding requests on the TaskExecutor and sets the _stopRetrying flag.
-     */
-    void _cancelPendingRequests();
-
-    /**
-     * If _stopRetrying is false, schedules retries for remotes that have had a retriable error.
-     *
-     * If any remote has successfully received a response, returns a Response for it.
-     * If any remote has an error response that can't be retried, returns a Response for it.
-     * Otherwise, returns boost::none.
-     */
-    boost::optional<Response> _ready();
-
-    /**
-     * For each remote that had a response, checks if it had a retriable error, and clears its
-     * response if so.
-     *
-     * For each remote without a response or pending request, schedules the remote request.
-     *
-     * On failure to schedule a request, pushes a noop job to the response queue.
-     */
-    void _scheduleRequests();
-
-    /**
-     * Helper to schedule a command to a remote.
-     *
-     * The 'remoteIndex' gives the position of the remote node from which we are retrieving the
-     * batch in '_remotes'.
-     *
-     * Returns success if the command was scheduled successfully.
-     */
-    Status _scheduleRequest(size_t remoteIndex);
-
-    /**
-     * Waits for forward progress in gathering responses from a remote.
-     *
-     * Stores the response or error in the remote.
-     */
-    void _makeProgress();
 
     OperationContext* _opCtx;
-
-    executor::TaskExecutor* _executor;
-    BatonDetacher _baton;
 
     // The metadata obj to pass along with the command remote. Used to indicate that the command is
     // ok to run on secondaries.
     BSONObj _metadataObj;
 
     // The database against which the commands are run.
-    const std::string _db;
+    const DatabaseName _db;
 
     // The readPreference to use for all requests.
     ReadPreferenceSetting _readPreference;
@@ -306,25 +312,40 @@ private:
     // The policy to use when deciding whether to retry on an error.
     Shard::RetryPolicy _retryPolicy;
 
-    // Is set to a non-OK status if the client operation is interrupted.
-    // When waiting for a remote to be ready, we only check for interrupt if the _interruptStatus
-    // has not already been set to an error (so we can wait for callbacks for (canceled) outstanding
-    // requests to complete after interrupt).
-    // When processing responses from remotes, if _interruptStatus is non-OK and the response status
-    // is CallbackCanceled, we promote the response status to the _interruptStatus.
-    Status _interruptStatus = Status::OK();
-
     // Data tracking the state of our communication with each of the remote nodes.
     std::vector<RemoteData> _remotes;
 
-    // Thread safe queue which collects responses from the task executor for execution in next()
-    //
-    // The queue supports unset jobs for a signal to wake up and check for failure
-    MultiProducerSingleConsumerQueue<boost::optional<Job>>::Pipe _responseQueue;
+    // Number of remotes we haven't returned final results from.
+    size_t _remotesLeft;
+
+    // Queue of responses.  We don't actually take advantage of the thread safety of the queue, but
+    // instead use it to collect results while waiting on a condvar (which allows us to use our
+    // underlying baton).
+    SingleProducerSingleConsumerQueue<Response> _responseQueue;
 
     // Used to determine if the ARS should attempt to retry any requests. Is set to true when
-    // stopRetrying() or cancelPendingRequests() is called.
+    // stopRetrying() is called.
     bool _stopRetrying = false;
+
+    Status _interruptStatus = Status::OK();
+
+    // Set to true if unyielding fails, even after a successful remote response.
+    bool _failedUnyield = false;
+
+    // NOTE: it's important that these two members go last in this class.  That ensures that we:
+    // 1. cancel/ensure no more callbacks run which touch the ARS
+    // 2. cancel any outstanding work in the task executor
+
+    // Scoped task executor which handles clean up of any handles after the ARS goes out of scope
+    executor::ScopedTaskExecutor _subExecutor;
+
+    // Scoped baton holder which ensures any callbacks which touch this ARS are called with a
+    // not-okay status (or not run, in the case of ExecutorFuture continuations).
+    Baton::SubBatonHolder _subBaton;
+
+    // Interface for yielding and unyielding resources while waiting on results from the network.
+    // Null if yielding isn't necessary.
+    std::unique_ptr<ResourceYielder> _resourceYielder;
 };
 
 }  // namespace mongo

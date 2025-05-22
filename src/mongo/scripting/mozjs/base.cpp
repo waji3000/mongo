@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,7 +27,14 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <js/RootingAPI.h>
+
+#include <js/CallArgs.h>
+#include <js/Class.h>
+#include <js/Id.h>
+#include <js/PropertySpec.h>
+#include <js/TracingAPI.h>
+#include <js/TypeDecls.h>
 
 #include "mongo/scripting/mozjs/base.h"
 
@@ -52,17 +58,14 @@ void BaseInfo::delProperty(JSContext* cx,
                            JS::ObjectOpResult& result) {}
 void BaseInfo::enumerate(JSContext* cx,
                          JS::HandleObject obj,
-                         JS::AutoIdVector& properties,
+                         JS::MutableHandleIdVector properties,
                          bool enumerableOnly) {}
-void BaseInfo::finalize(JSFreeOp* fop, JSObject* obj) {}
+void BaseInfo::finalize(JS::GCContext* gcCtx, JSObject* obj) {}
 void BaseInfo::getProperty(JSContext* cx,
                            JS::HandleObject obj,
                            JS::HandleId id,
+                           JS::HandleValue receiver,
                            JS::MutableHandleValue vp) {}
-void BaseInfo::hasInstance(JSContext* cx,
-                           JS::HandleObject obj,
-                           JS::MutableHandleValue vp,
-                           bool* bp) {}
 bool BaseInfo::mayResolve(const JSAtomState& names, jsid id, JSObject* maybeObj) {
     return false;
 }
@@ -71,8 +74,11 @@ void BaseInfo::resolve(JSContext* cx, JS::HandleObject obj, JS::HandleId id, boo
 void BaseInfo::setProperty(JSContext* cx,
                            JS::HandleObject obj,
                            JS::HandleId id,
-                           JS::MutableHandleValue vp,
+                           JS::HandleValue v,
+                           JS::HandleValue receiver,
                            JS::ObjectOpResult& result) {}
+
+void BaseInfo::trace(JSTracer* trc, JSObject* obj) {}
 
 }  // namespace mozjs
 }  // namespace mongo

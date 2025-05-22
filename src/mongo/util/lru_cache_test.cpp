@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,19 +27,31 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
 
+#include <absl/container/node_hash_map.h>
+#include <absl/hash/hash.h>
+#include <array>
+#include <boost/move/utility_core.hpp>
+#include <fmt/format.h>
+#include <functional>
 #include <iostream>
+#include <iterator>
+#include <memory>
 #include <type_traits>
 #include <utility>
 
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/string_data.h"
+#include "mongo/logv2/log.h"
 #include "mongo/stdx/type_traits.h"
 #include "mongo/unittest/unittest.h"
-#include "mongo/util/assert_util.h"
 #include "mongo/util/lru_cache.h"
 
-using namespace mongo;
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
+
+namespace mongo {
 namespace {
 
 /**
@@ -141,11 +152,11 @@ void assertNotInCache(const LRUCache<K, V>& cache, const K& key) {
     assertEquals(cache.cfind(key), cache.cend());
 }
 
-const std::array<int, 7> kTestSizes{1, 2, 3, 4, 5, 10, 1000};
-using SizedTest = stdx::function<void(int)>;
+const std::array<int, 7> kTestSizes{1, 2, 3, 4, 5, 10, 100};
+using SizedTest = std::function<void(int)>;
 void runWithDifferentSizes(SizedTest test) {
     for (auto size : kTestSizes) {
-        mongo::unittest::log() << "\t\tTesting cache size of " << size;
+        LOGV2(24152, "Testing cache size of {size}", "size"_attr = size);
         test(size);
     }
 }
@@ -193,7 +204,7 @@ TEST(LRUCacheTest, SizeZeroCache) {
 
     // When elements are added to a zero-size cache, instant eviction.
     auto evicted = cache.add(1, 2);
-    assertEquals(*evicted, 2);
+    assertEquals(evicted->second, 2);
     assertEquals(cache.size(), size_t(0));
     assertNotInCache(cache, 1);
 
@@ -215,7 +226,16 @@ TEST(LRUCacheTest, SizeZeroCache) {
 
 // Test a very large cache size
 TEST(LRUCacheTest, StressTest) {
+// If iterator debugging is on the LRU Cache destructor may be O(n^2). Reduce the max iteration size
+// to handle this.
+#if _MSC_VER && _ITERATOR_DEBUG_LEVEL >= 2
+    const int maxSize = 10000;
+    std::array<int, 3> sample{1, 34, 400};
+#else
     const int maxSize = 1000000;
+    std::array<int, 5> sample{1, 34, 400, 12345, 999999};
+#endif
+
     LRUCache<int, int> cache(maxSize);
 
     // Fill up the cache
@@ -227,7 +247,6 @@ TEST(LRUCacheTest, StressTest) {
     assertEquals(cache.size(), size_t(maxSize));
 
     // Perform some basic functions on the cache
-    std::array<int, 5> sample{1, 34, 400, 12345, 999999};
     for (auto s : sample) {
         auto found = cache.find(s);
         assertEquals(found->second, s);
@@ -246,7 +265,7 @@ TEST(LRUCacheTest, StressTest) {
     // Try causing an eviction
     auto evicted = cache.add(maxSize + 1, maxSize + 1);
     assertEquals(cache.size(), size_t(maxSize));
-    assertEquals(*evicted, 0);
+    assertEquals(evicted->second, 0);
     assertInCache(cache, maxSize + 1, maxSize + 1);
     assertNotInCache(cache, 0);
 }
@@ -270,7 +289,6 @@ TEST(LRUCacheTest, SizeOneCache) {
 // Test cache eviction when the cache is full and new elements are added.
 TEST(LRUCacheTest, EvictionTest) {
     runWithDifferentSizes([](int maxSize) {
-
         // Test eviction for any permutation of the original cache
         for (int i = 0; i < maxSize; i++) {
             LRUCache<int, int> cache(maxSize);
@@ -291,9 +309,9 @@ TEST(LRUCacheTest, EvictionTest) {
             // Adding another entry will evict the least-recently used one
             auto evicted = cache.add(maxSize, maxSize);
             assertEquals(cache.size(), size_t(maxSize));
-            assertEquals(*evicted, i);
+            assertEquals(evicted->second, i);
             assertInCache(cache, maxSize, maxSize);
-            assertNotInCache(cache, *evicted);
+            assertNotInCache(cache, evicted->second);
         }
     });
 }
@@ -302,7 +320,6 @@ TEST(LRUCacheTest, EvictionTest) {
 // from any original position in the cache.
 TEST(LRUCacheTest, PromoteTest) {
     runWithDifferentSizes([](int maxSize) {
-
         // Test promotion for any position in the original cache
         // i <= maxSize here, so we test promotion of cache.end(),
         // and of a non-existent key.
@@ -347,7 +364,6 @@ TEST(LRUCacheTest, PromoteTest) {
 // the existing entry and gets promoted properly
 TEST(LRUCacheTest, ReplaceKeyTest) {
     runWithDifferentSizes([](int maxSize) {
-
         // Test replacement for any position in the original cache
         for (int i = 0; i < maxSize; i++) {
             LRUCache<int, int> cache(maxSize);
@@ -371,7 +387,6 @@ TEST(LRUCacheTest, ReplaceKeyTest) {
 // the existing entry and gets promoted properly
 TEST(LRUCacheTest, EraseByKey) {
     runWithDifferentSizes([](int maxSize) {
-
         // Test replacement for any position in the original cache
         // i <= maxSize so we erase a non-existent element
         for (int i = 0; i <= maxSize; i++) {
@@ -409,7 +424,6 @@ TEST(LRUCacheTest, EraseByKey) {
 // Test removal of elements by iterator from the cache
 TEST(LRUCacheTest, EraseByIterator) {
     runWithDifferentSizes([](int maxSize) {
-
         // Test replacement for any position in the original cache
         for (int i = 0; i < maxSize; i++) {
             LRUCache<int, int> cache(maxSize);
@@ -572,7 +586,7 @@ TEST(LRUCacheTest, CustomHashAndEqualityTypeTest) {
     // this should replace the original value of 20 with 0.
     FunkyKeyType sortaEqual(10, 0);
     assertEquals(cache.size(), size_t(1));
-    auto replaced = cache.add(sortaEqual, sortaEqual._b);
+    cache.add(sortaEqual, sortaEqual._b);
     assertEquals(cache.size(), size_t(1));
     found = cache.find(key);
     assertNotEquals(found, cache.end());
@@ -601,3 +615,4 @@ TEST(LRUCacheTest, CountTest) {
 }
 
 }  // namespace
+}  // namespace mongo

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,12 +29,24 @@
 
 #pragma once
 
+#include <boost/optional/optional.hpp>
 #include <memory>
 
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/admission/execution_admission_context.h"
 #include "mongo/db/exec/collection_scan_common.h"
+#include "mongo/db/exec/plan_stage.h"
+#include "mongo/db/exec/plan_stats.h"
 #include "mongo/db/exec/requires_collection_stage.h"
-#include "mongo/db/matcher/expression_leaf.h"
+#include "mongo/db/exec/working_set.h"
+#include "mongo/db/matcher/expression.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/query/oplog_wait_config.h"
+#include "mongo/db/query/plan_executor.h"
+#include "mongo/db/query/stage_types.h"
 #include "mongo/db/record_id.h"
+#include "mongo/db/storage/record_store.h"
 
 namespace mongo {
 
@@ -52,16 +63,14 @@ class OperationContext;
  */
 class CollectionScan final : public RequiresCollectionStage {
 public:
-    static const char* kStageType;
-
-    CollectionScan(OperationContext* opCtx,
-                   const Collection* collection,
+    CollectionScan(ExpressionContext* expCtx,
+                   VariantCollectionPtrOrAcquisition collection,
                    const CollectionScanParams& params,
                    WorkingSet* workingSet,
                    const MatchExpression* filter);
 
     StageState doWork(WorkingSetID* out) final;
-    bool isEOF() final;
+    bool isEOF() const final;
 
     void doDetachFromOperationContext() final;
     void doReattachToOperationContext() final;
@@ -74,14 +83,32 @@ public:
         return _latestOplogEntryTimestamp;
     }
 
+    BSONObj getPostBatchResumeToken() const;
+
     std::unique_ptr<PlanStageStats> getStats() final;
 
     const SpecificStats* getSpecificStats() const final;
 
-protected:
-    void saveState(RequiresCollTag) final;
+    CollectionScanParams::Direction getDirection() const {
+        return _params.direction;
+    }
 
-    void restoreState(RequiresCollTag) final;
+    const CollectionScanParams& params() const {
+        return _params;
+    }
+
+    bool initializedCursor() const {
+        return _cursor != nullptr;
+    }
+
+    OplogWaitConfig* getOplogWaitConfig() {
+        return _oplogWaitConfig ? &(*_oplogWaitConfig) : nullptr;
+    }
+
+protected:
+    void doSaveStateRequiresCollection() final;
+
+    void doRestoreStateRequiresCollection() final;
 
 private:
     /**
@@ -91,11 +118,22 @@ private:
     StageState returnIfMatches(WorkingSetMember* member, WorkingSetID memberID, WorkingSetID* out);
 
     /**
+     * Sets '_latestOplogEntryTimestamp' to the current read timestamp, if available. This is
+     * equivalent to the latest visible timestamp in the oplog.
+     */
+    void setLatestOplogEntryTimestampToReadTimestamp();
+
+    /**
      * Extracts the timestamp from the 'ts' field of 'record', and sets '_latestOplogEntryTimestamp'
-     * to that time if it isn't already greater.  Returns an error if the 'ts' field cannot be
+     * to that time if it isn't already greater. Throws an exception if the 'ts' field cannot be
      * extracted.
      */
-    Status setLatestOplogEntryTimestamp(const Record& record);
+    void setLatestOplogEntryTimestamp(const Record& record);
+
+    /**
+     * Set up the cursor.
+     */
+    void initCursor(OperationContext* opCtx, const CollectionPtr& collPtr, bool forward);
 
     // WorkingSet is not owned by us.
     WorkingSet* _workingSet;
@@ -103,23 +141,27 @@ private:
     // The filter is not owned by us.
     const MatchExpression* _filter;
 
-    // If a document does not pass '_filter' but passes '_endCondition', stop scanning and return
-    // IS_EOF.
-    BSONObj _endConditionBSON;
-    std::unique_ptr<GTEMatchExpression> _endCondition;
-
     std::unique_ptr<SeekableRecordCursor> _cursor;
 
     CollectionScanParams _params;
 
     RecordId _lastSeenId;  // Null if nothing has been returned from _cursor yet.
 
-    // If _params.shouldTrackLatestOplogTimestamp is set and the collection is the oplog, the latest
-    // timestamp seen in the collection.  Otherwise, this is a null timestamp.
+    // If _params.shouldTrackLatestOplogTimestamp is set and the collection is the oplog or a change
+    // collection, this is the latest timestamp seen by the collection scan. For change collections,
+    // on EOF we advance this timestamp to the latest timestamp in the global oplog.
     Timestamp _latestOplogEntryTimestamp;
+
+    boost::optional<ScopedAdmissionPriority<ExecutionAdmissionContext>> _priority;
 
     // Stats
     CollectionScanStats _specificStats;
+
+    bool _useSeek = false;
+
+    // Coordinates waiting for oplog visibility. Must be initialized if we are doing an oplog scan,
+    // boost::none otherwise.
+    boost::optional<OplogWaitConfig> _oplogWaitConfig;
 };
 
 }  // namespace mongo

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,23 +27,34 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
 
-#include "mongo/platform/basic.h"
+#include <cstddef>
+#include <memory>
+#include <string>
 
-#include "mongo/db/repl/check_quorum_for_config_change.h"
 
-#include "mongo/base/disallow_copying.h"
+#include "mongo/base/error_codes.h"
 #include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/oid.h"
+#include "mongo/db/repl/check_quorum_for_config_change.h"
+#include "mongo/db/repl/member_config.h"
+#include "mongo/db/repl/member_id.h"
+#include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/repl_set_config.h"
 #include "mongo/db/repl/repl_set_heartbeat_args_v1.h"
 #include "mongo/db/repl/repl_set_heartbeat_response.h"
-#include "mongo/db/repl/scatter_gather_algorithm.h"
 #include "mongo/db/repl/scatter_gather_runner.h"
-#include "mongo/db/server_options.h"
+#include "mongo/logv2/log.h"
 #include "mongo/rpc/metadata/repl_set_metadata.h"
-#include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
+
 
 namespace mongo {
 namespace repl {
@@ -90,12 +100,15 @@ std::vector<RemoteCommandRequest> QuorumChecker::getRequests() const {
     ReplSetHeartbeatArgsV1 hbArgs;
     hbArgs.setSetName(_rsConfig->getReplSetName());
     hbArgs.setConfigVersion(_rsConfig->getConfigVersion());
+    hbArgs.setConfigTerm(_rsConfig->getConfigTerm());
     hbArgs.setHeartbeatVersion(1);
     if (isInitialConfig) {
         hbArgs.setCheckEmpty();
     }
+    // hbArgs allows (but doesn't require) us to pass the current primary id as an optimization,
+    // but it is not readily available within QuorumChecker.
     hbArgs.setSenderHost(myConfig.getHostAndPort());
-    hbArgs.setSenderId(myConfig.getId());
+    hbArgs.setSenderId(myConfig.getId().getData());
     hbArgs.setTerm(_term);
     hbRequest = hbArgs.toBSON();
 
@@ -109,7 +122,7 @@ std::vector<RemoteCommandRequest> QuorumChecker::getRequests() const {
             continue;
         }
         requests.push_back(RemoteCommandRequest(_rsConfig->getMemberAt(i).getHostAndPort(),
-                                                "admin",
+                                                DatabaseName::kAdmin,
                                                 hbRequest,
                                                 BSON(rpc::kReplSetMetadataFieldName << 1),
                                                 nullptr,
@@ -189,8 +202,10 @@ void QuorumChecker::_tabulateHeartbeatResponse(const RemoteCommandRequest& reque
                                                const executor::RemoteCommandResponse& response) {
     ++_numResponses;
     if (!response.isOK()) {
-        warning() << "Failed to complete heartbeat request to " << request.target << "; "
-                  << response.status;
+        LOGV2_WARNING(23722,
+                      "Failed to complete heartbeat request to target",
+                      "requestTarget"_attr = request.target,
+                      "responseStatus"_attr = response.status);
         _badResponses.push_back(std::make_pair(request.target, response.status));
         return;
     }
@@ -200,30 +215,22 @@ void QuorumChecker::_tabulateHeartbeatResponse(const RemoteCommandRequest& reque
     Status hbStatus = hbResp.initialize(resBSON, 0);
 
     if (hbStatus.code() == ErrorCodes::InconsistentReplicaSetNames) {
-        std::string message = str::stream() << "Our set name did not match that of "
-                                            << request.target.toString();
-        _vetoStatus = Status(ErrorCodes::NewReplicaSetConfigurationIncompatible, message);
-        warning() << message;
+        static constexpr char message[] = "Our set name did not match that of the request target";
+        _vetoStatus =
+            Status(ErrorCodes::NewReplicaSetConfigurationIncompatible,
+                   str::stream() << message << ", requestTarget:" << request.target.toString());
+        LOGV2_WARNING(23723, message, "requestTarget"_attr = request.target.toString());
         return;
     }
 
     if (!hbStatus.isOK() && hbStatus != ErrorCodes::InvalidReplicaSetConfig) {
-        warning() << "Got error (" << hbStatus << ") response on heartbeat request to "
-                  << request.target << "; " << hbResp;
+        LOGV2_WARNING(23724,
+                      "Got error response on heartbeat request",
+                      "hbStatus"_attr = hbStatus,
+                      "requestTarget"_attr = request.target,
+                      "hbResp"_attr = hbResp);
         _badResponses.push_back(std::make_pair(request.target, hbStatus));
         return;
-    }
-
-    if (!hbResp.getReplicaSetName().empty()) {
-        if (hbResp.getConfigVersion() >= _rsConfig->getConfigVersion()) {
-            std::string message = str::stream()
-                << "Our config version of " << _rsConfig->getConfigVersion()
-                << " is no larger than the version on " << request.target.toString()
-                << ", which is " << hbResp.getConfigVersion();
-            _vetoStatus = Status(ErrorCodes::NewReplicaSetConfigurationIncompatible, message);
-            warning() << message;
-            return;
-        }
     }
 
     if (_rsConfig->hasReplicaSetId()) {
@@ -231,12 +238,20 @@ void QuorumChecker::_tabulateHeartbeatResponse(const RemoteCommandRequest& reque
             rpc::ReplSetMetadata::readFromMetadata(response.data);
         if (replMetadata.isOK() && replMetadata.getValue().getReplicaSetId().isSet() &&
             _rsConfig->getReplicaSetId() != replMetadata.getValue().getReplicaSetId()) {
-            std::string message = str::stream()
-                << "Our replica set ID of " << _rsConfig->getReplicaSetId()
-                << " did not match that of " << request.target.toString() << ", which is "
-                << replMetadata.getValue().getReplicaSetId();
-            _vetoStatus = Status(ErrorCodes::NewReplicaSetConfigurationIncompatible, message);
-            warning() << message;
+            static constexpr char message[] =
+                "Our replica set ID did not match that of our request target";
+            _vetoStatus =
+                Status(ErrorCodes::NewReplicaSetConfigurationIncompatible,
+                       str::stream() << message << ", replSetId: " << _rsConfig->getReplicaSetId()
+                                     << ", requestTarget: " << request.target.toString()
+                                     << ", requestTargetReplSetId: "
+                                     << replMetadata.getValue().getReplicaSetId());
+            LOGV2_WARNING(23726,
+                          message,
+                          "replSetId"_attr = _rsConfig->getReplicaSetId(),
+                          "requestTarget"_attr = request.target.toString(),
+                          "requestTargetReplSetId"_attr =
+                              replMetadata.getValue().getReplicaSetId());
         }
     }
 
@@ -261,22 +276,8 @@ bool QuorumChecker::hasReceivedSufficientResponses() const {
         // Vetoed or everybody has responded.  All done.
         return true;
     }
-    if (_rsConfig->getConfigVersion() == 1) {
-        // Have not received responses from every member, and the proposed config
-        // version is 1 (initial configuration).  Keep waiting.
-        return false;
-    }
-    if (_numElectable == 0) {
-        // Have not heard from at least one electable node.  Keep waiting.
-        return false;
-    }
-    if (int(_voters.size()) < _rsConfig->getMajorityVoteCount()) {
-        // Have not heard from a majority of voters.  Keep waiting.
-        return false;
-    }
 
-    // Have heard from a majority of voters and one electable node.  All done.
-    return true;
+    return false;
 }
 
 Status checkQuorumGeneral(executor::TaskExecutor* executor,

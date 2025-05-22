@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Public Domain 2014-2018 MongoDB, Inc.
+# Public Domain 2014-present MongoDB, Inc.
 # Public Domain 2008-2014 WiredTiger, Inc.
 #
 # This is free and unencumbered software released into the public domain.
@@ -35,9 +35,6 @@ import wiredtiger, wttest
 from wiredtiger import stat
 from wtscenario import make_scenarios
 
-def timestamp_str(t):
-    return '%x' % t
-
 class test_timestamp04(wttest.WiredTigerTestCase, suite_subprocess):
     table_ts_log     = 'table:ts04_ts_logged'
     table_ts_nolog   = 'table:ts04_ts_nologged'
@@ -45,18 +42,21 @@ class test_timestamp04(wttest.WiredTigerTestCase, suite_subprocess):
     table_nots_nolog = 'table:ts04_nots_nologged'
 
     conncfg = [
-        ('nolog', dict(conn_config='', using_log=False)),
-        ('V1', dict(conn_config=',log=(enabled),compatibility=(release="2.9")', using_log=True)),
-        ('V2', dict(conn_config=',log=(enabled)', using_log=True)),
+        ('nolog', dict(conn_config=',eviction_dirty_trigger=50,eviction_updates_trigger=50',
+         using_log=False)),
+        ('V1', dict(conn_config=',eviction_dirty_trigger=50,eviction_updates_trigger=50,' \
+         'log=(enabled),compatibility=(release="2.9")', using_log=True)),
+        ('V2', dict(conn_config=',eviction_dirty_trigger=50,eviction_updates_trigger=50,' \
+         'log=(enabled)', using_log=True)),
     ]
 
-    # Minimum cache_size requirement of lsm is 31MB.
     types = [
-        ('col_fix', dict(empty=1, cacheSize='cache_size=20MB', extra_config=',key_format=r,value_format=8t')),
-        ('col_var', dict(empty=0, cacheSize='cache_size=20MB', extra_config=',key_format=r')),
-        ('lsm', dict(empty=0, cacheSize='cache_size=31MB', extra_config=',type=lsm')),
+        # FLCS does not yet work in a timestamp world.
+        ('col_fix', dict(empty=1, \
+          cacheSize='cache_size=20MB', extra_config=',key_format=r,value_format=8t')),
         ('row', dict(empty=0, cacheSize='cache_size=20MB', extra_config='',)),
         ('row-smallcache', dict(empty=0, cacheSize='cache_size=2MB', extra_config='',)),
+        ('var', dict(empty=0, cacheSize='cache_size=20MB', extra_config=',key_format=r')),
     ]
 
     scenarios = make_scenarios(conncfg, types)
@@ -70,14 +70,15 @@ class test_timestamp04(wttest.WiredTigerTestCase, suite_subprocess):
         if missing == False:
             actual = dict((k, v) for k, v in cur if v != 0)
             if actual != expected:
-                print "missing: ", sorted(set(expected.items()) - set(actual.items()))
-                print "extras: ", sorted(set(actual.items()) - set(expected.items()))
+                print("missing: ", sorted(set(expected.items()) - set(actual.items())))
+                print("extras: ", sorted(set(actual.items()) - set(expected.items())))
             self.assertTrue(actual == expected)
 
         # Search for the expected items as well as iterating.
-        for k, v in expected.iteritems():
+        for k, v in expected.items():
             if missing == False:
-                self.assertEqual(cur[k], v, "for key " + str(k))
+                self.assertEqual(cur[k], v, "for key " + str(k) +
+                    " expected " + str(v) + ", got " + str(cur[k]))
             else:
                 cur.set_key(k)
                 if self.empty:
@@ -104,8 +105,8 @@ class test_timestamp04(wttest.WiredTigerTestCase, suite_subprocess):
         try:
             self.conn = wiredtiger.wiredtiger_open(self.home, conn_params)
         except wiredtiger.WiredTigerError as e:
-            print "Failed conn at '%s' with config '%s'" % (dir, conn_params)
-        self.session = self.conn.open_session(None)
+            print("Failed conn at '%s' with config '%s'" % (dir, conn_params))
+        self.session = wttest.WiredTigerTestCase.setUpSessionOpen(self, self.conn)
 
     def test_rollback_to_stable(self):
         self.ConnectionOpen(self.cacheSize)
@@ -131,7 +132,7 @@ class test_timestamp04(wttest.WiredTigerTestCase, suite_subprocess):
 
         # Insert keys each with timestamp=key, in some order.
         key_range = 10000
-        keys = range(1, key_range + 1)
+        keys = list(range(1, key_range + 1))
 
         # Set keys 1-key_range to value 1.
         for k in keys:
@@ -140,14 +141,18 @@ class test_timestamp04(wttest.WiredTigerTestCase, suite_subprocess):
             self.session.begin_transaction()
             cur_ts_log[k] = 1
             cur_ts_nolog[k] = 1
-            self.session.commit_transaction('commit_timestamp=' + timestamp_str(k))
+            self.session.commit_transaction('commit_timestamp=' + self.timestamp_str(k))
             # Setup an oldest timestamp to ensure state remains in cache.
             if k == 1:
-                self.conn.set_timestamp('oldest_timestamp=' + timestamp_str(1))
+                self.conn.set_timestamp('oldest_timestamp=' + self.timestamp_str(1))
+        cur_ts_log.close()
+        cur_ts_nolog.close()
+        cur_nots_log.close()
+        cur_nots_nolog.close()
 
         # Scenario: 1
         # Check that we see all the inserted values(i.e 1) in all tables
-        latest_ts = timestamp_str(key_range)
+        latest_ts = self.timestamp_str(key_range)
         self.check(self.session, 'read_timestamp=' + latest_ts,
             self.table_nots_log, dict((k, 1) for k in keys[:]))
         self.check(self.session, 'read_timestamp=' + latest_ts,
@@ -159,13 +164,18 @@ class test_timestamp04(wttest.WiredTigerTestCase, suite_subprocess):
 
         # Scenario: 2
         # Roll back half timestamps.
-        stable_ts = timestamp_str(key_range / 2)
+        stable_ts = self.timestamp_str(key_range // 2)
         self.conn.set_timestamp('stable_timestamp=' + stable_ts)
+
+        # We're about to test rollback-to-stable which requires a checkpoint to which we can roll back.
+        self.session.checkpoint()
         self.conn.rollback_to_stable()
+
         stat_cursor = self.session.open_cursor('statistics:', None, None)
-        calls = stat_cursor[stat.conn.txn_rollback_to_stable][2]
-        upd_aborted = (stat_cursor[stat.conn.txn_rollback_upd_aborted][2] +
-            stat_cursor[stat.conn.txn_rollback_las_removed][2])
+        calls = stat_cursor[stat.conn.txn_rts][2]
+        upd_aborted = (stat_cursor[stat.conn.txn_rts_upd_aborted][2] +
+            stat_cursor[stat.conn.txn_rts_hs_removed][2] +
+            stat_cursor[stat.conn.txn_rts_keys_removed][2])
         stat_cursor.close()
         self.assertEqual(calls, 1)
         self.assertTrue(upd_aborted >= key_range/2)
@@ -182,9 +192,9 @@ class test_timestamp04(wttest.WiredTigerTestCase, suite_subprocess):
         # Check that we see the inserted value (i.e. 1) for the keys in a
         # timestamped table until the stable_timestamp only.
         self.check(self.session, 'read_timestamp=' + latest_ts,
-            self.table_ts_nolog, dict((k, 1) for k in keys[:(key_range / 2)]))
+            self.table_ts_nolog, dict((k, 1) for k in keys[:(key_range // 2)]))
         self.check(self.session, 'read_timestamp=' + latest_ts,
-            self.table_ts_nolog, dict((k, 1) for k in keys[(key_range / 2 + 1):]), missing=True)
+            self.table_ts_nolog, dict((k, 1) for k in keys[(key_range // 2 + 1):]), missing=True)
 
         # For logged tables, the behavior of rollback_to_stable changes based on
         # whether connection level logging is enabled or not.
@@ -198,25 +208,33 @@ class test_timestamp04(wttest.WiredTigerTestCase, suite_subprocess):
             # Check that we see the insertions are rolled back in timestamped tables
             # until the stable_timestamp.
             self.check(self.session, 'read_timestamp=' + latest_ts,
-                self.table_ts_log, dict((k, 1) for k in keys[:(key_range / 2)]))
+                self.table_ts_log, dict((k, 1) for k in keys[:(key_range // 2)]))
             self.check(self.session, 'read_timestamp=' + latest_ts,
-                self.table_ts_log, dict((k, 1) for k in keys[(key_range / 2 + 1):]), missing=True)
+                self.table_ts_log, dict((k, 1) for k in keys[(key_range // 2 + 1):]), missing=True)
 
         # Bump the oldest timestamp, we're not going back.
         self.conn.set_timestamp('oldest_timestamp=' + stable_ts)
 
         # Update the values again in preparation for rolling back more.
+        cur_ts_log = self.session.open_cursor(self.table_ts_log)
+        cur_ts_nolog = self.session.open_cursor(self.table_ts_nolog)
+        cur_nots_log = self.session.open_cursor(self.table_nots_log)
+        cur_nots_nolog = self.session.open_cursor(self.table_nots_nolog)
         for k in keys:
             cur_nots_log[k] = 2
             cur_nots_nolog[k] = 2
             self.session.begin_transaction()
             cur_ts_log[k] = 2
             cur_ts_nolog[k] = 2
-            self.session.commit_transaction('commit_timestamp=' + timestamp_str(k + key_range))
+            self.session.commit_transaction('commit_timestamp=' + self.timestamp_str(k + key_range))
+        cur_ts_log.close()
+        cur_ts_nolog.close()
+        cur_nots_log.close()
+        cur_nots_nolog.close()
 
         # Scenario: 3
         # Check that we see all values updated (i.e 2) in all tables.
-        latest_ts = timestamp_str(2 * key_range)
+        latest_ts = self.timestamp_str(2 * key_range)
         self.check(self.session, 'read_timestamp=' + latest_ts,
             self.table_nots_log, dict((k, 2) for k in keys[:]))
         self.check(self.session, 'read_timestamp=' + latest_ts,
@@ -229,16 +247,18 @@ class test_timestamp04(wttest.WiredTigerTestCase, suite_subprocess):
         # Scenario: 4
         # Advance the stable_timestamp by a quarter range and rollback.
         # Three-fourths of the later timestamps will be rolled back.
-        rolled_range = key_range + key_range / 4
-        stable_ts = timestamp_str(rolled_range)
+        rolled_range = key_range + key_range // 4
+        stable_ts = self.timestamp_str(rolled_range)
         self.conn.set_timestamp('stable_timestamp=' + stable_ts)
         self.conn.rollback_to_stable()
         stat_cursor = self.session.open_cursor('statistics:', None, None)
-        calls = stat_cursor[stat.conn.txn_rollback_to_stable][2]
-        upd_aborted = (stat_cursor[stat.conn.txn_rollback_upd_aborted][2] +
-            stat_cursor[stat.conn.txn_rollback_las_removed][2])
+        calls = stat_cursor[stat.conn.txn_rts][2]
+        upd_aborted = (stat_cursor[stat.conn.txn_rts_upd_aborted][2] +
+            stat_cursor[stat.conn.txn_rts_hs_removed][2] +
+            stat_cursor[stat.conn.txn_rts_keys_removed][2])
         stat_cursor.close()
         self.assertEqual(calls, 2)
+
         #
         # We rolled back half on the earlier call and now three-quarters on
         # this call, which is one and one quarter of all keys rolled back.
@@ -257,10 +277,10 @@ class test_timestamp04(wttest.WiredTigerTestCase, suite_subprocess):
         # the updated value (i.e. 2) for the first quarter keys and old values
         # (i.e. 1) for the second quarter keys.
         self.check(self.session, 'read_timestamp=' + latest_ts,
-            self.table_ts_nolog, dict((k, 2 if k <= key_range / 4 else 1)
-            for k in keys[:(key_range / 2)]))
+            self.table_ts_nolog, dict((k, 2 if k <= key_range // 4 else 1)
+            for k in keys[:(key_range // 2)]))
         self.check(self.session, 'read_timestamp=' + latest_ts,
-            self.table_ts_nolog, dict((k, 1) for k in keys[(1 + key_range / 2):]), missing=True)
+            self.table_ts_nolog, dict((k, 1) for k in keys[(1 + key_range // 2):]), missing=True)
 
         # For logged tables behavior changes for rollback_to_stable based on
         # whether connection level logging is enabled or not.
@@ -275,10 +295,7 @@ class test_timestamp04(wttest.WiredTigerTestCase, suite_subprocess):
             # the updated value (i.e. 2) for the first quarter keys and old values
             # (i.e. 1) for the second quarter keys.
             self.check(self.session, 'read_timestamp=' + latest_ts,
-                self.table_ts_log, dict((k, (2 if k <= key_range / 4 else 1))
-                for k in keys[:(key_range / 2)]))
+                self.table_ts_log, dict((k, (2 if k <= key_range // 4 else 1))
+                for k in keys[:(key_range // 2)]))
             self.check(self.session, 'read_timestamp=' + latest_ts,
-                self.table_ts_log, dict((k, 1) for k in keys[(1 + key_range / 2):]), missing=True)
-
-if __name__ == '__main__':
-    wttest.run()
+                self.table_ts_log, dict((k, 1) for k in keys[(1 + key_range // 2):]), missing=True)

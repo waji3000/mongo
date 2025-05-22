@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,7 +29,13 @@
 
 #pragma once
 
+#include <memory>
+#include <string>
+
 #include "mongo/db/repl/oplog_interface.h"
+#include "mongo/db/repl/optime.h"
+#include "mongo/db/transaction/transaction_history_iterator.h"
+#include "mongo/util/net/hostandport.h"
 
 namespace mongo {
 
@@ -44,14 +49,15 @@ namespace repl {
 
 class OplogInterfaceLocal : public OplogInterface {
 public:
-    OplogInterfaceLocal(OperationContext* opCtx, const std::string& collectionName);
+    OplogInterfaceLocal(OperationContext* opCtx);
     std::string toString() const override;
     std::unique_ptr<OplogInterface::Iterator> makeIterator() const override;
+    std::unique_ptr<TransactionHistoryIteratorBase> makeTransactionHistoryIterator(
+        const OpTime& startingOpTime, bool permitYield = false) const override;
     HostAndPort hostAndPort() const override;
 
 private:
     OperationContext* _opCtx;
-    std::string _collectionName;
 };
 
 }  // namespace repl

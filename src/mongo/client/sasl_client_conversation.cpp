@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -32,6 +31,6 @@
 
 namespace mongo {
 
-SaslClientConversation::~SaslClientConversation(){};
+SaslClientConversation::~SaslClientConversation() {};
 
 }  // namespace mongo

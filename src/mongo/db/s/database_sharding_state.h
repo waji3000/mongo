@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,98 +29,130 @@
 
 #pragma once
 
-#include "mongo/base/disallow_copying.h"
-#include "mongo/db/catalog/database.h"
-#include "mongo/db/s/sharding_migration_critical_section.h"
-#include "mongo/s/database_version_gen.h"
+#include <boost/optional/optional.hpp>
+#include <shared_mutex>
+#include <vector>
+
+#include "mongo/db/database_name.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/shard_id.h"
+#include "mongo/s/database_version.h"
 
 namespace mongo {
 
-class MovePrimarySourceManager;
-class OperationContext;
-
 /**
- * Synchronizes access to this shard server's cached database version for Database.
+ * Each shard node process (primary or secondary) has one instance of this object for each database
+ * whose primary is placed on, or is currently being movePrimary'd to, the current shard. It sits on
+ * the second level of the hierarchy of the Shard Role runtime-authoritative caches (along with
+ * CollectionShardingState) and contains sharding-related information about the database, such as
+ * its database version.
+ *
+ * SYNCHRONIZATION: Some methods might require holding a database level lock, so be sure to check
+ * the function-level comments for details.
  */
 class DatabaseShardingState {
-    MONGO_DISALLOW_COPYING(DatabaseShardingState);
+    DatabaseShardingState(const DatabaseShardingState&) = delete;
+    DatabaseShardingState& operator=(const DatabaseShardingState&) = delete;
 
 public:
-    static const Database::Decoration<DatabaseShardingState> get;
-
-    DatabaseShardingState();
-    ~DatabaseShardingState() = default;
+    DatabaseShardingState() = default;
+    virtual ~DatabaseShardingState() = default;
 
     /**
-     * Methods to control the databases's critical section. Must be called with the database X lock
-     * held.
+     * Obtains the sharding state for the specified database along with a lock in shared mode, which
+     * will be held until the object goes out of scope.
      */
-    void enterCriticalSectionCatchUpPhase(OperationContext* opCtx);
-    void enterCriticalSectionCommitPhase(OperationContext* opCtx);
-    void exitCriticalSection(OperationContext* opCtx,
-                             boost::optional<DatabaseVersion> newDbVersion);
+    class ScopedDatabaseShardingState {
+        using LockType = std::variant<std::shared_lock<std::shared_mutex>,   // NOLINT
+                                      std::unique_lock<std::shared_mutex>>;  // NOLINT
 
-    auto getCriticalSectionSignal(ShardingMigrationCriticalSection::Operation op) const {
-        return _critSec.getSignal(op);
-    }
+    public:
+        ScopedDatabaseShardingState(ScopedDatabaseShardingState&&);
+
+        ~ScopedDatabaseShardingState();
+
+        DatabaseShardingState* operator->() const {
+            return _dss;
+        }
+
+        DatabaseShardingState& operator*() const {
+            return *_dss;
+        }
+
+    private:
+        friend class DatabaseShardingState;
+        friend class DatabaseShardingRuntime;
+
+        ScopedDatabaseShardingState(LockType lock, DatabaseShardingState* dss);
+
+        static ScopedDatabaseShardingState acquireScopedDatabaseShardingState(
+            OperationContext* opCtx, const DatabaseName& dbName, LockMode mode);
+
+        LockType _lock;
+        DatabaseShardingState* _dss;
+    };
+
+    static ScopedDatabaseShardingState acquire(OperationContext* opCtx, const DatabaseName& dbName);
+
+    static ScopedDatabaseShardingState assertDbLockedAndAcquire(OperationContext* opCtx,
+                                                                const DatabaseName& dbName);
 
     /**
-     * Returns this shard server's cached dbVersion, if one is cached.
+     * Returns the names of the databases that have a DatabaseShardingState.
+     */
+    static std::vector<DatabaseName> getDatabaseNames(OperationContext* opCtx);
+
+    /**
+     * Checks that the cached database version matches the one attached to the operation, which
+     * means that the operation is routed to the right shard (database owner).
      *
-     * Invariants that the caller holds the DBLock in X or IS.
+     * Throws `StaleDbRoutingVersion` exception when the critical section is taken, there is no
+     * cached database version, or the cached database version does not match the one sent by the
+     * client.
      */
-    boost::optional<DatabaseVersion> getDbVersion(OperationContext* opCtx) const;
+    virtual void checkDbVersionOrThrow(OperationContext* opCtx) const = 0;
+
+    virtual void checkDbVersionOrThrow(OperationContext* opCtx,
+                                       const DatabaseVersion& receivedVersion) const = 0;
 
     /**
-     * Sets this shard server's cached dbVersion to newVersion.
+     * Checks that the current shard server is the primary for the given database, throwing
+     * `IllegalOperation` if not.
+     */
+    virtual void assertIsPrimaryShardForDb(OperationContext* opCtx) const = 0;
+
+    /**
+     * Returns `true` whether a `movePrimary` operation on this database is in progress, `false`
+     * otherwise.
+     */
+    virtual bool isMovePrimaryInProgress() const = 0;
+};
+
+
+/**
+ * Singleton factory to instantiate DatabaseShardingState objects specific to the type of instance
+ * which is running.
+ */
+class DatabaseShardingStateFactory {
+    DatabaseShardingStateFactory(const DatabaseShardingStateFactory&) = delete;
+    DatabaseShardingStateFactory& operator=(const DatabaseShardingStateFactory&) = delete;
+
+public:
+    static void set(ServiceContext* service, std::unique_ptr<DatabaseShardingStateFactory> factory);
+    static void clear(ServiceContext* service);
+
+    virtual ~DatabaseShardingStateFactory() = default;
+
+    /**
+     * Called by the DatabaseShardingState::acquire method once per newly cached database. It is
+     * invoked under a mutex and must not acquire any locks or do blocking work.
      *
-     * Invariants that the caller holds the DBLock in X mode.
+     * Implementations must be thread-safe when called from multiple threads.
      */
-    void setDbVersion(OperationContext* opCtx, boost::optional<DatabaseVersion> newVersion);
+    virtual std::unique_ptr<DatabaseShardingState> make(const DatabaseName& dbName) = 0;
 
-    /**
-     * If _critSecSignal is non-null, always throws StaleDbVersion.
-     * Otherwise, if there is a client dbVersion on the OperationContext, compares it with this
-     * shard server's cached dbVersion and throws StaleDbVersion if they do not match.
-     */
-    void checkDbVersion(OperationContext* opCtx) const;
-
-    /**
-     * Returns the active movePrimary source manager, if one is available.
-     */
-    MovePrimarySourceManager* getMovePrimarySourceManager();
-
-    /**
-     * Attaches a movePrimary source manager to this database's sharding state. Must be called with
-     * the database lock in X mode. May not be called if there is a movePrimary source manager
-     * already installed. Must be followed by a call to clearMovePrimarySourceManager.
-     */
-    void setMovePrimarySourceManager(OperationContext* opCtx, MovePrimarySourceManager* sourceMgr);
-
-    /**
-     * Removes a movePrimary source manager from this database's sharding state. Must be called with
-     * with the database lock in X mode. May not be called if there isn't a movePrimary source
-     * manager installed already through a previous call to setMovePrimarySourceManager.
-     */
-    void clearMovePrimarySourceManager(OperationContext* opCtx);
-
-private:
-    // Modifying the state below requires holding the DBLock in X mode; holding the DBLock in any
-    // mode is acceptable for reading it. (Note: accessing this class at all requires holding the
-    // DBLock in some mode, since it requires having a pointer to the Database).
-
-    ShardingMigrationCriticalSection _critSec;
-
-    // This shard server's cached dbVersion. If boost::none, indicates this shard server does not
-    // know the dbVersion.
-    boost::optional<DatabaseVersion> _dbVersion = boost::none;
-
-    // If this database is serving as a source shard for a movePrimary, the source manager will be
-    // non-null. To write this value, there needs to be X-lock on the database in order to
-    // synchronize with other callers which will read the source manager.
-    //
-    // NOTE: The source manager is not owned by this class.
-    MovePrimarySourceManager* _sourceMgr{nullptr};
+protected:
+    DatabaseShardingStateFactory() = default;
 };
 
 }  // namespace mongo

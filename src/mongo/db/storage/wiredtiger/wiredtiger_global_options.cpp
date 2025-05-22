@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,144 +27,151 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+#include <boost/optional/optional.hpp>
+#include <fmt/format.h>
+#include <wiredtiger.h>
 
-#include "mongo/platform/basic.h"
-
+#include "mongo/base/error_codes.h"
 #include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_global_options.h"
-#include "mongo/db/storage/wiredtiger/wiredtiger_record_store.h"
-#include "mongo/util/log.h"
-#include "mongo/util/options_parser/constraints.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_global_options_gen.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_kv_engine.h"
+#include "mongo/db/tenant_id.h"
+#include "mongo/logv2/log.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
+
+
+namespace moe = mongo::optionenvironment;
 
 namespace mongo {
 
 WiredTigerGlobalOptions wiredTigerGlobalOptions;
 
-Status WiredTigerGlobalOptions::add(moe::OptionSection* options) {
-    moe::OptionSection wiredTigerOptions("WiredTiger options");
-
+Status WiredTigerGlobalOptions::store(const moe::Environment& params) {
     // WiredTiger storage engine options
-    wiredTigerOptions.addOptionChaining("storage.wiredTiger.engineConfig.cacheSizeGB",
-                                        "wiredTigerCacheSizeGB",
-                                        moe::Double,
-                                        "maximum amount of memory to allocate for cache; "
-                                        "defaults to 1/2 of physical RAM");
-    wiredTigerOptions
-        .addOptionChaining("storage.wiredTiger.engineConfig.statisticsLogDelaySecs",
-                           "wiredTigerStatisticsLogDelaySecs",
-                           moe::Int,
-                           "seconds to wait between each write to a statistics file in the dbpath; "
-                           "0 means do not log statistics")
-        // FTDC supercedes WiredTiger's statistics logging.
-        .hidden()
-        .validRange(0, 100000)
-        .setDefault(moe::Value(0));
-    wiredTigerOptions
-        .addOptionChaining("storage.wiredTiger.engineConfig.journalCompressor",
-                           "wiredTigerJournalCompressor",
-                           moe::String,
-                           "use a compressor for log records [none|snappy|zlib]")
-        .format("(:?none)|(:?snappy)|(:?zlib)", "(none/snappy/zlib)")
-        .setDefault(moe::Value(std::string("snappy")));
-    wiredTigerOptions.addOptionChaining("storage.wiredTiger.engineConfig.directoryForIndexes",
-                                        "wiredTigerDirectoryForIndexes",
-                                        moe::Switch,
-                                        "Put indexes and data in different directories");
-    wiredTigerOptions
-        .addOptionChaining("storage.wiredTiger.engineConfig.configString",
-                           "wiredTigerEngineConfigString",
-                           moe::String,
-                           "WiredTiger storage engine custom "
-                           "configuration settings")
-        .hidden();
-
-    // WiredTiger collection options
-    wiredTigerOptions
-        .addOptionChaining("storage.wiredTiger.collectionConfig.blockCompressor",
-                           "wiredTigerCollectionBlockCompressor",
-                           moe::String,
-                           "block compression algorithm for collection data "
-                           "[none|snappy|zlib]")
-        .format("(:?none)|(:?snappy)|(:?zlib)", "(none/snappy/zlib)")
-        .setDefault(moe::Value(std::string("snappy")));
-    wiredTigerOptions
-        .addOptionChaining("storage.wiredTiger.collectionConfig.configString",
-                           "wiredTigerCollectionConfigString",
-                           moe::String,
-                           "WiredTiger custom collection configuration settings")
-        .hidden();
-
-
-    // WiredTiger index options
-    wiredTigerOptions
-        .addOptionChaining("storage.wiredTiger.indexConfig.prefixCompression",
-                           "wiredTigerIndexPrefixCompression",
-                           moe::Bool,
-                           "use prefix compression on row-store leaf pages")
-        .setDefault(moe::Value(true));
-    wiredTigerOptions
-        .addOptionChaining("storage.wiredTiger.indexConfig.configString",
-                           "wiredTigerIndexConfigString",
-                           moe::String,
-                           "WiredTiger custom index configuration settings")
-        .hidden();
-
-    return options->addSection(wiredTigerOptions);
-}
-
-Status WiredTigerGlobalOptions::store(const moe::Environment& params,
-                                      const std::vector<std::string>& args) {
-    // WiredTiger storage engine options
-    if (params.count("storage.wiredTiger.engineConfig.cacheSizeGB")) {
-        wiredTigerGlobalOptions.cacheSizeGB =
-            params["storage.wiredTiger.engineConfig.cacheSizeGB"].as<double>();
-    }
-    if (params.count("storage.syncPeriodSecs")) {
-        wiredTigerGlobalOptions.checkpointDelaySecs =
-            static_cast<size_t>(params["storage.syncPeriodSecs"].as<double>());
-    }
-    if (params.count("storage.wiredTiger.engineConfig.statisticsLogDelaySecs")) {
-        wiredTigerGlobalOptions.statisticsLogDelaySecs =
-            params["storage.wiredTiger.engineConfig.statisticsLogDelaySecs"].as<int>();
-    }
-    if (params.count("storage.wiredTiger.engineConfig.journalCompressor")) {
-        wiredTigerGlobalOptions.journalCompressor =
-            params["storage.wiredTiger.engineConfig.journalCompressor"].as<std::string>();
-    }
-    if (params.count("storage.wiredTiger.engineConfig.directoryForIndexes")) {
-        wiredTigerGlobalOptions.directoryForIndexes =
-            params["storage.wiredTiger.engineConfig.directoryForIndexes"].as<bool>();
-    }
-    if (params.count("storage.wiredTiger.engineConfig.configString")) {
-        wiredTigerGlobalOptions.engineConfig =
-            params["storage.wiredTiger.engineConfig.configString"].as<std::string>();
-        log() << "Engine custom option: " << wiredTigerGlobalOptions.engineConfig;
+    if (!wiredTigerGlobalOptions.engineConfig.empty()) {
+        LOGV2(22293, "Engine custom option", "option"_attr = wiredTigerGlobalOptions.engineConfig);
     }
 
-    // WiredTiger collection options
-    if (params.count("storage.wiredTiger.collectionConfig.blockCompressor")) {
-        wiredTigerGlobalOptions.collectionBlockCompressor =
-            params["storage.wiredTiger.collectionConfig.blockCompressor"].as<std::string>();
-    }
-    if (params.count("storage.wiredTiger.collectionConfig.configString")) {
-        wiredTigerGlobalOptions.collectionConfig =
-            params["storage.wiredTiger.collectionConfig.configString"].as<std::string>();
-        log() << "Collection custom option: " << wiredTigerGlobalOptions.collectionConfig;
+    if (!wiredTigerGlobalOptions.collectionConfig.empty()) {
+        LOGV2(22294,
+              "Collection custom option",
+              "option"_attr = wiredTigerGlobalOptions.collectionConfig);
     }
 
-    // WiredTiger index options
-    if (params.count("storage.wiredTiger.indexConfig.prefixCompression")) {
-        wiredTigerGlobalOptions.useIndexPrefixCompression =
-            params["storage.wiredTiger.indexConfig.prefixCompression"].as<bool>();
-    }
-    if (params.count("storage.wiredTiger.indexConfig.configString")) {
-        wiredTigerGlobalOptions.indexConfig =
-            params["storage.wiredTiger.indexConfig.configString"].as<std::string>();
-        log() << "Index custom option: " << wiredTigerGlobalOptions.indexConfig;
+    if (!wiredTigerGlobalOptions.indexConfig.empty()) {
+        LOGV2(22295, "Index custom option", "option"_attr = wiredTigerGlobalOptions.indexConfig);
     }
 
     return Status::OK();
 }
+
+Status WiredTigerGlobalOptions::validateWiredTigerCompressor(const std::string& value) {
+    if (!(str::equalCaseInsensitive(value, "none"_sd) ||
+          str::equalCaseInsensitive(value, "snappy"_sd) ||
+          str::equalCaseInsensitive(value, "zlib"_sd) ||
+          str::equalCaseInsensitive(value, "zstd"_sd))) {
+        return {ErrorCodes::BadValue,
+                "Compression option must be one of: 'none', 'snappy', 'zlib', or 'zstd'"};
+    }
+
+    return Status::OK();
+}
+
+Status WiredTigerGlobalOptions::validateWiredTigerLiveRestoreReadSizeMB(const int value) {
+    if (value < 1) {
+        return {ErrorCodes::BadValue,
+                "Live restore read size must be greater than or equal to 1MB."};
+    }
+
+    if (value > 16) {
+        return {ErrorCodes::BadValue, "Live restore read size must be less than or equal to 16MB."};
+    }
+
+    if ((value & (value - 1)) != 0) {
+        return {ErrorCodes::BadValue, "Live restore read size must be a power of two."};
+    }
+
+    return Status::OK();
+}
+
+void WiredTigerEngineRuntimeConfigParameter::append(OperationContext* opCtx,
+                                                    BSONObjBuilder* b,
+                                                    StringData name,
+                                                    const boost::optional<TenantId>&) {
+    *b << name << StringData{*_data.first};
+}
+
+Status validateExtraDiagnostics(const std::vector<std::string>& value,
+                                const boost::optional<TenantId>& tenantId) {
+    try {
+        std::set<std::string> flagArr = {"all",
+                                         "concurrent_access",
+                                         "data_validation",
+                                         "invalid_op",
+                                         "out_of_order",
+                                         "panic",
+                                         "slow_operation",
+                                         "visibility"};
+        for (const auto& diagFlag : value) {
+            if (!flagArr.contains(diagFlag)) {
+                return Status(ErrorCodes::BadValue,
+                              fmt::format("'{}' is not a valid flag option", diagFlag));
+            }
+        }
+    } catch (...) {
+        return exceptionToStatus();
+    }
+
+    return Status::OK();
+}
+
+Status WiredTigerEngineRuntimeConfigParameter::setFromString(StringData str,
+                                                             const boost::optional<TenantId>&) {
+    size_t pos = str.find('\0');
+    if (pos != std::string::npos) {
+        return Status(ErrorCodes::BadValue,
+                      (str::stream()
+                       << "WiredTiger configuration strings cannot have embedded null characters. "
+                          "Embedded null found at position "
+                       << pos));
+    }
+
+    LOGV2(22376, "Reconfiguring WiredTiger storage engine", "config"_attr = str);
+
+    invariant(_data.second);
+    int ret = _data.second->reconfigure(str.toString().c_str());
+    if (ret != 0) {
+        const char* errorStr = wiredtiger_strerror(ret);
+        std::string result = (str::stream() << "WiredTiger reconfiguration failed with error code ("
+                                            << ret << "): " << errorStr);
+        LOGV2_ERROR(22378,
+                    "WiredTiger reconfiguration failed",
+                    "error"_attr = ret,
+                    "message"_attr = errorStr);
+
+        return Status(ErrorCodes::BadValue, result);
+    }
+
+    _data.first = str.toString();
+    return Status::OK();
+}
+
+Status WiredTigerDirectoryForIndexesParameter::setFromString(StringData,
+                                                             const boost::optional<TenantId>&) {
+    return {ErrorCodes::IllegalOperation,
+            str::stream() << name() << " cannot be set via setParameter"};
+};
+void WiredTigerDirectoryForIndexesParameter::append(OperationContext* opCtx,
+                                                    BSONObjBuilder* builder,
+                                                    StringData name,
+                                                    const boost::optional<TenantId>&) {
+    builder->append(name, wiredTigerGlobalOptions.directoryForIndexes);
+}
+
 
 }  // namespace mongo

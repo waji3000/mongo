@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,34 +29,32 @@
 
 #pragma once
 
+#include <list>
+
 #include "mongo/base/checked_cast.h"
+#include "mongo/config.h"
+#include "mongo/stdx/mutex.h"
 #include "mongo/transport/session.h"
+#include "mongo/transport/session_util.h"
 #include "mongo/transport/transport_layer_mock.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/net/hostandport.h"
+#include "mongo/util/net/sockaddr.h"
+#include "mongo/util/net/ssl_types.h"
 
 namespace mongo {
 namespace transport {
 
-class MockSession : public Session {
-    MONGO_DISALLOW_COPYING(MockSession);
-
+class MockSessionBase : public Session {
 public:
-    static std::shared_ptr<MockSession> create(TransportLayer* tl) {
-        std::shared_ptr<MockSession> handle(new MockSession(tl));
-        return handle;
-    }
+    MockSessionBase() = default;
 
-    static std::shared_ptr<MockSession> create(HostAndPort remote,
-                                               HostAndPort local,
-                                               TransportLayer* tl) {
-        std::shared_ptr<MockSession> handle(
-            new MockSession(std::move(remote), std::move(local), tl));
-        return handle;
-    }
-
-    TransportLayer* getTransportLayer() const override {
-        return _tl;
-    }
+    explicit MockSessionBase(HostAndPort remote, SockAddr remoteAddr, SockAddr localAddr)
+        : _remote(std::move(remote)),
+          _remoteAddr(std::move(remoteAddr)),
+          _localAddr(std::move(localAddr)),
+          _local(HostAndPort(_localAddr.getAddr(), _localAddr.getPort())),
+          _restrictionEnvironment(_remoteAddr, _localAddr) {}
 
     const HostAndPort& remote() const override {
         return _remote;
@@ -65,6 +62,96 @@ public:
 
     const HostAndPort& local() const override {
         return _local;
+    }
+
+    const SockAddr& remoteAddr() const {
+        return _remoteAddr;
+    }
+
+    const SockAddr& localAddr() const {
+        return _localAddr;
+    }
+
+    void cancelAsyncOperations(const BatonHandle& handle = nullptr) override {}
+
+    void setTimeout(boost::optional<Milliseconds>) override {}
+
+    bool isConnected() override {
+        return true;
+    }
+
+    bool isLoadBalancerPeer() const override {
+        return false;
+    };
+
+    bool isConnectedToLoadBalancerPort() const override {
+        return false;
+    };
+
+    void setisLoadBalancerPeer(bool helloHasLoadBalancedOption) override {};
+
+    bool bindsToOperationState() const override {
+        return false;
+    }
+
+    void appendToBSON(BSONObjBuilder& bb) const override {
+        MONGO_UNIMPLEMENTED;
+    }
+
+    bool isExemptedByCIDRList(
+        const std::vector<std::variant<CIDR, std::string>>& exemptions) const override {
+        return transport::util::isExemptedByCIDRList(remoteAddr(), localAddr(), exemptions);
+    }
+
+#ifdef MONGO_CONFIG_SSL
+    void setSSLManager(std::shared_ptr<SSLManagerInterface> interface) {
+        _sslConfig = interface->getSSLConfiguration();
+    }
+
+    const SSLConfiguration* getSSLConfiguration() const override {
+        return _sslConfig ? &*_sslConfig : nullptr;
+    }
+#endif
+
+    const RestrictionEnvironment& getAuthEnvironment() const override {
+        return _restrictionEnvironment;
+    }
+
+private:
+    const HostAndPort _remote;
+    const SockAddr _remoteAddr;
+    const SockAddr _localAddr;
+    const HostAndPort _local;
+    RestrictionEnvironment _restrictionEnvironment;
+    boost::optional<SSLConfiguration> _sslConfig;
+};
+
+class MockSession : public MockSessionBase {
+    MockSession(const MockSession&) = delete;
+    MockSession& operator=(const MockSession&) = delete;
+
+public:
+    static std::shared_ptr<MockSession> create(TransportLayer* tl, bool isFromRouterPort = false) {
+        auto handle = std::make_shared<MockSession>(tl, isFromRouterPort);
+        return handle;
+    }
+
+    static std::shared_ptr<MockSession> create(HostAndPort remote,
+                                               SockAddr remoteAddr,
+                                               SockAddr localAddr,
+                                               TransportLayer* tl,
+                                               bool isFromRouterPort = false) {
+        auto handle = std::make_shared<MockSession>(
+            std::move(remote), std::move(remoteAddr), std::move(localAddr), tl, isFromRouterPort);
+        return handle;
+    }
+
+    TransportLayer* getTransportLayer() const override {
+        return _tl;
+    }
+
+    bool isFromRouterPort() const override {
+        return _isFromRouterPort;
     }
 
     void end() override {
@@ -85,8 +172,28 @@ public:
         return Message();  // Subclasses can do something different.
     }
 
-    Future<Message> asyncSourceMessage(const transport::BatonHandle& handle = nullptr) override {
+    Future<Message> asyncSourceMessage(const BatonHandle& handle = nullptr) override {
         return Future<Message>::makeReady(sourceMessage());
+    }
+
+    Status waitForData() override {
+        return asyncWaitForData().getNoThrow();
+    }
+
+    Future<void> asyncWaitForData() override {
+        auto fp = makePromiseFuture<void>();
+        stdx::lock_guard<stdx::mutex> lk(_waitForDataMutex);
+        _waitForDataQueue.emplace_back(std::move(fp.promise));
+        return std::move(fp.future);
+    }
+
+    void signalAvailableData() {
+        stdx::lock_guard<stdx::mutex> lk(_waitForDataMutex);
+        if (_waitForDataQueue.size() == 0)
+            return;
+        Promise<void> promise = std::move(_waitForDataQueue.front());
+        _waitForDataQueue.pop_front();
+        promise.emplaceValue();
     }
 
     Status sinkMessage(Message message) override {
@@ -101,31 +208,29 @@ public:
         return Status::OK();
     }
 
-    Future<void> asyncSinkMessage(Message message,
-                                  const transport::BatonHandle& handle = nullptr) override {
+    Future<void> asyncSinkMessage(Message message, const BatonHandle& handle = nullptr) override {
         return Future<void>::makeReady(sinkMessage(message));
     }
 
-    void cancelAsyncOperations(const transport::BatonHandle& handle = nullptr) override {}
-
-    void setTimeout(boost::optional<Milliseconds>) override {}
-
-    bool isConnected() override {
-        return true;
-    }
-
-    explicit MockSession(TransportLayer* tl)
-        : _tl(checked_cast<TransportLayerMock*>(tl)), _remote(), _local() {}
-    explicit MockSession(HostAndPort remote, HostAndPort local, TransportLayer* tl)
-        : _tl(checked_cast<TransportLayerMock*>(tl)),
-          _remote(std::move(remote)),
-          _local(std::move(local)) {}
+    explicit MockSession(TransportLayer* tl, bool isFromRouterPort = false)
+        : MockSessionBase(),
+          _tl(checked_cast<TransportLayerMock*>(tl)),
+          _isFromRouterPort(isFromRouterPort) {}
+    explicit MockSession(HostAndPort remote,
+                         SockAddr remoteAddr,
+                         SockAddr localAddr,
+                         TransportLayer* tl,
+                         bool isFromRouterPort = false)
+        : MockSessionBase(std::move(remote), std::move(remoteAddr), std::move(localAddr)),
+          _tl(checked_cast<TransportLayerMock*>(tl)),
+          _isFromRouterPort(isFromRouterPort) {}
 
 protected:
-    TransportLayerMock* _tl;
+    TransportLayerMock* const _tl;
+    const bool _isFromRouterPort;
 
-    HostAndPort _remote;
-    HostAndPort _local;
+    mutable stdx::mutex _waitForDataMutex;
+    std::list<Promise<void>> _waitForDataQueue;
 };
 
 }  // namespace transport

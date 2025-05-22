@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,20 +27,19 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#include "mongo/bson/bsonobjbuilder.h"
 
-#include "mongo/db/jsobj.h"
-
-#include <boost/lexical_cast.hpp>
+#include <string>
 
 #include "mongo/bson/timestamp.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 namespace mongo {
 
-using std::string;
-
-void BSONObjBuilder::appendMinForType(StringData fieldName, int t) {
+template <class Derived, class B>
+Derived& BSONObjBuilderBase<Derived, B>::appendMinForType(StringData fieldName, int t) {
     switch (t) {
         // Shared canonical types
         case NumberInt:
@@ -49,70 +47,69 @@ void BSONObjBuilder::appendMinForType(StringData fieldName, int t) {
         case NumberLong:
         case NumberDecimal:
             append(fieldName, std::numeric_limits<double>::quiet_NaN());
-            return;
+            return static_cast<Derived&>(*this);
         case Symbol:
         case String:
             append(fieldName, "");
-            return;
+            return static_cast<Derived&>(*this);
         case Date:
-            // min varies with V0 and V1 indexes, so we go one type lower.
-            appendBool(fieldName, true);
-            // appendDate( fieldName , numeric_limits<long long>::min() );
-            return;
+            appendDate(fieldName, Date_t::min());
+            return static_cast<Derived&>(*this);
         case bsonTimestamp:
             appendTimestamp(fieldName, 0);
-            return;
+            return static_cast<Derived&>(*this);
         case Undefined:  // shared with EOO
             appendUndefined(fieldName);
-            return;
+            return static_cast<Derived&>(*this);
 
         // Separate canonical types
         case MinKey:
             appendMinKey(fieldName);
-            return;
+            return static_cast<Derived&>(*this);
         case MaxKey:
             appendMaxKey(fieldName);
-            return;
+            return static_cast<Derived&>(*this);
         case jstOID: {
             OID o;
             appendOID(fieldName, &o);
-            return;
+            return static_cast<Derived&>(*this);
         }
         case Bool:
             appendBool(fieldName, false);
-            return;
+            return static_cast<Derived&>(*this);
         case jstNULL:
             appendNull(fieldName);
-            return;
+            return static_cast<Derived&>(*this);
         case Object:
             append(fieldName, BSONObj());
-            return;
+            return static_cast<Derived&>(*this);
         case Array:
             appendArray(fieldName, BSONObj());
-            return;
+            return static_cast<Derived&>(*this);
         case BinData:
-            appendBinData(fieldName, 0, BinDataGeneral, (const char*)0);
-            return;
+            appendBinData(fieldName, 0, BinDataGeneral, (const char*)nullptr);
+            return static_cast<Derived&>(*this);
         case RegEx:
             appendRegex(fieldName, "");
-            return;
+            return static_cast<Derived&>(*this);
         case DBRef: {
             OID o;
             appendDBRef(fieldName, "", o);
-            return;
+            return static_cast<Derived&>(*this);
         }
         case Code:
             appendCode(fieldName, "");
-            return;
+            return static_cast<Derived&>(*this);
         case CodeWScope:
             appendCodeWScope(fieldName, "", BSONObj());
-            return;
+            return static_cast<Derived&>(*this);
     };
-    log() << "type not supported for appendMinElementForType: " << t;
+    LOGV2(20101, "type not supported for appendMinElementForType: {t}", "t"_attr = t);
     uassert(10061, "type not supported for appendMinElementForType", false);
 }
 
-void BSONObjBuilder::appendMaxForType(StringData fieldName, int t) {
+template <class Derived, class B>
+Derived& BSONObjBuilderBase<Derived, B>::appendMaxForType(StringData fieldName, int t) {
     switch (t) {
         // Shared canonical types
         case NumberInt:
@@ -120,84 +117,86 @@ void BSONObjBuilder::appendMaxForType(StringData fieldName, int t) {
         case NumberLong:
         case NumberDecimal:
             append(fieldName, std::numeric_limits<double>::infinity());
-            return;
+            return static_cast<Derived&>(*this);
         case Symbol:
         case String:
             appendMinForType(fieldName, Object);
-            return;
+            return static_cast<Derived&>(*this);
         case Date:
-            appendDate(fieldName,
-                       Date_t::fromMillisSinceEpoch(std::numeric_limits<long long>::max()));
-            return;
+            appendDate(fieldName, Date_t::max());
+            return static_cast<Derived&>(*this);
         case bsonTimestamp:
             append(fieldName, Timestamp::max());
-            return;
+            return static_cast<Derived&>(*this);
         case Undefined:  // shared with EOO
             appendUndefined(fieldName);
-            return;
+            return static_cast<Derived&>(*this);
 
         // Separate canonical types
         case MinKey:
             appendMinKey(fieldName);
-            return;
+            return static_cast<Derived&>(*this);
         case MaxKey:
             appendMaxKey(fieldName);
-            return;
+            return static_cast<Derived&>(*this);
         case jstOID: {
             OID o = OID::max();
             appendOID(fieldName, &o);
-            return;
+            return static_cast<Derived&>(*this);
         }
         case Bool:
             appendBool(fieldName, true);
-            return;
+            return static_cast<Derived&>(*this);
         case jstNULL:
             appendNull(fieldName);
-            return;
+            return static_cast<Derived&>(*this);
         case Object:
             appendMinForType(fieldName, Array);
-            return;
+            return static_cast<Derived&>(*this);
         case Array:
             appendMinForType(fieldName, BinData);
-            return;
+            return static_cast<Derived&>(*this);
         case BinData:
             appendMinForType(fieldName, jstOID);
-            return;
+            return static_cast<Derived&>(*this);
         case RegEx:
             appendMinForType(fieldName, DBRef);
-            return;
+            return static_cast<Derived&>(*this);
         case DBRef:
             appendMinForType(fieldName, Code);
-            return;
+            return static_cast<Derived&>(*this);
         case Code:
             appendMinForType(fieldName, CodeWScope);
-            return;
+            return static_cast<Derived&>(*this);
         case CodeWScope:
             // This upper bound may change if a new bson type is added.
             appendMinForType(fieldName, MaxKey);
-            return;
+            return static_cast<Derived&>(*this);
     }
-    log() << "type not supported for appendMaxElementForType: " << t;
+    LOGV2(20102, "type not supported for appendMaxElementForType: {t}", "t"_attr = t);
     uassert(14853, "type not supported for appendMaxElementForType", false);
 }
 
-BSONObjBuilder& BSONObjBuilder::appendDate(StringData fieldName, Date_t dt) {
+template <class Derived, class B>
+Derived& BSONObjBuilderBase<Derived, B>::appendDate(StringData fieldName, Date_t dt) {
     _b.appendNum((char)Date);
-    _b.appendStr(fieldName);
+    _b.appendCStr(fieldName);
     _b.appendNum(dt.toMillisSinceEpoch());
-    return *this;
+    return static_cast<Derived&>(*this);
 }
 
 /* add all the fields from the object specified to this object */
-BSONObjBuilder& BSONObjBuilder::appendElements(const BSONObj& x) {
+template <class Derived, class B>
+Derived& BSONObjBuilderBase<Derived, B>::appendElements(const BSONObj& x) {
     if (!x.isEmpty())
         _b.appendBuf(x.objdata() + 4,   // skip over leading length
                      x.objsize() - 5);  // ignore leading length and trailing \0
-    return *this;
+    return static_cast<Derived&>(*this);
 }
 
 /* add all the fields from the object specified to this object if they don't exist */
-BSONObjBuilder& BSONObjBuilder::appendElementsUnique(const BSONObj& x) {
+template <class Derived, class B>
+Derived& BSONObjBuilderBase<Derived, B>::appendElementsUnique(const BSONObj& x) {
     std::set<std::string> have;
     {
         BSONObjIterator i = iterator();
@@ -212,16 +211,18 @@ BSONObjBuilder& BSONObjBuilder::appendElementsUnique(const BSONObj& x) {
             continue;
         append(e);
     }
-    return *this;
+    return static_cast<Derived&>(*this);
 }
 
-BSONObjIterator BSONObjBuilder::iterator() const {
+template <class Derived, class B>
+BSONObjIterator BSONObjBuilderBase<Derived, B>::iterator() const {
     const char* s = _b.buf() + _offset;
     const char* e = _b.buf() + _b.len();
     return BSONObjIterator(s, e);
 }
 
-bool BSONObjBuilder::hasField(StringData name) const {
+template <class Derived, class B>
+bool BSONObjBuilderBase<Derived, B>::hasField(StringData name) const {
     BSONObjIterator i = iterator();
     while (i.more())
         if (name == i.next().fieldName())
@@ -229,20 +230,18 @@ bool BSONObjBuilder::hasField(StringData name) const {
     return false;
 }
 
-const string BSONObjBuilder::numStrs[] = {
-    "0",  "1",  "2",  "3",  "4",  "5",  "6",  "7",  "8",  "9",  "10", "11", "12", "13", "14",
-    "15", "16", "17", "18", "19", "20", "21", "22", "23", "24", "25", "26", "27", "28", "29",
-    "30", "31", "32", "33", "34", "35", "36", "37", "38", "39", "40", "41", "42", "43", "44",
-    "45", "46", "47", "48", "49", "50", "51", "52", "53", "54", "55", "56", "57", "58", "59",
-    "60", "61", "62", "63", "64", "65", "66", "67", "68", "69", "70", "71", "72", "73", "74",
-    "75", "76", "77", "78", "79", "80", "81", "82", "83", "84", "85", "86", "87", "88", "89",
-    "90", "91", "92", "93", "94", "95", "96", "97", "98", "99",
-};
-
-// This is to ensure that BSONObjBuilder doesn't try to use numStrs before the strings have
-// been constructed I've tested just making numStrs a char[][], but the overhead of
-// constructing the strings each time was too high numStrsReady will be 0 until after
-// numStrs is initialized because it is a static variable
-bool BSONObjBuilder::numStrsReady = (numStrs[0].size() > 0);
+// Explicit instantiations
+template class BSONObjBuilderBase<BSONObjBuilder, BufBuilder>;
+template class BSONObjBuilderBase<UniqueBSONObjBuilder, UniqueBufBuilder>;
+template class BSONObjBuilderBase<allocator_aware::BSONObjBuilder<std::allocator<void>>,
+                                  allocator_aware::BufBuilder<std::allocator<void>>>;
+template class BSONObjBuilderBase<allocator_aware::BSONObjBuilder<tracking::Allocator<void>>,
+                                  allocator_aware::BufBuilder<tracking::Allocator<void>>>;
+template class BSONArrayBuilderBase<BSONArrayBuilder, BSONObjBuilder>;
+template class BSONArrayBuilderBase<allocator_aware::BSONArrayBuilder<std::allocator<void>>,
+                                    allocator_aware::BSONObjBuilder<std::allocator<void>>>;
+template class BSONArrayBuilderBase<allocator_aware::BSONArrayBuilder<tracking::Allocator<void>>,
+                                    allocator_aware::BSONObjBuilder<tracking::Allocator<void>>>;
+template class BSONArrayBuilderBase<UniqueBSONArrayBuilder, UniqueBSONObjBuilder>;
 
 }  // namespace mongo

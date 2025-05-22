@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Public Domain 2014-2018 MongoDB, Inc.
+# Public Domain 2014-present MongoDB, Inc.
 # Public Domain 2008-2014 WiredTiger, Inc.
 #
 # This is free and unencumbered software released into the public domain.
@@ -30,9 +30,7 @@
 # Log cursors
 #
 
-import fnmatch, os, shutil, run, time
 from suite_subprocess import suite_subprocess
-from wiredtiger import stat
 from wtscenario import make_scenarios
 import wttest
 
@@ -54,13 +52,13 @@ class test_cursor07(wttest.WiredTigerTestCase, suite_subprocess):
     ])
     # Enable logging for this test.
     def conn_config(self):
-        return 'log=(archive=false,enabled,file_max=%s),' % self.logmax + \
+        return 'log=(enabled,file_max=%s,remove=false),' % self.logmax + \
             'transaction_sync="(method=dsync,enabled)"'
 
     def test_log_cursor(self):
         # print "Creating %s with config '%s'" % (self.uri, self.create_params)
-        create_params = 'key_format=i,value_format=S'
-        create_nolog_params = 'key_format=i,value_format=S,log=(enabled=false)'
+        create_params = 'key_format=i,value_format=u'
+        create_nolog_params = 'key_format=i,value_format=u,log=(enabled=false)'
         self.session.create(self.uri1, create_params)
         c1 = self.session.open_cursor(self.uri1, None)
         self.session.create(self.uri2, create_nolog_params)
@@ -69,8 +67,8 @@ class test_cursor07(wttest.WiredTigerTestCase, suite_subprocess):
         c3 = self.session.open_cursor(self.uri3, None)
 
         # A binary value.
-        value = u'\u0001\u0002abcd\u0003\u0004'
-        value_nolog = u'\u0001\u0002dcba\u0003\u0004'
+        value = b'\x01\x02abcd\x03\x04'
+        value_nolog = b'\x01\x02dcba\x03\x04'
 
         # We want to test both adding data to a table that is not logged
         # that is part of the same transaction as a table that is logged
@@ -100,14 +98,10 @@ class test_cursor07(wttest.WiredTigerTestCase, suite_subprocess):
             keys = c.get_key()
             # txnid, rectype, optype, fileid, logrec_key, logrec_value
             values = c.get_value()
-            try:
-                if value in str(values[5]):   # logrec_value
+            # We are only looking for log records that have a key/value
+            # pair.
+            if values[4] != b'':
+                if value in values[5]:     # logrec_value
                     count += 1
-                self.assertFalse(value2 in str(values[5]))
-            except:
-                pass
         c.close()
         self.assertEqual(count, self.nkeys)
-
-if __name__ == '__main__':
-    wttest.run()

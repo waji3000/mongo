@@ -5,19 +5,21 @@
  * @tags: [requires_sharding]
  */
 
-function runTest(conn) {
-    var authzErrorCode = 13;
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
+function runTest(conn) {
     conn.getDB('admin').createUser({user: 'admin', pwd: 'pwd', roles: ['root']});
 
-    var adminConn = new Mongo(conn.host);
-    adminConn.getDB('admin').auth('admin', 'pwd');
-    var admin = adminConn.getDB('admin');
+    const adminConn = new Mongo(conn.host);
+    const admin = adminConn.getDB('admin');
+
+    assert(admin.auth('admin', 'pwd'));
     admin.createRole({role: 'myRole', roles: [], privileges: []});
     admin.createUser({user: 'spencer', pwd: 'pwd', roles: ['myRole']});
+    const arbitraryShard = admin.getSiblingDB("config").shards.findOne();
 
-    var db = conn.getDB('admin');
-    db.auth('spencer', 'pwd');
+    const db = conn.getDB('admin');
+    assert(db.auth('spencer', 'pwd'));
 
     /**
      * Tests that a single operation has the proper authorization.  The operation is run by invoking
@@ -28,7 +30,7 @@ function runTest(conn) {
      */
     function testProperAuthorization(testFunc, roles, privilege) {
         // Test built-in roles first
-        for (role in roles) {
+        for (let role in roles) {
             admin.updateRole("myRole", {roles: [role]});
             testFunc(roles[role]);
         }
@@ -114,10 +116,11 @@ function runTest(conn) {
             var passed = true;
             try {
                 var opid;
+                const maxOpId = Math.pow(2, 31) - 1;  // Operation id cannot exceed INT_MAX.
                 if (isMongos(db)) {  // opid format different between mongos and mongod
-                    opid = "shard0000:1234";
+                    opid = arbitraryShard._id + ":" + maxOpId.toString();
                 } else {
-                    opid = 1234;
+                    opid = maxOpId;
                 }
                 var res = db.killOp(opid);
                 printjson(res);
@@ -191,8 +194,6 @@ runTest(conn);
 MongoRunner.stopMongod(conn);
 
 jsTest.log('Test sharding');
-// TODO: Remove 'shardAsReplicaSet: false' when SERVER-32672 is fixed.
-var st = new ShardingTest(
-    {shards: 2, config: 3, keyFile: 'jstests/libs/key1', other: {shardAsReplicaSet: false}});
+var st = new ShardingTest({shards: 2, config: 3, keyFile: 'jstests/libs/key1'});
 runTest(st.s);
 st.stop();

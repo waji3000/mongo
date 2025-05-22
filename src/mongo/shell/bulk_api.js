@@ -2,7 +2,6 @@
 // Scope for the function
 //
 var _bulk_api_module = (function() {
-
     // Batch types
     var NONE = 0;
     var INSERT = 1;
@@ -37,7 +36,6 @@ var _bulk_api_module = (function() {
      * Accepts { w : x, j : x, wtimeout : x, fsync: x } or w, wtimeout, j
      */
     var WriteConcern = function(wValue, wTimeout, jValue) {
-
         if (!(this instanceof WriteConcern)) {
             var writeConcern = Object.create(WriteConcern.prototype);
             WriteConcern.apply(writeConcern, arguments);
@@ -97,7 +95,6 @@ var _bulk_api_module = (function() {
         this.shellPrint = function() {
             return this.toString();
         };
-
     };
 
     /**
@@ -107,7 +104,6 @@ var _bulk_api_module = (function() {
      * are used to filter the WriteResult to only include relevant result fields.
      */
     var WriteResult = function(bulkResult, singleBatchType, writeConcern) {
-
         if (!(this instanceof WriteResult))
             return new WriteResult(bulkResult, singleBatchType, writeConcern);
 
@@ -118,6 +114,10 @@ var _bulk_api_module = (function() {
         defineReadOnlyProperty(this, "nMatched", bulkResult.nMatched);
         defineReadOnlyProperty(this, "nModified", bulkResult.nModified);
         defineReadOnlyProperty(this, "nRemoved", bulkResult.nRemoved);
+        if (bulkResult.upserted.length > 0) {
+            defineReadOnlyProperty(
+                this, "_id", bulkResult.upserted[bulkResult.upserted.length - 1]._id);
+        }
 
         //
         // Define access methods
@@ -134,7 +134,7 @@ var _bulk_api_module = (function() {
         };
 
         this.getWriteError = function() {
-            if (bulkResult.writeErrors.length == 0) {
+            if (!bulkResult.hasOwnProperty("writeErrors") || bulkResult.writeErrors.length == 0) {
                 return null;
             } else {
                 return bulkResult.writeErrors[bulkResult.writeErrors.length - 1];
@@ -146,7 +146,8 @@ var _bulk_api_module = (function() {
         };
 
         this.getWriteConcernError = function() {
-            if (bulkResult.writeConcernErrors.length == 0) {
+            if (!bulkResult.hasOwnProperty("writeConcernErrors") ||
+                bulkResult.writeConcernErrors.length == 0) {
                 return null;
             } else {
                 return bulkResult.writeConcernErrors[0];
@@ -187,6 +188,10 @@ var _bulk_api_module = (function() {
                 result.writeError = {};
                 result.writeError.code = this.getWriteError().code;
                 result.writeError.errmsg = this.getWriteError().errmsg;
+                let errInfo = this.getWriteError().errInfo;
+                if (errInfo) {
+                    result.writeError.errInfo = errInfo;
+                }
             }
 
             if (this.getWriteConcernError() != null) {
@@ -213,7 +218,6 @@ var _bulk_api_module = (function() {
      * Wraps the result for the commands
      */
     var BulkWriteResult = function(bulkResult, singleBatchType, writeConcern) {
-
         if (!(this instanceof BulkWriteResult) && !(this instanceof BulkWriteError))
             return new BulkWriteResult(bulkResult, singleBatchType, writeConcern);
 
@@ -240,7 +244,7 @@ var _bulk_api_module = (function() {
         };
 
         this.hasWriteErrors = function() {
-            return bulkResult.writeErrors.length > 0;
+            return bulkResult.hasOwnProperty("writeErrors") && bulkResult.writeErrors.length > 0;
         };
 
         this.getWriteErrorCount = function() {
@@ -261,7 +265,8 @@ var _bulk_api_module = (function() {
         };
 
         this.hasWriteConcernError = function() {
-            return bulkResult.writeConcernErrors.length > 0;
+            return bulkResult.hasOwnProperty("writeConcernErrors") &&
+                bulkResult.writeConcernErrors.length > 0;
         };
 
         this.getWriteConcernError = function() {
@@ -350,7 +355,6 @@ var _bulk_api_module = (function() {
      * Represents a bulk write error, identical to a BulkWriteResult but thrown
      */
     var BulkWriteError = function(bulkResult, singleBatchType, writeConcern, message) {
-
         if (!(this instanceof BulkWriteError))
             return new BulkWriteError(bulkResult, singleBatchType, writeConcern, message);
 
@@ -393,7 +397,6 @@ var _bulk_api_module = (function() {
      * Wraps a command error
      */
     var WriteCommandError = function(commandError) {
-
         if (!(this instanceof WriteCommandError))
             return new WriteCommandError(commandError);
 
@@ -441,6 +444,9 @@ var _bulk_api_module = (function() {
         defineReadOnlyProperty(this, "code", err.code);
         defineReadOnlyProperty(this, "index", err.index);
         defineReadOnlyProperty(this, "errmsg", err.errmsg);
+        // errInfo field is optional.
+        if (err.hasOwnProperty("errInfo"))
+            defineReadOnlyProperty(this, "errInfo", err.errInfo);
 
         //
         // Define access methods
@@ -513,15 +519,6 @@ var _bulk_api_module = (function() {
         this.operations = [];
     };
 
-    /**
-     * Wraps a legacy operation so we can correctly rewrite its error
-     */
-    var LegacyOp = function(batchType, operation, index) {
-        this.batchType = batchType;
-        this.index = index;
-        this.operation = operation;
-    };
-
     /***********************************************************
      * Wraps the operations done for the batch
      ***********************************************************/
@@ -533,7 +530,10 @@ var _bulk_api_module = (function() {
         // Set max byte size
         var maxBatchSizeBytes = 1024 * 1024 * 16;
         var maxNumberOfDocsInBatch = 1000;
+        var idFieldOverhead = Object.bsonsize({_id: ObjectId()}) - Object.bsonsize({});
         var writeConcern = null;
+        var rawData = null;
+        var letParams = null;
         var currentOp;
 
         // Final results
@@ -603,12 +603,16 @@ var _bulk_api_module = (function() {
 
         // Add to internal list of documents
         var addToOperationsList = function(docType, document) {
-
             if (Array.isArray(document))
                 throw Error("operation passed in cannot be an Array");
 
             // Get the bsonSize
             var bsonSize = Object.bsonsize(document);
+
+            // If an _id will be added to the insert, adjust the bsonSize
+            if (docType === INSERT && documentNeedsId(document)) {
+                bsonSize += idFieldOverhead;
+            }
 
             // Create a new batch object if we don't have a current one
             if (currentBatch == null)
@@ -630,11 +634,20 @@ var _bulk_api_module = (function() {
         };
 
         /**
+         *
+         * @param obj {Object} the document to check if an _id is present
+         * @returns true if the document needs an _id and false otherwise
+         */
+        var documentNeedsId = function(obj) {
+            return typeof (obj._id) == "undefined" && !Array.isArray(obj);
+        };
+
+        /**
          * @return {Object} a new document with an _id: ObjectId if _id is not present.
          *     Otherwise, returns the same object passed.
          */
         var addIdIfNeeded = function(obj) {
-            if (typeof(obj._id) == "undefined" && !Array.isArray(obj)) {
+            if (documentNeedsId(obj)) {
                 var tmp = obj;  // don't want to modify input
                 obj = {_id: new ObjectId()};
                 for (var key in tmp) {
@@ -664,6 +677,11 @@ var _bulk_api_module = (function() {
                 var document =
                     {q: currentOp.selector, u: updateDocument, multi: true, upsert: upsert};
 
+                // Copy over the hint, if we have one.
+                if (currentOp.hasOwnProperty('hint')) {
+                    document.hint = currentOp.hint;
+                }
+
                 // Copy over the collation, if we have one.
                 if (currentOp.hasOwnProperty('collation')) {
                     document.collation = currentOp.collation;
@@ -687,6 +705,16 @@ var _bulk_api_module = (function() {
                 var document =
                     {q: currentOp.selector, u: updateDocument, multi: false, upsert: upsert};
 
+                // Copy over the sort, if we have one.
+                if (currentOp.hasOwnProperty('sort')) {
+                    document.sort = currentOp.sort;
+                }
+
+                // Copy over the hint, if we have one.
+                if (currentOp.hasOwnProperty('hint')) {
+                    document.hint = currentOp.hint;
+                }
+
                 // Copy over the collation, if we have one.
                 if (currentOp.hasOwnProperty('collation')) {
                     document.collation = currentOp.collation;
@@ -704,12 +732,26 @@ var _bulk_api_module = (function() {
             },
 
             replaceOne: function(updateDocument) {
+                // Cannot use pipeline-style updates in a replacement operation.
+                if (Array.isArray(updateDocument)) {
+                    throw new Error('Cannot use pipeline-style updates in a replacement operation');
+                }
                 findOperations.updateOne(updateDocument);
             },
 
             upsert: function() {
                 currentOp.upsert = true;
                 // Return the findOperations
+                return findOperations;
+            },
+
+            sort: function(sort) {
+                currentOp.sort = sort;
+                return findOperations;
+            },
+
+            hint: function(hint) {
+                currentOp.hint = hint;
                 return findOperations;
             },
 
@@ -744,31 +786,11 @@ var _bulk_api_module = (function() {
             },
 
             collation: function(collationSpec) {
-                if (!collection.getMongo().hasWriteCommands()) {
-                    throw new Error(
-                        "cannot use collation if server does not support write commands");
-                }
-
-                if (collection.getMongo().writeMode() !== "commands") {
-                    throw new Error("write mode must be 'commands' in order to use collation, " +
-                                    "but found write mode: " + collection.getMongo().writeMode());
-                }
-
                 currentOp.collation = collationSpec;
                 return findOperations;
             },
 
             arrayFilters: function(filters) {
-                if (!collection.getMongo().hasWriteCommands()) {
-                    throw new Error(
-                        "cannot use arrayFilters if server does not support write commands");
-                }
-
-                if (collection.getMongo().writeMode() !== "commands") {
-                    throw new Error("write mode must be 'commands' in order to use arrayFilters, " +
-                                    "but found write mode: " + collection.getMongo().writeMode());
-                }
-
                 currentOp.arrayFilters = filters;
                 return findOperations;
             },
@@ -786,10 +808,17 @@ var _bulk_api_module = (function() {
             return findOperations;
         };
 
+        this.setRawData = function(userRawData) {
+            rawData = userRawData;
+        };
+
+        this.setLetParams = function(userLet) {
+            letParams = userLet;
+        };
+
         //
         // Merge write command result into aggregated results object
         var mergeBatchResults = function(batch, bulkResult, result) {
-
             // If we have an insert Batch type
             if (batch.batchType == INSERT) {
                 bulkResult.nInserted = bulkResult.nInserted + result.n;
@@ -837,6 +866,10 @@ var _bulk_api_module = (function() {
                         errmsg: result.writeErrors[i].errmsg,
                         op: batch.operations[result.writeErrors[i].index]
                     };
+                    var errInfo = result.writeErrors[i].errInfo;
+                    if (errInfo) {
+                        writeError['errInfo'] = errInfo;
+                    }
 
                     bulkResult.writeErrors.push(new WriteError(writeError));
                 }
@@ -872,6 +905,15 @@ var _bulk_api_module = (function() {
                 cmd.writeConcern = writeConcern;
             }
 
+            if (rawData) {
+                cmd.rawData = rawData;
+            }
+
+            // If we have let parameters, add them to the command.
+            if (letParams) {
+                cmd.let = letParams;
+            }
+
             {
                 const kWireVersionSupportingRetryableWrites = 6;
                 const serverSupportsRetryableWrites =
@@ -880,8 +922,7 @@ var _bulk_api_module = (function() {
 
                 const session = collection.getDB().getSession();
                 if (serverSupportsRetryableWrites && session.getOptions().shouldRetryWrites() &&
-                    session._serverSession.canRetryWrites(cmd) &&
-                    !session._serverSession.isTxnActive()) {
+                    _ServerSession.canRetryWrites(cmd) && !session._serverSession.isTxnActive()) {
                     cmd = session._serverSession.assignTransactionNumber(cmd);
                 }
             }
@@ -906,222 +947,6 @@ var _bulk_api_module = (function() {
             mergeBatchResults(batch, bulkResult, result);
         };
 
-        // Execute a single legacy op
-        var executeLegacyOp = function(_legacyOp) {
-            // Handle the different types of operation types
-            if (_legacyOp.batchType == INSERT) {
-                if (Array.isArray(_legacyOp.operation)) {
-                    var transformedInserts = [];
-                    _legacyOp.operation.forEach(function(insertDoc) {
-                        transformedInserts.push(addIdIfNeeded(insertDoc));
-                    });
-                    _legacyOp.operation = transformedInserts;
-                } else {
-                    _legacyOp.operation = addIdIfNeeded(_legacyOp.operation);
-                }
-
-                collection.getMongo().insert(
-                    collection.getFullName(), _legacyOp.operation, ordered);
-            } else if (_legacyOp.batchType == UPDATE) {
-                collection.getMongo().update(collection.getFullName(),
-                                             _legacyOp.operation.q,
-                                             _legacyOp.operation.u,
-                                             _legacyOp.operation.upsert,
-                                             _legacyOp.operation.multi);
-            } else if (_legacyOp.batchType == REMOVE) {
-                var single = Boolean(_legacyOp.operation.limit);
-
-                collection.getMongo().remove(
-                    collection.getFullName(), _legacyOp.operation.q, single);
-            }
-        };
-
-        /**
-         * Parses the getLastError response and properly sets the write errors and
-         * write concern errors.
-         * Should kept be up to date with BatchSafeWriter::extractGLEErrors.
-         *
-         * @return {object} an object with the format:
-         *
-         * {
-         *   writeError: {object|null} raw write error object without the index.
-         *   wcError: {object|null} raw write concern error object.
-         * }
-         */
-        var extractGLEErrors = function(gleResponse) {
-            var isOK = gleResponse.ok ? true : false;
-            var err = (gleResponse.err) ? gleResponse.err : '';
-            var errMsg = (gleResponse.errmsg) ? gleResponse.errmsg : '';
-            var wNote = (gleResponse.wnote) ? gleResponse.wnote : '';
-            var jNote = (gleResponse.jnote) ? gleResponse.jnote : '';
-            var code = gleResponse.code;
-            var timeout = gleResponse.wtimeout ? true : false;
-
-            var extractedErr = {writeError: null, wcError: null, unknownError: null};
-
-            if (err == 'norepl' || err == 'noreplset') {
-                // Know this is legacy gle and the repl not enforced - write concern error in 2.4.
-                var errObj = {code: WRITE_CONCERN_FAILED};
-
-                if (errMsg != '') {
-                    errObj.errmsg = errMsg;
-                } else if (wNote != '') {
-                    errObj.errmsg = wNote;
-                } else {
-                    errObj.errmsg = err;
-                }
-
-                extractedErr.wcError = errObj;
-            } else if (timeout) {
-                // Know there was not write error.
-                var errObj = {code: WRITE_CONCERN_FAILED};
-
-                if (errMsg != '') {
-                    errObj.errmsg = errMsg;
-                } else {
-                    errObj.errmsg = err;
-                }
-
-                errObj.errInfo = {wtimeout: true};
-                extractedErr.wcError = errObj;
-            } else if (code == 19900 ||  // No longer primary
-                       code == 16805 ||  // replicatedToNum no longer primary
-                       code == 14330 ||  // gle wmode changed; invalid
-                       code == NOT_MASTER ||
-                       code == UNKNOWN_REPL_WRITE_CONCERN || code == WRITE_CONCERN_FAILED) {
-                extractedErr.wcError = {code: code, errmsg: errMsg};
-            } else if (!isOK) {
-                // This is a GLE failure we don't understand
-                extractedErr.unknownError = {code: code, errmsg: errMsg};
-            } else if (err != '') {
-                extractedErr.writeError = {code: (code == 0) ? UNKNOWN_ERROR : code, errmsg: err};
-            } else if (jNote != '') {
-                extractedErr.writeError = {code: WRITE_CONCERN_FAILED, errmsg: jNote};
-            }
-
-            // Handling of writeback not needed for mongo shell.
-            return extractedErr;
-        };
-
-        /**
-         * getLastErrorMethod that supports all write concerns
-         */
-        var executeGetLastError = function(db, options) {
-            var cmd = {getlasterror: 1};
-            cmd = Object.extend(cmd, options);
-            // Execute the getLastErrorCommand
-            return db.runCommand(cmd);
-        };
-
-        // Execute the operations, serially
-        var executeBatchWithLegacyOps = function(batch) {
-
-            var batchResult = {n: 0, writeErrors: [], upserted: []};
-
-            var extractedErr = null;
-
-            var totalToExecute = batch.operations.length;
-            // Run over all the operations
-            for (var i = 0; i < batch.operations.length; i++) {
-                if (batchResult.writeErrors.length > 0 && ordered)
-                    break;
-
-                var _legacyOp = new LegacyOp(batch.batchType, batch.operations[i], i);
-                executeLegacyOp(_legacyOp);
-
-                var result = executeGetLastError(collection.getDB(), {w: 1});
-                extractedErr = extractGLEErrors(result);
-
-                if (extractedErr.unknownError) {
-                    throw new WriteCommandError({
-                        ok: 0.0,
-                        code: extractedErr.unknownError.code,
-                        errmsg: extractedErr.unknownError.errmsg
-                    });
-                }
-
-                if (extractedErr.writeError != null) {
-                    // Create the emulated result set
-                    var errResult = {
-                        index: _legacyOp.index,
-                        code: extractedErr.writeError.code,
-                        errmsg: extractedErr.writeError.errmsg,
-                        op: batch.operations[_legacyOp.index]
-                    };
-
-                    batchResult.writeErrors.push(errResult);
-                } else if (_legacyOp.batchType == INSERT) {
-                    // Inserts don't give us "n" back, so we can only infer
-                    batchResult.n = batchResult.n + 1;
-                }
-
-                if (_legacyOp.batchType == UPDATE) {
-                    // Unfortunately v2.4 GLE does not include the upserted field when
-                    // the upserted _id is non-OID type.  We can detect this by the
-                    // updatedExisting field + an n of 1
-                    var upserted = result.upserted !== undefined ||
-                        (result.updatedExisting === false && result.n == 1);
-
-                    if (upserted) {
-                        batchResult.n = batchResult.n + 1;
-
-                        // If we don't have an upserted value, see if we can pull it from the update
-                        // or the
-                        // query
-                        if (result.upserted === undefined) {
-                            result.upserted = _legacyOp.operation.u._id;
-                            if (result.upserted === undefined) {
-                                result.upserted = _legacyOp.operation.q._id;
-                            }
-                        }
-
-                        batchResult.upserted.push({index: _legacyOp.index, _id: result.upserted});
-                    } else if (result.n) {
-                        batchResult.n = batchResult.n + result.n;
-                    }
-                }
-
-                if (_legacyOp.batchType == REMOVE && result.n) {
-                    batchResult.n = batchResult.n + result.n;
-                }
-            }
-
-            var needToEnforceWC = writeConcern != null &&
-                bsonWoCompare(writeConcern, {w: 1}) != 0 &&
-                bsonWoCompare(writeConcern, {w: 0}) != 0;
-
-            extractedErr = null;
-            if (needToEnforceWC && (batchResult.writeErrors.length == 0 ||
-                                    (!ordered &&
-                                     // not all errored.
-                                     batchResult.writeErrors.length < batch.operations.length))) {
-                // if last write errored
-                if (batchResult.writeErrors.length > 0 &&
-                    batchResult.writeErrors[batchResult.writeErrors.length - 1].index ==
-                        (batch.operations.length - 1)) {
-                    // Reset previous errors so we can apply the write concern no matter what
-                    // as long as it is valid.
-                    collection.getDB().runCommand({resetError: 1});
-                }
-
-                result = executeGetLastError(collection.getDB(), writeConcern);
-                extractedErr = extractGLEErrors(result);
-
-                if (extractedErr.unknownError) {
-                    // Report as a wc failure
-                    extractedErr.wcError = extractedErr.unknownError;
-                }
-            }
-
-            if (extractedErr != null && extractedErr.wcError != null) {
-                bulkResult.writeConcernErrors.push(extractedErr.wcError);
-            }
-
-            // Merge the results
-            mergeBatchResults(batch, bulkResult, batchResult);
-        };
-
-        //
         // Execute the batch
         this.execute = function(_writeConcern) {
             if (executed)
@@ -1140,17 +965,10 @@ var _bulk_api_module = (function() {
             // Total number of batches to execute
             var totalNumberToExecute = batches.length;
 
-            var useWriteCommands = collection.getMongo().useWriteCommands();
-
             // Execute all the batches
             for (var i = 0; i < batches.length; i++) {
                 // Execute the batch
-                if (collection.getMongo().hasWriteCommands() &&
-                    collection.getMongo().writeMode() == "commands") {
-                    executeBatch(batches[i]);
-                } else {
-                    executeBatchWithLegacyOps(batches[i]);
-                }
+                executeBatch(batches[i]);
 
                 // If we are ordered and have errors and they are
                 // not all replication errors terminate the operation
@@ -1166,7 +984,7 @@ var _bulk_api_module = (function() {
             executed = true;
 
             // Create final result object
-            typedResult = new BulkWriteResult(
+            let typedResult = new BulkWriteResult(
                 bulkResult, batches.length == 1 ? batches[0].batchType : null, writeConcern);
             // Throw on error
             if (typedResult.hasErrors()) {
@@ -1200,7 +1018,7 @@ var _bulk_api_module = (function() {
     // Exports
     //
 
-    module = {};
+    const module = {};
     module.WriteConcern = WriteConcern;
     module.WriteResult = WriteResult;
     module.BulkWriteResult = BulkWriteResult;
@@ -1215,13 +1033,12 @@ var _bulk_api_module = (function() {
     };
 
     return module;
-
 })();
 
 // Globals
 WriteConcern = _bulk_api_module.WriteConcern;
-WriteResult = _bulk_api_module.WriteResult;
-BulkWriteResult = _bulk_api_module.BulkWriteResult;
+WriteResult = _bulk_api_module.WriteResult;          // eslint-disable-line
+BulkWriteResult = _bulk_api_module.BulkWriteResult;  // eslint-disable-line
 BulkWriteError = _bulk_api_module.BulkWriteError;
 WriteCommandError = _bulk_api_module.WriteCommandError;
 WriteError = _bulk_api_module.WriteError;

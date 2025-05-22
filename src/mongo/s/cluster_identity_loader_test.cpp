@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,69 +27,68 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
 
-#include "mongo/platform/basic.h"
-
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+// IWYU pragma: no_include "cxxabi.h"
+#include <memory>
+#include <system_error>
 #include <vector>
 
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/client/read_preference.h"
 #include "mongo/client/remote_command_targeter_mock.h"
-#include "mongo/db/commands.h"
-#include "mongo/db/query/query_request.h"
-#include "mongo/db/service_context.h"
+#include "mongo/db/cluster_role.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/query/find_command.h"
+#include "mongo/db/query/query_request_helper.h"
+#include "mongo/db/server_options.h"
 #include "mongo/executor/network_interface_mock.h"
+#include "mongo/executor/network_test_env.h"
+#include "mongo/executor/remote_command_request.h"
 #include "mongo/executor/task_executor.h"
 #include "mongo/rpc/metadata/repl_set_metadata.h"
-#include "mongo/rpc/metadata/tracking_metadata.h"
-#include "mongo/s/catalog/config_server_version.h"
-#include "mongo/s/catalog/type_config_version.h"
-#include "mongo/s/client/shard_registry.h"
+#include "mongo/rpc/op_msg.h"
+#include "mongo/s/catalog/type_config_version_gen.h"
 #include "mongo/s/cluster_identity_loader.h"
-#include "mongo/s/sharding_router_test_fixture.h"
-#include "mongo/stdx/future.h"
-#include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/s/sharding_mongos_test_fixture.h"
+#include "mongo/unittest/unittest.h"
+#include "mongo/util/net/hostandport.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
+
 
 namespace mongo {
 namespace {
 
-using executor::NetworkInterfaceMock;
 using executor::RemoteCommandRequest;
-using executor::TaskExecutor;
-using unittest::assertGet;
-
-BSONObj getReplSecondaryOkMetadata() {
-    BSONObjBuilder o;
-    ReadPreferenceSetting(ReadPreference::Nearest).toContainingBSON(&o);
-    o.append(rpc::kReplSetMetadataFieldName, 1);
-    return o.obj();
-}
 
 class ClusterIdentityTest : public ShardingTestFixture {
 public:
-    ClusterIdentityTest() {
+    void setUp() override {
+        // TODO SERVER-78051: Remove once shards can access the loaded cluster id.
+        serverGlobalParams.clusterRole = {
+            ClusterRole::ShardServer, ClusterRole::ConfigServer, ClusterRole::RouterServer};
+
+        ShardingTestFixture::setUp();
         configTargeter()->setFindHostReturnValue(configHost);
     }
 
     void expectConfigVersionLoad(StatusWith<OID> result) {
         onFindCommand([&](const RemoteCommandRequest& request) {
             ASSERT_EQUALS(configHost, request.target);
-            ASSERT_BSONOBJ_EQ(getReplSecondaryOkMetadata(),
-                              rpc::TrackingMetadata::removeTrackingData(request.metadata));
 
-            const NamespaceString nss(request.dbname, request.cmdObj.firstElement().String());
-            ASSERT_EQ(nss.ns(), "config.version");
+            auto opMsg = static_cast<OpMsgRequest>(request);
+            auto query = query_request_helper::makeFromFindCommandForTests(opMsg.body);
 
-            auto query = assertGet(QueryRequest::makeFromFindCommand(nss, request.cmdObj, false));
-
-            ASSERT_EQ(query->nss().ns(), "config.version");
+            ASSERT_EQ(query->getNamespaceOrUUID().nss(), NamespaceString::kConfigVersionNamespace);
             ASSERT_BSONOBJ_EQ(query->getFilter(), BSONObj());
-            ASSERT_FALSE(query->getLimit().is_initialized());
+            ASSERT_FALSE(query->getLimit().has_value());
 
             if (result.isOK()) {
                 VersionType version;
-                version.setCurrentVersion(CURRENT_CONFIG_VERSION);
-                version.setMinCompatibleVersion(MIN_COMPATIBLE_CONFIG_VERSION);
                 version.setClusterId(result.getValue());
 
                 return StatusWith<std::vector<BSONObj>>{{version.toBSON()}};
@@ -109,83 +107,106 @@ TEST_F(ClusterIdentityTest, BasicLoadSuccess) {
 
     // The first time you ask for the cluster ID it will have to be loaded from the config servers.
     auto future = launchAsync([&] {
-        auto clusterIdStatus =
-            ClusterIdentityLoader::get(operationContext())
-                ->loadClusterId(operationContext(), repl::ReadConcernLevel::kMajorityReadConcern);
+        auto clusterIdStatus = ClusterIdentityLoader::get(operationContext())
+                                   ->loadClusterId(operationContext(),
+                                                   catalogClient(),
+                                                   repl::ReadConcernLevel::kMajorityReadConcern);
         ASSERT_OK(clusterIdStatus);
         ASSERT_EQUALS(clusterId, ClusterIdentityLoader::get(operationContext())->getClusterId());
     });
 
     expectConfigVersionLoad(clusterId);
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 
     // Subsequent requests for the cluster ID should not require any network traffic as we consult
     // the cached version.
-    ASSERT_OK(
-        ClusterIdentityLoader::get(operationContext())
-            ->loadClusterId(operationContext(), repl::ReadConcernLevel::kMajorityReadConcern));
+    ASSERT_OK(ClusterIdentityLoader::get(operationContext())
+                  ->loadClusterId(operationContext(),
+                                  catalogClient(),
+                                  repl::ReadConcernLevel::kMajorityReadConcern));
+}
+
+TEST_F(ClusterIdentityTest, NoConfigVersionDocument) {
+    // If no version document is found on config server loadClusterId will return an error
+    auto future = launchAsync([&] {
+        ASSERT_EQ(ClusterIdentityLoader::get(operationContext())
+                      ->loadClusterId(operationContext(),
+                                      catalogClient(),
+                                      repl::ReadConcernLevel::kMajorityReadConcern),
+                  ErrorCodes::NoMatchingDocument);
+    });
+
+    expectConfigVersionLoad(
+        Status(ErrorCodes::NoMatchingDocument, "No config version document found"));
+
+    future.default_timed_get();
 }
 
 TEST_F(ClusterIdentityTest, MultipleThreadsLoadingSuccess) {
     // Check that multiple threads calling getClusterId at once still results in only one network
     // operation.
     auto future1 = launchAsync([&] {
-        auto clusterIdStatus =
-            ClusterIdentityLoader::get(operationContext())
-                ->loadClusterId(operationContext(), repl::ReadConcernLevel::kMajorityReadConcern);
+        auto clusterIdStatus = ClusterIdentityLoader::get(operationContext())
+                                   ->loadClusterId(operationContext(),
+                                                   catalogClient(),
+                                                   repl::ReadConcernLevel::kMajorityReadConcern);
         ASSERT_OK(clusterIdStatus);
         ASSERT_EQUALS(clusterId, ClusterIdentityLoader::get(operationContext())->getClusterId());
     });
     auto future2 = launchAsync([&] {
-        auto clusterIdStatus =
-            ClusterIdentityLoader::get(operationContext())
-                ->loadClusterId(operationContext(), repl::ReadConcernLevel::kMajorityReadConcern);
+        auto clusterIdStatus = ClusterIdentityLoader::get(operationContext())
+                                   ->loadClusterId(operationContext(),
+                                                   catalogClient(),
+                                                   repl::ReadConcernLevel::kMajorityReadConcern);
         ASSERT_OK(clusterIdStatus);
         ASSERT_EQUALS(clusterId, ClusterIdentityLoader::get(operationContext())->getClusterId());
     });
     auto future3 = launchAsync([&] {
-        auto clusterIdStatus =
-            ClusterIdentityLoader::get(operationContext())
-                ->loadClusterId(operationContext(), repl::ReadConcernLevel::kMajorityReadConcern);
+        auto clusterIdStatus = ClusterIdentityLoader::get(operationContext())
+                                   ->loadClusterId(operationContext(),
+                                                   catalogClient(),
+                                                   repl::ReadConcernLevel::kMajorityReadConcern);
         ASSERT_OK(clusterIdStatus);
         ASSERT_EQUALS(clusterId, ClusterIdentityLoader::get(operationContext())->getClusterId());
     });
 
     expectConfigVersionLoad(clusterId);
 
-    future1.timed_get(kFutureTimeout);
-    future2.timed_get(kFutureTimeout);
-    future3.timed_get(kFutureTimeout);
+    future1.default_timed_get();
+    future2.default_timed_get();
+    future3.default_timed_get();
 }
 
 TEST_F(ClusterIdentityTest, BasicLoadFailureFollowedBySuccess) {
 
     // The first time you ask for the cluster ID it will have to be loaded from the config servers.
     auto future = launchAsync([&] {
-        auto clusterIdStatus =
-            ClusterIdentityLoader::get(operationContext())
-                ->loadClusterId(operationContext(), repl::ReadConcernLevel::kMajorityReadConcern);
+        auto clusterIdStatus = ClusterIdentityLoader::get(operationContext())
+                                   ->loadClusterId(operationContext(),
+                                                   catalogClient(),
+                                                   repl::ReadConcernLevel::kMajorityReadConcern);
         ASSERT_EQUALS(ErrorCodes::Interrupted, clusterIdStatus);
     });
 
     expectConfigVersionLoad(Status(ErrorCodes::Interrupted, "interrupted"));
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 
     // After a failure to load the cluster ID, subsequent attempts to get the cluster ID should
     // retry loading it.
     future = launchAsync([&] {
-        auto clusterIdStatus =
-            ClusterIdentityLoader::get(operationContext())
-                ->loadClusterId(operationContext(), repl::ReadConcernLevel::kMajorityReadConcern);
+        auto clusterIdStatus = ClusterIdentityLoader::get(operationContext())
+                                   ->loadClusterId(operationContext(),
+                                                   catalogClient(),
+                                                   repl::ReadConcernLevel::kMajorityReadConcern);
         ASSERT_OK(clusterIdStatus);
         ASSERT_EQUALS(clusterId, ClusterIdentityLoader::get(operationContext())->getClusterId());
     });
 
     expectConfigVersionLoad(clusterId);
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 }  // namespace

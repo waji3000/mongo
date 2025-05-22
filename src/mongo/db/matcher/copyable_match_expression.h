@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -55,15 +54,22 @@ public:
     CopyableMatchExpression(BSONObj matchAST,
                             const boost::intrusive_ptr<ExpressionContext>& expCtx,
                             std::unique_ptr<const ExtensionsCallback> extensionsCallback =
-                                stdx::make_unique<ExtensionsCallbackNoop>(),
+                                std::make_unique<ExtensionsCallbackNoop>(),
                             MatchExpressionParser::AllowedFeatureSet allowedFeatures =
-                                MatchExpressionParser::kDefaultSpecialFeatures)
+                                MatchExpressionParser::kDefaultSpecialFeatures,
+                            bool optimizeExpression = false)
         : _matchAST(matchAST), _extensionsCallback(std::move(extensionsCallback)) {
         StatusWithMatchExpression parseResult =
             MatchExpressionParser::parse(_matchAST, expCtx, *_extensionsCallback, allowedFeatures);
         uassertStatusOK(parseResult.getStatus());
-        _matchExpr = std::move(parseResult.getValue());
+        _matchExpr = optimizeExpression
+            ? MatchExpression::optimize(std::move(parseResult.getValue()),
+                                        /* enableSimplification */ true)
+            : std::move(parseResult.getValue());
     }
+
+    CopyableMatchExpression(BSONObj matchAST, std::unique_ptr<MatchExpression> matchExpr)
+        : _matchAST(matchAST), _matchExpr(std::move(matchExpr)) {}
 
     /**
      * Sets the collator on the underlying MatchExpression and all clones(!).
@@ -76,7 +82,7 @@ public:
      * Overload * so that CopyableMatchExpression can be dereferenced as if it were a pointer to the
      * underlying MatchExpression.
      */
-    const MatchExpression& operator*() {
+    const MatchExpression& operator*() const {
         return *_matchExpr;
     }
 
@@ -84,8 +90,12 @@ public:
      * Overload -> so that CopyableMatchExpression can be dereferenced as if it were a pointer to
      * the underlying MatchExpression.
      */
-    const MatchExpression* operator->() {
+    const MatchExpression* operator->() const {
         return &(*_matchExpr);
+    }
+
+    auto inputBSON() const {
+        return _matchAST;
     }
 
 private:

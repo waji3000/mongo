@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Public Domain 2014-2018 MongoDB, Inc.
+# Public Domain 2014-present MongoDB, Inc.
 # Public Domain 2008-2014 WiredTiger, Inc.
 #
 # This is free and unencumbered software released into the public domain.
@@ -30,7 +30,7 @@
 #   Verify opening a backup cursor forces a log file switch.
 #
 
-import os, shutil, stat
+import os, shutil
 import helper, wiredtiger, wttest
 from wtscenario import make_scenarios
 
@@ -73,11 +73,9 @@ class test_backup09(wttest.WiredTigerTestCase):
             cursor[doc_id] = doc_id
 
         last_doc_in_backup = doc_id
-        self.assertEqual(1, len(filter(lambda x:
-            x.startswith('WiredTigerLog.'), os.listdir('.'))))
+        self.assertEqual(1, len([x for x in os.listdir('.') if x.startswith('WiredTigerLog.')]))
         backup_cursor = self.session.open_cursor('backup:')
-        self.assertEqual(2, len(filter(lambda x:
-            x.startswith('WiredTigerLog.'), os.listdir('.'))))
+        self.assertEqual(2, len([x for x in os.listdir('.') if x.startswith('WiredTigerLog.')]))
 
         for i in range(10):
             doc_id += 1
@@ -90,8 +88,8 @@ class test_backup09(wttest.WiredTigerTestCase):
         log_files_to_copy = 0
         os.mkdir(self.backup_dir)
         if self.all_log_files:
-            helper.copy_wiredtiger_home('.', self.backup_dir)
-            log_files_copied = filter(lambda x: x.startswith('WiredTigerLog.'), os.listdir(self.backup_dir))
+            helper.copy_wiredtiger_home(self, '.', self.backup_dir)
+            log_files_copied = [x for x in os.listdir(self.backup_dir) if x.startswith('WiredTigerLog.')]
             self.assertEqual(len(log_files_copied), 2)
         else:
             while True:
@@ -140,6 +138,3 @@ class test_backup09(wttest.WiredTigerTestCase):
         # on the destination. Verify no document later than last_doc exists.
         self.copy_and_restore(
             backup_cursor, last_doc_in_backup, last_doc_in_data)
-
-if __name__ == '__main__':
-    wttest.run()

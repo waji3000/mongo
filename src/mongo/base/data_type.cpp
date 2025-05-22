@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,22 +29,31 @@
 
 #include "mongo/base/data_type.h"
 
-#include "mongo/util/mongoutils/str.h"
+#include <fmt/format.h>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/string_data.h"
 
 namespace mongo {
 
+namespace {
+auto makeOverflowStatus(StringData action, size_t sizeOfT, size_t length, size_t debug_offset) {
+    return Status(
+        ErrorCodes::Overflow,
+        fmt::format("buffer size too small to {} ({}) bytes out of buffer[{}] at offset: {}",
+                    action,
+                    sizeOfT,
+                    length,
+                    debug_offset));
+}
+}  // namespace
+
 Status DataType::makeTrivialLoadStatus(size_t sizeOfT, size_t length, size_t debug_offset) {
-    mongoutils::str::stream ss;
-    ss << "buffer size too small to read (" << sizeOfT << ") bytes out of buffer[" << length
-       << "] at offset: " << debug_offset;
-    return Status(ErrorCodes::Overflow, ss);
+    return makeOverflowStatus("read", sizeOfT, length, debug_offset);
 }
 
 Status DataType::makeTrivialStoreStatus(size_t sizeOfT, size_t length, size_t debug_offset) {
-    mongoutils::str::stream ss;
-    ss << "buffer size too small to write (" << sizeOfT << ") bytes into buffer[" << length
-       << "] at offset: " << debug_offset;
-    return Status(ErrorCodes::Overflow, ss);
+    return makeOverflowStatus("write", sizeOfT, length, debug_offset);
 }
 
 }  // namespace mongo

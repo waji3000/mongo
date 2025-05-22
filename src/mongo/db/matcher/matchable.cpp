@@ -1,6 +1,3 @@
-// matchable.h
-
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -31,8 +28,6 @@
  */
 
 #include "mongo/db/matcher/matchable.h"
-#include "mongo/db/jsobj.h"
-#include "mongo/platform/basic.h"
 
 namespace mongo {
 
@@ -41,4 +36,4 @@ BSONMatchableDocument::BSONMatchableDocument(const BSONObj& obj) : _obj(obj) {
 }
 
 BSONMatchableDocument::~BSONMatchableDocument() {}
-}
+}  // namespace mongo

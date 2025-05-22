@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,10 +27,16 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <ostream>
+#include <string>
 
-#include "mongo/bson/bsonmisc.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/bson/bsontypes_util.h"
 #include "mongo/crypto/sha256_block.h"
 #include "mongo/unittest/unittest.h"
 
@@ -39,7 +44,7 @@ namespace mongo {
 namespace {
 
 ConstDataRange makeTestItem(StringData sd) {
-    return ConstDataRange(sd.rawData(), sd.size());
+    return ConstDataRange(sd.data(), sd.size());
 }
 
 // SHA-256 test vectors from tom crypt
@@ -66,9 +71,16 @@ const struct {
 
 TEST(CryptoVectors, SHA256) {
     size_t numTests = sizeof(sha256Tests) / sizeof(sha256Tests[0]);
+    SHA256Block::Secure resultSec;
     for (size_t i = 0; i < numTests; i++) {
+        // Normal allocator.
         SHA256Block result = SHA256Block::computeHash(sha256Tests[i].msg);
-        ASSERT(sha256Tests[i].hash == result) << "Failed SHA256 iteration " << i;
+        ASSERT_EQ(sha256Tests[i].hash, result) << "Failed SHA256 iteration " << i;
+        // Secure allocator.
+        SHA256Block::Secure::computeHash(sha256Tests[i].msg, &resultSec);
+        ASSERT_EQ(sha256Tests[i].hash, resultSec) << "Failed SHA256 secure iteration " << i;
+
+        ASSERT_EQ(result, resultSec) << "Stack allocator != Secure allocator hash" << i;
     }
 }
 

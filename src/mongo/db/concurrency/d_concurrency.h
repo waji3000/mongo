@@ -29,40 +29,25 @@
 
 #pragma once
 
-#include <climits>  // For UINT_MAX
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
 
+#include "mongo/db/concurrency/lock_manager_defs.h"
 #include "mongo/db/concurrency/locker.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/util/timer.h"
+#include "mongo/db/tenant_id.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo {
 
-class StringData;
-class NamespaceString;
-
 class Lock {
 public:
-    /**
-     * NOTE: DO NOT add any new usages of TempRelease. It is being deprecated/removed.
-     */
-    class TempRelease {
-        MONGO_DISALLOW_COPYING(TempRelease);
-
-    public:
-        explicit TempRelease(Locker* lockState);
-        ~TempRelease();
-
-    private:
-        // Not owned
-        Locker* const _lockState;
-
-        // If _locksReleased is true, this stores the persisted lock information to be restored
-        // in the destructor. Otherwise it is empty.
-        Locker::LockSnapshot _lockSnapshot;
-
-        // False if locks could not be released because of recursive locking
-        const bool _locksReleased;
-    };
+    // TODO (SERVER-102774): Remove this aliasing by substituting all usages of Lock::ResourceMutex
+    // with ResourceMutex.
+    using ResourceMutex = mongo::ResourceMutex;
 
     /**
      * General purpose RAII wrapper for a resource managed by the lock manager
@@ -72,79 +57,42 @@ public:
      * resources other than RESOURCE_GLOBAL, RESOURCE_DATABASE and RESOURCE_COLLECTION.
      */
     class ResourceLock {
-        MONGO_DISALLOW_COPYING(ResourceLock);
-
     public:
-        ResourceLock(Locker* locker, ResourceId rid)
-            : _rid(rid), _locker(locker), _result(LOCK_INVALID) {}
-
-        ResourceLock(Locker* locker, ResourceId rid, LockMode mode)
-            : _rid(rid), _locker(locker), _result(LOCK_INVALID) {
-            lock(mode);
+        ResourceLock(OperationContext* opCtx,
+                     ResourceId rid,
+                     LockMode mode,
+                     Date_t deadline = Date_t::max())
+            : _opCtx(opCtx), _rid(rid) {
+            _lock(mode, deadline);
         }
 
-        ResourceLock(ResourceLock&& otherLock)
-            : _rid(otherLock._rid), _locker(otherLock._locker), _result(otherLock._result) {
-            // Mark as moved so the destructor doesn't invalidate the newly-
-            // constructed lock.
-            otherLock._result = LOCK_INVALID;
-        }
+        ResourceLock(ResourceLock&& other);
 
         ~ResourceLock() {
-            if (isLocked()) {
-                unlock();
-            }
+            _unlock();
         }
 
-        void lock(LockMode mode);
-        void unlock();
-
-        bool isLocked() const {
+    protected:
+        /**
+         * Acquires lock on this specified resource in the specified mode.
+         *
+         * If 'deadline' is provided, we will wait until 'deadline' for the lock to be granted.
+         * Otherwise, this parameter defaults to an infinite deadline.
+         *
+         * This function may throw an exception if it is interrupted.
+         */
+        void _lock(LockMode mode, Date_t deadline = Date_t::max());
+        void _unlock();
+        bool _isLocked() const {
             return _result == LOCK_OK;
         }
 
-    private:
-        const ResourceId _rid;
-        Locker* const _locker;
-
-        LockResult _result;
-    };
-
-    class SharedLock;
-    class ExclusiveLock;
-
-    /**
-     * For use as general mutex or readers/writers lock, outside the general multi-granularity
-     * model. A ResourceMutex is not affected by yielding/temprelease and two phase locking
-     * semantics inside WUOWs. Lock with ResourceLock, SharedLock or ExclusiveLock. Uses same
-     * fairness as other LockManager locks.
-     */
-    class ResourceMutex {
-    public:
-        ResourceMutex(std::string resourceLabel);
-
-        std::string getName() const {
-            return getName(_rid);
-        };
-
-        static std::string getName(ResourceId resourceId);
-
-        bool isExclusivelyLocked(Locker* locker);
-
-        bool isAtLeastReadLocked(Locker* locker);
+        OperationContext* _opCtx;
 
     private:
-        friend class Lock::SharedLock;
-        friend class Lock::ExclusiveLock;
+        ResourceId _rid;
 
-        /**
-         * Each instantiation of this class allocates a new ResourceId.
-         */
-        ResourceId rid() const {
-            return _rid;
-        }
-
-        const ResourceId _rid;
+        LockResult _result{LOCK_INVALID};
     };
 
     /**
@@ -152,8 +100,19 @@ public:
      */
     class ExclusiveLock : public ResourceLock {
     public:
-        ExclusiveLock(Locker* locker, ResourceMutex mutex)
-            : ResourceLock(locker, mutex.rid(), MODE_X) {}
+        ExclusiveLock(OperationContext* opCtx, ResourceMutex mutex)
+            : ResourceLock(opCtx, mutex.getRid(), MODE_X) {}
+
+        // Lock/unlock overloads to allow ExclusiveLock to be used with condition_variable-like
+        // utilities such as stdx::condition_variable_any and waitForConditionOrInterrupt
+        void lock();
+        void unlock() {
+            _unlock();
+        }
+
+        bool isLocked() const {
+            return _isLocked();
+        }
     };
 
     /**
@@ -163,8 +122,8 @@ public:
      */
     class SharedLock : public ResourceLock {
     public:
-        SharedLock(Locker* locker, ResourceMutex mutex)
-            : ResourceLock(locker, mutex.rid(), MODE_IS) {}
+        SharedLock(OperationContext* opCtx, ResourceMutex mutex)
+            : ResourceLock(opCtx, mutex.getRid(), MODE_IS) {}
     };
 
     /**
@@ -174,6 +133,12 @@ public:
         kThrow,         // Throw the interruption exception.
         kLeaveUnlocked  // Suppress the exception, but leave unlocked such that a call to isLocked()
                         // returns false.
+    };
+
+    struct GlobalLockSkipOptions {
+        bool skipFlowControlTicket = false;
+        bool skipRSTLLock = false;
+        bool skipDirectConnectionChecks = false;
     };
 
     /**
@@ -186,8 +151,6 @@ public:
      */
     class GlobalLock {
     public:
-        class EnqueueOnly {};
-
         /**
          * A GlobalLock without a deadline defaults to Date_t::max() and an InterruptBehavior of
          * kThrow.
@@ -203,55 +166,36 @@ public:
                    Date_t deadline,
                    InterruptBehavior behavior);
 
-        GlobalLock(GlobalLock&&);
-
-        /**
-         * Enqueues lock but does not block on lock acquisition.
-         * Call waitForLockUntil() to complete locking process.
-         *
-         * Does not set that the global lock was taken on the GlobalLockAcquisitionTracker. Call
-         * waitForLockUntil to do so.
-         */
         GlobalLock(OperationContext* opCtx,
                    LockMode lockMode,
                    Date_t deadline,
                    InterruptBehavior behavior,
-                   EnqueueOnly enqueueOnly);
+                   GlobalLockSkipOptions skipOptions);
 
-        ~GlobalLock() {
-            if (isLocked()) {
-                // Abandon our snapshot if destruction of the GlobalLock object results in actually
-                // unlocking the global lock. Recursive locking and the two-phase locking protocol
-                // may prevent lock release.
-                const bool willReleaseLock = _isOutermostLock &&
-                    !(_opCtx->lockState() && _opCtx->lockState()->inAWriteUnitOfWork());
-                if (willReleaseLock) {
-                    _opCtx->recoveryUnit()->abandonSnapshot();
-                }
-                _unlock();
-            }
-            _opCtx->lockState()->unlock(resourceIdReplicationStateTransitionLock);
-        }
+        GlobalLock(GlobalLock&&);
 
-        /**
-         * Waits for lock to be granted. Sets that the global lock was taken on the
-         * GlobalLockAcquisitionTracker.
-         */
-        void waitForLockUntil(Date_t deadline);
+        ~GlobalLock();
 
         bool isLocked() const {
             return _result == LOCK_OK;
         }
 
     private:
-        void _enqueue(LockMode lockMode, Date_t deadline);
+        /**
+         * Constructor helper functions, to handle skipping or taking the RSTL lock.
+         */
+        void _takeGlobalLockOnly(LockMode lockMode, Date_t deadline);
+        void _takeGlobalAndRSTLLocks(LockMode lockMode, Date_t deadline);
+
         void _unlock();
 
         OperationContext* const _opCtx;
-        LockResult _result;
-        ResourceLock _pbwm;
+        LockResult _result{LOCK_INVALID};
+
+        boost::optional<ResourceLock> _multiDocTxnBarrier;
+
         InterruptBehavior _interruptBehavior;
-        const bool _isOutermostLock;
+        bool _skipRSTLLock;
     };
 
     /**
@@ -284,8 +228,40 @@ public:
             : GlobalLock(opCtx, MODE_S, deadline, behavior) {}
     };
 
+    using DBLockSkipOptions = GlobalLockSkipOptions;
+
     /**
-     * Database lock with support for collection- and document-level locking
+     *  Tenant lock.
+     *
+     *  Controls access to resources belonging to a tenant.
+     *
+     * This lock supports four modes (see Lock_Mode):
+     *   MODE_IS: concurrent access to tenant's resources, requiring further database read locks
+     *   MODE_IX: concurrent access to tenant's resources, requiring further database read or write
+     * locks
+     *   MODE_S: shared read access to tenant's resources, blocking any writers
+     *   MODE_X: exclusive access to tenant's resources, blocking all other readers and writers.
+     */
+    class TenantLock {
+        TenantLock(const TenantLock&) = delete;
+        TenantLock& operator=(const TenantLock&) = delete;
+
+    public:
+        TenantLock(OperationContext* opCtx,
+                   const TenantId& tenantId,
+                   LockMode mode,
+                   Date_t deadline = Date_t::max());
+
+        TenantLock(TenantLock&&);
+        ~TenantLock();
+
+    private:
+        ResourceId _id;
+        OperationContext* _opCtx;
+    };
+
+    /**
+     * Database lock.
      *
      * This lock supports four modes (see Lock_Mode):
      *   MODE_IS: concurrent database access, requiring further collection read locks
@@ -297,26 +273,38 @@ public:
      * for MODE_IX or MODE_X also acquires global lock in intent-exclusive (IX) mode.
      * For storage engines that do not support collection-level locking, MODE_IS will be
      * upgraded to MODE_S and MODE_IX will be upgraded to MODE_X.
+     *
+     * If the database belongs to a tenant, then acquires a tenant lock before the database lock.
+     * For 'mode' MODE_IS or MODE_S acquires tenant lock in intent-shared (IS) mode, otherwise,
+     * acquires a tenant lock in intent-exclusive (IX) mode. A different, stronger tenant lock mode
+     * to acquire can be specified with 'tenantLockMode' parameter. Passing boost::none for the
+     * tenant lock mode does not skip the tenant lock, but indicates that the tenant lock in default
+     * mode should be acquired.
      */
     class DBLock {
     public:
         DBLock(OperationContext* opCtx,
-               StringData db,
+               const DatabaseName& dbName,
                LockMode mode,
-               Date_t deadline = Date_t::max());
+               Date_t deadline = Date_t::max(),
+               boost::optional<LockMode> tenantLockMode = boost::none);
+
+        DBLock(OperationContext* opCtx,
+               const DatabaseName& dbName,
+               LockMode mode,
+               Date_t deadline,
+               DBLockSkipOptions skipOptions,
+               boost::optional<LockMode> tenantLockMode = boost::none);
+
         DBLock(DBLock&&);
         ~DBLock();
 
-        /**
-         * Releases the DBLock and reacquires it with the new mode. The global intent
-         * lock is retained (so the database can't disappear). Relocking from MODE_IS or
-         * MODE_S to MODE_IX or MODE_X is not allowed to avoid violating the global intent.
-         * Use relockWithMode() instead of upgrading to avoid deadlock.
-         */
-        void relockWithMode(LockMode newMode);
-
         bool isLocked() const {
             return _result == LOCK_OK;
+        }
+
+        LockMode mode() const {
+            return _mode;
         }
 
     private:
@@ -330,78 +318,43 @@ public:
         LockMode _mode;
 
         // Acquires the global lock on our behalf.
-        GlobalLock _globalLock;
+        boost::optional<GlobalLock> _globalLock;
+
+        // Acquires the tenant lock on behalf of this DB lock.
+        boost::optional<TenantLock> _tenantLock;
+        bool _oldBlockingAllowed;
     };
 
     /**
-     * Collection lock with support for document-level locking
+     * Collection lock.
      *
      * This lock supports four modes (see Lock_Mode):
-     *   MODE_IS: concurrent collection access, requiring document level locking read locks
-     *   MODE_IX: concurrent collection access, requiring document level read or write locks
+     *   MODE_IS: concurrent collection access, requiring read locks
+     *   MODE_IX: concurrent collection access, requiring read or write locks
      *   MODE_S:  shared read access to the collection, blocking any writers
      *   MODE_X:  exclusive access to the collection, blocking all other readers and writers
      *
      * An appropriate DBLock must already be held before locking a collection: it is an error,
-     * checked with a dassert(), to not have a suitable database lock before locking the
-     * collection. For storage engines that do not support document-level locking, MODE_IS
-     * will be upgraded to MODE_S and MODE_IX will be upgraded to MODE_X.
+     * checked with a dassert(), to not have a suitable database lock before locking the collection.
      */
     class CollectionLock {
-        MONGO_DISALLOW_COPYING(CollectionLock);
+        CollectionLock(const CollectionLock&) = delete;
+        CollectionLock& operator=(const CollectionLock&) = delete;
 
     public:
-        CollectionLock(Locker* lockState,
-                       StringData ns,
+        CollectionLock(OperationContext* opCtx,
+                       const NamespaceString& ns,
                        LockMode mode,
                        Date_t deadline = Date_t::max());
+
         CollectionLock(CollectionLock&&);
+        CollectionLock& operator=(CollectionLock&& other);
         ~CollectionLock();
 
-        bool isLocked() const {
-            return _result == LOCK_OK;
-        }
-
     private:
-        const ResourceId _id;
-        LockResult _result;
-        Locker* _lockState;
-    };
-
-    /**
-     * Like the CollectionLock, but optimized for the local oplog. Always locks in MODE_IX,
-     * must call serializeIfNeeded() before doing any concurrent operations in order to
-     * support storage engines without document level locking. It is an error, checked with a
-     * dassert(), to not have a suitable database lock when taking this lock.
-     */
-    class OplogIntentWriteLock {
-        MONGO_DISALLOW_COPYING(OplogIntentWriteLock);
-
-    public:
-        explicit OplogIntentWriteLock(Locker* lockState);
-        ~OplogIntentWriteLock();
-        void serializeIfNeeded();
-
-    private:
-        Locker* const _lockState;
-        bool _serialized;
-    };
-
-    /**
-     * Turn on "parallel batch writer mode" by locking the global ParallelBatchWriterMode
-     * resource in exclusive mode. This mode is off by default.
-     * Note that only one thread creates a ParallelBatchWriterMode object; the other batch
-     * writers just call setShouldConflictWithSecondaryBatchApplication(false).
-     */
-    class ParallelBatchWriterMode {
-        MONGO_DISALLOW_COPYING(ParallelBatchWriterMode);
-
-    public:
-        explicit ParallelBatchWriterMode(Locker* lockState);
-
-    private:
-        ResourceLock _pbwm;
-        ShouldNotConflictWithSecondaryBatchApplicationBlock _shouldNotConflictBlock;
+        ResourceId _id;
+        OperationContext* _opCtx;
+        bool _oldBlockingAllowed;
     };
 };
 

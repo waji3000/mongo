@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,23 +29,27 @@
 
 #pragma once
 
+#include <fmt/format.h>
 #include <iosfwd>
 #include <string>
 
 #include <boost/optional.hpp>
 
 #include "mongo/bson/util/builder.h"
-#include "mongo/platform/hash_namespace.h"
-#include "mongo/util/net/sockaddr.h"
+#include "mongo/db/tenant_id.h"
 
 namespace mongo {
 
 class Status;
-template <typename Allocator>
-class StringBuilderImpl;
-class StringData;
 template <typename T>
 class StatusWith;
+class StringData;
+
+/**
+ * Validate that a string is either empty or is parseable to a HostAndPort. This is intended for use
+ * as an IDL validator callback.
+ */
+Status validateHostAndPort(const std::string& hostAndPortStr, const boost::optional<TenantId>&);
 
 /**
  * Name of a process on the network.
@@ -88,14 +91,6 @@ struct HostAndPort {
     HostAndPort(const std::string& h, int p);
 
     /**
-     * Constructs a HostAndPort from a SockAddr
-     *
-     * Used by the TransportLayer to convert raw socket addresses into HostAndPorts to be
-     * accessed via tranport::Session
-     */
-    explicit HostAndPort(SockAddr addr);
-
-    /**
      * (Re-)initializes this HostAndPort by parsing "s".  Returns
      * Status::OK on success.  The state of this HostAndPort is unspecified
      * after initialize() returns a non-OK status, though it is safe to
@@ -128,22 +123,9 @@ struct HostAndPort {
     std::string toString() const;
 
     /**
-     * Like toString(), above, but writes to "ss", instead.
-     */
-    void append(StringBuilder& ss) const;
-
-    /**
      * Returns true if this object represents no valid HostAndPort.
      */
     bool empty() const;
-
-    /**
-     * Returns the SockAddr representation of this address, if available
-     */
-    const boost::optional<SockAddr>& sockAddr() const& {
-        return _addr;
-    }
-    void sockAddr() && = delete;
 
     const std::string& host() const {
         return _host;
@@ -154,24 +136,75 @@ struct HostAndPort {
         return _port >= 0;
     }
 
+    template <typename H>
+    friend H AbslHashValue(H h, const HostAndPort& hostAndPort) {
+        return H::combine(std::move(h), hostAndPort.host(), hostAndPort.port());
+    }
+
 private:
-    boost::optional<SockAddr> _addr;
+    friend struct fmt::formatter<HostAndPort>;
+
+    struct AppendVisitor {
+        virtual void operator()(StringData v) = 0;
+        virtual void operator()(std::uint16_t v) = 0;
+        virtual ~AppendVisitor() = default;
+    };
+
+    void _appendToVisitor(AppendVisitor& sink) const;
+
+    template <typename F>
+    void _appendToPolymorphicFunc(F f) const;
+
+    template <typename Stream>
+    Stream& _appendToStream(Stream& os) const {
+        _appendToPolymorphicFunc([&](const auto& v) { os << v; });
+        return os;
+    }
+
+    friend std::ostream& operator<<(std::ostream& os, const HostAndPort& hp) {
+        return hp._appendToStream(os);
+    }
+    friend StringBuilder& operator<<(StringBuilder& os, const HostAndPort& hp) {
+        return hp._appendToStream(os);
+    }
+    friend StackStringBuilder& operator<<(StackStringBuilder& os, const HostAndPort& hp) {
+        return hp._appendToStream(os);
+    }
+
     std::string _host;
     int _port;  // -1 indicates unspecified
 };
 
-std::ostream& operator<<(std::ostream& os, const HostAndPort& hp);
-
-template <typename Allocator>
-StringBuilderImpl<Allocator>& operator<<(StringBuilderImpl<Allocator>& os, const HostAndPort& hp);
+template <typename F>
+void HostAndPort::_appendToPolymorphicFunc(F f) const {
+    struct Vis : AppendVisitor {
+        explicit Vis(F f) : _f{std::move(f)} {}
+        void operator()(StringData v) override {
+            _f(v);
+        }
+        void operator()(std::uint16_t v) override {
+            _f(v);
+        }
+        F _f;
+    };
+    Vis visitor(std::move(f));
+    _appendToVisitor(visitor);
+}
 
 }  // namespace mongo
 
-MONGO_HASH_NAMESPACE_START
-
+namespace fmt {
 template <>
-struct hash<mongo::HostAndPort> {
-    size_t operator()(const mongo::HostAndPort& host) const;
+struct formatter<mongo::HostAndPort> {
+    template <typename ParseContext>
+    constexpr auto parse(ParseContext& ctx) {
+        return ctx.begin();
+    }
+    template <typename FormatContext>
+    auto format(const mongo::HostAndPort& hp, FormatContext& ctx) const {
+        auto&& it = ctx.out();
+        hp._appendToPolymorphicFunc([&](const auto& v) { it = fmt::format_to(it, "{}", v); });
+        return it;
+    }
 };
-
-MONGO_HASH_NAMESPACE_END
+}  // namespace fmt

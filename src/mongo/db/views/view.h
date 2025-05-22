@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -35,6 +34,7 @@
 
 #include "mongo/base/string_data.h"
 #include "mongo/bson/bsonobj.h"
+#include "mongo/db/database_name.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/query/collation/collator_interface.h"
 
@@ -49,7 +49,7 @@ public:
      * In the database 'dbName', create a new view 'viewName' on the view or collection
      * 'viewOnName'. Neither 'viewName' nor 'viewOnName' should include the name of the database.
      */
-    ViewDefinition(StringData dbName,
+    ViewDefinition(const DatabaseName& dbName,
                    StringData viewName,
                    StringData viewOnName,
                    const BSONObj& pipeline,
@@ -91,12 +91,20 @@ public:
         return _collator.get();
     }
 
+    /**
+     * Returns 'true' if this view is a time-series collection. That is, it is backed by a
+     * time-series buckets collection.
+     */
+    bool timeseries() const {
+        return _viewOnNss.isTimeseriesBucketsCollection();
+    }
+
     void setViewOn(const NamespaceString& viewOnNss);
 
     /**
      * Pipeline must be of type array.
      */
-    void setPipeline(const BSONElement& pipeline);
+    void setPipeline(std::vector<mongo::BSONObj> pipeline);
 
 private:
     NamespaceString _viewNss;

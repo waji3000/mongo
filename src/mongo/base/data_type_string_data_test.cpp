@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,11 +27,11 @@
  *    it in the license file.
  */
 
-#include "mongo/base/data_type.h"
+#include <utility>
 
-#include "mongo/base/data_range.h"
 #include "mongo/base/data_range_cursor.h"
 #include "mongo/base/data_type_terminated.h"
+#include "mongo/base/string_data.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
@@ -46,9 +45,9 @@ TEST(DataTypeStringData, Basic) {
     {
         DataRangeCursor drc(buf, buf + sizeof(buf));
 
-        ASSERT_OK(drc.writeAndAdvance(Terminated<'\0', StringData>(a)));
-        ASSERT_OK(drc.writeAndAdvance(Terminated<'\0', StringData>(b)));
-        ASSERT_OK(drc.writeAndAdvance(Terminated<'\0', StringData>(c)));
+        ASSERT_OK(drc.writeAndAdvanceNoThrow(Terminated<'\0', StringData>(a)));
+        ASSERT_OK(drc.writeAndAdvanceNoThrow(Terminated<'\0', StringData>(b)));
+        ASSERT_OK(drc.writeAndAdvanceNoThrow(Terminated<'\0', StringData>(c)));
 
         ASSERT_EQUALS(1 + 2 + 3 + 3, drc.data() - buf);
     }
@@ -58,13 +57,13 @@ TEST(DataTypeStringData, Basic) {
 
         Terminated<'\0', StringData> tsd;
 
-        ASSERT_OK(cdrc.readAndAdvance(&tsd));
+        ASSERT_OK(cdrc.readAndAdvanceNoThrow(&tsd));
         ASSERT_EQUALS(a, tsd.value);
 
-        ASSERT_OK(cdrc.readAndAdvance(&tsd));
+        ASSERT_OK(cdrc.readAndAdvanceNoThrow(&tsd));
         ASSERT_EQUALS(b, tsd.value);
 
-        ASSERT_OK(cdrc.readAndAdvance(&tsd));
+        ASSERT_OK(cdrc.readAndAdvanceNoThrow(&tsd));
         ASSERT_EQUALS(c, tsd.value);
     }
 }

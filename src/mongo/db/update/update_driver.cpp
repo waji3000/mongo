@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,77 +29,60 @@
 
 #include "mongo/db/update/update_driver.h"
 
+#include <boost/move/utility_core.hpp>
+#include <set>
+#include <string>
+#include <utility>
+
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
 
 #include "mongo/base/error_codes.h"
+#include "mongo/base/status_with.h"
 #include "mongo/base/string_data.h"
-#include "mongo/bson/mutable/algorithm.h"
-#include "mongo/bson/mutable/document.h"
-#include "mongo/db/bson/dotted_path_support.h"
-#include "mongo/db/field_ref.h"
-#include "mongo/db/matcher/expression_leaf.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/db/curop_failpoint_helpers.h"
+#include "mongo/db/exec/mutable_bson/document.h"
+#include "mongo/db/matcher/expression_parser.h"
 #include "mongo/db/matcher/extensions_callback_noop.h"
-#include "mongo/db/server_options.h"
-#include "mongo/db/update/log_builder.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/query/canonical_query.h"
+#include "mongo/db/query/find_command.h"
+#include "mongo/db/query/write_ops/update_request.h"
+#include "mongo/db/update/delta_executor.h"
 #include "mongo/db/update/modifier_table.h"
-#include "mongo/db/update/object_replace_node.h"
+#include "mongo/db/update/object_replace_executor.h"
+#include "mongo/db/update/object_transform_executor.h"
 #include "mongo/db/update/path_support.h"
-#include "mongo/db/update/storage_validation.h"
-#include "mongo/util/embedded_builder.h"
-#include "mongo/util/mongoutils/str.h"
-#include "mongo/util/stringutils.h"
+#include "mongo/db/update/pipeline_executor.h"
+#include "mongo/db/update/update_object_node.h"
+#include "mongo/platform/compiler.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/overloaded_visitor.h"  // IWYU pragma: keep
+#include "mongo/util/str.h"
 
 namespace mongo {
 
-namespace str = mongoutils::str;
-namespace mb = mongo::mutablebson;
-
-using std::unique_ptr;
-using std::vector;
+MONGO_FAIL_POINT_DEFINE(hangAfterPipelineUpdateFCVCheck);
 
 using pathsupport::EqualityMatches;
 
 namespace {
-
-StatusWith<UpdateSemantics> updateSemanticsFromElement(BSONElement element) {
-    if (element.type() != BSONType::NumberInt && element.type() != BSONType::NumberLong) {
-        return {ErrorCodes::BadValue, "'$v' (UpdateSemantics) field must be an integer."};
-    }
-
-    auto updateSemantics = element.numberLong();
-
-    // As of 3.7, we only support one version of the update language.
-    if (updateSemantics != static_cast<int>(UpdateSemantics::kUpdateNode)) {
-        return {ErrorCodes::Error(40682),
-                str::stream() << "Unrecognized value for '$v' (UpdateSemantics) field: "
-                              << updateSemantics};
-    }
-
-    return static_cast<UpdateSemantics>(updateSemantics);
-}
-
 modifiertable::ModifierType validateMod(BSONElement mod) {
     auto modType = modifiertable::getType(mod.fieldName());
 
-    uassert(ErrorCodes::FailedToParse,
-            str::stream() << "Unknown modifier: " << mod.fieldName(),
-            modType != modifiertable::MOD_UNKNOWN);
+    uassert(
+        ErrorCodes::FailedToParse,
+        str::stream()
+            << "Unknown modifier: " << mod.fieldName()
+            << ". Expected a valid update modifier or pipeline-style update specified as an array",
+        modType != modifiertable::MOD_UNKNOWN);
 
     uassert(ErrorCodes::FailedToParse,
             str::stream() << "Modifiers operate on fields but we found type "
-                          << typeName(mod.type())
-                          << " instead. For example: {$mod: {<field>: ...}}"
-                          << " not {"
-                          << mod
-                          << "}",
+                          << typeName(mod.type()) << " instead. For example: {$mod: {<field>: ...}}"
+                          << " not {" << mod << "}",
             mod.type() == BSONType::Object);
-
-    uassert(ErrorCodes::FailedToParse,
-            str::stream() << "'" << mod.fieldName()
-                          << "' is empty. You must specify a field like so: "
-                             "{"
-                          << mod.fieldName()
-                          << ": {<field>: ...}}",
-            !mod.embeddedObject().isEmpty());
 
     return modType;
 }
@@ -113,19 +95,7 @@ bool parseUpdateExpression(
     const std::map<StringData, std::unique_ptr<ExpressionWithPlaceholder>>& arrayFilters) {
     bool positional = false;
     std::set<std::string> foundIdentifiers;
-    bool foundUpdateSemanticsField = false;
     for (auto&& mod : updateExpr) {
-        // If there is a "$v" field among the modifiers, it should have already been used by the
-        // caller to determine that this is the correct parsing function.
-        if (mod.fieldNameStringData() == LogBuilder::kUpdateSemanticsFieldName) {
-            uassert(ErrorCodes::BadValue,
-                    "Duplicate $v in oplog update document",
-                    !foundUpdateSemanticsField);
-            foundUpdateSemanticsField = true;
-            invariant(mod.numberLong() == static_cast<long long>(UpdateSemantics::kUpdateNode));
-            continue;
-        }
-
         auto modType = validateMod(mod);
         for (auto&& field : mod.Obj()) {
             auto statusWithPositional = UpdateObjectNode::parseAndMerge(
@@ -138,8 +108,7 @@ bool parseUpdateExpression(
     for (const auto& arrayFilter : arrayFilters) {
         uassert(ErrorCodes::FailedToParse,
                 str::stream() << "The array filter for identifier '" << arrayFilter.first
-                              << "' was not used in the update "
-                              << updateExpr,
+                              << "' was not used in the update " << updateExpr,
                 foundIdentifiers.find(arrayFilter.first.toString()) != foundIdentifiers.end());
     }
 
@@ -152,42 +121,82 @@ UpdateDriver::UpdateDriver(const boost::intrusive_ptr<ExpressionContext>& expCtx
     : _expCtx(expCtx) {}
 
 void UpdateDriver::parse(
-    const BSONObj& updateExpr,
+    const write_ops::UpdateModification& updateMod,
     const std::map<StringData, std::unique_ptr<ExpressionWithPlaceholder>>& arrayFilters,
+    boost::optional<BSONObj> constants,
     const bool multi) {
-    invariant(!_root && !_replacementMode, "Multiple calls to parse() on same UpdateDriver");
+    invariant(!_updateExecutor, "Multiple calls to parse() on same UpdateDriver");
 
-    // Check if the update expression is a full object replacement.
-    if (isDocReplacement(updateExpr)) {
-        uassert(ErrorCodes::FailedToParse, "multi update only works with $ operators", !multi);
-
-        _root = stdx::make_unique<ObjectReplaceNode>(updateExpr);
-
-        // Register the fact that this driver will only do full object replacements.
-        _replacementMode = true;
-
+    if (updateMod.type() == write_ops::UpdateModification::Type::kPipeline) {
+        uassert(ErrorCodes::FailedToParse,
+                "arrayFilters may not be specified for pipeline-style updates",
+                arrayFilters.empty());
+        _updateExecutor =
+            std::make_unique<PipelineExecutor>(_expCtx, updateMod.getUpdatePipeline(), constants);
+        _updateType = UpdateType::kPipeline;
         return;
     }
 
-    // Register the fact that this driver is not doing a full object replacement.
-    _replacementMode = false;
+    if (updateMod.type() == write_ops::UpdateModification::Type::kDelta) {
+        uassert(4772603,
+                "arrayFilters may not be specified for delta-style updates",
+                arrayFilters.empty());
 
-    // Some versions of mongod support more than one version of the update language and look for a
-    // $v "UpdateSemantics" field when applying an oplog entry, in order to know which version of
-    // the update language to apply with. We currently only support the 'kUpdateNode' version, but
-    // we parse $v and check its value for compatibility.
-    BSONElement updateSemanticsElement = updateExpr[LogBuilder::kUpdateSemanticsFieldName];
-    if (updateSemanticsElement) {
-        uassert(ErrorCodes::FailedToParse,
-                "The $v update field is only recognized internally",
-                _fromOplogApplication);
-
-        uassertStatusOK(updateSemanticsFromElement(updateSemanticsElement));
+        _updateType = UpdateType::kDelta;
+        _updateExecutor = std::make_unique<DeltaExecutor>(
+            updateMod.getDiff(), updateMod.mustCheckExistenceForInsertOperations());
+        return;
     }
 
-    auto root = stdx::make_unique<UpdateObjectNode>();
-    _positional = parseUpdateExpression(updateExpr, root.get(), _expCtx, arrayFilters);
-    _root = std::move(root);
+    if (MONGO_unlikely(constants)) {
+        // Throws "Constant values may be only be specified for pipeline updates" error.
+        UpdateRequest::throwUnexpectedConstantValuesException();
+    }
+
+    // Check if the update expression is a full object replacement.
+    if (updateMod.type() == write_ops::UpdateModification::Type::kReplacement) {
+        uassert(ErrorCodes::FailedToParse,
+                "multi update is not supported for replacement-style update",
+                !multi);
+
+        // For updates that originated from the oplog, we're required to apply the update
+        // exactly as it was recorded (even if it contains zero-valued timestamps). Therefore,
+        // we should only replace zero-valued timestamps with the current time when both
+        // '_bypassEmptyTsReplacement' and '_fromOplogApplication' are false.
+        const bool bypassEmptyTsReplacement = _bypassEmptyTsReplacement || _fromOplogApplication;
+
+        _updateExecutor = std::make_unique<ObjectReplaceExecutor>(updateMod.getUpdateReplacement(),
+                                                                  bypassEmptyTsReplacement);
+
+        // Register the fact that this driver will only do full object replacements.
+        _updateType = UpdateType::kReplacement;
+        return;
+    }
+
+    if (updateMod.type() == write_ops::UpdateModification::Type::kTransform) {
+        uassert(5857811, "multi update is not supported for transform-style update", !multi);
+
+        uassert(5857812,
+                "arrayFilters may not be specified for transform-style updates",
+                arrayFilters.empty());
+
+        _updateType = UpdateType::kTransform;
+        _updateExecutor = std::make_unique<ObjectTransformExecutor>(updateMod.getTransform());
+        return;
+    }
+
+    invariant(_updateType == UpdateType::kOperator);
+
+    // By this point we are expecting a "kModifier" update. This version of mongod only supports
+    // $v: 2 (delta) (older versions support $v: 0 and $v: 1). We've already checked whether
+    // this is a delta update, so we verify that we're not on the oplog application path.
+    tassert(5030100,
+            "An oplog update can only be of type 'kReplacement' or 'kDelta'",
+            !_fromOplogApplication);
+    auto root = std::make_unique<UpdateObjectNode>();
+    _positional =
+        parseUpdateExpression(updateMod.getUpdateModifier(), root.get(), _expCtx, arrayFilters);
+    _updateExecutor = std::make_unique<UpdateTreeExecutor>(std::move(root));
 }
 
 Status UpdateDriver::populateDocumentWithQueryFields(OperationContext* opCtx,
@@ -197,40 +206,35 @@ Status UpdateDriver::populateDocumentWithQueryFields(OperationContext* opCtx,
     // We canonicalize the query to collapse $and/$or, and the namespace is not needed.  Also,
     // because this is for the upsert case, where we insert a new document if one was not found, the
     // $where/$text clauses do not make sense, hence empty ExtensionsCallback.
-    auto qr = stdx::make_unique<QueryRequest>(NamespaceString(""));
-    qr->setFilter(query);
-    const boost::intrusive_ptr<ExpressionContext> expCtx;
+    auto findCommand = std::make_unique<FindCommandRequest>(NamespaceString::kEmpty);
+    findCommand->setFilter(query);
     // $expr is not allowed in the query for an upsert, since it is not clear what the equality
     // extraction behavior for $expr should be.
-    auto statusWithCQ =
-        CanonicalQuery::canonicalize(opCtx,
-                                     std::move(qr),
-                                     expCtx,
-                                     ExtensionsCallbackNoop(),
-                                     MatchExpressionParser::kAllowAllSpecialFeatures &
-                                         ~MatchExpressionParser::AllowedFeatures::kExpr);
+    auto allowedFeatures = MatchExpressionParser::kAllowAllSpecialFeatures &
+        ~MatchExpressionParser::AllowedFeatures::kExpr;
+    auto statusWithCQ = CanonicalQuery::make(
+        {.expCtx = ExpressionContextBuilder{}.fromRequest(opCtx, *findCommand).build(),
+         .parsedFind = ParsedFindCommandParams{.findCommand = std::move(findCommand),
+                                               .allowedFeatures = allowedFeatures}});
     if (!statusWithCQ.isOK()) {
         return statusWithCQ.getStatus();
     }
-    unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
-
-    return populateDocumentWithQueryFields(*cq, immutablePaths, doc);
+    auto cq = std::move(statusWithCQ.getValue());
+    return populateDocumentWithQueryFields(*cq->getPrimaryMatchExpression(), immutablePaths, doc);
 }
 
-Status UpdateDriver::populateDocumentWithQueryFields(const CanonicalQuery& query,
+Status UpdateDriver::populateDocumentWithQueryFields(const MatchExpression& query,
                                                      const FieldRefSet& immutablePaths,
                                                      mutablebson::Document& doc) const {
     EqualityMatches equalities;
     Status status = Status::OK();
 
-    if (isDocReplacement()) {
-
-        // Extract only immutable fields from replacement-style
-        status =
-            pathsupport::extractFullEqualityMatches(*query.root(), immutablePaths, &equalities);
+    if (_updateType == UpdateType::kReplacement) {
+        // Extract only immutable fields.
+        status = pathsupport::extractFullEqualityMatches(query, immutablePaths, &equalities);
     } else {
-        // Extract all fields from op-style
-        status = pathsupport::extractEqualityMatches(*query.root(), &equalities);
+        // Extract all fields from op-style update.
+        status = pathsupport::extractEqualityMatches(query, &equalities);
     }
 
     if (!status.isOK())
@@ -240,94 +244,64 @@ Status UpdateDriver::populateDocumentWithQueryFields(const CanonicalQuery& query
     return status;
 }
 
-Status UpdateDriver::update(StringData matchedField,
+Status UpdateDriver::update(OperationContext* opCtx,
+                            StringData matchedField,
                             mutablebson::Document* doc,
                             bool validateForStorage,
                             const FieldRefSet& immutablePaths,
+                            bool isInsert,
                             BSONObj* logOpRec,
-                            bool* docWasModified) {
+                            bool* docWasModified,
+                            FieldRefSetWithStorage* modifiedPaths) {
     // TODO: assert that update() is called at most once in a !_multi case.
 
-    _affectIndices = (isDocReplacement() && (_indexedFields != NULL));
-
     _logDoc.reset();
-    LogBuilder logBuilder(_logDoc.root());
 
-    UpdateNode::ApplyParams applyParams(doc->root(), immutablePaths);
+    UpdateExecutor::ApplyParams applyParams(doc->root(), immutablePaths);
     applyParams.matchedField = matchedField;
-    applyParams.insert = _insert;
+    applyParams.insert = isInsert;
     applyParams.fromOplogApplication = _fromOplogApplication;
+    applyParams.skipDotsDollarsCheck = _skipDotsDollarsCheck;
     applyParams.validateForStorage = validateForStorage;
-    applyParams.indexData = _indexedFields;
+    applyParams.modifiedPaths = modifiedPaths;
+    // The supplied 'modifiedPaths' must be an empty set.
+    invariant(!modifiedPaths || modifiedPaths->empty());
+
+    if (!opCtx->isEnforcingConstraints()) {
+        applyParams.skipDotsDollarsCheck = true;
+        applyParams.validateForStorage = false;
+    }
+
     if (_logOp && logOpRec) {
-        applyParams.logBuilder = &logBuilder;
+        applyParams.logMode = ApplyParams::LogMode::kGenerateOplogEntry;
+
+        if (MONGO_unlikely(hangAfterPipelineUpdateFCVCheck.shouldFail()) &&
+            type() == UpdateType::kPipeline) {
+            CurOpFailpointHelpers::waitWhileFailPointEnabled(
+                &hangAfterPipelineUpdateFCVCheck, opCtx, "hangAfterPipelineUpdateFCVCheck");
+        }
     }
-    auto applyResult = _root->apply(applyParams);
-    if (applyResult.indexesAffected) {
-        _affectIndices = true;
-        doc->disableInPlaceUpdates();
-    }
+
+    invariant(_updateExecutor);
+    auto applyResult = _updateExecutor->applyUpdate(applyParams);
     if (docWasModified) {
         *docWasModified = !applyResult.noop;
     }
-    if (!_replacementMode && _logOp && logOpRec) {
-        // If there are binVersion=3.6 mongod nodes in the replica set, they need to be told that
-        // this update is using the "kUpdateNode" version of the update semantics and not the older
-        // update semantics that could be used by a featureCompatibilityVersion=3.4 node.
-        //
-        // TODO (SERVER-32240): Once binVersion <= 3.6 nodes are not supported in a replica set, we
-        // can safely elide this "$v" UpdateSemantics field from oplog entries, because there will
-        // only one supported version, which all nodes will assume is in use.
-        //
-        // We also don't need to specify the semantics for a full document replacement (and there
-        // would be no place to put a "$v" field in the update document).
-        invariant(logBuilder.setUpdateSemantics(UpdateSemantics::kUpdateNode));
+
+    if (_logOp && logOpRec && !applyResult.noop) {
+        *logOpRec = applyResult.oplogEntry;
     }
 
-    if (_logOp && logOpRec)
-        *logOpRec = _logDoc.getObject();
+    _containsDotsAndDollarsField =
+        (_containsDotsAndDollarsField || applyResult.containsDotsAndDollarsField);
 
     return Status::OK();
 }
 
-bool UpdateDriver::isDocReplacement() const {
-    return _replacementMode;
-}
-
-bool UpdateDriver::modsAffectIndices() const {
-    return _affectIndices;
-}
-
-void UpdateDriver::refreshIndexKeys(const UpdateIndexData* indexedFields) {
-    _indexedFields = indexedFields;
-}
-
-bool UpdateDriver::logOp() const {
-    return _logOp;
-}
-
-void UpdateDriver::setLogOp(bool logOp) {
-    _logOp = logOp;
-}
-
-bool UpdateDriver::fromOplogApplication() const {
-    return _fromOplogApplication;
-}
-
-void UpdateDriver::setFromOplogApplication(bool fromOplogApplication) {
-    _fromOplogApplication = fromOplogApplication;
-}
-
 void UpdateDriver::setCollator(const CollatorInterface* collator) {
-    if (_root) {
-        _root->setCollator(collator);
+    if (_updateExecutor) {
+        _updateExecutor->setCollator(collator);
     }
-
-    _expCtx->setCollator(collator);
-}
-
-bool UpdateDriver::isDocReplacement(const BSONObj& updateExpr) {
-    return *updateExpr.firstElementFieldName() != '$';
 }
 
 }  // namespace mongo

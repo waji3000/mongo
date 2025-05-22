@@ -1,6 +1,3 @@
-// fts_index_format.h
-
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -32,11 +29,20 @@
 
 #pragma once
 
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
 #include <string>
 
 #include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobj_comparator_interface.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/ordering.h"
 #include "mongo/db/fts/fts_util.h"
+#include "mongo/db/record_id.h"
+#include "mongo/db/storage/key_string/key_string.h"
+#include "mongo/db/storage/sorted_data_interface.h"
+#include "mongo/util/shared_buffer_fragment.h"
 
 namespace mongo {
 
@@ -46,7 +52,13 @@ class FTSSpec;
 
 class FTSIndexFormat {
 public:
-    static void getKeys(const FTSSpec& spec, const BSONObj& document, BSONObjSet* keys);
+    static void getKeys(SharedBufferFragmentBuilder& pooledBufferBuilder,
+                        const FTSSpec& spec,
+                        const BSONObj& document,
+                        KeyStringSet* keys,
+                        key_string::Version keyStringVersion,
+                        Ordering ordering,
+                        const boost::optional<RecordId>& id = boost::none);
 
     /**
      * Helper method to get return entry from the FTSIndex as a BSONObj
@@ -62,16 +74,29 @@ public:
 
 private:
     /**
-     * Helper method to get return entry from the FTSIndex as a BSONObj
-     * @param b, reference to the BSONOBjBuilder
-     * @param weight, the weight of the term in the entry
-     * @param term, the std::string term in the entry
-     * @param textIndexVersion, index version. affects key format.
+     * Helper method to get return entry from the FTSIndex as a BSONObj.
+     * 'b' is a reference to the BSONOBjBuilder.
+     * 'weight' is the weight of the term in the entry.
+     * 'term' is the std::string term in the entry.
+     * 'textIndexVersion' is index version, affects key format.
      */
     static void _appendIndexKey(BSONObjBuilder& b,
                                 double weight,
                                 const std::string& term,
                                 TextIndexVersion textIndexVersion);
+
+    /**
+     * Helper method to get return entry from the FTSIndex as a BSONObj.
+     * 'keyString' is a reference to the KeyString builder.
+     * 'weight' is the weight of the term in the entry.
+     * 'term' is the std::string term in the entry.
+     * 'textIndexVersion' is index version, affects key format.
+     */
+    template <typename KeyStringBuilder>
+    static void _appendIndexKey(KeyStringBuilder& keyString,
+                                double weight,
+                                const std::string& term,
+                                TextIndexVersion textIndexVersion);
 };
-}
-}
+}  // namespace fts
+}  // namespace mongo

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,40 +27,37 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/query/query_test_service_context.h"
 
+#include <memory>
+
 #include "mongo/db/operation_context.h"
+#include "mongo/db/query/collation/collator_factory_interface.h"
 #include "mongo/db/query/collation/collator_factory_mock.h"
-#include "mongo/stdx/memory.h"
+#include "mongo/s/sharding_state.h"
 
 namespace mongo {
 
-QueryTestServiceContext::QueryTestServiceContext()
-    : _service(ServiceContext::make()), _client(_service->makeClient("query_test")) {
-    CollatorFactoryInterface::set(getServiceContext(), stdx::make_unique<CollatorFactoryMock>());
+QueryTestServiceContext::QueryTestServiceContext(
+    std::unique_ptr<TickSourceMock<Nanoseconds>> tickSource)
+    : _serviceContext(ServiceContext::make(nullptr, nullptr, std::move(tickSource))),
+      _client(_serviceContext->getService()->makeClient("query_test")) {
+    ShardingState::create(getServiceContext());
+    CollatorFactoryInterface::set(getServiceContext(), std::make_unique<CollatorFactoryMock>());
 }
 
 QueryTestServiceContext::~QueryTestServiceContext() = default;
 
-ServiceContext::UniqueOperationContext QueryTestServiceContext::makeOperationContext() {
-    return getClient()->makeOperationContext();
-}
-
-ServiceContext::UniqueOperationContext QueryTestServiceContext::makeOperationContext(
-    LogicalSessionId lsid) {
-    auto opCtx = makeOperationContext();
-    opCtx->setLogicalSessionId(lsid);
-    return opCtx;
+ServiceContext* QueryTestServiceContext::getServiceContext() const {
+    return _serviceContext.get();
 }
 
 Client* QueryTestServiceContext::getClient() const {
     return _client.get();
 }
 
-ServiceContext* QueryTestServiceContext::getServiceContext() {
-    return _service.get();
+ServiceContext::UniqueOperationContext QueryTestServiceContext::makeOperationContext() {
+    return getClient()->makeOperationContext();
 }
 
 }  // namespace mongo

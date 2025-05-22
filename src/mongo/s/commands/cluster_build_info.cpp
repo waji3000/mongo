@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,50 +27,12 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
-
-#include "mongo/platform/basic.h"
 
 #include "mongo/db/commands.h"
-#include "mongo/util/version.h"
+#include "mongo/db/commands/buildinfo_common.h"
 
 namespace mongo {
 namespace {
-
-class ClusterCmdBuildInfo : public BasicCommand {
-public:
-    ClusterCmdBuildInfo() : BasicCommand("buildInfo", "buildinfo") {}
-
-    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
-        return AllowedOnSecondary::kAlways;
-    }
-
-    bool requiresAuth() const override {
-        return false;
-    }
-    virtual bool adminOnly() const {
-        return false;
-    }
-    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
-        return false;
-    }
-    virtual void addRequiredPrivileges(const std::string& dbname,
-                                       const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) const {}  // No auth required
-    std::string help() const override {
-        return "get version #, etc.\n"
-               "{ buildinfo:1 }";
-    }
-
-    bool run(OperationContext* opCtx,
-             const std::string& dbname,
-             const BSONObj& jsobj,
-             BSONObjBuilder& result) {
-        VersionInfoInterface::instance().appendBuildInfo(&result);
-        return true;
-    }
-
-} cmdBuildInfo;
-
+MONGO_REGISTER_COMMAND(CmdBuildInfoCommon).forRouter();
 }  // namespace
 }  // namespace mongo

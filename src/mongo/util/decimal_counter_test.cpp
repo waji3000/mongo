@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,13 +27,11 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include <array>
 #include <cstdint>
-#include <limits>
+#include <string>
 
 #include "mongo/base/string_data.h"
+#include "mongo/stdx/type_traits.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/decimal_counter.h"
 
@@ -47,7 +44,7 @@ TEST(DecimalCounter, CountUntilWrapAround) {
     do {
         StringData str = counter;
         ASSERT_EQ(std::to_string(check), str.toString());
-        ASSERT_EQ(str.rawData()[str.size()], '\0');
+        ASSERT_EQ(str.data()[str.size()], '\0');
         ASSERT_EQ(uint16_t(++counter), ++check);
     } while (check);
     ASSERT_EQ(StringData(counter), "0"_sd);

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -32,16 +31,17 @@
 
 #include <boost/filesystem/path.hpp>
 #include <boost/optional.hpp>
-#include <fstream>
-#include <stddef.h>
+#include <cstddef>
+#include <fstream>  // IWYU pragma: keep
+#include <tuple>
 #include <vector>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/db/ftdc/decompressor.h"
 #include "mongo/db/ftdc/util.h"
-#include "mongo/db/jsobj.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo {
 
@@ -51,7 +51,8 @@ namespace mongo {
  * Does not recover interim files into archive files.
  */
 class FTDCFileReader {
-    MONGO_DISALLOW_COPYING(FTDCFileReader);
+    FTDCFileReader(const FTDCFileReader&) = delete;
+    FTDCFileReader& operator=(const FTDCFileReader&) = delete;
 
 public:
     FTDCFileReader() : _state(State::kNeedsDoc) {}
@@ -71,8 +72,12 @@ public:
 
     /**
      * Returns the next document.
-     * Metadata documents are unowned.
+     * Metadata and periodic metadata documents are unowned.
      * Metric documents are owned.
+     *
+     * For periodic metadata documents, this returns the raw periodic metadata BSON parsed
+     * from the file. It does not reconstruct a full periodic metadata sample based on previous
+     * deltas, unlike metric documents.
      */
     std::tuple<FTDCBSONUtil::FTDCType, const BSONObj&, Date_t> next();
 
@@ -124,10 +129,13 @@ private:
     // Current set of metrics documents
     std::vector<BSONObj> _docs;
 
-    // _id of current metadata or metric chunk
+    // Type of the current document
+    FTDCBSONUtil::FTDCType _type;
+
+    // _id of current metadata, metric chunk, or periodic metadata
     Date_t _dateId;
 
-    // Current metadata document - unowned
+    // Current metadata or periodic metadata document - unowned
     BSONObj _metadata;
 
     // Parent document

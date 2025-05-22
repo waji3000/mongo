@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,13 +27,12 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <memory>
+#include <utility>
 
-#include "mongo/stdx/memory.h"
 #include "mongo/transport/message_compressor_noop.h"
 #include "mongo/transport/message_compressor_registry.h"
 #include "mongo/unittest/unittest.h"
-#include "mongo/util/assert_util.h"
 
 /**
  * Asserts that a value is null
@@ -47,7 +45,7 @@ namespace mongo {
 namespace {
 TEST(MessageCompressorRegistry, RegularTest) {
     MessageCompressorRegistry registry;
-    auto compressor = stdx::make_unique<NoopMessageCompressor>();
+    auto compressor = std::make_unique<NoopMessageCompressor>();
     auto compressorPtr = compressor.get();
 
     std::vector<std::string> compressorList = {compressorPtr->getName()};
@@ -74,7 +72,7 @@ TEST(MessageCompressorRegistry, NothingRegistered) {
 
 TEST(MessageCompressorRegistry, SetSupported) {
     MessageCompressorRegistry registry;
-    auto compressor = stdx::make_unique<NoopMessageCompressor>();
+    auto compressor = std::make_unique<NoopMessageCompressor>();
     auto compressorId = compressor->getId();
     auto compressorName = compressor->getName();
 

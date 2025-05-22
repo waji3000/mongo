@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,15 +27,19 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <utility>
+#include <vector>
 
-#include "mongo/client/remote_command_targeter_factory_mock.h"
 
+#include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
-#include "mongo/client/connection_string.h"
-#include "mongo/client/remote_command_targeter_mock.h"
-#include "mongo/stdx/memory.h"
+#include "mongo/client/read_preference.h"
+#include "mongo/client/remote_command_targeter_factory_mock.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/cancellation.h"
+#include "mongo/util/future.h"
+#include "mongo/util/net/hostandport.h"
 
 namespace mongo {
 namespace {
@@ -54,17 +57,26 @@ public:
         return _mock->findHost(opCtx, readPref);
     }
 
-    Future<HostAndPort> findHostWithMaxWait(const ReadPreferenceSetting& readPref,
-                                            Milliseconds maxWait) override {
-        return _mock->findHostWithMaxWait(readPref, maxWait);
+    SemiFuture<HostAndPort> findHost(const ReadPreferenceSetting& readPref,
+                                     const CancellationToken& cancelToken) override {
+        return _mock->findHost(readPref, cancelToken);
     }
 
-    void markHostNotMaster(const HostAndPort& host, const Status& status) override {
-        _mock->markHostNotMaster(host, status);
+    SemiFuture<std::vector<HostAndPort>> findHosts(const ReadPreferenceSetting& readPref,
+                                                   const CancellationToken& cancelToken) override {
+        return _mock->findHosts(readPref, cancelToken);
+    }
+
+    void markHostNotPrimary(const HostAndPort& host, const Status& status) override {
+        _mock->markHostNotPrimary(host, status);
     }
 
     void markHostUnreachable(const HostAndPort& host, const Status& status) override {
         _mock->markHostUnreachable(host, status);
+    }
+
+    void markHostShuttingDown(const HostAndPort& host, const Status& status) override {
+        _mock->markHostShuttingDown(host, status);
     }
 
 private:
@@ -81,10 +93,10 @@ std::unique_ptr<RemoteCommandTargeter> RemoteCommandTargeterFactoryMock::create(
     const ConnectionString& connStr) {
     auto it = _mockTargeters.find(connStr);
     if (it != _mockTargeters.end()) {
-        return stdx::make_unique<TargeterProxy>(it->second);
+        return std::make_unique<TargeterProxy>(it->second);
     }
 
-    return stdx::make_unique<RemoteCommandTargeterMock>();
+    return std::make_unique<RemoteCommandTargeterMock>();
 }
 
 void RemoteCommandTargeterFactoryMock::addTargeterToReturn(
@@ -96,7 +108,7 @@ void RemoteCommandTargeterFactoryMock::removeTargeterToReturn(const ConnectionSt
     MockTargetersMap::iterator it = _mockTargeters.find(connStr);
 
     invariant(it != _mockTargeters.end());
-    invariant(it->second.unique());
+    invariant(it->second.use_count() == 1);
 
     _mockTargeters.erase(it);
 }

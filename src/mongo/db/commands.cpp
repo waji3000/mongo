@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,69 +27,88 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
-
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/commands.h"
 
+#include <absl/container/node_hash_map.h>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr.hpp>
+#include <fmt/format.h>
+#include <memory>
 #include <string>
 #include <vector>
 
-#include "mongo/bson/mutable/algorithm.h"
-#include "mongo/bson/mutable/document.h"
-#include "mongo/bson/timestamp.h"
+#include "mongo/base/error_extra_info.h"
+#include "mongo/bson/bsontypes.h"
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/db/audit.h"
-#include "mongo/db/auth/action_set.h"
-#include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_session.h"
-#include "mongo/db/auth/privilege.h"
+#include "mongo/db/auth/validated_tenancy_scope.h"
 #include "mongo/db/client.h"
-#include "mongo/db/command_generic_argument.h"
+#include "mongo/db/cluster_role.h"
 #include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/curop.h"
-#include "mongo/db/jsobj.h"
+#include "mongo/db/curop_diagnostic_printer.h"
+#include "mongo/db/error_labels.h"
+#include "mongo/db/exec/mutable_bson/algorithm.h"
+#include "mongo/db/exec/mutable_bson/document.h"
+#include "mongo/db/generic_argument_util.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/server_parameters.h"
-#include "mongo/rpc/factory.h"
+#include "mongo/db/tenant_id.h"
+#include "mongo/db/version_context.h"
+#include "mongo/db/write_concern_options.h"
+#include "mongo/idl/command_generic_argument.h"
+#include "mongo/idl/idl_parser.h"
+#include "mongo/logv2/log.h"
+#include "mongo/platform/compiler.h"
+#include "mongo/rpc/metadata/client_metadata.h"
 #include "mongo/rpc/op_msg_rpc_impls.h"
-#include "mongo/rpc/protocol.h"
+#include "mongo/rpc/rewrite_state_change_errors.h"
 #include "mongo/rpc/write_concern_error_detail.h"
-#include "mongo/s/stale_exception.h"
-#include "mongo/util/fail_point_service.h"
-#include "mongo/util/invariant.h"
-#include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/transport/session.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/decorable.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/namespace_string_util.h"
+#include "mongo/util/safe_num.h"
+#include "mongo/util/static_immortal.h"
+#include "mongo/util/str.h"
+#include "mongo/util/string_map.h"
+#include "mongo/util/uuid.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 namespace mongo {
 
-using logger::LogComponent;
+const std::set<std::string> kNoApiVersions = {};
+const std::set<std::string> kApiVersions1 = {"1"};
 
 namespace {
 
+const int kFailedFindCommandDebugLevel = 3;
+
 const char kWriteConcernField[] = "writeConcern";
-const WriteConcernOptions kMajorityWriteConcern(
-    WriteConcernOptions::kMajority,
-    // Note: Even though we're setting UNSET here, kMajority implies JOURNAL if journaling is
-    // supported by the mongod.
-    WriteConcernOptions::SyncMode::UNSET,
-    WriteConcernOptions::kWriteConcernTimeoutUserCommand);
 
 // Returns true if found to be authorized, false if undecided. Throws if unauthorized.
-bool checkAuthorizationImplPreParse(OperationContext* opCtx,
-                                    const Command* command,
-                                    const OpMsgRequest& request) {
+bool checkAuthorizationImplPreParse(
+    OperationContext* opCtx,
+    const Command* command,
+    const boost::optional<auth::ValidatedTenancyScope>& validatedTenancyScope) {
     auto client = opCtx->getClient();
     if (client->isInDirectClient())
         return true;
-    uassert(ErrorCodes::Unauthorized,
-            str::stream() << command->getName() << " may only be run against the admin database.",
-            !command->adminOnly() || request.getDatabase() == NamespaceString::kAdminDb);
 
     auto authzSession = AuthorizationSession::get(client);
-    if (!authzSession->getAuthorizationManager().isAuthEnabled()) {
+    uassert(ErrorCodes::ReauthenticationRequired,
+            fmt::format("Command {} requires reauthentication since the current authorization "
+                        "session has expired. Please re-auth.",
+                        command->getName()),
+            !command->requiresAuth() || !authzSession->isExpired());
+
+    if (!AuthorizationManager::get(opCtx->getService())->isAuthEnabled()) {
         // Running without auth, so everything should be allowed except remotely invoked
         // commands that have the 'localHostOnlyIfNoAuth' restriction.
         uassert(ErrorCodes::Unauthorized,
@@ -100,56 +118,102 @@ bool checkAuthorizationImplPreParse(OperationContext* opCtx,
                     client->getIsLocalHostConnection());
         return true;  // Blanket authorization: don't need to check anything else.
     }
+
     if (authzSession->isUsingLocalhostBypass())
         return false;  // Still can't decide on auth because of the localhost bypass.
+
     uassert(ErrorCodes::Unauthorized,
-            str::stream() << "command " << command->getName() << " requires authentication",
-            !command->requiresAuth() || authzSession->isAuthenticated());
+            str::stream() << "Command " << command->getName() << " requires authentication",
+            !command->requiresAuth() || authzSession->isAuthenticated() ||
+                (validatedTenancyScope && validatedTenancyScope->hasAuthenticatedUser()));
+
     return false;
 }
 
-// The command names that are allowed in a multi-document transaction.
-const StringMap<int> txnCmdWhitelist = {{"abortTransaction", 1},
-                                        {"aggregate", 1},
-                                        {"commitTransaction", 1},
-                                        {"coordinateCommitTransaction", 1},
-                                        {"delete", 1},
-                                        {"distinct", 1},
-                                        {"doTxn", 1},
-                                        {"find", 1},
-                                        {"findandmodify", 1},
-                                        {"findAndModify", 1},
-                                        {"geoSearch", 1},
-                                        {"getMore", 1},
-                                        {"insert", 1},
-                                        {"killCursors", 1},
-                                        {"prepareTransaction", 1},
-                                        {"update", 1},
-                                        {"voteAbortTransaction", 1},
-                                        {"voteCommitTransaction", 1}};
+void checkAuthForRawData(OperationContext* opCtx,
+                         const GenericArguments& genArg,
+                         const OpMsgRequest& request) {
+    if (!genArg.getRawData())
+        return;
+    auto ns = NamespaceStringUtil::deserialize(request.parseDbName(),
+                                               request.body.firstElement().valueStringDataSafe());
+    auto authSession = AuthorizationSession::get(opCtx->getClient());
+    uassert(
+        ErrorCodes::Unauthorized,
+        "Not authorized to run command with rawData",
+        authSession->isAuthorizedForActionsOnNamespace(ns, ActionType::performRawDataOperations) ||
+            authSession->isAuthorizedForActionsOnNamespace(ns, ActionType::internal));
+}
 
-// The command names that are allowed in a multi-document transaction only when test commands are
-// enabled.
-const StringMap<int> txnCmdForTestingWhitelist = {{"dbHash", 1}};
+auto getCommandInvocationHooks =
+    ServiceContext::declareDecoration<std::unique_ptr<CommandInvocationHooks>>();
 
+class CommandNameAtomRegistry {
+public:
+    size_t lookup(StringData s);
 
-// The commands that can be run on the 'admin' database in multi-document transactions.
-const StringMap<int> txnAdminCommands = {{"abortTransaction", 1},
-                                         {"commitTransaction", 1},
-                                         {"coordinateCommitTransaction", 1},
-                                         {"doTxn", 1},
-                                         {"prepareTransaction", 1},
-                                         {"voteAbortTransaction", 1},
-                                         {"voteCommitTransaction", 1}};
+private:
+    StringMap<size_t> _atoms;
+    stdx::mutex _mutex;
+};
+
+size_t CommandNameAtomRegistry::lookup(StringData s) {
+    stdx::lock_guard lock(_mutex);
+
+    auto itr = _atoms.find(s);
+    if (itr != _atoms.end()) {
+        return itr->second;
+    }
+
+    size_t nextIdx = _atoms.size();
+    _atoms[s] = nextIdx;
+    return nextIdx;
+}
+
+BSONObj appendWCToObj(const BSONObj& cmdObj, WriteConcernOptions newWC) {
+    // Append all original fields except the writeConcern field to the new command.
+    BSONObjBuilder cmdObjWithWriteConcern;
+    for (const auto& elem : cmdObj) {
+        const auto name = elem.fieldNameStringData();
+        if (name != "writeConcern" && !cmdObjWithWriteConcern.hasField(name)) {
+            cmdObjWithWriteConcern.append(elem);
+        }
+    }
+
+    // Finally, add the new write concern.
+    cmdObjWithWriteConcern.append(kWriteConcernField, newWC.toBSON());
+    return cmdObjWithWriteConcern.obj();
+}
 
 }  // namespace
 
+bool prepareForFLERewrite(OperationContext* opCtx,
+                          const boost::optional<EncryptionInformation>& encryptionInformation) {
+    // Check if request has encryption information set.
+    // Only if encryption information is set, we can do the actual FLE rewriting.
+    if (!encryptionInformation) {
+        return false;
+    }
+    // Make OperationContext forget about diagnostics, so it won't leak sensitive field
+    // information into them.
+    {
+        stdx::lock_guard<Client> lk(*opCtx->getClient());
+        CurOp::get(opCtx)->setShouldOmitDiagnosticInformation(lk, true);
+    }
+    // Prevent duplicate rewriting.
+    return !encryptionInformation->getCrudProcessed().value_or(false);
+}
+
+void CommandInvocationHooks::set(ServiceContext* serviceContext,
+                                 std::unique_ptr<CommandInvocationHooks> hooks) {
+    getCommandInvocationHooks(serviceContext) = std::move(hooks);
+}
 
 //////////////////////////////////////////////////////////////
 // CommandHelpers
 
 BSONObj CommandHelpers::runCommandDirectly(OperationContext* opCtx, const OpMsgRequest& request) {
-    auto command = globalCommandRegistry()->findCommand(request.getCommandName());
+    auto command = getCommandRegistry(opCtx)->findCommand(request.getCommandName());
     invariant(command);
     rpc::OpMsgReplyBuilder replyBuilder;
     std::unique_ptr<CommandInvocation> invocation;
@@ -158,7 +222,7 @@ BSONObj CommandHelpers::runCommandDirectly(OperationContext* opCtx, const OpMsgR
         invocation->run(opCtx, &replyBuilder);
         auto body = replyBuilder.getBodyBuilder();
         CommandHelpers::extractOrAppendOk(body);
-    } catch (const StaleConfigException&) {
+    } catch (const ExceptionFor<ErrorCodes::StaleConfig>&) {
         // These exceptions are intended to be handled at a higher level.
         throw;
     } catch (const DBException& ex) {
@@ -172,14 +236,68 @@ BSONObj CommandHelpers::runCommandDirectly(OperationContext* opCtx, const OpMsgR
     return replyBuilder.releaseBody();
 }
 
+Future<void> CommandHelpers::runCommandInvocation(std::shared_ptr<RequestExecutionContext> rec,
+                                                  std::shared_ptr<CommandInvocation> invocation,
+                                                  bool useDedicatedThread) {
+    if (useDedicatedThread)
+        return makeReadyFutureWith([rec = std::move(rec), invocation = std::move(invocation)] {
+            runCommandInvocation(rec->getOpCtx(), invocation.get(), rec->getReplyBuilder());
+        });
+    return runCommandInvocationAsync(std::move(rec), std::move(invocation));
+}
+
+void CommandHelpers::runCommandInvocation(OperationContext* opCtx,
+                                          CommandInvocation* invocation,
+                                          rpc::ReplyBuilderInterface* response) {
+    auto&& hooks = getCommandInvocationHooks(opCtx->getServiceContext());
+    if (hooks) {
+        hooks->onBeforeRun(opCtx, invocation);
+    }
+
+    // Capture diagnostics for failures such as tasserts, invariants, and segfaults that may occur
+    // during execution of eligible commands. No work is done on the hot-path; all computation of
+    // these diagnostics is done lazily during failure handling. This line just creates an RAII
+    // object which holds references to objects on this stack frame, which will be used to print
+    // diagnostics in the event of a failure.
+    ScopedDebugInfo cmdDiagnostics("curOpDiagnostics", diagnostic_printers::CurOpPrinter{opCtx});
+
+    invocation->run(opCtx, response);
+
+    if (hooks) {
+        hooks->onAfterRun(opCtx, invocation, response);
+    }
+}
+
+Future<void> CommandHelpers::runCommandInvocationAsync(
+    std::shared_ptr<RequestExecutionContext> rec,
+    std::shared_ptr<CommandInvocation> invocation) try {
+    auto&& hooks = getCommandInvocationHooks(rec->getOpCtx()->getServiceContext());
+    if (hooks)
+        hooks->onBeforeAsyncRun(rec, invocation.get());
+    return invocation->runAsync(rec).then([rec, hooks = hooks.get(), invocation] {
+        if (hooks)
+            hooks->onAfterAsyncRun(rec, invocation.get());
+    });
+} catch (const DBException& e) {
+    return e.toStatus();
+}
+
 void CommandHelpers::auditLogAuthEvent(OperationContext* opCtx,
                                        const CommandInvocation* invocation,
                                        const OpMsgRequest& request,
                                        ErrorCodes::Error err) {
     class Hook final : public audit::CommandInterface {
     public:
-        explicit Hook(const CommandInvocation* invocation, const NamespaceString* nss)
-            : _invocation(invocation), _nss(nss) {}
+        Hook(const CommandInvocation* invocation, const OpMsgRequest& request)
+            : _invocation(invocation) {
+            if (_invocation) {
+                _nss = _invocation->ns();
+                _name = _invocation->definition()->getName();
+            } else {
+                _nss = NamespaceString(request.parseDbName());
+                _name = request.getCommandName().toString();
+            }
+        }
 
         void snipForLogging(mutablebson::Document* cmdObj) const override {
             if (_invocation) {
@@ -187,22 +305,19 @@ void CommandHelpers::auditLogAuthEvent(OperationContext* opCtx,
             }
         }
 
-        StringData sensitiveFieldName() const override {
+        std::set<StringData> sensitiveFieldNames() const override {
             if (_invocation) {
-                return _invocation->definition()->sensitiveFieldName();
+                return _invocation->definition()->sensitiveFieldNames();
             }
-            return StringData{};
+            return {};
         }
 
         StringData getName() const override {
-            if (!_invocation) {
-                return "Error"_sd;
-            }
-            return _invocation->definition()->getName();
+            return _name;
         }
 
         NamespaceString ns() const override {
-            return *_nss;
+            return _nss;
         }
 
         bool redactArgs() const override {
@@ -211,11 +326,19 @@ void CommandHelpers::auditLogAuthEvent(OperationContext* opCtx,
 
     private:
         const CommandInvocation* _invocation;
-        const NamespaceString* _nss;
+        NamespaceString _nss;
+        std::string _name;
     };
 
-    NamespaceString nss = invocation ? invocation->ns() : NamespaceString(request.getDatabase());
-    audit::logCommandAuthzCheck(opCtx->getClient(), request, Hook(invocation, &nss), err);
+    // Always audit errors other than Unauthorized.
+    //
+    // When we get Unauthorized (usually),
+    // then only audit if our Command definition wants it (default),
+    // or if we don't know our Command definition.
+    if ((err != ErrorCodes::Unauthorized) || !invocation ||
+        invocation->definition()->auditAuthorizationFailure()) {
+        audit::logCommandAuthzCheck(opCtx->getClient(), request, Hook(invocation, request), err);
+    }
 }
 
 void CommandHelpers::uassertNoDocumentSequences(StringData commandName,
@@ -227,62 +350,56 @@ void CommandHelpers::uassertNoDocumentSequences(StringData commandName,
 }
 
 std::string CommandHelpers::parseNsFullyQualified(const BSONObj& cmdObj) {
-    BSONElement first = cmdObj.firstElement();
-    uassert(ErrorCodes::BadValue,
-            str::stream() << "collection name has invalid type " << typeName(first.type()),
-            first.canonicalType() == canonicalizeBSONType(mongo::String));
-    const NamespaceString nss(first.valueStringData());
+    const auto ns = IDLParserContext::checkAndAssertCollectionName(cmdObj.firstElement(), false);
     uassert(ErrorCodes::InvalidNamespace,
-            str::stream() << "Invalid namespace specified '" << nss.ns() << "'",
-            nss.isValid());
-    return nss.ns();
+            str::stream() << "Invalid namespace specified '" << ns << "'",
+            NamespaceString::isValid(ns));
+    return ns.toString();
 }
 
-NamespaceString CommandHelpers::parseNsCollectionRequired(StringData dbname,
+NamespaceString CommandHelpers::parseNsCollectionRequired(const DatabaseName& dbName,
                                                           const BSONObj& cmdObj) {
-    // Accepts both BSON String and Symbol for collection name per SERVER-16260
-    // TODO(kangas) remove Symbol support in MongoDB 3.0 after Ruby driver audit
-    BSONElement first = cmdObj.firstElement();
+    const auto coll = IDLParserContext::checkAndAssertCollectionName(cmdObj.firstElement(), false);
+    NamespaceString nss(NamespaceStringUtil::deserialize(dbName, coll));
     uassert(ErrorCodes::InvalidNamespace,
-            str::stream() << "collection name has invalid type " << typeName(first.type()),
-            first.canonicalType() == canonicalizeBSONType(mongo::String));
-    const NamespaceString nss(dbname, first.valueStringData());
-    uassert(ErrorCodes::InvalidNamespace,
-            str::stream() << "Invalid namespace specified '" << nss.ns() << "'",
+            str::stream() << "Invalid namespace specified '" << nss.toStringForErrorMsg() << "'",
             nss.isValid());
     return nss;
 }
 
-NamespaceStringOrUUID CommandHelpers::parseNsOrUUID(StringData dbname, const BSONObj& cmdObj) {
+NamespaceStringOrUUID CommandHelpers::parseNsOrUUID(const DatabaseName& dbName,
+                                                    const BSONObj& cmdObj) {
     BSONElement first = cmdObj.firstElement();
     if (first.type() == BinData && first.binDataType() == BinDataType::newUUID) {
-        return {dbname.toString(), uassertStatusOK(UUID::parse(first))};
+        return {dbName, uassertStatusOK(UUID::parse(first))};
     } else {
-        // Ensure collection identifier is not a Command
-        const NamespaceString nss(parseNsCollectionRequired(dbname, cmdObj));
-        uassert(ErrorCodes::InvalidNamespace,
-                str::stream() << "Invalid collection name specified '" << nss.ns() << "'",
-                nss.isNormal());
+        const NamespaceString nss(parseNsCollectionRequired(dbName, cmdObj));
+        ensureValidCollectionName(nss);
         return nss;
     }
 }
 
-std::string CommandHelpers::parseNsFromCommand(StringData dbname, const BSONObj& cmdObj) {
+void CommandHelpers::ensureValidCollectionName(const NamespaceString& nss) {
+    uassert(ErrorCodes::InvalidNamespace,
+            str::stream() << "Invalid collection name specified '" << nss.toStringForErrorMsg()
+                          << "'",
+            (NamespaceString::validCollectionName(nss.coll()) ||
+             nss == NamespaceString::kLocalOplogDollarMain));
+}
+
+NamespaceString CommandHelpers::parseNsFromCommand(const DatabaseName& dbName,
+                                                   const BSONObj& cmdObj) {
     BSONElement first = cmdObj.firstElement();
     if (first.type() != mongo::String)
-        return dbname.toString();
-    return str::stream() << dbname << '.' << cmdObj.firstElement().valueStringData();
+        return NamespaceString(dbName);
+    return NamespaceStringUtil::deserialize(dbName, cmdObj.firstElement().valueStringData());
 }
 
-ResourcePattern CommandHelpers::resourcePatternForNamespace(const std::string& ns) {
+ResourcePattern CommandHelpers::resourcePatternForNamespace(const NamespaceString& ns) {
     if (!NamespaceString::validCollectionComponent(ns)) {
-        return ResourcePattern::forDatabaseName(ns);
+        return ResourcePattern::forDatabaseName(ns.dbName());
     }
-    return ResourcePattern::forExactNamespace(NamespaceString(ns));
-}
-
-Command* CommandHelpers::findCommand(StringData name) {
-    return globalCommandRegistry()->findCommand(name);
+    return ResourcePattern::forExactNamespace(ns);
 }
 
 bool CommandHelpers::appendCommandStatusNoThrow(BSONObjBuilder& result, const Status& status) {
@@ -294,6 +411,21 @@ bool CommandHelpers::appendCommandStatusNoThrow(BSONObjBuilder& result, const St
     }
     if (auto extraInfo = status.extraInfo()) {
         extraInfo->serialize(&result);
+    }
+    // If the command has errored, assert that it satisfies the IDL-defined requirements on a
+    // command error reply.
+    // Only validate error reply in test mode so that we don't expose users to errors if we
+    // construct an invalid error reply.
+    if (!status.isOK() && getTestCommandsEnabled()) {
+        try {
+            ErrorReply::parse(IDLParserContext("appendCommandStatusNoThrow"), result.asTempObj());
+        } catch (const DBException&) {
+            invariant(false,
+                      "invalid error-response to a command constructed in "
+                      "CommandHelpers::appendComandStatusNoThrow. All erroring command responses "
+                      "must comply with the format specified by the IDL-defined struct ErrorReply, "
+                      "defined in idl/basic_types.idl");
+        }
     }
     return status.isOK();
 }
@@ -318,9 +450,25 @@ bool CommandHelpers::extractOrAppendOk(BSONObjBuilder& reply) {
         // If ok is present, use its truthiness.
         return okField.trueValue();
     }
+
     // Missing "ok" field is an implied success.
-    CommandHelpers::appendSimpleCommandStatus(reply, true);
+    reply.append("ok", 1.0);
     return true;
+}
+
+Status CommandHelpers::extractOrAppendOkAndGetStatus(BSONObjBuilder& reply) {
+    auto replyObj = reply.asTempObj();
+    auto okField = replyObj["ok"];
+    if (!okField) {
+        reply.append("ok", 1.0);
+        return Status::OK();
+    }
+
+    if (okField.trueValue()) {
+        return Status::OK();
+    }
+
+    return getErrorStatusFromCommandResult(replyObj);
 }
 
 void CommandHelpers::appendCommandWCStatus(BSONObjBuilder& result,
@@ -329,58 +477,56 @@ void CommandHelpers::appendCommandWCStatus(BSONObjBuilder& result,
     if (!awaitReplicationStatus.isOK() && !result.hasField("writeConcernError")) {
         WriteConcernErrorDetail wcError;
         wcError.setStatus(awaitReplicationStatus);
+        BSONObjBuilder errInfoBuilder;
         if (wcResult.wTimedOut) {
-            wcError.setErrInfo(BSON("wtimeout" << true));
+            errInfoBuilder.append("wtimeout", true);
         }
+        errInfoBuilder.append(kWriteConcernField, wcResult.wcUsed.toBSON());
+        wcError.setErrInfo(errInfoBuilder.obj());
         result.append("writeConcernError", wcError.toBSON());
     }
 }
 
-BSONObj CommandHelpers::appendPassthroughFields(const BSONObj& cmdObjWithPassthroughFields,
-                                                const BSONObj& request) {
-    BSONObjBuilder b;
-    b.appendElements(request);
-    for (const auto& elem : filterCommandRequestForPassthrough(cmdObjWithPassthroughFields)) {
+void CommandHelpers::appendGenericReplyFields(const BSONObj& replyObjWithGenericReplyFields,
+                                              const BSONObj& reply,
+                                              BSONObjBuilder* replyBuilder) {
+    replyBuilder->appendElements(reply);
+    for (const auto& elem : filterCommandReplyForPassthrough(replyObjWithGenericReplyFields)) {
         const auto name = elem.fieldNameStringData();
-        if (isGenericArgument(name) && !request.hasField(name)) {
-            b.append(elem);
+        if (isGenericArgument(name) && !reply.hasField(name)) {
+            replyBuilder->append(elem);
         }
     }
+}
+
+BSONObj CommandHelpers::appendGenericReplyFields(const BSONObj& replyObjWithGenericReplyFields,
+                                                 const BSONObj& reply) {
+    BSONObjBuilder b;
+    appendGenericReplyFields(replyObjWithGenericReplyFields, reply, &b);
     return b.obj();
 }
 
-BSONObj CommandHelpers::appendMajorityWriteConcern(const BSONObj& cmdObj) {
-    WriteConcernOptions newWC = kMajorityWriteConcern;
-
+BSONObj CommandHelpers::appendMajorityWriteConcern(const BSONObj& cmdObj,
+                                                   WriteConcernOptions defaultWC) {
     if (cmdObj.hasField(kWriteConcernField)) {
-        auto wc = cmdObj.getField(kWriteConcernField);
-        // The command has a writeConcern field and it's majority, so we can
-        // return it as-is.
-        if (wc["w"].ok() && wc["w"].str() == "majority") {
+        auto parsedWC = uassertStatusOK(WriteConcernOptions::extractWCFromCommand(cmdObj));
+
+        // The command has a writeConcern field and it's majority, so we can return it as-is.
+        if (parsedWC.isMajority()) {
             return cmdObj;
         }
 
-        if (wc["wtimeout"].ok()) {
-            // They set a timeout, but aren't using majority WC. We want to use their
-            // timeout along with majority WC.
-            newWC = WriteConcernOptions(WriteConcernOptions::kMajority,
-                                        WriteConcernOptions::SyncMode::UNSET,
-                                        wc["wtimeout"].Number());
-        }
+        parsedWC.w = WriteConcernOptions::kMajority;
+        return appendWCToObj(cmdObj, parsedWC);
     }
 
-    // Append all original fields except the writeConcern field to the new command.
-    BSONObjBuilder cmdObjWithWriteConcern;
-    for (const auto& elem : cmdObj) {
-        const auto name = elem.fieldNameStringData();
-        if (name != "writeConcern" && !cmdObjWithWriteConcern.hasField(name)) {
-            cmdObjWithWriteConcern.append(elem);
-        }
-    }
+    auto global = defaultMajorityWriteConcernDoNotUse();
+    if (defaultWC.usedDefaultConstructedWC)
+        return appendWCToObj(cmdObj, global);
 
-    // Finally, add the new write concern.
-    cmdObjWithWriteConcern.append(kWriteConcernField, newWC.toBSON());
-    return cmdObjWithWriteConcern.obj();
+    defaultWC.w = WriteConcernOptions::kMajority;
+    defaultWC.wTimeout = std::max(defaultWC.wTimeout, global.wTimeout);
+    return appendWCToObj(cmdObj, defaultWC);
 }
 
 BSONObj CommandHelpers::filterCommandRequestForPassthrough(const BSONObj& cmdObj) {
@@ -399,7 +545,7 @@ void CommandHelpers::filterCommandRequestForPassthrough(BSONObjIterator* cmdIter
             BSONObjBuilder(requestBuilder->subobjStart("$queryOptions")).append(elem);
             continue;
         }
-        if (isRequestStripArgument(name))
+        if (!shouldForwardToShards(name))
             continue;
         requestBuilder->append(elem);
     }
@@ -409,7 +555,7 @@ void CommandHelpers::filterCommandReplyForPassthrough(const BSONObj& cmdObj,
                                                       BSONObjBuilder* output) {
     for (auto elem : cmdObj) {
         const auto name = elem.fieldNameStringData();
-        if (isReplyStripArgument(name))
+        if (!shouldForwardFromShards(name))
             continue;
         output->append(elem);
     }
@@ -429,57 +575,166 @@ bool CommandHelpers::uassertShouldAttemptParse(OperationContext* opCtx,
                                                const Command* command,
                                                const OpMsgRequest& request) {
     try {
-        return checkAuthorizationImplPreParse(opCtx, command, request);
+        return checkAuthorizationImplPreParse(opCtx, command, request.validatedTenancyScope);
     } catch (const ExceptionFor<ErrorCodes::Unauthorized>& e) {
-        CommandHelpers::auditLogAuthEvent(opCtx, nullptr, request, e.code());
+        if (command->auditAuthorizationFailure()) {
+            CommandHelpers::auditLogAuthEvent(opCtx, nullptr, request, e.code());
+        }
         throw;
     }
 }
 
+void CommandHelpers::uassertCommandRunWithMajority(StringData commandName,
+                                                   const WriteConcernOptions& writeConcern) {
+    uassert(ErrorCodes::InvalidOptions,
+            fmt::format("\"{}\" must be called with majority writeConcern, got: {} ",
+                        commandName,
+                        writeConcern.toBSON().toString()),
+            writeConcern.isMajority());
+}
 
-Status CommandHelpers::canUseTransactions(StringData dbName, StringData cmdName) {
-    if (cmdName == "count"_sd) {
-        return {ErrorCodes::OperationNotSupportedInTransaction,
-                "Cannot run 'count' in a multi-document transaction. Please see "
-                "http://dochub.mongodb.org/core/transaction-count for a recommended alternative."};
+namespace {
+const CommandNameAtom countAtom("count"_sd);
+}  // namespace
+
+void CommandHelpers::canUseTransactions(const std::vector<NamespaceString>& namespaces,
+                                        Command* command,
+                                        bool allowTransactionsOnConfigDatabase) {
+    uassert(ErrorCodes::OperationNotSupportedInTransaction,
+            "Cannot run 'count' in a multi-document transaction. Please see "
+            "http://dochub.mongodb.org/core/transaction-count for a recommended alternative.",
+            command->getNameAtom() != countAtom);
+
+    uassert(ErrorCodes::OperationNotSupportedInTransaction,
+            str::stream() << "Cannot run '" << command->getName()
+                          << "' in a multi-document transaction.",
+            command->allowedInTransactions());
+
+    for (auto& nss : namespaces) {
+        const auto dbName = nss.dbName();
+
+        uassert(ErrorCodes::OperationNotSupportedInTransaction,
+                str::stream() << "Cannot run command against the '" << dbName.toStringForErrorMsg()
+                              << "' database in a transaction.",
+                !dbName.isLocalDB());
+
+        uassert(ErrorCodes::OperationNotSupportedInTransaction,
+                str::stream() << "Cannot run command against the '" << nss.toStringForErrorMsg()
+                              << "' collection in a transaction.",
+                !(nss.isSystemDotProfile() || nss.isSystemDotViews()));
+
+        if (allowTransactionsOnConfigDatabase) {
+            uassert(ErrorCodes::OperationNotSupportedInTransaction,
+                    "Cannot run command against the config.transactions namespace in a transaction"
+                    "on a sharded cluster.",
+                    nss != NamespaceString::kSessionTransactionsTableNamespace);
+        } else {
+            uassert(ErrorCodes::OperationNotSupportedInTransaction,
+                    "Cannot run command against the config database in a transaction.",
+                    !dbName.isConfigDB());
+        }
     }
-
-    if (txnCmdWhitelist.find(cmdName) == txnCmdWhitelist.cend() &&
-        !(getTestCommandsEnabled() &&
-          txnCmdForTestingWhitelist.find(cmdName) != txnCmdForTestingWhitelist.cend())) {
-        return {ErrorCodes::OperationNotSupportedInTransaction,
-                str::stream() << "Cannot run '" << cmdName << "' in a multi-document transaction."};
-    }
-
-    if (dbName == "config"_sd || dbName == "local"_sd ||
-        (dbName == "admin"_sd && txnAdminCommands.find(cmdName) == txnAdminCommands.cend())) {
-        return {ErrorCodes::OperationNotSupportedInTransaction,
-                str::stream() << "Cannot run command against the '" << dbName
-                              << "' database in a transaction"};
-    }
-
-    return Status::OK();
 }
 
 constexpr StringData CommandHelpers::kHelpFieldName;
 
 MONGO_FAIL_POINT_DEFINE(failCommand);
+MONGO_FAIL_POINT_DEFINE(waitInCommandMarkKillOnClientDisconnect);
+
+// A decoration representing error labels specified in a failCommand failpoint that has affected a
+// command in this OperationContext.
+const auto errorLabelsOverrideDecoration =
+    OperationContext::declareDecoration<boost::optional<BSONArray>>();
+
+boost::optional<BSONArray>& errorLabelsOverride(OperationContext* opCtx) {
+    return (*opCtx)[errorLabelsOverrideDecoration];
+}
 
 bool CommandHelpers::shouldActivateFailCommandFailPoint(const BSONObj& data,
-                                                        StringData cmdName,
+                                                        const CommandInvocation* invocation,
                                                         Client* client) {
-    if (cmdName == "configureFailPoint"_sd)  // Banned even if in failCommands.
+    const Command* cmd = invocation->definition();
+    NamespaceString nss;
+    try {
+        nss = invocation->ns();
+    } catch (const ExceptionFor<ErrorCodes::InvalidNamespace>&) {
+        return false;
+    }
+    return shouldActivateFailCommandFailPoint(data, nss, cmd, client);
+}
+
+bool CommandHelpers::shouldActivateFailCommandFailPoint(const BSONObj& data,
+                                                        const NamespaceString& nss,
+                                                        const Command* cmd,
+                                                        Client* client) {
+    if (cmd->getName() == "configureFailPoint"_sd)  // Banned even if in failCommands.
         return false;
 
-    if (data.hasField("threadName") &&
-        (client->desc() !=
-         data.getStringField(
-             "threadName"))) {  // only activate failpoint on thread from certain client
+    if (!(data.hasField("failLocalClients") && data.getBoolField("failLocalClients")) &&
+        !client->session()) {
         return false;
     }
 
+    auto threadName = client->desc();
+    auto appName = StringData();
+    if (auto clientMetadata = ClientMetadata::get(client)) {
+        appName = clientMetadata->getApplicationName();
+    }
+
+    auto isInternalThreadOrClient = !client->session() || client->isInternalClient();
+
+    if (data.hasField("threadName") && (threadName != data.getStringField("threadName"))) {
+        return false;  // only activate failpoint on thread from certain client
+    }
+
+    if (data.hasField("appName") && (appName != data.getStringField("appName"))) {
+        return false;  // only activate failpoint on connection with a certain appName
+    }
+
+    if (data.hasField("namespace")) {
+        const auto fpNss = NamespaceStringUtil::parseFailPointData(data, "namespace"_sd);
+        if (nss != fpNss) {
+            return false;
+        }
+    }
+
+    if (!(data.hasField("failInternalCommands") && data.getBoolField("failInternalCommands")) &&
+        isInternalThreadOrClient) {
+        return false;
+    }
+
+    if (client->isInDirectClient()) {
+        bool failDirectClientCommands = data.hasField("failDirectClientCommands")
+            ? data.getBoolField("failDirectClientCommands")
+            : true;
+        if (!failDirectClientCommands) {
+            return false;
+        }
+    }
+
+    if (data.hasField("failAllCommands")) {
+        LOGV2(6348500,
+              "Activating 'failCommand' failpoint for all commands",
+              "data"_attr = data,
+              "threadName"_attr = threadName,
+              "appName"_attr = appName,
+              logAttrs(nss),
+              "isInternalClient"_attr = isInternalThreadOrClient,
+              "command"_attr = cmd->getName());
+        return true;
+    }
+
     for (auto&& failCommand : data.getObjectField("failCommands")) {
-        if (failCommand.type() == String && failCommand.valueStringData() == cmdName) {
+        if (failCommand.type() == String && cmd->hasAlias(failCommand.valueStringData())) {
+            LOGV2(4898500,
+                  "Activating 'failCommand' failpoint",
+                  "data"_attr = data,
+                  "threadName"_attr = threadName,
+                  "appName"_attr = appName,
+                  logAttrs(nss),
+                  "isInternalClient"_attr = isInternalThreadOrClient,
+                  "command"_attr = cmd->getName());
+
             return true;
         }
     }
@@ -487,33 +742,184 @@ bool CommandHelpers::shouldActivateFailCommandFailPoint(const BSONObj& data,
     return false;
 }
 
-void CommandHelpers::evaluateFailCommandFailPoint(OperationContext* opCtx, StringData commandName) {
-    MONGO_FAIL_POINT_BLOCK_IF(failCommand, data, [&](const BSONObj& data) {
-        return shouldActivateFailCommandFailPoint(data, commandName, opCtx->getClient()) &&
-            (data.hasField("closeConnection") || data.hasField("errorCode"));
-    }) {
-        bool closeConnection;
-        if (bsonExtractBooleanField(data.getData(), "closeConnection", &closeConnection).isOK() &&
-            closeConnection) {
-            opCtx->getClient()->session()->end();
-            log() << "Failing command '" << commandName
-                  << "' via 'failCommand' failpoint. Action: closing connection.";
-            uasserted(50985, "Failing command due to 'failCommand' failpoint");
-        }
+void CommandHelpers::evaluateFailCommandFailPoint(OperationContext* opCtx,
+                                                  const CommandInvocation* invocation) {
+    bool closeConnection;
+    bool blockConnection;
+    bool hasErrorCode;
+    /**
+     * Default value is used to suppress the uassert for `errorExtraInfo` if `errorCode` is not set.
+     */
+    long long errorCode = ErrorCodes::OK;
+    const Command* cmd = invocation->definition();
+    failCommand.executeIf(
+        [&](const BSONObj& data) {
+            rpc::RewriteStateChangeErrors::onActiveFailCommand(opCtx, data);
 
-        long long errorCode;
-        if (bsonExtractIntegerField(data.getData(), "errorCode", &errorCode).isOK()) {
-            log() << "Failing command '" << commandName
-                  << "' via 'failCommand' failpoint. Action: returning error code " << errorCode
-                  << ".";
-            uasserted(ErrorCodes::Error(errorCode),
-                      "Failing command due to 'failCommand' failpoint");
+            if (data.hasField(kErrorLabelsFieldName) &&
+                data[kErrorLabelsFieldName].type() == Array) {
+                // Propagate error labels specified in the failCommand failpoint to the
+                // OperationContext decoration to override getErrorLabels() behaviors.
+                invariant(!errorLabelsOverride(opCtx));
+                errorLabelsOverride(opCtx).emplace(
+                    data.getObjectField(kErrorLabelsFieldName).getOwned());
+            }
+
+            if (blockConnection) {
+                if (data.hasField("blockTimeMS")) {
+                    long long blockTimeMS = 0;
+                    uassert(ErrorCodes::InvalidOptions,
+                            "Failed to parse 'blockTimeMS'",
+                            bsonExtractIntegerField(data, "blockTimeMS", &blockTimeMS).isOK());
+                    uassert(ErrorCodes::InvalidOptions,
+                            "'blockTimeMS' must be non-negative",
+                            blockTimeMS >= 0);
+
+                    LOGV2(20432,
+                          "Blocking command via 'failCommand' failpoint",
+                          "command"_attr = cmd->getName(),
+                          "blockTime"_attr = Milliseconds{blockTimeMS});
+                    opCtx->sleepFor(Milliseconds{blockTimeMS});
+                } else {
+                    LOGV2(10303900,
+                          "Blocking command via 'failCommand' failpoint until failpoint is unset",
+                          "command"_attr = cmd->getName());
+                    failCommand.pauseWhileSet(opCtx);
+                }
+                LOGV2(20433,
+                      "Unblocking command via 'failCommand' failpoint",
+                      "command"_attr = cmd->getName());
+            }
+
+            auto tassert = [&] {
+                bool b;
+                Status st = bsonExtractBooleanField(data, "tassert", &b);
+                if (st == ErrorCodes::NoSuchKey) {
+                    return false;
+                }
+                uassertStatusOK(st);
+                return b;
+            }();
+
+            auto raise = [&](const Status& status) {
+                if (tassert) {
+                    tassert(status);
+                } else {
+                    uassertStatusOK(status);
+                }
+            };
+
+            static constexpr auto failpointMsg = "Failing command via 'failCommand' failpoint"_sd;
+
+            if (closeConnection) {
+                opCtx->getClient()->session()->end();
+                LOGV2(20431,
+                      "Failing {command} via 'failCommand' failpoint: closing connection",
+                      "command"_attr = cmd->getName());
+                raise(Status(tassert ? ErrorCodes::Error(5704000) : ErrorCodes::Error(50985),
+                             failpointMsg));
+            }
+
+            auto errorExtraInfo = [&]() -> boost::optional<BSONObj> {
+                BSONElement e;
+                Status st = bsonExtractTypedField(data, "errorExtraInfo", BSONType::Object, &e);
+                if (st == ErrorCodes::NoSuchKey)
+                    return {};  // It's optional. Missing is allowed. Other errors aren't.
+                uassertStatusOK(st);
+                return {e.Obj()};
+            }();
+
+            if (errorExtraInfo) {
+                LOGV2(20434,
+                      "Failing {command} via 'failCommand' failpoint: returning {errorCode} and "
+                      "{errorExtraInfo}",
+                      "command"_attr = cmd->getName(),
+                      "errorCode"_attr = errorCode,
+                      "errorExtraInfo"_attr = errorExtraInfo);
+                raise(Status(ErrorCodes::Error(errorCode), failpointMsg, *errorExtraInfo));
+
+            } else if (hasErrorCode) {
+                LOGV2(
+                    20435,
+                    "Failing command {command} via 'failCommand' failpoint: returning {errorCode}",
+                    "command"_attr = cmd->getName(),
+                    "errorCode"_attr = errorCode);
+                raise(Status(ErrorCodes::Error(errorCode), failpointMsg));
+            }
+        },
+        [&](const BSONObj& data) {
+            closeConnection = data.hasField("closeConnection") &&
+                bsonExtractBooleanField(data, "closeConnection", &closeConnection).isOK() &&
+                closeConnection;
+            hasErrorCode = data.hasField("errorCode") &&
+                bsonExtractIntegerField(data, "errorCode", &errorCode).isOK();
+            blockConnection = data.hasField("blockConnection") &&
+                bsonExtractBooleanField(data, "blockConnection", &blockConnection).isOK() &&
+                blockConnection;
+            return shouldActivateFailCommandFailPoint(data, invocation, opCtx->getClient()) &&
+                (closeConnection || blockConnection || hasErrorCode);
+        });
+}
+
+void CommandHelpers::handleMarkKillOnClientDisconnect(OperationContext* opCtx,
+                                                      bool shouldMarkKill) {
+    if (opCtx->getClient()->isInDirectClient()) {
+        return;
+    }
+
+    if (shouldMarkKill) {
+        opCtx->markKillOnClientDisconnect();
+    }
+
+    waitInCommandMarkKillOnClientDisconnect.executeIf(
+        [&](const BSONObj&) { waitInCommandMarkKillOnClientDisconnect.pauseWhileSet(opCtx); },
+        [&](const BSONObj& obj) {
+            auto md = ClientMetadata::get(opCtx->getClient());
+            return md && (md->getApplicationName() == obj["appName"].str());
+        });
+}
+
+void CommandHelpers::checkForInternalError(rpc::ReplyBuilderInterface* replyBuilder,
+                                           bool isInternalClient) {
+    if (isInternalClient) {
+        return;
+    }
+
+    auto obj = replyBuilder->getBodyBuilder().asTempObj();
+    if (auto e = obj.getField("code"); MONGO_unlikely(!e.eoo())) {
+        const auto errorCode = static_cast<ErrorCodes::Error>(e.safeNumberInt());
+        try {
+            tassert(
+                errorCode,
+                fmt::format("Attempted to return an internal-only error to the client, errmsg: {}",
+                            obj.getStringField("errmsg")),
+                !ErrorCodes::isInternalOnly(errorCode));
+        } catch (...) {
+            // No need to throw as we only require the diagnostics provided by `tassert` and
+            // do not want to close the connection.
         }
     }
 }
 
+namespace {
+// We store the CommandInvocation as a shared_ptr on the OperationContext in case we need to persist
+// the invocation past the lifetime of the op. If so, this shared_ptr can be copied off to another
+// thread. If not, there is only one shared_ptr and the invocation goes out of scope when the op
+// ends.
+auto invocationForOpCtx = OperationContext::declareDecoration<std::shared_ptr<CommandInvocation>>();
+}  // namespace
+
 //////////////////////////////////////////////////////////////
 // CommandInvocation
+
+void CommandInvocation::set(OperationContext* opCtx,
+                            std::shared_ptr<CommandInvocation> invocation) {
+    invocationForOpCtx(opCtx) = std::move(invocation);
+}
+
+std::shared_ptr<CommandInvocation>& CommandInvocation::get(OperationContext* opCtx) {
+    return invocationForOpCtx(opCtx);
+}
 
 CommandInvocation::~CommandInvocation() = default;
 
@@ -523,23 +929,31 @@ void CommandInvocation::checkAuthorization(OperationContext* opCtx,
     // Not using a scope guard because auditLogAuthEvent could conceivably throw.
     try {
         const Command* c = definition();
-        if (checkAuthorizationImplPreParse(opCtx, c, request)) {
+
+        uassert(ErrorCodes::Unauthorized,
+                str::stream() << c->getName() << " may only be run against the admin database.",
+                !c->adminOnly() || db().isAdminDB());
+
+        if (checkAuthorizationImplPreParse(opCtx, c, request.validatedTenancyScope)) {
             // Blanket authorization: don't need to check anything else.
         } else {
             try {
+                checkAuthForRawData(opCtx, getGenericArguments(), request);
                 doCheckAuthorization(opCtx);
             } catch (const ExceptionFor<ErrorCodes::Unauthorized>&) {
                 namespace mmb = mutablebson;
                 mmb::Document cmdToLog(request.body, mmb::Document::kInPlaceDisabled);
                 c->snipForLogging(&cmdToLog);
-                auto dbname = request.getDatabase();
                 uasserted(ErrorCodes::Unauthorized,
-                          str::stream() << "not authorized on " << dbname << " to execute command "
-                                        << redact(cmdToLog.getObject()));
+                          str::stream() << "not authorized on " << db().toStringForErrorMsg()
+                                        << " to execute command " << redact(cmdToLog.getObject()));
             }
         }
     } catch (const DBException& e) {
-        log(LogComponent::kAccessControl) << e.toStatus();
+        LOGV2_OPTIONS(20436,
+                      {logv2::LogComponent::kAccessControl},
+                      "Checking authorization failed",
+                      "error"_attr = e.toStatus());
         CommandHelpers::auditLogAuthEvent(opCtx, this, request, e.code());
         throw;
     }
@@ -549,109 +963,170 @@ void CommandInvocation::checkAuthorization(OperationContext* opCtx,
 //////////////////////////////////////////////////////////////
 // Command
 
-class BasicCommand::Invocation final : public CommandInvocation {
+class BasicCommandWithReplyBuilderInterface::Invocation final : public CommandInvocation {
 public:
-    Invocation(OperationContext*, const OpMsgRequest& request, BasicCommand* command)
+    Invocation(OperationContext*,
+               const OpMsgRequest& request,
+               BasicCommandWithReplyBuilderInterface* command)
         : CommandInvocation(command),
           _command(command),
-          _request(&request),
-          _dbName(_request->getDatabase().toString()) {}
+          _request(request),
+          _dbName(request.parseDbName()),
+          _genericArgs(GenericArguments::parse(IDLParserContext(_command->getName(),
+                                                                request.validatedTenancyScope,
+                                                                request.getValidatedTenantId(),
+                                                                request.getSerializationContext()),
+                                               _request.body)) {}
 
 private:
     void run(OperationContext* opCtx, rpc::ReplyBuilderInterface* result) override {
-        BSONObjBuilder bob = result->getBodyBuilder();
-        bool ok = _command->run(opCtx, _dbName, _request->body, bob);
-        if (!ok)
+        bool ok = _command->runWithReplyBuilder(opCtx, _dbName, _request.body, result);
+        if (!ok) {
+            BSONObjBuilder bob = result->getBodyBuilder();
             CommandHelpers::appendSimpleCommandStatus(bob, ok);
+        }
+    }
+
+    Future<void> runAsync(std::shared_ptr<RequestExecutionContext> rec) override {
+        return _command->runAsync(rec, _dbName).onError([rec](Status status) {
+            if (status.code() != ErrorCodes::FailedToRunWithReplyBuilder)
+                return status;
+            BSONObjBuilder bob = rec->getReplyBuilder()->getBodyBuilder();
+            CommandHelpers::appendSimpleCommandStatus(bob, false);
+            return Status::OK();
+        });
     }
 
     void explain(OperationContext* opCtx,
                  ExplainOptions::Verbosity verbosity,
                  rpc::ReplyBuilderInterface* result) override {
-        uassertStatusOK(_command->explain(opCtx, *_request, verbosity, result));
+        uassertStatusOK(_command->explain(opCtx, _request, verbosity, result));
     }
 
     NamespaceString ns() const override {
-        return NamespaceString(_command->parseNs(_dbName, cmdObj()));
+        return _command->parseNs(_dbName, cmdObj());
+    }
+
+    const DatabaseName& db() const override {
+        return _dbName;
     }
 
     bool supportsWriteConcern() const override {
         return _command->supportsWriteConcern(cmdObj());
     }
 
-    bool supportsReadConcern(repl::ReadConcernLevel level) const override {
-        return _command->supportsReadConcern(_dbName, cmdObj(), level);
+    ReadConcernSupportResult supportsReadConcern(repl::ReadConcernLevel level,
+                                                 bool isImplicitDefault) const override {
+        return _command->supportsReadConcern(cmdObj(), level, isImplicitDefault);
+    }
+
+    bool supportsRawData() const override {
+        return _command->supportsRawData();
+    }
+
+    bool isSubjectToIngressAdmissionControl() const override {
+        return _command->isSubjectToIngressAdmissionControl();
+    }
+
+    bool supportsReadMirroring() const override {
+        return _command->supportsReadMirroring(cmdObj());
+    }
+
+    DatabaseName getDBForReadMirroring() const override {
+        invariant(cmdObj().isOwned());
+        return _dbName;
+    }
+
+    void appendMirrorableRequest(BSONObjBuilder* bob) const override {
+        invariant(cmdObj().isOwned());
+        _command->appendMirrorableRequest(bob, cmdObj());
     }
 
     bool allowsAfterClusterTime() const override {
         return _command->allowsAfterClusterTime(cmdObj());
     }
 
+    bool canIgnorePrepareConflicts() const override {
+        return _command->canIgnorePrepareConflicts();
+    }
+
     void doCheckAuthorization(OperationContext* opCtx) const override {
-        uassertStatusOK(_command->checkAuthForOperation(
-            opCtx, _request->getDatabase().toString(), _request->body));
+        uassertStatusOK(_command->checkAuthForOperation(opCtx, _dbName, _request.body));
     }
 
     const BSONObj& cmdObj() const {
-        return _request->body;
+        return _request.body;
     }
 
-    BasicCommand* const _command;
-    const OpMsgRequest* const _request;
-    const std::string _dbName;
+    const GenericArguments& getGenericArguments() const override {
+        return _genericArgs;
+    }
+
+    BasicCommandWithReplyBuilderInterface* const _command;
+    const OpMsgRequest _request;
+    const DatabaseName _dbName;
+    const GenericArguments _genericArgs;
 };
+
+CommandNameAtom::CommandNameAtom(StringData s) {
+    static StaticImmortal<CommandNameAtomRegistry> registry;
+    _atom = registry->lookup(s);
+}
 
 Command::~Command() = default;
 
 void Command::snipForLogging(mutablebson::Document* cmdObj) const {
-    StringData sensitiveField = sensitiveFieldName();
-    if (!sensitiveField.empty()) {
-
-        for (mutablebson::Element pwdElement =
-                 mutablebson::findFirstChildNamed(cmdObj->root(), sensitiveField);
-             pwdElement.ok();
-             pwdElement =
-                 mutablebson::findElementNamed(pwdElement.rightSibling(), sensitiveField)) {
-            uassertStatusOK(pwdElement.setValueString("xxx"));
+    auto sensitiveFields = sensitiveFieldNames();
+    if (!sensitiveFields.empty()) {
+        for (auto& sensitiveField : sensitiveFields) {
+            for (mutablebson::Element element =
+                     mutablebson::findFirstChildNamed(cmdObj->root(), sensitiveField);
+                 element.ok();
+                 element = mutablebson::findElementNamed(element.rightSibling(), sensitiveField)) {
+                uassertStatusOK(element.setValueString("xxx"));
+            }
         }
     }
 }
 
 
-std::unique_ptr<CommandInvocation> BasicCommand::parse(OperationContext* opCtx,
-                                                       const OpMsgRequest& request) {
+std::unique_ptr<CommandInvocation> BasicCommandWithReplyBuilderInterface::parse(
+    OperationContext* opCtx, const OpMsgRequest& request) {
     CommandHelpers::uassertNoDocumentSequences(getName(), request);
-    return stdx::make_unique<Invocation>(opCtx, request, this);
+    return std::make_unique<Invocation>(opCtx, request, this);
 }
 
-Command::Command(StringData name, StringData oldName)
-    : _name(name.toString()),
-      _commandsExecutedMetric("commands." + _name + ".total", &_commandsExecuted),
-      _commandsFailedMetric("commands." + _name + ".failed", &_commandsFailed) {
-    globalCommandRegistry()->registerCommand(this, name, oldName);
+Command::Command(StringData name, std::vector<StringData> aliases)
+    : _name(name.toString()), _aliases(std::move(aliases)) {}
+
+void Command::initializeClusterRole(ClusterRole role) {
+    for (auto&& [ptr, stat] : {
+             std::pair{&_commandsExecuted, "total"},
+             std::pair{&_commandsFailed, "failed"},
+             std::pair{&_commandsRejected, "rejected"},
+         })
+        *ptr = &*MetricBuilder<Counter64>{fmt::format("commands.{}.{}", _name, stat)}.setRole(role);
+    doInitializeClusterRole(role);
 }
 
-Status BasicCommand::explain(OperationContext* opCtx,
-                             const OpMsgRequest& request,
-                             ExplainOptions::Verbosity verbosity,
-                             rpc::ReplyBuilderInterface* result) const {
+const std::set<std::string>& Command::apiVersions() const {
+    return kNoApiVersions;
+}
+
+const std::set<std::string>& Command::deprecatedApiVersions() const {
+    return kNoApiVersions;
+}
+
+bool Command::hasAlias(StringData alias) const {
+    return getName() == alias ||
+        std::find(_aliases.begin(), _aliases.end(), alias) != _aliases.end();
+}
+
+Status BasicCommandWithReplyBuilderInterface::explain(OperationContext* opCtx,
+                                                      const OpMsgRequest& request,
+                                                      ExplainOptions::Verbosity verbosity,
+                                                      rpc::ReplyBuilderInterface* result) const {
     return {ErrorCodes::IllegalOperation, str::stream() << "Cannot explain cmd: " << getName()};
-}
-
-Status BasicCommand::checkAuthForOperation(OperationContext* opCtx,
-                                           const std::string& dbname,
-                                           const BSONObj& cmdObj) const {
-    return checkAuthForCommand(opCtx->getClient(), dbname, cmdObj);
-}
-
-Status BasicCommand::checkAuthForCommand(Client* client,
-                                         const std::string& dbname,
-                                         const BSONObj& cmdObj) const {
-    std::vector<Privilege> privileges;
-    this->addRequiredPrivileges(dbname, cmdObj, &privileges);
-    if (AuthorizationSession::get(client)->isAuthorizedForPrivileges(privileges))
-        return Status::OK();
-    return Status(ErrorCodes::Unauthorized, "unauthorized");
 }
 
 void Command::generateHelpResponse(OperationContext* opCtx,
@@ -664,11 +1139,11 @@ void Command::generateHelpResponse(OperationContext* opCtx,
 }
 
 bool ErrmsgCommandDeprecated::run(OperationContext* opCtx,
-                                  const std::string& db,
+                                  const DatabaseName& dbName,
                                   const BSONObj& cmdObj,
                                   BSONObjBuilder& result) {
     std::string errmsg;
-    auto ok = errmsgRun(opCtx, db, cmdObj, errmsg, result);
+    auto ok = errmsgRun(opCtx, dbName, cmdObj, errmsg, result);
     if (!errmsg.empty()) {
         CommandHelpers::appendSimpleCommandStatus(result, ok, errmsg);
     }
@@ -678,28 +1153,133 @@ bool ErrmsgCommandDeprecated::run(OperationContext* opCtx,
 //////////////////////////////////////////////////////////////
 // CommandRegistry
 
-void CommandRegistry::registerCommand(Command* command, StringData name, StringData oldName) {
-    for (StringData key : {name, oldName}) {
-        if (key.empty()) {
+CommandRegistry* getCommandRegistry(Service* service) {
+    auto role = service->role();
+    static auto makeReg = [](Service* service) {
+        CommandRegistry reg;
+        // `reg` will be a singleton registry, so create a per-service unknowns
+        // counter for it.
+        auto unknowns = &*MetricBuilder<Counter64>{"commands.<UNKNOWN>"}.setRole(service->role());
+        reg.setOnUnknownCommandCallback([unknowns] { unknowns->increment(); });
+        globalCommandConstructionPlan().execute(&reg, service);
+        return reg;
+    };
+    if (role.hasExclusively(ClusterRole::ShardServer)) {
+        static StaticImmortal obj = makeReg(service);
+        return &*obj;
+    }
+    if (role.hasExclusively(ClusterRole::RouterServer)) {
+        static StaticImmortal obj = makeReg(service);
+        return &*obj;
+    }
+    MONGO_UNREACHABLE;  // Service role has to be exclusively Shard or Router.
+}
+
+void CommandRegistry::registerCommand(Command* command) {
+    StringData name = command->getName();
+    std::vector<StringData> aliases = command->getAliases();
+    auto ep = std::make_unique<Entry>();
+    ep->command = command;
+    auto [cIt, cOk] = _commands.emplace(command, std::move(ep));
+    invariant(cOk, fmt::format("Command identity collision: {}", name));
+
+    // When a `Command*` is introduced to `_commands`, its names are introduced
+    // to `_commandNames`.
+    aliases.push_back(name);
+    for (StringData key : aliases) {
+        if (key.empty())
             continue;
-        }
-        auto hashedKey = CommandMap::HashedKey(key);
-        auto iter = _commands.find(hashedKey);
-        invariant(iter == _commands.end(), str::stream() << "command name collision: " << key);
-        _commands[hashedKey] = command;
+        auto [nIt, nOk] = _commandNames.try_emplace(key, command);
+        invariant(nOk, fmt::format("Command name collision: {}", key));
     }
 }
 
+namespace {
+boost::optional<ClusterRole> getRegistryRole(const CommandRegistry* reg) {
+    if (auto sc = getGlobalServiceContext())
+        for (auto r : {ClusterRole::ShardServer, ClusterRole::RouterServer})
+            if (auto srv = sc->getService(r); srv && getCommandRegistry(srv) == reg)
+                return ClusterRole(r);
+    return {};
+}
+}  // namespace
 Command* CommandRegistry::findCommand(StringData name) const {
-    auto it = _commands.find(name);
-    if (it == _commands.end())
+    auto it = _commandNames.find(name);
+    if (it == _commandNames.end()) {
+        LOGV2_DEBUG(8097101,
+                    kFailedFindCommandDebugLevel,
+                    "Failed findCommand",
+                    "name"_attr = name,
+                    "registryRole"_attr = getRegistryRole(this));
         return nullptr;
+    }
     return it->second;
 }
 
-CommandRegistry* globalCommandRegistry() {
-    static auto reg = new CommandRegistry();
-    return reg;
+CommandConstructionPlan& globalCommandConstructionPlan() {
+    static StaticImmortal<CommandConstructionPlan> obj{};
+    return *obj;
+}
+
+BSONObj toBSON(const CommandConstructionPlan::Entry& e) {
+    BSONObjBuilder bob;
+    bob.append("expr", e.expr);
+    bob.append("roles", toString(e.roles.value_or(ClusterRole::None)));
+    if (e.location)
+        bob.append("loc", fmt::format("{}:{}", e.location->file_name(), e.location->line()));
+    return bob.obj();
+}
+
+void CommandConstructionPlan::execute(CommandRegistry* registry,
+                                      Service* service,
+                                      const std::function<bool(const Entry&)>& pred) const {
+    LOGV2_DEBUG(8043400, 3, "Constructing Command objects from specs");
+    StringMap<boost::optional<SourceLocation>> dupCheck;
+    for (auto&& entry : entries()) {
+        if (entry->testOnly && !getTestCommandsEnabled()) {
+            LOGV2_DEBUG(8043401, 3, "Skipping test-only command", "entry"_attr = *entry);
+            continue;
+        }
+        // Do not register feature-gated commands that cannot become enabled at runtime.
+        if (entry->featureFlag && !entry->featureFlag->canBeEnabled()) {
+            LOGV2_DEBUG(8043402, 3, "Skipping FeatureFlag gated command", "entry"_attr = *entry);
+            continue;
+        }
+        if (!pred(*entry)) {
+            LOGV2_DEBUG(8043403, 3, "Skipping command for failed predicate", "entry"_attr = *entry);
+            continue;
+        }
+        auto c = entry->construct();
+        {
+            const std::string& name = c->getName();
+            auto&& loc = entry->location;
+            if (auto dup = dupCheck.find(name); dup != dupCheck.end()) {
+                LOGV2_FATAL(10205200,
+                            "Duplicate command",
+                            "name"_attr = name,
+                            "role"_attr = service->role(),
+                            "location"_attr = loc,
+                            "dupLocation"_attr = dup->second);
+            }
+            dupCheck.insert({c->getName(), loc});
+        }
+        c->initializeClusterRole(service ? service->role() : ClusterRole{});
+        LOGV2_DEBUG(8043404, 3, "Created", "command"_attr = c->getName(), "entry"_attr = *entry);
+        registry->registerCommand(&*c);
+
+        // In the future, we should get to the point where the registry owns the
+        // command object. But we aren't there yet and they have to be leaked,
+        // So we at least do it as an explicit choice here.
+        static StaticImmortal leakedCommands = std::vector<std::unique_ptr<Command>>{};
+        leakedCommands->push_back(std::move(c));
+    }
+}
+
+void CommandConstructionPlan::execute(CommandRegistry* registry, Service* service) const {
+    execute(registry, service, [r = service->role()](const auto& e) {
+        invariant(e.roles, "All commands must have a role.");
+        return e.roles->has(r);
+    });
 }
 
 }  // namespace mongo

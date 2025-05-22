@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -31,12 +30,14 @@
 #pragma once
 
 #include <map>
+#include <memory>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "mongo/base/clonable_ptr.h"
 #include "mongo/db/matcher/expression_with_placeholder.h"
 #include "mongo/db/update/update_internal_node.h"
-#include "mongo/stdx/memory.h"
 
 namespace mongo {
 
@@ -65,7 +66,7 @@ public:
         : UpdateInternalNode(Type::Array), _arrayFilters(arrayFilters) {}
 
     std::unique_ptr<UpdateNode> clone() const final {
-        return stdx::make_unique<UpdateArrayNode>(*this);
+        return std::make_unique<UpdateArrayNode>(*this);
     }
 
     void setCollator(const CollatorInterface* collator) final {
@@ -74,15 +75,31 @@ public:
         }
     }
 
-    ApplyResult apply(ApplyParams applyParams) const final;
+    ApplyResult apply(ApplyParams applyParams,
+                      UpdateNodeApplyParams updateNodeApplyParams) const final;
 
     UpdateNode* getChild(const std::string& field) const final;
 
     void setChild(std::string field, std::unique_ptr<UpdateNode> child) final;
 
+    void produceSerializationMap(
+        FieldRef* currentPath,
+        std::map<std::string, std::vector<std::pair<std::string, BSONObj>>>*
+            operatorOrientedUpdates) const final {
+        for (const auto& [pathSuffix, child] : _children) {
+            FieldRef::FieldRefTempAppend tempAppend(*currentPath,
+                                                    toArrayFilterIdentifier(pathSuffix));
+            child->produceSerializationMap(currentPath, operatorOrientedUpdates);
+        }
+    }
+
+    void acceptVisitor(UpdateNodeVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
 private:
     const std::map<StringData, std::unique_ptr<ExpressionWithPlaceholder>>& _arrayFilters;
-    std::map<std::string, clonable_ptr<UpdateNode>> _children;
+    std::map<std::string, clonable_ptr<UpdateNode>, pathsupport::cmpPathsAndArrayIndexes> _children;
 
     // When calling apply() causes us to merge elements of '_children', we store the result of the
     // merge in case we need it for another array element or document.

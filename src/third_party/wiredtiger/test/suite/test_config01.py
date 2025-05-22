@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Public Domain 2014-2018 MongoDB, Inc.
+# Public Domain 2014-present MongoDB, Inc.
 # Public Domain 2008-2014 WiredTiger, Inc.
 #
 # This is free and unencumbered software released into the public domain.
@@ -26,7 +26,7 @@
 # ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
 # OTHER DEALINGS IN THE SOFTWARE.
 
-import wiredtiger, wtscenario, wttest
+import wtscenario, wttest
 import test_base03
 
 # test_config01.py
@@ -42,8 +42,5 @@ class test_config01(test_base03.test_base03):
         if hasattr(self, 'cache_size'):
             wtopen_args += ',cache_size=' + str(self.cache_size)
         conn = self.wiredtiger_open(dir, wtopen_args)
-        self.pr(`conn`)
+        self.pr(repr(conn))
         return conn
-
-if __name__ == '__main__':
-    wttest.run()

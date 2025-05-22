@@ -1,6 +1,3 @@
-/** @file connpool.h */
-
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -32,19 +29,33 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
 #include <cstdint>
+#include <list>
+#include <map>
+#include <memory>
+#include <mutex>
 #include <stack>
+#include <string>
+#include <vector>
 
+#include "mongo/client/connection_string.h"
 #include "mongo/client/dbclient_base.h"
 #include "mongo/client/mongo_uri.h"
+#include "mongo/executor/connection_pool_stats.h"
 #include "mongo/platform/atomic_word.h"
+#include "mongo/stdx/condition_variable.h"
+#include "mongo/stdx/mutex.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/background.h"
-#include "mongo/util/concurrency/mutex.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/hierarchical_acquisition.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
 
 class BSONObjBuilder;
+
 class DBConnectionPool;
 
 namespace executor {
@@ -72,7 +83,8 @@ struct ConnectionPoolStats;
  * PoolForHost is not thread-safe; thread safety is handled by DBConnectionPool.
  */
 class PoolForHost {
-    MONGO_DISALLOW_COPYING(PoolForHost);
+    PoolForHost(const PoolForHost&) = delete;
+    PoolForHost& operator=(const PoolForHost&) = delete;
 
 public:
     // Sentinel value indicating pool has no cleanup limit
@@ -139,7 +151,7 @@ public:
     }
 
     ConnectionString::ConnectionType type() const {
-        verify(_created);
+        MONGO_verify(_created);
         return _type;
     }
 
@@ -151,7 +163,19 @@ public:
     // Deletes all connections in the pool
     void clear();
 
-    void done(DBConnectionPool* pool, DBClientBase* c);
+    /**
+     * A concrete statement about the health of a DBClientBase connection
+     */
+    enum class ConnectionHealth {
+        kReuseable,
+        kTooMany,
+        kFailed,
+    };
+
+    /**
+     * Attempt to reclaim the underlying connection behind the DBClientBase
+     */
+    ConnectionHealth done(DBConnectionPool* pool, DBClientBase* c);
 
     void flush();
 
@@ -187,6 +211,22 @@ public:
      * Notifies any waiters that there are new connections available.
      */
     void notifyWaiters();
+
+    /**
+     * Records the connection waittime in the connAcquisitionWaitTime histogram
+     */
+    inline void recordConnectionWaitTime(Date_t requestedAt) {
+        auto connTime = Date_t::now() - requestedAt;
+        _connAcquisitionWaitTimeStats.increment(connTime);
+        _connTime = connTime;
+    }
+
+    /**
+     * Returns the connAcquisitionWaitTime histogram
+     */
+    const executor::ConnectionWaitTimeHistogram& connectionWaitTimeStats() const {
+        return _connAcquisitionWaitTimeStats;
+    }
 
     /**
      * Shuts down this pool, notifying all waiters.
@@ -234,6 +274,11 @@ private:
     // Whether our parent DBConnectionPool object is in destruction
     bool _parentDestroyed;
 
+    // Time it took for the last connection to be established
+    Milliseconds _connTime;
+
+    executor::ConnectionWaitTimeHistogram _connAcquisitionWaitTimeStats{};
+
     stdx::condition_variable _cv;
 
     AtomicWord<bool> _inShutdown;
@@ -266,7 +311,7 @@ public:
 class DBConnectionPool : public PeriodicTask {
 public:
     DBConnectionPool();
-    ~DBConnectionPool();
+    ~DBConnectionPool() override;
 
     /** right now just controls some asserts.  defaults to "dbconnectionpool" */
     void setName(const std::string& name) {
@@ -328,12 +373,19 @@ public:
     DBClientBase* get(const MongoURI& uri, double socketTimeout = 0);
 
     /**
+     * Gets the time it took for the last connection to be established from the PoolMap given a host
+     * and timeout.
+     */
+    Milliseconds getPoolHostConnTime_forTest(const std::string& host, double timeout) const;
+
+    /**
      * Gets the number of connections available in the pool.
      */
     int getNumAvailableConns(const std::string& host, double socketTimeout = 0) const;
     int getNumBadConns(const std::string& host, double socketTimeout = 0) const;
 
     void release(const std::string& host, DBClientBase* c);
+    void decrementEgress(const std::string& host, DBClientBase* c);
 
     void addHook(DBConnectionHook* hook);  // we take ownership
     void appendConnectionStats(executor::ConnectionPoolStats* stats) const;
@@ -344,7 +396,7 @@ public:
     void clear();
 
     /**
-     * Checks whether the connection for a given host is black listed or not.
+     * Checks whether the connection for a given host is deny listed or not.
      *
      * @param hostName the name of the host the connection connects to.
      * @param conn the connection to check.
@@ -362,10 +414,10 @@ public:
         bool operator()(const std::string& a, const std::string& b) const;
     };
 
-    virtual std::string taskName() const {
+    std::string taskName() const override {
         return "DBConnectionPool-cleaner";
     }
-    virtual void taskDoWork();
+    void taskDoWork() override;
 
     /**
      * Shuts down the connection pool, unblocking any waiters on connections.
@@ -377,9 +429,12 @@ private:
 
     DBConnectionPool(DBConnectionPool& p);
 
-    DBClientBase* _get(const std::string& ident, double socketTimeout);
+    DBClientBase* _get(const std::string& ident, double socketTimeout, Date_t& connRequestedAt);
 
-    DBClientBase* _finishCreate(const std::string& ident, double socketTimeout, DBClientBase* conn);
+    DBClientBase* _finishCreate(const std::string& ident,
+                                double socketTimeout,
+                                DBClientBase* conn,
+                                Date_t& connRequestedAt);
 
     struct PoolKey {
         PoolKey(const std::string& i, double t) : ident(i), timeout(t) {}
@@ -414,7 +469,8 @@ private:
 };
 
 class AScopedConnection {
-    MONGO_DISALLOW_COPYING(AScopedConnection);
+    AScopedConnection(const AScopedConnection&) = delete;
+    AScopedConnection& operator=(const AScopedConnection&) = delete;
 
 public:
     AScopedConnection() {
@@ -441,7 +497,7 @@ public:
     }
 
 private:
-    static AtomicInt32 _numConnections;
+    static AtomicWord<int> _numConnections;
 };
 
 /** Use to get a connection from the pool.  On exceptions things
@@ -457,7 +513,7 @@ public:
     explicit ScopedDbConnection(const ConnectionString& host, double socketTimeout = 0);
     explicit ScopedDbConnection(const MongoURI& host, double socketTimeout = 0);
 
-    ScopedDbConnection() : _host(""), _conn(0), _socketTimeoutSecs(0) {}
+    ScopedDbConnection() : _host(""), _conn(nullptr), _socketTimeoutSecs(0) {}
 
     /* @param conn - bind to an existing connection */
     ScopedDbConnection(const std::string& host, DBClientBase* conn, double socketTimeout = 0)
@@ -465,7 +521,7 @@ public:
         _setSocketTimeout();
     }
 
-    ~ScopedDbConnection();
+    ~ScopedDbConnection() override;
 
     static void clearPool();
 
@@ -482,26 +538,23 @@ public:
     }
 
     /** get the associated connection object */
-    DBClientBase* get() {
+    DBClientBase* get() override {
         uassert(13102, "connection was returned to the pool already", _conn);
         return _conn;
     }
 
-    bool ok() const {
-        return _conn != NULL;
+    bool ok() const override {
+        return _conn != nullptr;
     }
 
-    std::string getHost() const {
+    std::string getHost() const override {
         return _host;
     }
 
     /** Force closure of the connection.  You should call this if you leave it in
         a bad state.  Destructor will do this too, but it is verbose.
     */
-    void kill() {
-        delete _conn;
-        _conn = 0;
-    }
+    void kill();
 
     /** Call this when you are done with the connection.
 
@@ -509,7 +562,7 @@ public:
         we can't be sure we fully read all expected data of a reply on the socket.  so
         we don't try to reuse the connection in that situation.
     */
-    void done();
+    void done() override;
 
 private:
     void _setSocketTimeout();

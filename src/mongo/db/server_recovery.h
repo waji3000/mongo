@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -35,11 +34,11 @@
 
 #include "mongo/db/service_context.h"
 #include "mongo/stdx/mutex.h"
+#include "mongo/util/string_map.h"
 
 namespace mongo {
 /**
- * This class is for use with non-MMAPv1 storage engines that track record store sizes in catalog
- * metadata.
+ * This class is for use with storage engines that track record store sizes in catalog metadata.
  *
  * During normal server operation, we adjust the size metadata for all record stores. But when
  * performing replication recovery, we avoid doing so, as we trust that the size metadata on disk is
@@ -81,9 +80,22 @@ public:
      */
     void clearStateBeforeRecovery();
 
+    /**
+     * Informs the SizeRecoveryState that record stores should always check their size information.
+     */
+    void setRecordStoresShouldAlwaysCheckSize(bool);
+
+    /**
+     * Returns whether record stores should always check their size information. This can either be
+     * due to setRecordStoresShouldAlwaysCheckSize being called or due to being in replication
+     * recovery.
+     */
+    bool shouldRecordStoresAlwaysCheckSize() const;
+
 private:
     mutable stdx::mutex _mutex;
-    std::set<std::string> _collectionsAlwaysNeedingSizeAdjustment;
+    StringSet _collectionsAlwaysNeedingSizeAdjustment;
+    bool _recordStoresShouldAlwayCheckSize = false;
 };
 
 /**
@@ -92,8 +104,32 @@ private:
 SizeRecoveryState& sizeRecoveryState(ServiceContext* serviceCtx);
 
 /**
- * Returns a mutable reference to a boolean decoration on 'serviceCtx', which indicates whether or
- * not the server is currently undergoing replication recovery.
+ * The "in replication recovery" flag. Provided by a thread-safe decorator on ServiceContext, this
+ * class provides an RAII utility around setting the flag value and allowing it to be checked by
+ * readers. Note that this flag is advisory-only: writers will not check for readers and no further
+ * synchronization is performed.
  */
-bool& inReplicationRecovery(ServiceContext* serviceCtx);
+class InReplicationRecovery final {
+    InReplicationRecovery(const InReplicationRecovery&) = delete;
+    InReplicationRecovery(InReplicationRecovery&&) = delete;
+    InReplicationRecovery& operator=(const InReplicationRecovery&) = delete;
+    InReplicationRecovery& operator=(InReplicationRecovery&&) = delete;
+
+    ServiceContext* _serviceContext{nullptr};
+
+public:
+    /**
+     * Constructing this class increments the `inReplicationRecovery` flag on
+     * the provided ServiceContext. The flag will be decremented upon
+     * destruction.
+     */
+    explicit InReplicationRecovery(ServiceContext*);
+    ~InReplicationRecovery();
+
+    /**
+     * Checks whether the flag is non-zero, indicating at least 1 context has
+     * declared that replication recovery is happening.
+     */
+    static bool isSet(ServiceContext*);
+};
 }  // namespace mongo

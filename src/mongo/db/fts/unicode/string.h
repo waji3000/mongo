@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,12 +29,14 @@
 
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
 
 #include "mongo/base/string_data.h"
 #include "mongo/bson/util/builder.h"
+#include "mongo/bson/util/builder_fwd.h"
 #include "mongo/db/fts/unicode/codepoints.h"
 
 namespace mongo {
@@ -59,7 +60,7 @@ public:
     /**
      * Reset the String with the new UTF-8 source data, reusing the underlying buffer when possible.
      */
-    void resetData(const StringData utf8_src);
+    void resetData(StringData utf8_src);
 
     /**
      * Takes a substring of the current String and puts it in another String.
@@ -148,7 +149,7 @@ private:
     /**
      * Helper method for converting a UTF-8 string to a UTF-32 string.
      */
-    void setData(const StringData utf8_src);
+    void setData(StringData utf8_src);
 
     /**
      * Unified implementation of substrToBuf and toLowerToBuf.

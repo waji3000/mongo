@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,47 +29,58 @@
 
 #include "mongo/rpc/metadata/repl_set_metadata.h"
 
-#include "mongo/bson/util/bson_check.h"
+#include <utility>
+
+#include <boost/move/utility_core.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
 #include "mongo/bson/util/bson_extract.h"
-#include "mongo/db/jsobj.h"
 #include "mongo/db/repl/bson_extract_optime.h"
-#include "mongo/rpc/metadata.h"
+#include "mongo/util/str.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo {
 namespace rpc {
 
 using repl::OpTime;
+using repl::OpTimeAndWallTime;
 
 const char kReplSetMetadataFieldName[] = "$replData";
 
 namespace {
 
 const char kLastOpCommittedFieldName[] = "lastOpCommitted";
+const char kLastCommittedWallFieldName[] = "lastCommittedWall";
 const char kLastOpVisibleFieldName[] = "lastOpVisible";
 const char kConfigVersionFieldName[] = "configVersion";
+const char kConfigTermFieldName[] = "configTerm";
 const char kReplicaSetIdFieldName[] = "replicaSetId";
 const char kPrimaryIndexFieldName[] = "primaryIndex";
 const char kSyncSourceIndexFieldName[] = "syncSourceIndex";
 const char kTermFieldName[] = "term";
+const char kIsPrimaryFieldName[] = "isPrimary";
 
 }  // unnamed namespace
 
-const int ReplSetMetadata::kNoPrimary;
-
 ReplSetMetadata::ReplSetMetadata(long long term,
-                                 OpTime committedOpTime,
+                                 OpTimeAndWallTime committedOpTime,
                                  OpTime visibleOpTime,
                                  long long configVersion,
+                                 long long configTerm,
                                  OID id,
-                                 int currentPrimaryIndex,
-                                 int currentSyncSourceIndex)
+                                 int currentSyncSourceIndex,
+                                 bool isPrimary)
     : _lastOpCommitted(std::move(committedOpTime)),
       _lastOpVisible(std::move(visibleOpTime)),
       _currentTerm(term),
       _configVersion(configVersion),
+      _configTerm(configTerm),
       _replicaSetId(id),
-      _currentPrimaryIndex(currentPrimaryIndex),
-      _currentSyncSourceIndex(currentSyncSourceIndex) {}
+      _currentSyncSourceIndex(currentSyncSourceIndex),
+      _isPrimary(isPrimary) {}
 
 StatusWith<ReplSetMetadata> ReplSetMetadata::readFromMetadata(const BSONObj& metadataObj) {
     BSONElement replMetadataElement;
@@ -83,6 +93,11 @@ StatusWith<ReplSetMetadata> ReplSetMetadata::readFromMetadata(const BSONObj& met
 
     long long configVersion;
     status = bsonExtractIntegerField(replMetadataObj, kConfigVersionFieldName, &configVersion);
+    if (!status.isOK())
+        return status;
+
+    long long configTerm;
+    status = bsonExtractIntegerField(replMetadataObj, kConfigTermFieldName, &configTerm);
     if (!status.isOK())
         return status;
 
@@ -104,35 +119,58 @@ StatusWith<ReplSetMetadata> ReplSetMetadata::readFromMetadata(const BSONObj& met
     if (!status.isOK())
         return status;
 
+    bool isPrimary;
+    status = bsonExtractBooleanField(replMetadataObj, kIsPrimaryFieldName, &isPrimary);
+    if (!status.isOK())
+        return status;
+
     long long term;
     status = bsonExtractIntegerField(replMetadataObj, kTermFieldName, &term);
     if (!status.isOK())
         return status;
 
-    repl::OpTime lastOpCommitted;
-    status = bsonExtractOpTimeField(replMetadataObj, kLastOpCommittedFieldName, &lastOpCommitted);
+    repl::OpTimeAndWallTime lastOpCommitted;
+    auto lastCommittedStatus = bsonExtractOpTimeField(
+        replMetadataObj, kLastOpCommittedFieldName, &(lastOpCommitted.opTime));
     // We check for NoSuchKey because these fields will be removed in SERVER-27668.
-    if (!status.isOK() && status != ErrorCodes::NoSuchKey)
-        return status;
+    if (!lastCommittedStatus.isOK() && lastCommittedStatus != ErrorCodes::NoSuchKey)
+        return lastCommittedStatus;
 
     repl::OpTime lastOpVisible;
     status = bsonExtractOpTimeField(replMetadataObj, kLastOpVisibleFieldName, &lastOpVisible);
     if (!status.isOK() && status != ErrorCodes::NoSuchKey)
         return status;
 
-    return ReplSetMetadata(
-        term, lastOpCommitted, lastOpVisible, configVersion, id, primaryIndex, syncSourceIndex);
+    BSONElement wallClockTimeElement;
+    status = bsonExtractTypedField(
+        replMetadataObj, kLastCommittedWallFieldName, BSONType::Date, &wallClockTimeElement);
+
+    if (!status.isOK()) {
+        return status;
+    }
+
+    lastOpCommitted.wallTime = wallClockTimeElement.Date();
+    return ReplSetMetadata(term,
+                           lastOpCommitted,
+                           lastOpVisible,
+                           configVersion,
+                           configTerm,
+                           id,
+                           syncSourceIndex,
+                           isPrimary);
 }
 
 Status ReplSetMetadata::writeToMetadata(BSONObjBuilder* builder) const {
     BSONObjBuilder replMetadataBuilder(builder->subobjStart(kReplSetMetadataFieldName));
     replMetadataBuilder.append(kTermFieldName, _currentTerm);
-    _lastOpCommitted.append(&replMetadataBuilder, kLastOpCommittedFieldName);
-    _lastOpVisible.append(&replMetadataBuilder, kLastOpVisibleFieldName);
+    _lastOpCommitted.opTime.append(kLastOpCommittedFieldName, &replMetadataBuilder);
+    replMetadataBuilder.appendDate(kLastCommittedWallFieldName, _lastOpCommitted.wallTime);
+    _lastOpVisible.append(kLastOpVisibleFieldName, &replMetadataBuilder);
     replMetadataBuilder.append(kConfigVersionFieldName, _configVersion);
+    replMetadataBuilder.append(kConfigTermFieldName, _configTerm);
     replMetadataBuilder.append(kReplicaSetIdFieldName, _replicaSetId);
-    replMetadataBuilder.append(kPrimaryIndexFieldName, _currentPrimaryIndex);
     replMetadataBuilder.append(kSyncSourceIndexFieldName, _currentSyncSourceIndex);
+    replMetadataBuilder.append(kIsPrimaryFieldName, _isPrimary);
     replMetadataBuilder.doneFast();
 
     return Status::OK();
@@ -142,10 +180,11 @@ std::string ReplSetMetadata::toString() const {
     str::stream output;
     output << "ReplSetMetadata";
     output << " Config Version: " << _configVersion;
+    output << " Config Term: " << _configTerm;
     output << " Replicaset ID: " << _replicaSetId;
     output << " Term: " << _currentTerm;
-    output << " Primary Index: " << _currentPrimaryIndex;
     output << " Sync Source Index: " << _currentSyncSourceIndex;
+    output << " Is Primary: " << _isPrimary;
     output << " Last Op Committed: " << _lastOpCommitted.toString();
     output << " Last Op Visible: " << _lastOpVisible.toString();
     return output;

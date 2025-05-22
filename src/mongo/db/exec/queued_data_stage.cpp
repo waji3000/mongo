@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,56 +29,36 @@
 
 #include "mongo/db/exec/queued_data_stage.h"
 
-#include "mongo/db/exec/scoped_timer.h"
-#include "mongo/db/exec/working_set_common.h"
-#include "mongo/stdx/memory.h"
+#include <memory>
 
 namespace mongo {
 
 using std::unique_ptr;
-using std::vector;
-using stdx::make_unique;
 
 const char* QueuedDataStage::kStageType = "QUEUED_DATA";
 
-QueuedDataStage::QueuedDataStage(OperationContext* opCtx, WorkingSet* ws)
-    : PlanStage(kStageType, opCtx), _ws(ws) {}
+QueuedDataStage::QueuedDataStage(ExpressionContext* expCtx, WorkingSet*)
+    : PlanStage(kStageType, expCtx) {}
 
 PlanStage::StageState QueuedDataStage::doWork(WorkingSetID* out) {
     if (isEOF()) {
         return PlanStage::IS_EOF;
     }
 
-    StageState state = _results.front();
-    _results.pop();
-
-    switch (state) {
-        case PlanStage::ADVANCED:
-            *out = _members.front();
-            _members.pop();
-            break;
-        case PlanStage::DEAD:
-        case PlanStage::FAILURE:
-            // On DEAD or FAILURE, this stage is reponsible for allocating the WorkingSetMember with
-            // the error details.
-            *out = WorkingSetCommon::allocateStatusMember(
-                _ws, Status(ErrorCodes::InternalError, "Queued data stage failure"));
-            break;
-        default:
-            break;
-    }
-
-    return state;
+    *out = _members.front();
+    _members.pop();
+    return PlanStage::ADVANCED;
 }
 
-bool QueuedDataStage::isEOF() {
-    return _results.empty();
+bool QueuedDataStage::isEOF() const {
+    return _members.empty();
 }
 
 unique_ptr<PlanStageStats> QueuedDataStage::getStats() {
     _commonStats.isEOF = isEOF();
-    unique_ptr<PlanStageStats> ret = make_unique<PlanStageStats>(_commonStats, STAGE_QUEUED_DATA);
-    ret->specific = make_unique<MockStats>(_specificStats);
+    unique_ptr<PlanStageStats> ret =
+        std::make_unique<PlanStageStats>(_commonStats, STAGE_QUEUED_DATA);
+    ret->specific = std::make_unique<MockStats>(_specificStats);
     return ret;
 }
 
@@ -88,15 +67,7 @@ const SpecificStats* QueuedDataStage::getSpecificStats() const {
     return &_specificStats;
 }
 
-void QueuedDataStage::pushBack(const PlanStage::StageState state) {
-    invariant(PlanStage::ADVANCED != state);
-    _results.push(state);
-}
-
 void QueuedDataStage::pushBack(const WorkingSetID& id) {
-    _results.push(PlanStage::ADVANCED);
-
-    // member lives in _ws.  We'll return it when _results hits ADVANCED.
     _members.push(id);
 }
 

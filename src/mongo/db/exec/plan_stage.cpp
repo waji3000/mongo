@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,36 +27,16 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
-
-#include "mongo/platform/basic.h"
 
 #include "mongo/db/exec/plan_stage.h"
 
-#include "mongo/db/exec/scoped_timer.h"
+
 #include "mongo/db/operation_context.h"
-#include "mongo/db/service_context.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
+
 
 namespace mongo {
-
-PlanStage::StageState PlanStage::work(WorkingSetID* out) {
-    invariant(_opCtx);
-    ScopedTimer timer(getClock(), &_commonStats.executionTimeMillis);
-    ++_commonStats.works;
-
-    StageState workResult = doWork(out);
-
-    if (StageState::ADVANCED == workResult) {
-        ++_commonStats.advanced;
-    } else if (StageState::NEED_TIME == workResult) {
-        ++_commonStats.needTime;
-    } else if (StageState::NEED_YIELD == workResult) {
-        ++_commonStats.needYield;
-    }
-
-    return workResult;
-}
-
 void PlanStage::saveState() {
     ++_commonStats.yields;
     for (auto&& child : _children) {
@@ -67,13 +46,13 @@ void PlanStage::saveState() {
     doSaveState();
 }
 
-void PlanStage::restoreState() {
+void PlanStage::restoreState(const RestoreContext& context) {
     ++_commonStats.unyields;
     for (auto&& child : _children) {
-        child->restoreState();
+        child->restoreState(context);
     }
 
-    doRestoreState();
+    doRestoreState(context);
 }
 
 void PlanStage::detachFromOperationContext() {
@@ -97,9 +76,4 @@ void PlanStage::reattachToOperationContext(OperationContext* opCtx) {
 
     doReattachToOperationContext();
 }
-
-ClockSource* PlanStage::getClock() const {
-    return _opCtx->getServiceContext()->getFastClockSource();
-}
-
 }  // namespace mongo

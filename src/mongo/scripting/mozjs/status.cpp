@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,16 +27,29 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <js/CallArgs.h>
+#include <js/ComparisonOperators.h>
+#include <js/Object.h>
+#include <js/PropertyDescriptor.h>
+#include <js/RootingAPI.h>
+#include <js/ValueArray.h>
+#include <jsapi.h>
+#include <memory>
+#include <string>
+#include <utility>
 
-#include "mongo/scripting/mozjs/status.h"
+#include <js/TypeDecls.h>
 
+#include "mongo/base/error_codes.h"
 #include "mongo/scripting/jsexception.h"
+#include "mongo/scripting/mozjs/error.h"
 #include "mongo/scripting/mozjs/implscope.h"
 #include "mongo/scripting/mozjs/internedstring.h"
 #include "mongo/scripting/mozjs/objectwrapper.h"
+#include "mongo/scripting/mozjs/status.h"
 #include "mongo/scripting/mozjs/valuereader.h"
-#include "mongo/scripting/mozjs/wrapconstrainedmethod.h"
+#include "mongo/scripting/mozjs/wrapconstrainedmethod.h"  // IWYU pragma: keep
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 namespace mozjs {
@@ -46,20 +58,21 @@ const char* const MongoStatusInfo::className = "MongoStatus";
 const char* const MongoStatusInfo::inheritFrom = "Error";
 
 Status MongoStatusInfo::toStatus(JSContext* cx, JS::HandleObject object) {
-    return *static_cast<Status*>(JS_GetPrivate(object));
+    return *JS::GetMaybePtrFromReservedSlot<Status>(object, StatusSlot);
 }
 
 Status MongoStatusInfo::toStatus(JSContext* cx, JS::HandleValue value) {
-    return *static_cast<Status*>(JS_GetPrivate(value.toObjectOrNull()));
+    return *JS::GetMaybePtrFromReservedSlot<Status>(value.toObjectOrNull(), StatusSlot);
 }
 
 void MongoStatusInfo::fromStatus(JSContext* cx, Status status, JS::MutableHandleValue value) {
+    invariant(status != Status::OK());
     auto scope = getScope(cx);
 
     JS::RootedValue undef(cx);
     undef.setUndefined();
 
-    JS::AutoValueArray<1> args(cx);
+    JS::RootedValueArray<1> args(cx);
     ValueReader(cx, args[0]).fromStringData(status.reason());
     JS::RootedObject error(cx);
     scope->getProto<ErrorInfo>().newInstance(args, &error);
@@ -67,46 +80,36 @@ void MongoStatusInfo::fromStatus(JSContext* cx, Status status, JS::MutableHandle
     JS::RootedObject thisv(cx);
     scope->getProto<MongoStatusInfo>().newObjectWithProto(&thisv, error);
     ObjectWrapper thisvObj(cx, thisv);
-    thisvObj.defineProperty(
-        InternedString::code,
-        undef,
-        JSPROP_ENUMERATE | JSPROP_SHARED,
-        smUtils::wrapConstrainedMethod<Functions::code, false, MongoStatusInfo>);
+    thisvObj.defineProperty(InternedString::code,
+                            JSPROP_ENUMERATE,
+                            smUtils::wrapConstrainedMethod<Functions::code, false, MongoStatusInfo>,
+                            nullptr);
 
     thisvObj.defineProperty(
         InternedString::reason,
-        undef,
-        JSPROP_ENUMERATE | JSPROP_SHARED,
-        smUtils::wrapConstrainedMethod<Functions::reason, false, MongoStatusInfo>);
+        JSPROP_ENUMERATE,
+        smUtils::wrapConstrainedMethod<Functions::reason, false, MongoStatusInfo>,
+        nullptr);
 
     // We intentionally omit JSPROP_ENUMERATE to match how Error.prototype.stack is a non-enumerable
     // property.
     thisvObj.defineProperty(
         InternedString::stack,
-        undef,
-        JSPROP_SHARED,
-        smUtils::wrapConstrainedMethod<Functions::stack, false, MongoStatusInfo>);
+        0,
+        smUtils::wrapConstrainedMethod<Functions::stack, false, MongoStatusInfo>,
+        nullptr);
 
-    JS_SetPrivate(thisv, scope->trackedNew<Status>(std::move(status)));
+    JS::SetReservedSlot(
+        thisv, StatusSlot, JS::PrivateValue(scope->trackedNew<Status>(std::move(status))));
 
     value.setObjectOrNull(thisv);
 }
 
-void MongoStatusInfo::construct(JSContext* cx, JS::CallArgs args) {
-    auto code = args.get(0).toInt32();
-    auto reason = JSStringWrapper(cx, args.get(1).toString()).toString();
-
-    JS::RootedValue out(cx);
-    fromStatus(cx, Status(ErrorCodes::Error(code), std::move(reason)), &out);
-
-    args.rval().set(out);
-}
-
-void MongoStatusInfo::finalize(JSFreeOp* fop, JSObject* obj) {
-    auto status = static_cast<Status*>(JS_GetPrivate(obj));
+void MongoStatusInfo::finalize(JS::GCContext* gcCtx, JSObject* obj) {
+    auto status = JS::GetMaybePtrFromReservedSlot<Status>(obj, StatusSlot);
 
     if (status)
-        getScope(fop)->trackedDelete(status);
+        getScope(gcCtx)->trackedDelete(status);
 }
 
 void MongoStatusInfo::Functions::code::call(JSContext* cx, JS::CallArgs args) {
@@ -138,7 +141,8 @@ void MongoStatusInfo::Functions::stack::call(JSContext* cx, JS::CallArgs args) {
             .fromStringData(extraInfo->stack + parentWrapper.getString(InternedString::stack));
 
         // We redefine the "stack" property as the combined JavaScript stacktrace. It is important
-        // that we omit JSPROP_SHARED to the thisvObj.defineProperty() call in order to have
+        // that we omit (TODO/FIXME, no more JSPROP_SHARED) JSPROP_SHARED to the
+        // thisvObj.defineProperty() call in order to have
         // SpiderMonkey allocate memory for the string value. We also intentionally omit
         // JSPROP_ENUMERATE to match how Error.prototype.stack is a non-enumerable property.
         ObjectWrapper thisvObj(cx, args.thisv());
@@ -154,8 +158,10 @@ void MongoStatusInfo::Functions::stack::call(JSContext* cx, JS::CallArgs args) {
 
 void MongoStatusInfo::postInstall(JSContext* cx, JS::HandleObject global, JS::HandleObject proto) {
     auto scope = getScope(cx);
-
-    JS_SetPrivate(proto, scope->trackedNew<Status>(Status::OK()));
+    JS::SetReservedSlot(proto,
+                        StatusSlot,
+                        JS::PrivateValue(scope->trackedNew<Status>(
+                            Status(ErrorCodes::UnknownError, "Mongo Status Prototype"))));
 }
 
 }  // namespace mozjs

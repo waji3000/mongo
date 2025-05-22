@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,10 +27,10 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <fmt/format.h>
 
+#include "mongo/base/status.h"
 #include "mongo/client/connection_string.h"
-
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
@@ -39,7 +38,7 @@ namespace {
 
 using unittest::assertGet;
 
-TEST(ConnectionString, EqualityOperatorMaster) {
+TEST(ConnectionString, EqualityOperatorStandalone) {
     const auto cs = assertGet(ConnectionString::parse("TestHostA:12345"));
     ASSERT(cs == assertGet(ConnectionString::parse("TestHostA:12345")));
     ASSERT_FALSE(cs != assertGet(ConnectionString::parse("TestHostA:12345")));

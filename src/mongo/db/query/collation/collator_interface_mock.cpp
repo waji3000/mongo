@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,16 +27,17 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/query/collation/collator_interface_mock.h"
-
 #include <algorithm>
-#include <cctype>
+#include <memory>
 #include <string>
+#include <utility>
 
-#include "mongo/stdx/memory.h"
+#include <boost/move/utility_core.hpp>
+
+#include "mongo/db/basic_types_gen.h"
+#include "mongo/db/query/collation/collator_interface_mock.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -56,15 +56,26 @@ std::string mockTypeToString(CollatorInterfaceMock::MockType type) {
     MONGO_UNREACHABLE;
 }
 
+Collation makeCollation(StringData locale, StringData version) {
+    Collation collation(locale.toString());
+    // "backwards" is optional. The ICU collator always sets it to true/false based on the locale.
+    collation.setBackwards(false);
+    collation.setVersion(version);
+    return collation;
+}
+
 }  // namespace
 
 CollatorInterfaceMock::CollatorInterfaceMock(MockType mockType)
-    : CollatorInterface(CollationSpec(mockTypeToString(mockType), "mock_version")),
+    : CollatorInterface(makeCollation(mockTypeToString(mockType), "mock_version")),
       _mockType(mockType) {}
 
 std::unique_ptr<CollatorInterface> CollatorInterfaceMock::clone() const {
-    auto clone = stdx::make_unique<CollatorInterfaceMock>(_mockType);
-    return {std::move(clone)};
+    return std::make_unique<CollatorInterfaceMock>(_mockType);
+}
+
+std::shared_ptr<CollatorInterface> CollatorInterfaceMock::cloneShared() const {
+    return std::make_shared<CollatorInterfaceMock>(_mockType);
 }
 
 int CollatorInterfaceMock::compare(StringData left, StringData right) const {
@@ -78,15 +89,8 @@ int CollatorInterfaceMock::compare(StringData left, StringData right) const {
             StringData rightReversed(rightString);
             return leftReversed.compare(rightReversed);
         }
-        case MockType::kToLowerString: {
-            std::string leftString = left.toString();
-            std::string rightString = right.toString();
-            std::transform(leftString.begin(), leftString.end(), leftString.begin(), ::tolower);
-            std::transform(rightString.begin(), rightString.end(), rightString.begin(), ::tolower);
-            StringData leftLower(leftString);
-            StringData rightLower(rightString);
-            return leftLower.compare(rightLower);
-        }
+        case MockType::kToLowerString:
+            return str::toLower(left).compare(str::toLower(right));
         case MockType::kAlwaysEqual:
             return 0;
     }
@@ -102,12 +106,8 @@ CollatorInterface::ComparisonKey CollatorInterfaceMock::getComparisonKey(
             std::reverse(keyDataString.begin(), keyDataString.end());
             return makeComparisonKey(std::move(keyDataString));
         }
-        case MockType::kToLowerString: {
-            std::string keyDataString = stringData.toString();
-            std::transform(
-                keyDataString.begin(), keyDataString.end(), keyDataString.begin(), ::tolower);
-            return makeComparisonKey(std::move(keyDataString));
-        }
+        case MockType::kToLowerString:
+            return makeComparisonKey(str::toLower(stringData));
         case MockType::kAlwaysEqual:
             return makeComparisonKey("always_equal");
     }

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,41 +29,63 @@
 
 #include "mongo/db/index/btree_access_method.h"
 
+#include <utility>
 #include <vector>
 
-#include "mongo/base/status.h"
-#include "mongo/base/status_with.h"
+#include <boost/optional/optional.hpp>
+
+#include "mongo/bson/bsonelement.h"
 #include "mongo/db/catalog/index_catalog_entry.h"
-#include "mongo/db/jsobj.h"
-#include "mongo/db/keypattern.h"
+#include "mongo/db/index/expression_keys_private.h"
+#include "mongo/db/index/index_descriptor.h"
 
 namespace mongo {
 
 using std::vector;
 
 // Standard Btree implementation below.
-BtreeAccessMethod::BtreeAccessMethod(IndexCatalogEntry* btreeState, SortedDataInterface* btree)
-    : AbstractIndexAccessMethod(btreeState, btree) {
+BtreeAccessMethod::BtreeAccessMethod(IndexCatalogEntry* btreeState,
+                                     std::unique_ptr<SortedDataInterface> btree)
+    : SortedDataIndexAccessMethod(btreeState, std::move(btree)) {
     // The key generation wants these values.
     vector<const char*> fieldNames;
     vector<BSONElement> fixed;
 
-    BSONObjIterator it(_descriptor->keyPattern());
+    BSONObjIterator it(btreeState->descriptor()->keyPattern());
     while (it.more()) {
         BSONElement elt = it.next();
         fieldNames.push_back(elt.fieldName());
         fixed.push_back(BSONElement());
     }
 
-    _keyGenerator = std::make_unique<BtreeKeyGenerator>(
-        fieldNames, fixed, _descriptor->isSparse(), btreeState->getCollator());
+    _keyGenerator =
+        std::make_unique<BtreeKeyGenerator>(fieldNames,
+                                            fixed,
+                                            btreeState->descriptor()->isSparse(),
+                                            getSortedDataInterface()->getKeyStringVersion(),
+                                            getSortedDataInterface()->getOrdering());
 }
 
-void BtreeAccessMethod::doGetKeys(const BSONObj& obj,
-                                  BSONObjSet* keys,
-                                  BSONObjSet* multikeyMetadataKeys,
-                                  MultikeyPaths* multikeyPaths) const {
-    _keyGenerator->getKeys(obj, keys, multikeyPaths);
+void BtreeAccessMethod::validateDocument(const CollectionPtr& collection,
+                                         const BSONObj& obj,
+                                         const BSONObj& keyPattern) const {
+    ExpressionKeysPrivate::validateDocumentCommon(collection, obj, keyPattern);
+}
+
+void BtreeAccessMethod::doGetKeys(OperationContext* opCtx,
+                                  const CollectionPtr& collection,
+                                  const IndexCatalogEntry* entry,
+                                  SharedBufferFragmentBuilder& pooledBufferBuilder,
+                                  const BSONObj& obj,
+                                  GetKeysContext context,
+                                  KeyStringSet* keys,
+                                  KeyStringSet* multikeyMetadataKeys,
+                                  MultikeyPaths* multikeyPaths,
+                                  const boost::optional<RecordId>& id) const {
+    const auto skipMultikey =
+        context == GetKeysContext::kValidatingKeys && !entry->isMultikey(opCtx, collection);
+    _keyGenerator->getKeys(
+        pooledBufferBuilder, obj, skipMultikey, keys, multikeyPaths, entry->getCollator(), id);
 }
 
 }  // namespace mongo

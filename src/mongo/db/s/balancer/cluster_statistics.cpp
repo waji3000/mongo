@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,12 +27,9 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <utility>
 
 #include "mongo/db/s/balancer/cluster_statistics.h"
-
-#include "mongo/bson/bsonobj.h"
-#include "mongo/bson/bsonobjbuilder.h"
 
 namespace mongo {
 
@@ -42,39 +38,9 @@ ClusterStatistics::ClusterStatistics() = default;
 ClusterStatistics::~ClusterStatistics() = default;
 
 ClusterStatistics::ShardStatistics::ShardStatistics(ShardId inShardId,
-                                                    uint64_t inMaxSizeMB,
-                                                    uint64_t inCurrSizeMB,
                                                     bool inIsDraining,
-                                                    std::set<std::string> inShardTags,
-                                                    std::string inMongoVersion)
+                                                    std::set<std::string> inShardZones)
     : shardId(std::move(inShardId)),
-      maxSizeMB(inMaxSizeMB),
-      currSizeMB(inCurrSizeMB),
       isDraining(inIsDraining),
-      shardTags(std::move(inShardTags)),
-      mongoVersion(std::move(inMongoVersion)) {}
-
-bool ClusterStatistics::ShardStatistics::isSizeMaxed() const {
-    if (!maxSizeMB || !currSizeMB) {
-        return false;
-    }
-
-    return currSizeMB >= maxSizeMB;
-}
-
-BSONObj ClusterStatistics::ShardStatistics::toBSON() const {
-    BSONObjBuilder builder;
-    builder.append("id", shardId.toString());
-    builder.append("maxSizeMB", static_cast<long long>(maxSizeMB));
-    builder.append("currSizeMB", static_cast<long long>(currSizeMB));
-    builder.append("draining", isDraining);
-    if (!shardTags.empty()) {
-        BSONArrayBuilder arrayBuilder(builder.subarrayStart("tags"));
-        arrayBuilder.append(shardTags);
-    }
-
-    builder.append("version", mongoVersion);
-    return builder.obj();
-}
-
+      shardZones(std::move(inShardZones)) {}
 }  // namespace mongo

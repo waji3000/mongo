@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,16 +27,22 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <fmt/format.h>
+#include <memory>
+#include <utility>
 
 #include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
 #include "mongo/db/repl/abstract_async_component.h"
+#include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/task_executor_mock.h"
+#include "mongo/executor/network_interface_mock.h"
 #include "mongo/executor/thread_pool_task_executor_test_fixture.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/stdx/mutex.h"
-
+#include "mongo/stdx/type_traits.h"
 #include "mongo/unittest/unittest.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/duration.h"
 
 namespace {
 
@@ -46,7 +51,7 @@ using namespace mongo::repl;
 
 /**
  * Mock implementation of AbstractAsyncComponent that supports returning errors from
- * _doStartup_inlock() and also tracks if this function has ever been called by
+ * _doStartup() and also tracks if this function has ever been called by
  * AbstractAsyncComponent.
  */
 class MockAsyncComponent : public AbstractAsyncComponent {
@@ -54,7 +59,7 @@ public:
     explicit MockAsyncComponent(executor::TaskExecutor* executor);
 
     /**
-     * Publicly visible versions of _checkForShutdownAndConvertStatus_inlock() for testing.
+     * Publicly visible versions of _checkForShutdownAndConvertStatus() for testing.
      */
     Status checkForShutdownAndConvertStatus_forTest(
         const executor::TaskExecutor::CallbackArgs& callbackArgs, const std::string& message);
@@ -62,15 +67,15 @@ public:
                                                     const std::string& message);
 
     /**
-     * Publicly visible versions of _scheduleWorkAndSaveHandle_inlock() and
-     * _scheduleWorkAtAndSaveHandle_inlock() for testing.
+     * Publicly visible versions of _scheduleWorkAndSaveHandle() and
+     * _scheduleWorkAtAndSaveHandle() for testing.
      */
     Status scheduleWorkAndSaveHandle_forTest(executor::TaskExecutor::CallbackFn work,
                                              executor::TaskExecutor::CallbackHandle* handle,
                                              const std::string& name);
 
     /**
-     * Publicly visible version of _scheduleWorkAtAndSaveHandle_inlock() for testing.
+     * Publicly visible version of _scheduleWorkAtAndSaveHandle() for testing.
      */
     Status scheduleWorkAtAndSaveHandle_forTest(Date_t when,
                                                executor::TaskExecutor::CallbackFn work,
@@ -78,33 +83,34 @@ public:
                                                const std::string& name);
 
     /**
-     * Publicly visible version of _cancelHandle_inlock() for testing.
+     * Publicly visible version of _cancelHandle() for testing.
      */
     void cancelHandle_forTest(executor::TaskExecutor::CallbackHandle handle);
 
     /**
-     * Publicly visible version of _startupComponent_inlock() for testing.
+     * Publicly visible version of _startupComponent() for testing.
      */
     Status startupComponent_forTest(std::unique_ptr<MockAsyncComponent>& component);
 
     /**
-     * Publicly visible version of _shutdownComponent_inlock() for testing.
+     * Publicly visible version of _shutdownComponent() for testing.
      */
     void shutdownComponent_forTest(const std::unique_ptr<MockAsyncComponent>& component);
 
 private:
-    Status _doStartup_inlock() noexcept override;
-    void _doShutdown_inlock() noexcept override;
+    void _doStartup(WithLock) override;
+    void _doShutdown(WithLock) noexcept override;
+    void _preJoin() noexcept override {}
     stdx::mutex* _getMutex() noexcept override;
 
     // Used by AbstractAsyncComponent to guard start changes.
     stdx::mutex _mutex;
 
 public:
-    // Returned by _doStartup_inlock(). Override for testing.
+    // Asserted to be OK by _doStartup(). Override for testing.
     Status doStartupResult = Status::OK();
 
-    // Set to true when _doStartup_inlock() is called.
+    // Set to true when _doStartup() is called.
     bool doStartupCalled = false;
 };
 
@@ -113,12 +119,14 @@ MockAsyncComponent::MockAsyncComponent(executor::TaskExecutor* executor)
 
 Status MockAsyncComponent::checkForShutdownAndConvertStatus_forTest(
     const executor::TaskExecutor::CallbackArgs& callbackArgs, const std::string& message) {
-    return _checkForShutdownAndConvertStatus_inlock(callbackArgs, message);
+    stdx::lock_guard<stdx::mutex> lock(_mutex);
+    return _checkForShutdownAndConvertStatus(lock, callbackArgs, message);
 }
 
 Status MockAsyncComponent::checkForShutdownAndConvertStatus_forTest(const Status& status,
                                                                     const std::string& message) {
-    return _checkForShutdownAndConvertStatus_inlock(status, message);
+    stdx::lock_guard<stdx::mutex> lock(_mutex);
+    return _checkForShutdownAndConvertStatus(lock, status, message);
 }
 
 Status MockAsyncComponent::scheduleWorkAndSaveHandle_forTest(
@@ -126,7 +134,7 @@ Status MockAsyncComponent::scheduleWorkAndSaveHandle_forTest(
     executor::TaskExecutor::CallbackHandle* handle,
     const std::string& name) {
     stdx::lock_guard<stdx::mutex> lock(_mutex);
-    return _scheduleWorkAndSaveHandle_inlock(std::move(work), handle, name);
+    return _scheduleWorkAndSaveHandle(lock, std::move(work), handle, name);
 }
 
 Status MockAsyncComponent::scheduleWorkAtAndSaveHandle_forTest(
@@ -135,12 +143,12 @@ Status MockAsyncComponent::scheduleWorkAtAndSaveHandle_forTest(
     executor::TaskExecutor::CallbackHandle* handle,
     const std::string& name) {
     stdx::lock_guard<stdx::mutex> lock(_mutex);
-    return _scheduleWorkAtAndSaveHandle_inlock(when, std::move(work), handle, name);
+    return _scheduleWorkAtAndSaveHandle(lock, when, std::move(work), handle, name);
 }
 
 void MockAsyncComponent::cancelHandle_forTest(executor::TaskExecutor::CallbackHandle handle) {
     stdx::lock_guard<stdx::mutex> lock(_mutex);
-    _cancelHandle_inlock(handle);
+    _cancelHandle(lock, handle);
 }
 
 Status MockAsyncComponent::startupComponent_forTest(
@@ -153,12 +161,12 @@ void MockAsyncComponent::shutdownComponent_forTest(
     _shutdownComponent(component);
 }
 
-Status MockAsyncComponent::_doStartup_inlock() noexcept {
+void MockAsyncComponent::_doStartup(WithLock) {
     doStartupCalled = true;
-    return doStartupResult;
+    uassertStatusOK(doStartupResult);
 }
 
-void MockAsyncComponent::_doShutdown_inlock() noexcept {}
+void MockAsyncComponent::_doShutdown(WithLock) noexcept {}
 
 stdx::mutex* MockAsyncComponent::_getMutex() noexcept {
     return &_mutex;
@@ -350,7 +358,8 @@ TEST_F(AbstractAsyncComponentTest,
     component.shutdown();
     ASSERT_EQUALS(AbstractAsyncComponent::State::kShuttingDown, component.getState_forTest());
 
-    auto callback = [](const executor::TaskExecutor::CallbackArgs&) {};
+    auto callback = [](const executor::TaskExecutor::CallbackArgs&) {
+    };
     executor::TaskExecutor::CallbackHandle handle;
     ASSERT_EQUALS(ErrorCodes::CallbackCanceled,
                   component.scheduleWorkAndSaveHandle_forTest(callback, &handle, "mytask"));
@@ -358,12 +367,15 @@ TEST_F(AbstractAsyncComponentTest,
 
 TEST_F(AbstractAsyncComponentTest,
        ScheduleWorkAndSaveHandlePassesThroughErrorFromTaskExecutorScheduleWork) {
-    TaskExecutorMock taskExecutorMock(&getExecutor());
-    MockAsyncComponent component(&taskExecutorMock);
+    auto taskExecutorMock = std::make_shared<TaskExecutorMock>(&getExecutor());
+    MockAsyncComponent component(taskExecutorMock.get());
 
-    taskExecutorMock.shouldFailScheduleWorkRequest = []() { return true; };
+    taskExecutorMock->shouldFailScheduleWorkRequest = []() {
+        return true;
+    };
 
-    auto callback = [](const executor::TaskExecutor::CallbackArgs&) {};
+    auto callback = [](const executor::TaskExecutor::CallbackArgs&) {
+    };
     executor::TaskExecutor::CallbackHandle handle;
     ASSERT_EQUALS(ErrorCodes::OperationFailed,
                   component.scheduleWorkAndSaveHandle_forTest(callback, &handle, "mytask"));
@@ -393,7 +405,8 @@ TEST_F(AbstractAsyncComponentTest,
     ASSERT_EQUALS(AbstractAsyncComponent::State::kShuttingDown, component.getState_forTest());
 
     auto when = getExecutor().now() + Seconds(1);
-    auto callback = [](const executor::TaskExecutor::CallbackArgs&) {};
+    auto callback = [](const executor::TaskExecutor::CallbackArgs&) {
+    };
     executor::TaskExecutor::CallbackHandle handle;
     ASSERT_EQUALS(ErrorCodes::CallbackCanceled,
                   component.scheduleWorkAtAndSaveHandle_forTest(when, callback, &handle, "mytask"));
@@ -401,13 +414,16 @@ TEST_F(AbstractAsyncComponentTest,
 
 TEST_F(AbstractAsyncComponentTest,
        ScheduleWorkAtAndSaveHandlePassesThroughErrorFromTaskExecutorScheduleWork) {
-    TaskExecutorMock taskExecutorMock(&getExecutor());
-    MockAsyncComponent component(&taskExecutorMock);
+    auto taskExecutorMock = std::make_shared<TaskExecutorMock>(&getExecutor());
+    MockAsyncComponent component(taskExecutorMock.get());
 
-    taskExecutorMock.shouldFailScheduleWorkAtRequest = []() { return true; };
+    taskExecutorMock->shouldFailScheduleWorkAtRequest = []() {
+        return true;
+    };
 
     auto when = getExecutor().now() + Seconds(1);
-    auto callback = [](const executor::TaskExecutor::CallbackArgs&) {};
+    auto callback = [](const executor::TaskExecutor::CallbackArgs&) {
+    };
     executor::TaskExecutor::CallbackHandle handle;
     ASSERT_EQUALS(ErrorCodes::OperationFailed,
                   component.scheduleWorkAtAndSaveHandle_forTest(when, callback, &handle, "mytask"));
@@ -452,6 +468,9 @@ TEST_F(AbstractAsyncComponentTest,
     auto handle =
         unittest::assertGet(executor->scheduleWorkAt(executor->now() + Seconds(1), callback));
     component.cancelHandle_forTest(handle);
+    getNet()->enterNetwork();
+    getNet()->runReadyNetworkOperations();
+    getNet()->exitNetwork();
     executor->wait(handle);
     ASSERT_EQUALS(ErrorCodes::CallbackCanceled, status);
 }
@@ -462,8 +481,8 @@ TEST_F(AbstractAsyncComponentTest,
     ASSERT_OK(component.startup());
     ASSERT_EQUALS(AbstractAsyncComponent::State::kRunning, component.getState_forTest());
 
-    // Create a child component to pass to _startupComponent_inlock().
-    auto childComponent = stdx::make_unique<MockAsyncComponent>(&getExecutor());
+    // Create a child component to pass to _startupComponent().
+    auto childComponent = std::make_unique<MockAsyncComponent>(&getExecutor());
     ASSERT_OK(component.startupComponent_forTest(childComponent));
     ASSERT_EQUALS(AbstractAsyncComponent::State::kRunning, childComponent->getState_forTest());
 }
@@ -477,10 +496,10 @@ TEST_F(AbstractAsyncComponentTest,
     component.shutdown();
     ASSERT_EQUALS(AbstractAsyncComponent::State::kShuttingDown, component.getState_forTest());
 
-    // Create a child component to pass to _startupComponent_inlock().
-    // _startupComponent_inlock() should return early because 'component' is shutting down and
+    // Create a child component to pass to _startupComponent().
+    // _startupComponent() should return early because 'component' is shutting down and
     // reset the unique_ptr for the child component.
-    auto childComponent = stdx::make_unique<MockAsyncComponent>(&getExecutor());
+    auto childComponent = std::make_unique<MockAsyncComponent>(&getExecutor());
     ASSERT_EQUALS(ErrorCodes::CallbackCanceled, component.startupComponent_forTest(childComponent));
     ASSERT_FALSE(childComponent);
 }
@@ -491,15 +510,15 @@ TEST_F(AbstractAsyncComponentTest,
     ASSERT_OK(component.startup());
     ASSERT_EQUALS(AbstractAsyncComponent::State::kRunning, component.getState_forTest());
 
-    // Create a child component to pass to _startupComponent_inlock(). Transition child component's
+    // Create a child component to pass to _startupComponent(). Transition child component's
     // state to Complete so that calling startup() will fail.
-    auto childComponent = stdx::make_unique<MockAsyncComponent>(&getExecutor());
+    auto childComponent = std::make_unique<MockAsyncComponent>(&getExecutor());
     ASSERT_OK(childComponent->startup());
     childComponent->shutdown();
     ASSERT_EQUALS(ErrorCodes::ShutdownInProgress, childComponent->startup());
     ASSERT_EQUALS(AbstractAsyncComponent::State::kShuttingDown, childComponent->getState_forTest());
 
-    // _startupComponent_inlock() should pass through the startup() error from the child component
+    // _startupComponent() should pass through the startup() error from the child component
     // and reset the unique_ptr for the child component.
     ASSERT_EQUALS(ErrorCodes::ShutdownInProgress,
                   component.startupComponent_forTest(childComponent));
@@ -517,8 +536,8 @@ TEST_F(AbstractAsyncComponentTest,
     ASSERT_OK(component.startup());
     ASSERT_EQUALS(AbstractAsyncComponent::State::kRunning, component.getState_forTest());
 
-    // Create a child component to pass to _startupComponent_inlock().
-    auto childComponent = stdx::make_unique<MockAsyncComponent>(&getExecutor());
+    // Create a child component to pass to _startupComponent().
+    auto childComponent = std::make_unique<MockAsyncComponent>(&getExecutor());
     ASSERT_OK(childComponent->startup());
     ASSERT_EQUALS(AbstractAsyncComponent::State::kRunning, childComponent->getState_forTest());
 

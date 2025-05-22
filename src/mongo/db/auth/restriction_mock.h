@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -49,7 +48,7 @@ public:
                       "Mock restriction forced to be unmet");
     }
 
-    virtual void appendToBuilder(BSONArrayBuilder* builder) const {
+    void appendToBuilder(BSONArrayBuilder* builder) const override {
         builder->append(_shouldPass);
     }
 
@@ -75,7 +74,7 @@ public:
                       "Mock restriction forced to be unmet");
     }
 
-    virtual void appendToBuilder(BSONObjBuilder* builder) const final {
+    void appendToBuilder(BSONObjBuilder* builder) const final {
         builder->append(_name, _shouldPass);
     }
 

@@ -32,55 +32,106 @@ global:
     cpp_namespace: "mongo"
 
 imports:
-    - "mongo/idl/basic_types.idl"
+    - "mongo/db/basic_types.idl"
+    - "mongo/s/sharding_types.idl"
 
 structs:
+    MovePrimaryRequestBase:
+        description: The movePrimary request fields shared by several commands
+        strict: false
+        fields:
+            to:
+                type: shard_id
+                description: Shard serving as the destination for un-sharded collections
+                validator:
+                    callback: "ShardId::validate"
+
+commands:
     movePrimary:
-        description: "The public movePrimary command on mongos"
+        command_name: movePrimary
+        command_alias: moveprimary
+        description: The public movePrimary command on mongos
+        cpp_name: MovePrimary
+        namespace: type
+        type: database_name
+        api_version:
         strict: false
-        fields:
-            movePrimary:
-                type: namespacestring
-                description: "The namespace of the database whose primary shard is to be reassigned."
-                optional: true
-            moveprimary:
-                type: namespacestring
-                description: "The deprecated version of this command's name."
-                optional: true
-            to:
-                type: string
-                description: "The shard serving as the destination for un-sharded collections."
+        chained_structs:
+            MovePrimaryRequestBase: MovePrimaryRequestBase
 
-    ConfigsvrMovePrimary:
-        description: "The internal movePrimary command on the config server"
+    changePrimary:
+        command_name: changePrimary
+        description: The public changePrimary command on mongos
+        cpp_name: ChangePrimary
+        namespace: type
+        type: database_name
+        api_version:
         strict: false
-        fields:
-            _configsvrMovePrimary:
-                type: namespacestring
-                description: "The namespace of the database whose primary shard is to be reassigned."
-            to:
-                type: string
-                description: "The shard serving as the destination for un-sharded collections."
+        chained_structs:
+            MovePrimaryRequestBase: MovePrimaryRequestBase
 
-    ShardMovePrimary:
-        description: "The internal movePrimary command on a primary shard"
-        generate_comparison_operators: true
+    _shardsvrMovePrimary:
+        command_name: _shardsvrMovePrimary
+        description: The internal movePrimary command on a primary shard
+        cpp_name: ShardsvrMovePrimary
+        namespace: type
+        type: database_name
+        api_version:
         strict: false
-        fields:
-            _movePrimary:
-                type: namespacestring
-                description: "The namespace of the database whose primary shard is to be reassigned."
-            to:
-                type: string
-                description: "The shard serving as the destination for un-sharded collections."
+        chained_structs:
+            MovePrimaryRequestBase: MovePrimaryRequestBase
 
-    ConfigsvrCommitMovePrimary:
-        description: "The internal commitMovePrimary command on the config server"
+    _shardsvrChangePrimary:
+        command_name: _shardsvrChangePrimary
+        description: The internal changePrimary command to move primary without migrating unsharded collections
+        cpp_name: ShardsvrChangePrimary
+        namespace: type
+        type: database_name
+        api_version:
+        strict: false
+        chained_structs:
+            MovePrimaryRequestBase: MovePrimaryRequestBase
+
+    _shardsvrMovePrimaryEnterCriticalSection:
+        command_name: _shardsvrMovePrimaryEnterCriticalSection
+        description: Block CRUD operations on the given database by entering the critical section.
+        cpp_name: ShardsvrMovePrimaryEnterCriticalSection
+        namespace: type
+        type: database_name
+        api_version:
         strict: false
         fields:
-            _configsvrCommitMovePrimary:
-                type: string
-                description: "The namespace of the database whose primary shard is to be reassigned."
+            reason:
+                type: object
+                description: Descriptive reason for the critical section
+
+    _shardsvrMovePrimaryExitCriticalSection:
+        command_name: _shardsvrMovePrimaryExitCriticalSection
+        description: >-
+            Clear the local metadata of the given database, and unblocks CRUD operations by exiting
+            the critical section.
+        cpp_name: ShardsvrMovePrimaryExitCriticalSection
+        namespace: type
+        type: database_name
+        api_version:
+        strict: false
+        fields:
+            reason:
+                type: object
+                description: Descriptive reason for the critical section
+
+    _configsvrCommitMovePrimary:
+        command_name: _configsvrCommitMovePrimary
+        description: Reassign a new primary shard for the given database on the config server
+        cpp_name: ConfigsvrCommitMovePrimary
+        namespace: type
+        type: database_name
+        api_version:
+        strict: false
+        fields:
+            expectedDatabaseVersion:
+                type: database_version
+                description: Database version known by the current primary shard
             to:
-                type: string
-                description: "The shard serving as the destination for un-sharded collections."
+                type: shard_id
+                description: Shard serving as the destination for un-sharded collections

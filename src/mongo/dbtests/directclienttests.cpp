@@ -1,7 +1,3 @@
-/** @file directclienttests.cpp
-*/
-
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -31,98 +27,68 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <cstdint>
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
 
-#include <iostream>
+#include <boost/cstdint.hpp>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
 
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/client/dbclient_cursor.h"
 #include "mongo/db/client.h"
-#include "mongo/db/db.h"
+#include "mongo/db/database_name.h"
 #include "mongo/db/dbdirectclient.h"
-#include "mongo/db/json.h"
-#include "mongo/db/lasterror.h"
-#include "mongo/dbtests/dbtests.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/query/find_command.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/tenant_id.h"
+#include "mongo/dbtests/dbtests.h"  // IWYU pragma: keep
 #include "mongo/rpc/get_status_from_command_result.h"
-#include "mongo/util/timer.h"
+#include "mongo/unittest/unittest.h"
+#include "mongo/util/assert_util.h"
 
+namespace mongo {
 namespace DirectClientTests {
 
-using std::unique_ptr;
-using std::vector;
+const NamespaceString nss = NamespaceString::createNamespaceString_forTest("a.b");
 
-class ClientBase {
-public:
-    ClientBase() {
-        mongo::LastError::get(cc()).reset();
-    }
-    virtual ~ClientBase() {
-        mongo::LastError::get(cc()).reset();
-    }
-};
-
-const char* ns = "a.b";
-
-class Capped : public ClientBase {
-public:
-    virtual void run() {
-        // Skip the test if the storage engine doesn't support capped collections.
-        if (!getGlobalServiceContext()->getStorageEngine()->supportsCappedCollections()) {
-            return;
-        }
-
-        const ServiceContext::UniqueOperationContext opCtxPtr = cc().makeOperationContext();
-        OperationContext& opCtx = *opCtxPtr;
-        DBDirectClient client(&opCtx);
-        for (int pass = 0; pass < 3; pass++) {
-            client.createCollection(ns, 1024 * 1024, true, 999);
-            for (int j = 0; j < pass * 3; j++)
-                client.insert(ns, BSON("x" << j));
-
-            // test truncation of a capped collection
-            if (pass) {
-                BSONObj info;
-                BSONObj cmd = BSON("captrunc"
-                                   << "b"
-                                   << "n"
-                                   << 1
-                                   << "inc"
-                                   << true);
-                // cout << cmd.toString() << endl;
-                bool ok = client.runCommand("a", cmd, info);
-                // cout << info.toString() << endl;
-                verify(ok);
-            }
-
-            verify(client.dropCollection(ns));
-        }
-    }
-};
-
-class InsertMany : ClientBase {
+class InsertMany {
 public:
     virtual void run() {
         const ServiceContext::UniqueOperationContext opCtxPtr = cc().makeOperationContext();
         OperationContext& opCtx = *opCtxPtr;
         DBDirectClient client(&opCtx);
 
-        vector<BSONObj> objs;
+        std::vector<BSONObj> objs;
         objs.push_back(BSON("_id" << 1));
         objs.push_back(BSON("_id" << 1));
         objs.push_back(BSON("_id" << 2));
 
+        client.dropCollection(nss);
 
-        client.dropCollection(ns);
-        client.insert(ns, objs);
-        ASSERT_EQUALS(client.getLastErrorDetailed()["code"].numberInt(), 11000);
-        ASSERT_EQUALS((int)client.count(ns), 1);
+        auto response = client.insertAcknowledged(nss, objs);
+        ASSERT_EQUALS(ErrorCodes::DuplicateKey, getStatusFromWriteCommandReply(response));
+        ASSERT_EQUALS((int)client.count(nss), 1);
 
-        client.dropCollection(ns);
-        client.insert(ns, objs, InsertOption_ContinueOnError);
-        ASSERT_EQUALS(client.getLastErrorDetailed()["code"].numberInt(), 11000);
-        ASSERT_EQUALS((int)client.count(ns), 2);
+        client.dropCollection(nss);
+
+        response = client.insertAcknowledged(nss, objs, false /*ordered*/);
+        ASSERT_EQUALS(ErrorCodes::DuplicateKey, getStatusFromWriteCommandReply(response));
+        ASSERT_EQUALS((int)client.count(nss), 2);
     }
 };
 
-class BadNSCmd : ClientBase {
+class BadNSCmd {
 public:
     virtual void run() {
         const ServiceContext::UniqueOperationContext opCtxPtr = cc().makeOperationContext();
@@ -130,27 +96,30 @@ public:
         DBDirectClient client(&opCtx);
 
         BSONObj result;
-        BSONObj cmdObj = BSON("count"
-                              << "");
-        ASSERT(!client.runCommand("", cmdObj, result)) << result;
+        BSONObj cmdObj = BSON("count" << "");
+        ASSERT(!client.runCommand(
+            DatabaseName::createDatabaseName_forTest(boost::none, ""), cmdObj, result))
+            << result;
         ASSERT_EQ(getStatusFromCommandResult(result), ErrorCodes::InvalidNamespace);
     }
 };
 
-class BadNSQuery : ClientBase {
+class BadNSQuery {
 public:
     virtual void run() {
         const ServiceContext::UniqueOperationContext opCtxPtr = cc().makeOperationContext();
         OperationContext& opCtx = *opCtxPtr;
         DBDirectClient client(&opCtx);
 
-        ASSERT_THROWS_CODE(client.query(NamespaceString(), Query(), 1)->nextSafe(),
+        FindCommandRequest findRequest{NamespaceString{}};
+        findRequest.setLimit(1);
+        ASSERT_THROWS_CODE(client.find(std::move(findRequest))->nextSafe(),
                            AssertionException,
                            ErrorCodes::InvalidNamespace);
     }
 };
 
-class BadNSGetMore : ClientBase {
+class BadNSGetMore {
 public:
     virtual void run() {
         const ServiceContext::UniqueOperationContext opCtxPtr = cc().makeOperationContext();
@@ -158,51 +127,57 @@ public:
         DBDirectClient client(&opCtx);
 
         ASSERT_THROWS_CODE(
-            client.getMore("", 1, 1)->nextSafe(), AssertionException, ErrorCodes::InvalidNamespace);
+            client.getMore(NamespaceString::createNamespaceString_forTest(""), 1)->nextSafe(),
+            AssertionException,
+            ErrorCodes::InvalidNamespace);
     }
 };
 
-class BadNSInsert : ClientBase {
+class BadNSInsert {
 public:
     virtual void run() {
         const ServiceContext::UniqueOperationContext opCtxPtr = cc().makeOperationContext();
         OperationContext& opCtx = *opCtxPtr;
         DBDirectClient client(&opCtx);
 
-        client.insert("", BSONObj(), 0);
-        ASSERT(!client.getLastError().empty());
+        auto response = client.insertAcknowledged(
+            NamespaceString::createNamespaceString_forTest(""), {BSONObj()});
+        ASSERT_EQ(ErrorCodes::InvalidNamespace, getStatusFromCommandResult(response));
     }
 };
 
-class BadNSUpdate : ClientBase {
+class BadNSUpdate {
 public:
     virtual void run() {
         const ServiceContext::UniqueOperationContext opCtxPtr = cc().makeOperationContext();
         OperationContext& opCtx = *opCtxPtr;
         DBDirectClient client(&opCtx);
 
-        client.update("", Query(), BSON("$set" << BSON("x" << 1)));
-        ASSERT(!client.getLastError().empty());
+        auto response =
+            client.updateAcknowledged(NamespaceString::createNamespaceString_forTest(""),
+                                      BSONObj{} /*filter*/,
+                                      BSON("$set" << BSON("x" << 1)));
+        ASSERT_EQ(ErrorCodes::InvalidNamespace, getStatusFromCommandResult(response));
     }
 };
 
-class BadNSRemove : ClientBase {
+class BadNSRemove {
 public:
     virtual void run() {
         const ServiceContext::UniqueOperationContext opCtxPtr = cc().makeOperationContext();
         OperationContext& opCtx = *opCtxPtr;
         DBDirectClient client(&opCtx);
 
-        client.remove("", Query());
-        ASSERT(!client.getLastError().empty());
+        auto response = client.removeAcknowledged(
+            NamespaceString::createNamespaceString_forTest(""), BSONObj{} /*filter*/);
+        ASSERT_EQ(ErrorCodes::InvalidNamespace, getStatusFromCommandResult(response));
     }
 };
 
-class All : public Suite {
+class All : public unittest::OldStyleSuiteSpecification {
 public:
-    All() : Suite("directclient") {}
-    void setupTests() {
-        add<Capped>();
+    All() : OldStyleSuiteSpecification("directclient") {}
+    void setupTests() override {
         add<InsertMany>();
         add<BadNSCmd>();
         add<BadNSQuery>();
@@ -213,5 +188,7 @@ public:
     }
 };
 
-SuiteInstance<All> myall;
+unittest::OldStyleSuiteInitializer<All> myall;
+
 }  // namespace DirectClientTests
+}  // namespace mongo

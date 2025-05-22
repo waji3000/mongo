@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -38,4 +37,4 @@ namespace mongo {
 // Generate windows event name for shutdown signal
 std::string getShutdownSignalName(int processId);
 #endif
-}
+}  // namespace mongo

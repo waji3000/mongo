@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,22 +29,36 @@
 
 #pragma once
 
+#include <memory>
+#include <s2.h>
+#include <s2cell.h>
+#include <s2cellid.h>
+#include <s2polygon.h>
+#include <s2polyline.h>
+#include <s2region.h>
+#include <s2regionunion.h>
 #include <string>
+#include <vector>
 
-#include "mongo/base/disallow_copying.h"
+#include "mongo/base/clonable_ptr.h"
+#include "mongo/base/status.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/dotted_path/dotted_path_support.h"
 #include "mongo/db/geo/shapes.h"
-#include "third_party/s2/s2regionunion.h"
+
 
 namespace mongo {
 
 class GeometryContainer {
-    MONGO_DISALLOW_COPYING(GeometryContainer);
-
 public:
     /**
      * Creates an empty geometry container which may then be loaded from BSON or directly.
      */
     GeometryContainer() = default;
+
+    GeometryContainer(const GeometryContainer&);
+    GeometryContainer& operator=(const GeometryContainer&);
 
     /**
      * Loads an empty GeometryContainer from query.
@@ -66,6 +79,11 @@ public:
      * Whether this geometry is a point
      */
     bool isPoint() const;
+
+    /**
+     * Returns the point data, if this geometry is a point.
+     */
+    PointWithCRS getPoint() const;
 
     /**
      * Reports the CRS of the contained geometry.
@@ -125,10 +143,14 @@ public:
     // TODO: Remove these hacks
     const CapWithCRS* getCapGeometryHack() const;
 
+    BSONElement getGeoElement() const {
+        return _geoElm;
+    }
+
 private:
     class R2BoxRegion;
 
-    Status parseFromGeoJSON(const BSONObj& obj, bool skipValidation = false);
+    Status parseFromGeoJSON(bool skipValidation = false);
 
     // Does 'this' intersect with the provided type?
     bool intersects(const S2Cell& otherPoint) const;
@@ -145,23 +167,45 @@ private:
     bool contains(const S2Polyline& otherLine) const;
     bool contains(const S2Polygon& otherPolygon) const;
 
-    // Only one of these shared_ptrs should be non-NULL.  S2Region is a
+    // Only one of these clonable_ptrs should be non-NULL.  S2Region is a
     // superclass but it only supports testing against S2Cells.  We need
     // the most specific class we can get.
-    std::unique_ptr<PointWithCRS> _point;
-    std::unique_ptr<LineWithCRS> _line;
-    std::unique_ptr<BoxWithCRS> _box;
-    std::unique_ptr<PolygonWithCRS> _polygon;
-    std::unique_ptr<CapWithCRS> _cap;
-    std::unique_ptr<MultiPointWithCRS> _multiPoint;
-    std::unique_ptr<MultiLineWithCRS> _multiLine;
-    std::unique_ptr<MultiPolygonWithCRS> _multiPolygon;
-    std::unique_ptr<GeometryCollection> _geometryCollection;
+    clonable_ptr<PointWithCRS> _point;
+    clonable_ptr<LineWithCRS> _line;
+    clonable_ptr<BoxWithCRS> _box;
+    clonable_ptr<PolygonWithCRS> _polygon;
+    clonable_ptr<CapWithCRS> _cap;
+    clonable_ptr<MultiPointWithCRS> _multiPoint;
+    clonable_ptr<MultiLineWithCRS> _multiLine;
+    clonable_ptr<MultiPolygonWithCRS> _multiPolygon;
+    clonable_ptr<GeometryCollection> _geometryCollection;
 
     // Cached for use during covering calculations
     // TODO: _s2Region is currently generated immediately - don't necessarily need to do this
     std::unique_ptr<S2RegionUnion> _s2Region;
     std::unique_ptr<R2Region> _r2Region;
+
+    BSONElement _geoElm;
+};
+
+/**
+ * Structure that holds BSON addresses (BSONElements) and the corresponding geometry parsed
+ * at those locations.
+ * Used to separate the parsing of geometries from a BSONObj (which must stay in scope) from
+ * the computation over those geometries.
+ * TODO: Merge with 2D/2DSphere key extraction?
+ */
+class StoredGeometry {
+public:
+    static StoredGeometry* parseFrom(const BSONElement& element, bool skipValidation);
+
+    static void extractGeometries(const BSONObj& doc,
+                                  const string& path,
+                                  std::vector<std::unique_ptr<StoredGeometry>>* geometries,
+                                  bool skipValidation);
+
+    BSONElement element;
+    GeometryContainer geometry;
 };
 
 }  // namespace mongo

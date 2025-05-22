@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,7 +29,14 @@
 
 #pragma once
 
-#include "mongo/s/config_server_catalog_cache_loader.h"
+#include "mongo/base/string_data.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/s/shard_server_catalog_cache_loader.h"
+#include "mongo/s/catalog/type_database_gen.h"
+#include "mongo/s/chunk_version.h"
+#include "mongo/s/config_server_catalog_cache_loader_impl.h"
+#include "mongo/util/future.h"
 
 namespace mongo {
 
@@ -39,26 +45,32 @@ namespace mongo {
  * return, rather than invariant, so this class can be plugged into the shard server for read-only
  * mode, where persistence should not be attempted.
  */
-class ReadOnlyCatalogCacheLoader final : public CatalogCacheLoader {
+class ReadOnlyCatalogCacheLoader final : public ShardServerCatalogCacheLoader {
 public:
+    ReadOnlyCatalogCacheLoader() = default;
+    ~ReadOnlyCatalogCacheLoader() override;
+
+    void shutDown() override;
+
+    SemiFuture<CollectionAndChangedChunks> getChunksSince(const NamespaceString& nss,
+                                                          ChunkVersion version) override;
+    SemiFuture<DatabaseType> getDatabase(const DatabaseName& dbName) override;
+
     void initializeReplicaSetRole(bool isPrimary) override {}
     void onStepDown() override {}
     void onStepUp() override {}
-    void notifyOfCollectionVersionUpdate(const NamespaceString& nss) override {}
-    void waitForCollectionFlush(OperationContext* opCtx, const NamespaceString& nss) override;
-    void waitForDatabaseFlush(OperationContext* opCtx, StringData dbName) override;
-
-    std::shared_ptr<Notification<void>> getChunksSince(
-        const NamespaceString& nss,
-        ChunkVersion version,
-        GetChunksSinceCallbackFn callbackFn) override;
-
-    void getDatabase(
-        StringData dbName,
-        stdx::function<void(OperationContext*, StatusWith<DatabaseType>)> callbackFn) override;
+    void onReplicationRollback() override {}
+    void notifyOfCollectionRefreshEndMarkerSeen(const NamespaceString& nss,
+                                                const Timestamp& commitTime) override {}
+    void waitForCollectionFlush(OperationContext* opCtx, const NamespaceString& nss) override {
+        MONGO_UNREACHABLE;
+    }
+    void waitForDatabaseFlush(OperationContext* opCtx, const DatabaseName& dbName) override {
+        MONGO_UNREACHABLE;
+    }
 
 private:
-    ConfigServerCatalogCacheLoader _configServerLoader;
+    ConfigServerCatalogCacheLoaderImpl _configServerLoader;
 };
 
 }  // namespace mongo

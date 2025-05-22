@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Public Domain 2014-2018 MongoDB, Inc.
+# Public Domain 2014-present MongoDB, Inc.
 # Public Domain 2008-2014 WiredTiger, Inc.
 #
 # This is free and unencumbered software released into the public domain.
@@ -41,28 +41,28 @@ def timestamp_str(t):
 class test_prepare04(wttest.WiredTigerTestCase, suite_subprocess):
     tablename = 'test_prepare_cursor'
     uri = 'table:' + tablename
+
     before_ts = timestamp_str(150)
     prepare_ts = timestamp_str(200)
     after_ts = timestamp_str(250)
 
     types = [
-        ('col', dict(extra_config=',log=(enabled=false),key_format=r')),
-        ('lsm', dict(extra_config=',log=(enabled=false),type=lsm')),
-        ('row', dict(extra_config=',log=(enabled=false)')),
+        ('col', dict(extra_config=',key_format=r')),
+        ('col-fix', dict(extra_config=',key_format=r,value_format=8t')),
+        ('row', dict(extra_config='')),
     ]
 
     # Various begin_transaction config
     txncfg = [
-        ('before_ts', dict(txn_config='isolation=snapshot,read_timestamp=' + before_ts, after_ts=False)),
-        ('after_ts', dict(txn_config='isolation=snapshot,read_timestamp=' + after_ts, after_ts=True)),
-        ('no_ts', dict(txn_config='isolation=snapshot', after_ts=True)),
+        ('before_ts', dict(txn_config='read_timestamp=' + before_ts, after_ts=False)),
+        ('after_ts', dict(txn_config='read_timestamp=' + after_ts, after_ts=True)),
+        ('no_ts', dict(txn_config='', after_ts=True)),
     ]
 
     preparecfg = [
         ('ignore_false', dict(ignore_config=',ignore_prepare=false', ignore=False)),
         ('ignore_true', dict(ignore_config=',ignore_prepare=true', ignore=True)),
     ]
-    conn_config = 'log=(enabled)'
 
     scenarios = make_scenarios(types, txncfg, preparecfg)
 
@@ -72,7 +72,7 @@ class test_prepare04(wttest.WiredTigerTestCase, suite_subprocess):
         c = self.session.open_cursor(self.uri)
 
         # Insert keys 1..100 each with timestamp=key, in some order
-        orig_keys = range(1, 101)
+        orig_keys = list(range(1, 101))
         keys = orig_keys[:]
         random.shuffle(keys)
 
@@ -89,7 +89,7 @@ class test_prepare04(wttest.WiredTigerTestCase, suite_subprocess):
 
         # make prepared updates.
         k = 1
-        self.session.begin_transaction('isolation=snapshot')
+        self.session.begin_transaction()
         c.set_key(1)
         c.set_value(2)
         c.update()
@@ -104,16 +104,18 @@ class test_prepare04(wttest.WiredTigerTestCase, suite_subprocess):
         s_other.begin_transaction(self.txn_config + self.ignore_config)
         c_other.set_key(1)
         if self.ignore == False and self.after_ts == True:
-            self.assertRaises(wiredtiger.WiredTigerError, lambda:c_other.search())
+            # Make sure we get the expected prepare conflict message.
+            self.assertRaisesException(wiredtiger.WiredTigerError, lambda:c_other.search(), preparemsg)
         else:
             c_other.search()
             self.assertTrue(c_other.get_value() == 1)
+
         c_other.set_value(3)
-        self.assertRaises(wiredtiger.WiredTigerError, lambda:c_other.update())
-        s_other.commit_transaction()
-        #'''
 
-        self.session.commit_transaction('commit_timestamp=' + timestamp_str(300))
+        # Make sure we detect the conflict between operations.
+        self.assertRaisesException(wiredtiger.WiredTigerError, lambda:c_other.update(), conflictmsg)
+        s_other.rollback_transaction()
 
-if __name__ == '__main__':
-    wttest.run()
+        self.session.timestamp_transaction('commit_timestamp=' + timestamp_str(300))
+        self.session.timestamp_transaction('durable_timestamp=' + timestamp_str(300))
+        self.session.commit_transaction()

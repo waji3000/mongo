@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,8 +27,6 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/repl/heartbeat_response_action.h"
 
 namespace mongo {
@@ -57,6 +54,12 @@ HeartbeatResponseAction HeartbeatResponseAction::makeCatchupTakeoverAction() {
     return result;
 }
 
+HeartbeatResponseAction HeartbeatResponseAction::makeRetryReconfigAction() {
+    HeartbeatResponseAction result;
+    result._action = RetryReconfig;
+    return result;
+}
+
 HeartbeatResponseAction HeartbeatResponseAction::makeStepDownSelfAction(int primaryIndex) {
     HeartbeatResponseAction result;
     result._action = StepDownSelf;
@@ -70,8 +73,16 @@ void HeartbeatResponseAction::setNextHeartbeatStartDate(Date_t when) {
     _nextHeartbeatStartDate = when;
 }
 
-void HeartbeatResponseAction::setAdvancedOpTime(bool advanced) {
-    _advancedOpTime = advanced;
+void HeartbeatResponseAction::setAdvancedOpTimeOrUpdatedConfig(bool advancedOrUpdated) {
+    _advancedOpTimeOrUpdatedConfig = advancedOrUpdated;
+}
+
+void HeartbeatResponseAction::setBecameElectable(bool becameElectable) {
+    _becameElectable = becameElectable;
+}
+
+void HeartbeatResponseAction::setChangedMemberState(bool changedMemberState) {
+    _changedMemberState = changedMemberState;
 }
 
 }  // namespace repl

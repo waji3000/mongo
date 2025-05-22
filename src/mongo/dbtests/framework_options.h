@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -34,6 +33,7 @@
 #include <vector>
 
 #include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
 
 namespace mongo {
 
@@ -69,4 +69,4 @@ bool handlePreValidationTestFrameworkOptions(const moe::Environment& params,
 
 Status storeTestFrameworkOptions(const moe::Environment& params,
                                  const std::vector<std::string>& args);
-}
+}  // namespace mongo

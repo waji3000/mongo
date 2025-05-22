@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,48 +27,72 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kControl
 
 #include "mongo/util/net/private/ssl_expiration.h"
 
 #include <string>
 
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/time_support.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
+
 
 namespace mongo {
 
 static const auto oneDay = Hours(24);
 
-CertificateExpirationMonitor::CertificateExpirationMonitor(Date_t date)
-    : _certExpiration(date), _lastCheckTime(Date_t::now()) {}
+CertificateExpirationMonitor* theCertificateExpirationMonitor;
 
-std::string CertificateExpirationMonitor::taskName() const {
-    return "CertificateExpirationMonitor";
+void CertificateExpirationMonitor::updateExpirationDeadline(Date_t date) {
+    stdx::lock_guard<stdx::mutex> lock(_mutex);
+    _certExpiration = date;
 }
 
-void CertificateExpirationMonitor::taskDoWork() {
-    const Milliseconds timeSinceLastCheck = Date_t::now() - _lastCheckTime;
+CertificateExpirationMonitor* CertificateExpirationMonitor::get() {
+    if (!theCertificateExpirationMonitor) {
+        theCertificateExpirationMonitor = new CertificateExpirationMonitor();
+    }
+    return theCertificateExpirationMonitor;
+}
 
-    if (timeSinceLastCheck < oneDay)
-        return;
+void CertificateExpirationMonitor::start(ServiceContext* service) {
+    stdx::lock_guard<stdx::mutex> lock(_mutex);
 
+    auto periodicRunner = service->getPeriodicRunner();
+    invariant(periodicRunner);
+
+    // The certificate expiration monitor is technically killable, but since it never creates an
+    // operation context, it will never actually be interrupted.
+    PeriodicRunner::PeriodicJob job(
+        "CertificateExpirationMonitor",
+        [this](Client* client) { return run(client); },
+        oneDay,
+        true /*isKillableByStepdown*/);
+
+    _job = std::make_unique<PeriodicJobAnchor>(periodicRunner->makeJob(std::move(job)));
+    _job->start();
+}
+
+void CertificateExpirationMonitor::run(Client*) {
     const Date_t now = Date_t::now();
-    _lastCheckTime = now;
-
+    stdx::lock_guard<stdx::mutex> lock(_mutex);
     if (_certExpiration <= now) {
         // The certificate has expired.
-        warning() << "Server certificate is now invalid. It expired on "
-                  << dateToISOStringUTC(_certExpiration);
+        LOGV2_WARNING(23785,
+                      "Server certificate has expired",
+                      "certExpiration"_attr = dateToISOStringUTC(_certExpiration));
         return;
     }
 
     const auto remainingValidDuration = _certExpiration - now;
 
     if (remainingValidDuration <= 30 * oneDay) {
-        // The certificate will expire in the next 30 days.
-        warning() << "Server certificate will expire on " << dateToISOStringUTC(_certExpiration)
-                  << " in " << durationCount<Hours>(remainingValidDuration) / 24 << " days.";
+        // The certificate will expire in the next 30 days
+        LOGV2_WARNING(23786,
+                      "Server certificate will expire soon",
+                      "certExpiration"_attr = dateToISOStringUTC(_certExpiration),
+                      "validDuration"_attr = durationCount<Hours>(remainingValidDuration));
     }
 }
 

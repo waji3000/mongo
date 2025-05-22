@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -27,14 +26,22 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/storage/index_entry_comparison.h"
-
+#include <boost/move/utility_core.hpp>
+#include <cstddef>
+#include <limits>
 #include <ostream>
 
-#include "mongo/db/jsobj.h"
-#include "mongo/db/storage/duplicate_key_error_info.h"
+#include <boost/optional/optional.hpp>
+
+#include "mongo/bson/bsontypes.h"
+#include "mongo/bson/util/builder.h"
+#include "mongo/bson/util/builder_fwd.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/storage/index_entry_comparison.h"
+#include "mongo/db/storage/key_string/key_string.h"
+#include "mongo/util/hex.h"
+#include "mongo/util/str.h"
+#include "mongo/util/text.h"  // IWYU pragma: keep
 
 namespace mongo {
 
@@ -110,75 +117,88 @@ int IndexEntryComparison::compare(const IndexKeyEntry& lhs, const IndexKeyEntry&
     return lhs.loc.compare(rhs.loc);  // is supposed to ignore ordering
 }
 
-// reading the comment in the .h file is highly recommended if you need to understand what this
-// function is doing
-BSONObj IndexEntryComparison::makeQueryObject(const BSONObj& keyPrefix,
-                                              int prefixLen,
-                                              bool prefixExclusive,
-                                              const std::vector<const BSONElement*>& keySuffix,
-                                              const std::vector<bool>& suffixInclusive,
-                                              const int cursorDirection) {
-    // Please read the comments in the header file to see why this is done.
-    // The basic idea is that we use the field name to store a byte which indicates whether
-    // each field in the query object is inclusive and exclusive, and if it is exclusive, in
-    // which direction.
-    const char exclusiveByte = (cursorDirection == 1 ? greater : less);
+std::span<const char> IndexEntryComparison::makeKeyStringFromSeekPointForSeek(
+    const IndexSeekPoint& seekPoint, bool isForward, key_string::Builder& builder) {
+    const bool inclusive = seekPoint.firstExclusive < 0;
+    const auto discriminator = isForward == inclusive ? key_string::Discriminator::kExclusiveBefore
+                                                      : key_string::Discriminator::kExclusiveAfter;
 
-    const StringData exclusiveFieldName(&exclusiveByte, 1);
-
-    BSONObjBuilder bb;
-
-    // handle the prefix
-    if (prefixLen > 0) {
-        BSONObjIterator it(keyPrefix);
-        for (int i = 0; i < prefixLen; i++) {
+    // Appends keyPrefix elements to the builder.
+    if (seekPoint.prefixLen > 0) {
+        BSONObjIterator it(seekPoint.keyPrefix);
+        for (int i = 0; i < seekPoint.prefixLen; i++) {
             invariant(it.more());
             const BSONElement e = it.next();
-
-            if (prefixExclusive && i == prefixLen - 1) {
-                bb.appendAs(e, exclusiveFieldName);
-            } else {
-                bb.appendAs(e, StringData());
-            }
+            builder.appendBSONElement(e);
         }
     }
 
-    // If the prefix is exclusive then the suffix does not matter as it will never be used
-    if (prefixExclusive) {
-        invariant(prefixLen > 0);
-        return bb.obj();
+    // Handles the suffix. Note that the useful parts of the suffix start at index prefixLen rather
+    // than at 0.
+    size_t end = seekPoint.firstExclusive >= 0 ? static_cast<size_t>(seekPoint.firstExclusive + 1)
+                                               : seekPoint.keySuffix.size();
+    for (size_t i = seekPoint.prefixLen; i < end; i++) {
+        builder.appendBSONElement(seekPoint.keySuffix[i]);
     }
 
-    // Handle the suffix. Note that the useful parts of the suffix start at index prefixLen
-    // rather than at 0.
-    invariant(keySuffix.size() == suffixInclusive.size());
-    for (size_t i = prefixLen; i < keySuffix.size(); i++) {
-        invariant(keySuffix[i]);
-        if (suffixInclusive[i]) {
-            bb.appendAs(*keySuffix[i], StringData());
-        } else {
-            bb.appendAs(*keySuffix[i], exclusiveFieldName);
+    return builder.finishAndGetBuffer(discriminator);
+}
 
-            // If an exclusive field exists then no fields after this will matter, since an
-            // exclusive field never evaluates as equal
-            return bb.obj();
-        }
-    }
+std::span<const char> IndexEntryComparison::makeKeyStringFromBSONKeyForSeek(
+    const BSONObj& bsonKey,
+    Ordering ord,
+    bool isForward,
+    bool inclusive,
+    key_string::Builder& builder) {
+    return makeKeyStringFromBSONKey(bsonKey,
+                                    ord,
+                                    isForward == inclusive
+                                        ? key_string::Discriminator::kExclusiveBefore
+                                        : key_string::Discriminator::kExclusiveAfter,
+                                    builder);
+}
 
-    return bb.obj();
+std::span<const char> IndexEntryComparison::makeKeyStringFromBSONKey(
+    const BSONObj& bsonKey,
+    Ordering ord,
+    key_string::Discriminator discrim,
+    key_string::Builder& builder) {
+    builder.resetToKey(bsonKey, ord, discrim);
+    return builder.finishAndGetBuffer();
 }
 
 Status buildDupKeyErrorStatus(const BSONObj& key,
-                              const std::string& collectionNamespace,
+                              const NamespaceString& collectionNamespace,
                               const std::string& indexName,
-                              const BSONObj& keyPattern) {
+                              const BSONObj& keyPattern,
+                              const BSONObj& indexCollation,
+                              DuplicateKeyErrorInfo::FoundValue&& foundValue,
+                              const boost::optional<RecordId> duplicateRid) {
+    const bool hasCollation = !indexCollation.isEmpty();
+
     StringBuilder sb;
     sb << "E11000 duplicate key error";
-    sb << " collection: " << collectionNamespace;
-    sb << " index: " << indexName;
+    sb << " collection: " << collectionNamespace.toStringForErrorMsg();
+    if (indexName.size()) {
+        // This helper may be used for clustered collections when there is no index for the cluster
+        // key.
+        sb << " index: " << indexName;
+    }
+    if (hasCollation) {
+        sb << " collation: " << indexCollation;
+    }
     sb << " dup key: ";
 
-    BSONObjBuilder builder;
+    // For the purpose of producing a useful error message, generate a representation of the key
+    // with field names hydrated and with invalid UTF-8 hex-encoded.
+    BSONObjBuilder builderForErrmsg;
+
+    // Used to build a version of the key after hydrating with field names but without hex encoding
+    // invalid UTF-8. This key is attached to the extra error info and consumed by callers who may
+    // wish to retry on duplicate key errors. The field names are rehydrated so that we don't return
+    // BSON with duplicate key names to clients.
+    BSONObjBuilder builderForErrorExtraInfo;
+
     // key is a document with forms like: '{ : 123}', '{ : {num: 123} }', '{ : 123, : "str" }'
     BSONObjIterator keyValueIt(key);
     // keyPattern is a document with only one level. e.g. '{a : 1, b : -1}', '{a.b : 1}'
@@ -191,11 +211,60 @@ Status buildDupKeyErrorStatus(const BSONObj& key,
         if (keyNameElem.eoo())
             break;
 
-        builder.appendAs(keyValueElem, keyNameElem.fieldName());
+        builderForErrorExtraInfo.appendAs(keyValueElem, keyNameElem.fieldName());
+
+        // If the duplicate key value contains a string, then it's possible that the string contains
+        // binary data which is not valid UTF-8. This is true for all indexes with a collation,
+        // since the index stores collation keys rather than raw user strings. But it's also
+        // possible that the application has stored binary data inside a string, which the system
+        // has never rejected.
+        //
+        // If the string in the key is invalid UTF-8, then we hex encode it before adding it to the
+        // error message so that the driver can assume valid UTF-8 when reading the reply.
+        const bool shouldHexEncode = keyValueElem.type() == BSONType::String &&
+            (hasCollation || !isValidUTF8(keyValueElem.valueStringData()));
+
+        if (shouldHexEncode) {
+            std::string hexEncoded = "0x" + hexblob::encodeLower(keyValueElem.valueStringData());
+            if (hasCollation) {
+                hexEncoded = str::stream() << "CollationKey(" << hexEncoded << ")";
+            }
+            builderForErrmsg.append(keyNameElem.fieldName(), hexEncoded);
+        } else {
+            builderForErrmsg.appendAs(keyValueElem, keyNameElem.fieldName());
+        }
     }
 
-    sb << builder.obj();
-    return Status(DuplicateKeyErrorInfo(keyPattern), sb.str());
+    sb << builderForErrmsg.obj();
+
+    visit(OverloadedVisitor{
+              [](std::monostate) {},
+              [&sb](const RecordId& rid) { sb << " found value: " << rid; },
+              [&sb](const BSONObj& obj) {
+                  if (obj.objsize() < BSONObjMaxUserSize / 2) {
+                      sb << " found value: " << obj;
+                  }
+              },
+          },
+          foundValue);
+
+    return Status(DuplicateKeyErrorInfo(keyPattern,
+                                        builderForErrorExtraInfo.obj(),
+                                        indexCollation,
+                                        std::move(foundValue),
+                                        duplicateRid),
+                  sb.str());
+}
+
+Status buildDupKeyErrorStatus(const key_string::Value& keyString,
+                              const NamespaceString& collectionNamespace,
+                              const std::string& indexName,
+                              const BSONObj& keyPattern,
+                              const BSONObj& indexCollation,
+                              const Ordering& ordering) {
+    const BSONObj key = key_string::toBson(keyString.getView(), ordering, keyString.getTypeBits());
+
+    return buildDupKeyErrorStatus(key, collectionNamespace, indexName, keyPattern, indexCollation);
 }
 
 }  // namespace mongo

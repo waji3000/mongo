@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,36 +27,30 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <memory>
+#include <vector>
 
 #include "mongo/db/exec/count.h"
-
-#include "mongo/db/catalog/collection.h"
-#include "mongo/db/exec/scoped_timer.h"
-#include "mongo/db/exec/working_set_common.h"
-#include "mongo/stdx/memory.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 
 using std::unique_ptr;
-using std::vector;
-using stdx::make_unique;
 
 // static
 const char* CountStage::kStageType = "COUNT";
 
-CountStage::CountStage(OperationContext* opCtx,
-                       Collection* collection,
-                       CountStageParams params,
-                       WorkingSet* ws,
-                       PlanStage* child)
-    : PlanStage(kStageType, opCtx), _params(std::move(params)), _leftToSkip(_params.skip), _ws(ws) {
+CountStage::CountStage(
+    ExpressionContext* expCtx, long long limit, long long skip, WorkingSet* ws, PlanStage* child)
+    : PlanStage(kStageType, expCtx), _limit(limit), _skip(skip), _leftToSkip(_skip), _ws(ws) {
+    invariant(_skip >= 0);
+    invariant(_limit >= 0);
     invariant(child);
     _children.emplace_back(child);
 }
 
-bool CountStage::isEOF() {
-    if (_params.limit > 0 && _specificStats.nCounted >= _params.limit) {
+bool CountStage::isEOF() const {
+    if (_limit > 0 && _specificStats.nCounted >= _limit) {
         return true;
     }
 
@@ -82,12 +75,6 @@ PlanStage::StageState CountStage::doWork(WorkingSetID* out) {
     if (PlanStage::IS_EOF == state) {
         _commonStats.isEOF = true;
         return PlanStage::IS_EOF;
-    } else if (PlanStage::FAILURE == state || PlanStage::DEAD == state) {
-        // The stage which produces a failure is responsible for allocating a working set member
-        // with error details.
-        invariant(WorkingSet::INVALID_ID != id);
-        *out = id;
-        return state;
     } else if (PlanStage::ADVANCED == state) {
         // We got a result. If we're still skipping, then decrement the number left to skip.
         // Otherwise increment the count until we hit the limit.
@@ -113,8 +100,8 @@ PlanStage::StageState CountStage::doWork(WorkingSetID* out) {
 
 unique_ptr<PlanStageStats> CountStage::getStats() {
     _commonStats.isEOF = isEOF();
-    unique_ptr<PlanStageStats> ret = make_unique<PlanStageStats>(_commonStats, STAGE_COUNT);
-    ret->specific = make_unique<CountStats>(_specificStats);
+    unique_ptr<PlanStageStats> ret = std::make_unique<PlanStageStats>(_commonStats, STAGE_COUNT);
+    ret->specific = std::make_unique<CountStats>(_specificStats);
     if (!_children.empty()) {
         ret->children.emplace_back(child()->getStats());
     }

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,9 +27,10 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
 
 #include "mongo/db/update/update_array_node.h"
+
+#include "mongo/db/exec/matcher/matcher.h"
 
 namespace mongo {
 
@@ -39,7 +39,7 @@ std::unique_ptr<UpdateNode> UpdateArrayNode::createUpdateNodeByMerging(
     const UpdateArrayNode& leftNode, const UpdateArrayNode& rightNode, FieldRef* pathTaken) {
     invariant(&leftNode._arrayFilters == &rightNode._arrayFilters);
 
-    auto mergedNode = stdx::make_unique<UpdateArrayNode>(leftNode._arrayFilters);
+    auto mergedNode = std::make_unique<UpdateArrayNode>(leftNode._arrayFilters);
 
     const bool wrapFieldNameAsArrayFilterIdentifier = true;
     mergedNode->_children = createUpdateNodeMapByMerging(
@@ -48,13 +48,15 @@ std::unique_ptr<UpdateNode> UpdateArrayNode::createUpdateNodeByMerging(
     return std::move(mergedNode);
 }
 
-UpdateNode::ApplyResult UpdateArrayNode::apply(ApplyParams applyParams) const {
-    if (!applyParams.pathToCreate->empty()) {
-        for (size_t i = 0; i < applyParams.pathToCreate->numParts(); ++i) {
-            applyParams.pathTaken->appendPart(applyParams.pathToCreate->getPart(i));
+UpdateExecutor::ApplyResult UpdateArrayNode::apply(
+    ApplyParams applyParams, UpdateNodeApplyParams updateNodeApplyParams) const {
+    if (!updateNodeApplyParams.pathToCreate->empty()) {
+        FieldRef pathTakenCopy(updateNodeApplyParams.pathTaken->fieldRef());
+        for (size_t i = 0; i < updateNodeApplyParams.pathToCreate->numParts(); ++i) {
+            pathTakenCopy.appendPart(updateNodeApplyParams.pathToCreate->getPart(i));
         }
         uasserted(ErrorCodes::BadValue,
-                  str::stream() << "The path '" << applyParams.pathTaken->dottedField()
+                  str::stream() << "The path '" << pathTakenCopy.dottedField()
                                 << "' must exist in the document in order to apply array updates.");
     }
 
@@ -87,7 +89,7 @@ UpdateNode::ApplyResult UpdateArrayNode::apply(ApplyParams applyParams) const {
             } else {
                 auto filter = _arrayFilters.find(update.first);
                 invariant(filter != _arrayFilters.end());
-                if (filter->second->matchesBSONElement(arrayElement)) {
+                if (exec::matcher::matchesBSONElement(filter->second->getFilter(), arrayElement)) {
                     matchingElements[i].push_back(update.second.get());
                 }
             }
@@ -117,7 +119,10 @@ UpdateNode::ApplyResult UpdateArrayNode::apply(ApplyParams applyParams) const {
             // Merge all of the updates for this array element.
             invariant(updates->second.size() > 0);
             auto mergedChild = updates->second[0];
-            FieldRefTempAppend tempAppend(*(applyParams.pathTaken), childElement.getFieldName());
+            RuntimeUpdatePathTempAppend tempAppend(*updateNodeApplyParams.pathTaken,
+                                                   childElement.getFieldName(),
+                                                   RuntimeUpdatePath::ComponentType::kArrayIndex);
+
             for (size_t j = 1; j < updates->second.size(); ++j) {
 
                 // Use the cached merge result, if it is available.
@@ -127,24 +132,29 @@ UpdateNode::ApplyResult UpdateArrayNode::apply(ApplyParams applyParams) const {
                     continue;
                 }
 
+                // UpdateNode::createUpdateNodeByMerging() requires a mutable field path
+                FieldRef pathTakenFieldRefCopy(updateNodeApplyParams.pathTaken->fieldRef());
+
+
                 // The cached merge result is not available, so perform the merge and cache the
                 // result.
                 _mergedChildrenCache[mergedChild][updates->second[j]] =
                     UpdateNode::createUpdateNodeByMerging(
-                        *mergedChild, *updates->second[j], applyParams.pathTaken.get());
+                        *mergedChild, *updates->second[j], &pathTakenFieldRefCopy);
                 mergedChild = _mergedChildrenCache[mergedChild][updates->second[j]].get();
             }
 
             auto childApplyParams = applyParams;
             childApplyParams.element = childElement;
+            auto childUpdateNodeApplyParams = updateNodeApplyParams;
             if (!childrenShouldLogThemselves) {
-                childApplyParams.logBuilder = nullptr;
+                childApplyParams.logMode = ApplyParams::LogMode::kDoNotGenerateOplogEntry;
+                childUpdateNodeApplyParams.logBuilder = nullptr;
             }
 
-            auto childApplyResult = mergedChild->apply(childApplyParams);
+            auto childApplyResult =
+                mergedChild->apply(childApplyParams, childUpdateNodeApplyParams);
 
-            applyResult.indexesAffected =
-                applyResult.indexesAffected || childApplyResult.indexesAffected;
             applyResult.noop = applyResult.noop && childApplyResult.noop;
             if (!childApplyResult.noop) {
                 modifiedElement = childElement;
@@ -155,25 +165,31 @@ UpdateNode::ApplyResult UpdateArrayNode::apply(ApplyParams applyParams) const {
         ++i;
     }
 
+    // If no elements match the array filter, report the path to the array itself as modified.
+    if (applyParams.modifiedPaths && matchingElements.size() == 0) {
+        applyParams.modifiedPaths->keepShortest(updateNodeApplyParams.pathTaken->fieldRef());
+    }
+
     // If the child updates have not been logged, log the updated array elements.
-    if (!childrenShouldLogThemselves && applyParams.logBuilder) {
+    auto* const logBuilder = updateNodeApplyParams.logBuilder;
+    if (!childrenShouldLogThemselves && logBuilder) {
+        // Earlier we should have checked that the path already exists.
+        invariant(updateNodeApplyParams.pathToCreate->empty());
+
         if (nModified > 1) {
-
             // Log the entire array.
-            auto logElement = applyParams.logBuilder->getDocument().makeElementWithNewFieldName(
-                applyParams.pathTaken->dottedField(), applyParams.element);
-            invariant(logElement.ok());
-            uassertStatusOK(applyParams.logBuilder->addToSets(logElement));
+            uassertStatusOK(
+                logBuilder->logUpdatedField(*updateNodeApplyParams.pathTaken, applyParams.element));
         } else if (nModified == 1) {
-
             // Log the modified array element.
             invariant(modifiedElement);
-            FieldRefTempAppend tempAppend(*(applyParams.pathTaken),
-                                          modifiedElement->getFieldName());
-            auto logElement = applyParams.logBuilder->getDocument().makeElementWithNewFieldName(
-                applyParams.pathTaken->dottedField(), *modifiedElement);
-            invariant(logElement.ok());
-            uassertStatusOK(applyParams.logBuilder->addToSets(logElement));
+
+            // Temporarily append the array index.
+            RuntimeUpdatePathTempAppend tempAppend(*updateNodeApplyParams.pathTaken,
+                                                   modifiedElement->getFieldName(),
+                                                   RuntimeUpdatePath::ComponentType::kArrayIndex);
+            uassertStatusOK(
+                logBuilder->logUpdatedField(*updateNodeApplyParams.pathTaken, *modifiedElement));
         }
     }
 

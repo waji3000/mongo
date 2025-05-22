@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,15 +27,24 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <string>
 
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
 #include "mongo/db/pipeline/document_source_count.h"
-
-#include "mongo/db/jsobj.h"
 #include "mongo/db/pipeline/document_source_group.h"
 #include "mongo/db/pipeline/document_source_project.h"
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/lite_parsed_document_source.h"
+#include "mongo/db/query/allowed_contexts.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/intrusive_counter.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -44,9 +52,10 @@ using boost::intrusive_ptr;
 using std::list;
 using std::string;
 
-REGISTER_MULTI_STAGE_ALIAS(count,
-                           LiteParsedDocumentSourceDefault::parse,
-                           DocumentSourceCount::createFromBson);
+REGISTER_DOCUMENT_SOURCE(count,
+                         LiteParsedDocumentSourceDefault::parse,
+                         DocumentSourceCount::createFromBson,
+                         AllowedWithApiStrict::kAlways);
 
 list<intrusive_ptr<DocumentSource>> DocumentSourceCount::createFromBson(
     BSONElement elem, const intrusive_ptr<ExpressionContext>& pExpCtx) {
@@ -69,6 +78,8 @@ list<intrusive_ptr<DocumentSource>> DocumentSourceCount::createFromBson(
     uassert(40160,
             str::stream() << "the count field cannot contain '.'",
             elemString.find('.') == string::npos);
+
+    uassert(9039800, str::stream() << "the count field cannot be '_id'", elemString != "_id");
 
     BSONObj groupObj = BSON("$group" << BSON("_id" << BSONNULL << elemString << BSON("$sum" << 1)));
     BSONObj projectObj = BSON("$project" << BSON("_id" << 0 << elemString << 1));

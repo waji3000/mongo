@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,10 +29,12 @@
 
 #pragma once
 
+#include <memory>
+
+#include "mongo/db/client.h"
+#include "mongo/rpc/message.h"
 #include "mongo/rpc/op_msg.h"
 #include "mongo/rpc/protocol.h"
-
-#include <memory>
 
 /**
  * Utilities to construct the correct concrete rpc class based on what the remote server
@@ -53,19 +54,9 @@ class ReplyInterface;
 std::unique_ptr<ReplyInterface> makeReply(const Message* unownedMessage);
 
 /**
- * Serializes an OpMsgRequest for a server that speaks the requested protocol.
- */
-Message messageFromOpMsgRequest(Protocol proto, const OpMsgRequest&);
-inline Message messageFromOpMsgRequest(ProtocolSet clientProtos,
-                                       ProtocolSet serverProtos,
-                                       const OpMsgRequest& request) {
-    return messageFromOpMsgRequest(uassertStatusOK(negotiate(clientProtos, serverProtos)), request);
-}
-
-/**
  * Parses the message (from any protocol) into an OpMsgRequest.
  */
-OpMsgRequest opMsgRequestFromAnyProtocol(const Message& unownedMessage);
+OpMsgRequest opMsgRequestFromAnyProtocol(const Message& unownedMessage, Client* client = nullptr);
 
 /**
  * Returns the appropriate concrete ReplyBuilder.

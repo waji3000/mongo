@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,11 +29,28 @@
 
 #pragma once
 
+#include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+#include <utility>
+
 #include "mongo/platform/compiler.h"
-#include "mongo/stdx/functional.h"
+#include "mongo/util/duration.h"
 #include "mongo/util/exit_code.h"
+#include "mongo/util/functional.h"
 
 namespace mongo {
+
+/**
+ * ShutdownTaskArgs holds any arguments we might like to pass from a manual invocation of the
+ * shutdown command.  It is meant to give a default shutdown when default constructed.
+ */
+struct ShutdownTaskArgs {
+    // This should be set to true if we called shutdown from the shutdown command
+    bool isUserInitiated = false;
+
+    // The time allowed for quiesce mode.
+    boost::optional<Milliseconds> quiesceTime;
+};
 
 /**
  * Determines if the shutdown flag is set.
@@ -52,13 +68,22 @@ bool globalInShutdownDeprecated();
  */
 ExitCode waitForShutdown();
 
+using ShutdownTask = unique_function<void(const ShutdownTaskArgs& shutdownArgs)>;
+
 /**
  * Registers a new shutdown task to be called when shutdown or
  * shutdownNoTerminate is called. If this function is invoked after
  * shutdown or shutdownNoTerminate has been called, std::terminate is
  * called.
  */
-void registerShutdownTask(stdx::function<void()>);
+void registerShutdownTask(ShutdownTask);
+
+/**
+ * Helper for registering shutdown tasks, converts void lambda to shutdown lambda form.
+ */
+inline void registerShutdownTask(unique_function<void()> task) {
+    registerShutdownTask([task = std::move(task)](const ShutdownTaskArgs&) { task(); });
+}
 
 /**
  * Toggles the shutdown flag to 'true', runs registered shutdown
@@ -67,7 +92,7 @@ void registerShutdownTask(stdx::function<void()>);
  * shutdown tasks. It is illegal to reenter this function from a
  * registered shutdown task. The function does not return.
  */
-MONGO_COMPILER_NORETURN void shutdown(ExitCode code);
+MONGO_COMPILER_NORETURN void shutdown(ExitCode code, const ShutdownTaskArgs& shutdownArgs = {});
 
 /**
  * Toggles the shutdown flag to 'true' and runs the registered
@@ -76,7 +101,7 @@ MONGO_COMPILER_NORETURN void shutdown(ExitCode code);
  * callers return immediately. It is legal to call shutdownNoTerminate
  * from a shutdown task.
  */
-void shutdownNoTerminate();
+void shutdownNoTerminate(const ShutdownTaskArgs& shutdownArgs = {});
 
 /** An alias for 'shutdown'. */
 MONGO_COMPILER_NORETURN inline void exitCleanly(ExitCode code) {

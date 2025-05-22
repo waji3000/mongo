@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,12 +29,21 @@
 
 #pragma once
 
+#include <map>
 #include <memory>
+#include <string>
+#include <utility>
+#include <vector>
 
 #include "mongo/bson/bsonelement.h"
-#include "mongo/bson/mutable/element.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/exec/mutable_bson/element.h"
+#include "mongo/db/field_ref.h"
 #include "mongo/db/field_ref_set.h"
-#include "mongo/db/update/log_builder.h"
+#include "mongo/db/update/log_builder_interface.h"
+#include "mongo/db/update/runtime_update_path.h"
+#include "mongo/db/update/update_executor.h"
+#include "mongo/db/update/update_node_visitor.h"
 #include "mongo/db/update_index_data.h"
 #include "mongo/util/assert_util.h"
 
@@ -43,6 +51,9 @@ namespace mongo {
 
 class CollatorInterface;
 class FieldRef;
+
+using ApplyParams = UpdateExecutor::ApplyParams;
+using ApplyResult = UpdateExecutor::ApplyResult;
 
 /**
  * Update modifier expressions are stored as a prefix tree of UpdateNodes, where two modifiers that
@@ -64,34 +75,7 @@ public:
     enum class Context { kAll, kInsertOnly };
     enum class Type { Object, Array, Leaf, Replacement };
 
-    explicit UpdateNode(Type type, Context context = Context::kAll)
-        : context(context), type(type) {}
-    virtual ~UpdateNode() = default;
-
-    virtual std::unique_ptr<UpdateNode> clone() const = 0;
-
-    /**
-     * Set the collation on the node and all descendants. This is a noop if no leaf nodes require a
-     * collator. If setCollator() is called, it is required that the current collator of all leaf
-     * nodes is the simple collator (nullptr). The collator must outlive the modifier interface.
-     * This is used to override the collation after obtaining a collection lock if the update did
-     * not specify a collation and the collection has a non-simple default collation.
-     */
-    virtual void setCollator(const CollatorInterface* collator) = 0;
-
-    /**
-     * The parameters required by UpdateNode::apply.
-     */
-    struct ApplyParams {
-        ApplyParams(mutablebson::Element element, const FieldRefSet& immutablePaths)
-            : element(element), immutablePaths(immutablePaths) {}
-
-        // The element to update.
-        mutablebson::Element element;
-
-        // UpdateNode::apply uasserts if it modifies an immutable path.
-        const FieldRefSet& immutablePaths;
-
+    struct UpdateNodeApplyParams {
         // The path taken through the UpdateNode tree beyond where the path existed in the document.
         // For example, if the update is {$set: {'a.b.c': 5}}, and the document is {a: {}}, then at
         // the leaf node, 'pathToCreate'="b.c".
@@ -100,53 +84,21 @@ public:
         // The path through the root document to 'element', ending with the field name of 'element'.
         // For example, if the update is {$set: {'a.b.c': 5}}, and the document is {a: {}}, then at
         // the leaf node, 'pathTaken'="a".
-        std::shared_ptr<FieldRef> pathTaken = std::make_shared<FieldRef>();
+        std::shared_ptr<RuntimeUpdatePath> pathTaken = std::make_shared<RuntimeUpdatePath>();
 
-        // If there was a positional ($) element in the update expression, 'matchedField' is the
-        // index of the array element that caused the query to match the document.
-        StringData matchedField;
-
-        // True if the update is being applied to a document to be inserted. $setOnInsert behaves as
-        // a no-op when this flag is false.
-        bool insert = false;
-
-        // This is provided because some modifiers may ignore certain errors when the update is from
-        // replication.
-        bool fromOplogApplication = false;
-
-        // If true, UpdateNode::apply ensures that modified elements do not violate depth or DBRef
-        // constraints.
-        bool validateForStorage = true;
-
-        // Used to determine whether indexes are affected.
-        const UpdateIndexData* indexData = nullptr;
-
-        // If provided, UpdateNode::apply will log the update here.
-        LogBuilder* logBuilder = nullptr;
+        // Builder object used for constructing an oplog entry. A value of nullptr indicates that
+        // no oplog entry needs to be constructed.
+        LogBuilderInterface* logBuilder = nullptr;
     };
 
-    /**
-     * The outputs of apply().
-     */
-    struct ApplyResult {
-        static ApplyResult noopResult() {
-            ApplyResult applyResult;
-            applyResult.indexesAffected = false;
-            applyResult.noop = true;
-            return applyResult;
-        }
+    explicit UpdateNode(Type type, Context context = Context::kAll)
+        : context(context), type(type) {}
+    virtual ~UpdateNode() = default;
 
-        bool indexesAffected = true;
-        bool noop = false;
-    };
+    virtual std::unique_ptr<UpdateNode> clone() const = 0;
 
-    /**
-     * Applies the update node to 'applyParams.element', creating the fields in
-     * 'applyParams.pathToCreate' if required by the leaves (i.e. the leaves are not all $unset).
-     * Returns an ApplyResult specifying whether the operation was a no-op and whether indexes are
-     * affected.
-     */
-    virtual ApplyResult apply(ApplyParams applyParams) const = 0;
+    virtual ApplyResult apply(ApplyParams applyParams,
+                              UpdateNodeApplyParams updateNodeApplyParams) const = 0;
 
     /**
      * Creates a new node by merging the contents of two input nodes. The semantics of the merge
@@ -159,6 +111,36 @@ public:
                                                                  const UpdateNode& rightNode,
                                                                  FieldRef* pathTaken);
 
+    /**
+     * Produces a map of serialization components for an update. The map is indexed according to
+     * operator name. The value of each map entry is a vector of operator components. These two
+     * components are an operator field, which is a string representing a path, and an operator
+     * value, which is a BSONObj of the arguments to the operation. 'currentPath' keeps running
+     * track of the full path to the current node. Note that, although produceSerializationMap()
+     * mutates its 'currentPath' FieldRef for use in recursive calls, it always restores the
+     * original value before the function returns so the caller will witness no change.
+     */
+    virtual void produceSerializationMap(
+        FieldRef* currentPath,
+        std::map<std::string, std::vector<std::pair<std::string, BSONObj>>>*
+            operatorOrientedUpdates) const = 0;
+
+    /**
+     * Set the collation. This is a noop if the UpdateExecutor subclass does not require a collator.
+     * If setCollator() is called, it is required that the current collator is the simple collator
+     * (nullptr). The collator must outlive the modifier interface. This is used to override the
+     * collation after obtaining a collection lock if the update did not specify a collation and the
+     * collection has a non-simple default collation.
+     */
+    virtual void setCollator(const CollatorInterface* collator) = 0;
+
+    /**
+     * This allows an arbitrary class to implement logic which gets dispatched to at runtime
+     * depending on the type of the UpdateExecutor.
+     */
+    virtual void acceptVisitor(UpdateNodeVisitor* visitor) = 0;
+
+public:
     const Context context;
     const Type type;
 };

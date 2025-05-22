@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Public Domain 2014-2018 MongoDB, Inc.
+# Public Domain 2014-present MongoDB, Inc.
 # Public Domain 2008-2014 WiredTiger, Inc.
 #
 # This is free and unencumbered software released into the public domain.
@@ -59,7 +59,7 @@ class test_config03(test_base03.test_base03):
     # a way to redirect verbose output to a file in Python.
     #
     #verbose_scenarios = wtscenario.quick_scenarios('s_verbose',
-    #    ['block', 'evict,evictserver', 'fileops,hazard,mutex',
+    #    ['block', 'eviction', 'fileops,hazard,mutex',
     #     'read,readserver,reconcile,salvage','verify,write',''], None)
     verbose_scenarios = wtscenario.quick_scenarios('s_verbose', [None], None)
 
@@ -123,8 +123,5 @@ class test_config03(test_base03.test_base03):
 
         self.verbose(3, 'wiredtiger_open with args: ' + args)
         conn = self.wiredtiger_open(dir, args)
-        self.pr(`conn`)
+        self.pr(repr(conn))
         return conn
-
-if __name__ == '__main__':
-    wttest.run()

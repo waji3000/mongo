@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,8 +27,15 @@
  *    it in the license file.
  */
 
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/database_name.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/operation_id.h"
+#include "mongo/db/service_context.h"
 
 namespace mongo {
 
@@ -41,7 +47,7 @@ class KillOpCmdBase : public BasicCommand {
 public:
     KillOpCmdBase() : BasicCommand("killOp") {}
 
-    virtual ~KillOpCmdBase() = default;
+    ~KillOpCmdBase() override = default;
 
     bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
@@ -55,31 +61,15 @@ public:
         return true;
     }
 
-    Status checkAuthForCommand(Client* client,
-                               const std::string& dbname,
-                               const BSONObj& cmdObj) const final;
+    Status checkAuthForOperation(OperationContext* opCtx,
+                                 const DatabaseName& dbName,
+                                 const BSONObj& cmdObj) const final;
 
 protected:
     /**
-     * Given an operation ID, search for an OperationContext with that ID. Returns either
-     * boost::none if no operation with the given ID exists, or the OperationContext along with the
-     * (acquired) lock for the associated Client.
-     */
-    static boost::optional<std::tuple<stdx::unique_lock<Client>, OperationContext*>>
-    findOperationContext(ServiceContext* serviceContext, unsigned int opId);
-
-    /**
-     * Find the given operation, and check if we're authorized to kill it. If the operation is
-     * found, and we're allowed to kill it, this returns the OperationContext as well as the
-     * acquired lock for the associated Client. Otherwise boost::none is returned.
-     */
-    static boost::optional<std::tuple<stdx::unique_lock<Client>, OperationContext*>>
-    findOpForKilling(Client* client, unsigned int opId);
-
-    /**
      * Kill an operation running on this instance of mongod or mongos.
      */
-    static void killLocalOperation(OperationContext* opCtx, unsigned int opToKill);
+    static void killLocalOperation(OperationContext* opCtx, OperationId opToKill);
 
     /**
      * Extract the "op" field from 'cmdObj' and convert the value to unsigned int. Since BSON only
@@ -88,6 +78,10 @@ protected:
      * taken care of here.
      */
     static unsigned int parseOpId(const BSONObj& cmdObj);
+
+    static void reportSuccessfulCompletion(OperationContext* opCtx,
+                                           const DatabaseName& dbName,
+                                           const BSONObj& cmdObj);
 
     /**
      * Return whether the operation being killed is "local" or not. All operations on a mongod are

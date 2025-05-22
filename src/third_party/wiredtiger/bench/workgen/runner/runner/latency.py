@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Public Domain 2014-2018 MongoDB, Inc.
+# Public Domain 2014-present MongoDB, Inc.
 # Public Domain 2008-2014 WiredTiger, Inc.
 #
 # This is free and unencumbered software released into the public domain.
@@ -114,9 +114,12 @@ def workload_latency(workload, outfilename = None):
         fh = open(outfilename, 'w')
     else:
         fh = sys.stdout
+
     _latency_optype(fh, 'insert', 'I', workload.stats.insert)
+    _latency_optype(fh, 'checkpoint', 'C', workload.stats.checkpoint)
     _latency_optype(fh, 'read', 'R', workload.stats.read)
     _latency_optype(fh, 'remove', 'X', workload.stats.remove)
     _latency_optype(fh, 'update', 'U', workload.stats.update)
     _latency_optype(fh, 'truncate', 'T', workload.stats.truncate)
+    _latency_optype(fh, 'rts', 'S', workload.stats.rts)
     _latency_optype(fh, 'not found', 'N', workload.stats.not_found)

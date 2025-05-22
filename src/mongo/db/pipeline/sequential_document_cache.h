@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -31,12 +30,13 @@
 #pragma once
 
 #include <boost/optional/optional.hpp>
-#include <stddef.h>
+#include <cstddef>
+#include <utility>
 #include <vector>
 
-#include "mongo/db/pipeline/document.h"
-
 #include "mongo/base/status.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/pipeline/variables.h"
 
 namespace mongo {
 
@@ -45,7 +45,8 @@ namespace mongo {
  * three states: building, serving, or abandoned. See SequentialDocumentCache::CacheStatus.
  */
 class SequentialDocumentCache {
-    MONGO_DISALLOW_COPYING(SequentialDocumentCache);
+    SequentialDocumentCache(const SequentialDocumentCache&) = delete;
+    SequentialDocumentCache& operator=(const SequentialDocumentCache&) = delete;
 
 public:
     explicit SequentialDocumentCache(size_t maxCacheSizeBytes) : _maxSizeBytes(maxCacheSizeBytes) {}
@@ -142,6 +143,24 @@ public:
         return _status == CacheStatus::kAbandoned;
     }
 
+
+    /**
+     * Maps 'var' to 'val' and overwrites any previously existing value for the variable.
+     */
+    void setCachedVariableValue(Variables::Id var, Value val) {
+        _cachedVariables.insert_or_assign(var, val);
+    }
+
+    /**
+     * Returns value of variable or Missing value if not found.
+     */
+    Value getCachedVariableValue(Variables::Id var) {
+        if (auto val = _cachedVariables.find(var); val != _cachedVariables.end()) {
+            return val->second;
+        }
+        return Value();
+    }
+
 private:
     CacheStatus checkCacheSize(const Document& doc);
 
@@ -151,6 +170,8 @@ private:
 
     std::vector<Document>::iterator _cacheIter;
     std::vector<Document> _cache;
+
+    absl::flat_hash_map<Variables::Id, Value> _cachedVariables;
 };
 
 }  // namespace mongo

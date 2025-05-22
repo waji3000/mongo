@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,65 +27,72 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <memory>
+#include <set>
+#include <string>
 
-#include "mongo/base/init.h"
-#include "mongo/db/auth/authorization_session.h"
-#include "mongo/db/client.h"
+#include <absl/container/node_hash_set.h>
+
 #include "mongo/db/commands.h"
-#include "mongo/db/jsobj.h"
-#include "mongo/db/logical_session_cache.h"
-#include "mongo/db/logical_session_id_helpers.h"
+#include "mongo/db/commands/sessions_commands_gen.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/refresh_sessions_gen.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/session/logical_session_cache.h"
+#include "mongo/db/session/logical_session_id.h"
+#include "mongo/db/session/logical_session_id_helpers.h"
+#include "mongo/rpc/op_msg.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
+namespace {
 
-class RefreshSessionsCommand final : public BasicCommand {
-    MONGO_DISALLOW_COPYING(RefreshSessionsCommand);
-
+class RefreshSessionsCommand final : public RefreshSessionsCmdVersion1Gen<RefreshSessionsCommand> {
 public:
-    RefreshSessionsCommand() : BasicCommand("refreshSessions") {}
+    RefreshSessionsCommand() = default;
 
-    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const final {
         return AllowedOnSecondary::kAlways;
     }
-    bool adminOnly() const override {
+
+    bool adminOnly() const final {
         return false;
     }
-    bool supportsWriteConcern(const BSONObj& cmd) const override {
-        return false;
-    }
-    std::string help() const override {
+
+    std::string help() const final {
         return "renew a set of logical sessions";
     }
-    Status checkAuthForOperation(OperationContext* opCtx,
-                                 const std::string& dbname,
-                                 const BSONObj& cmdObj) const override {
-        // It is always ok to run this command, as long as you are authenticated
-        // as some user, if auth is enabled.
-        AuthorizationSession* authSession = AuthorizationSession::get(opCtx->getClient());
-        try {
-            auto user = authSession->getSingleUser();
-            invariant(user);
-            return Status::OK();
-        } catch (...) {
-            return exceptionToStatus();
+
+    class Invocation final : public InvocationBaseGen {
+    public:
+        using InvocationBaseGen::InvocationBaseGen;
+
+        bool supportsWriteConcern() const final {
+            return false;
         }
-    }
 
-    virtual bool run(OperationContext* opCtx,
-                     const std::string& db,
-                     const BSONObj& cmdObj,
-                     BSONObjBuilder& result) override {
-        IDLParserErrorContext ctx("RefreshSessionsCmdFromClient");
-        auto cmd = RefreshSessionsCmdFromClient::parse(ctx, cmdObj);
-        auto res =
-            LogicalSessionCache::get(opCtx->getServiceContext())->refreshSessions(opCtx, cmd);
-        uassertStatusOK(res);
+        NamespaceString ns() const final {
+            return NamespaceString(request().getDbName());
+        }
 
-        return true;
-    }
-} refreshSessionsCommand;
+        void doCheckAuthorization(OperationContext* opCtx) const final {
+            // It is always ok to run this command, as long as you are authenticated
+            // as some user, if auth is enabled.
+            // requiresAuth() => true covers this for us.
+        }
 
+        Reply typedRun(OperationContext* opCtx) final {
+            const auto lsCache = LogicalSessionCache::get(opCtx);
+
+            for (const auto& lsid : makeLogicalSessionIds(request().getCommandParameter(), opCtx)) {
+                uassertStatusOK(lsCache->vivify(opCtx, lsid));
+            }
+
+            return Reply();
+        }
+    };
+};
+MONGO_REGISTER_COMMAND(RefreshSessionsCommand).forRouter().forShard();
+
+}  // namespace
 }  // namespace mongo

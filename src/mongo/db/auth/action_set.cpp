@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,20 +27,15 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kAccessControl
-
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/auth/action_set.h"
-
 #include <bitset>
+#include <cstddef>
 #include <string>
 
+#include "mongo/base/error_codes.h"
 #include "mongo/base/status.h"
-#include "mongo/bson/util/builder.h"
-#include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
-#include "mongo/util/stringutils.h"
+#include "mongo/base/status_with.h"
+#include "mongo/db/auth/action_set.h"
+#include "mongo/db/auth/action_type_gen.h"
 
 namespace mongo {
 
@@ -51,12 +45,12 @@ ActionSet::ActionSet(std::initializer_list<ActionType> actions) {
     }
 }
 
-void ActionSet::addAction(const ActionType& action) {
+void ActionSet::addAction(ActionType action) {
     if (action == ActionType::anyAction) {
         addAllActions();
         return;
     }
-    _actions.set(action.getIdentifier(), true);
+    _actions.set(static_cast<size_t>(action), true);
 }
 
 void ActionSet::addAllActionsFromSet(const ActionSet& actions) {
@@ -68,99 +62,90 @@ void ActionSet::addAllActionsFromSet(const ActionSet& actions) {
 }
 
 void ActionSet::addAllActions() {
-    _actions = ~std::bitset<ActionType::NUM_ACTION_TYPES>();
+    _actions.set();
 }
 
-void ActionSet::removeAction(const ActionType& action) {
-    _actions.set(action.getIdentifier(), false);
-    _actions.set(ActionType::anyAction.getIdentifier(), false);
+void ActionSet::removeAction(ActionType action) {
+    _actions.set(static_cast<size_t>(action), false);
+    _actions.set(static_cast<size_t>(ActionType::anyAction), false);
 }
 
 void ActionSet::removeAllActionsFromSet(const ActionSet& other) {
     _actions &= ~other._actions;
     if (!other.empty()) {
-        _actions.set(ActionType::anyAction.getIdentifier(), false);
+        _actions.set(static_cast<size_t>(ActionType::anyAction), false);
     }
 }
 
 void ActionSet::removeAllActions() {
-    _actions = std::bitset<ActionType::NUM_ACTION_TYPES>();
+    _actions.reset();
 }
 
-bool ActionSet::contains(const ActionType& action) const {
-    return _actions[action.getIdentifier()];
+bool ActionSet::contains(ActionType action) const {
+    return _actions[static_cast<size_t>(action)];
+}
+
+bool ActionSet::contains(const ActionSet& other) const {
+    return (_actions | other._actions) == _actions;
 }
 
 bool ActionSet::isSupersetOf(const ActionSet& other) const {
     return (_actions & other._actions) == other._actions;
 }
 
-Status ActionSet::parseActionSetFromString(const std::string& actionsString, ActionSet* result) {
-    std::vector<std::string> actionsList;
-    splitStringDelim(actionsString, &actionsList, ',');
-    std::vector<std::string> unrecognizedActions;
-    Status status = parseActionSetFromStringVector(actionsList, result, &unrecognizedActions);
-    invariant(status);
-    if (unrecognizedActions.empty()) {
-        return Status::OK();
-    }
-    std::string unrecognizedActionsString;
-    joinStringDelim(unrecognizedActions, &unrecognizedActionsString, ',');
-    return Status(ErrorCodes::FailedToParse,
-                  str::stream() << "Unrecognized action privilege strings: "
-                                << unrecognizedActionsString);
-}
+ActionSet ActionSet::parseFromStringVector(const std::vector<StringData>& actions,
+                                           std::vector<std::string>* unrecognizedActions) {
+    ActionSet ret;
 
-Status ActionSet::parseActionSetFromStringVector(const std::vector<std::string>& actionsVector,
-                                                 ActionSet* result,
-                                                 std::vector<std::string>* unrecognizedActions) {
-    result->removeAllActions();
-    for (size_t i = 0; i < actionsVector.size(); i++) {
-        ActionType action;
-        Status status = ActionType::parseActionFromString(actionsVector[i], &action);
-        if (status == ErrorCodes::FailedToParse) {
-            unrecognizedActions->push_back(actionsVector[i]);
-        } else {
-            invariant(status);
-            if (action == ActionType::anyAction) {
-                result->addAllActions();
-                return Status::OK();
+    for (auto action : actions) {
+        auto swActionType = parseActionFromString(action);
+        if (!swActionType.isOK()) {
+            if ((swActionType.getStatus() == ErrorCodes::FailedToParse) && unrecognizedActions) {
+                unrecognizedActions->push_back(action.toString());
             }
-            result->addAction(action);
+            continue;
         }
+
+        if (swActionType.getValue() == ActionType::anyAction) {
+            ret.addAllActions();
+            return ret;
+        }
+
+        ret.addAction(swActionType.getValue());
     }
-    return Status::OK();
+
+    return ret;
 }
 
 std::string ActionSet::toString() const {
     if (contains(ActionType::anyAction)) {
-        return ActionType::anyAction.toString();
+        using mongo::toString;
+        return toString(ActionType::anyAction);
     }
-    StringBuilder str;
-    bool addedOne = false;
-    for (int i = 0; i < ActionType::actionTypeEndValue; i++) {
-        ActionType action(i);
+    std::string str;
+    StringData sep;
+    for (size_t i = 0; i < kNumActionTypes; ++i) {
+        auto action = static_cast<ActionType>(i);
         if (contains(action)) {
-            if (addedOne) {
-                str << ",";
-            }
-            str << ActionType::actionToString(action);
-            addedOne = true;
+            StringData name = toStringData(action);
+            str.append(sep.data(), sep.size());
+            str.append(name.data(), name.size());
+            sep = ","_sd;
         }
     }
-    return str.str();
+    return str;
 }
 
-std::vector<std::string> ActionSet::getActionsAsStrings() const {
-    std::vector<std::string> result;
+std::vector<StringData> ActionSet::getActionsAsStringDatas() const {
     if (contains(ActionType::anyAction)) {
-        result.push_back(ActionType::anyAction.toString());
-        return result;
+        return {ActionType_serializer(ActionType::anyAction)};
     }
-    for (int i = 0; i < ActionType::actionTypeEndValue; i++) {
-        ActionType action(i);
+
+    std::vector<StringData> result;
+    for (size_t i = 0; i < kNumActionTypes; ++i) {
+        auto action = static_cast<ActionType>(i);
         if (contains(action)) {
-            result.push_back(ActionType::actionToString(action));
+            result.push_back(toStringData(action));
         }
     }
     return result;

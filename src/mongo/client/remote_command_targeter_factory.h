@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,21 +29,17 @@
 
 #pragma once
 
-#include <memory>
-
-#include "mongo/base/disallow_copying.h"
+#include "mongo/client/remote_command_targeter.h"
 
 namespace mongo {
-
-class ConnectionString;
-class RemoteCommandTargeter;
 
 /**
  * Constructs RemoteCommandTargeters based on the specific type of the target (standalone,
  * replica set, etc).
  */
 class RemoteCommandTargeterFactory {
-    MONGO_DISALLOW_COPYING(RemoteCommandTargeterFactory);
+    RemoteCommandTargeterFactory(const RemoteCommandTargeterFactory&) = delete;
+    RemoteCommandTargeterFactory& operator=(const RemoteCommandTargeterFactory&) = delete;
 
 public:
     virtual ~RemoteCommandTargeterFactory() = default;

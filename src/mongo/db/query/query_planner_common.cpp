@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,17 +27,62 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
 
-#include "mongo/platform/basic.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional.hpp>
 
+#include <boost/optional/optional.hpp>
+
+#include "mongo/db/catalog/clustered_collection_options_gen.h"
+#include "mongo/db/catalog/clustered_collection_util.h"
+#include "mongo/db/query/collation/collator_interface.h"
+#include "mongo/db/query/index_bounds.h"
+#include "mongo/db/query/index_entry.h"
 #include "mongo/db/query/query_planner_common.h"
+#include "mongo/db/query/query_solution.h"
+#include "mongo/db/query/stage_types.h"
+#include "mongo/logv2/redaction.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/log.h"
+#include "mongo/util/str.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
+
 
 namespace mongo {
 
-void QueryPlannerCommon::reverseScans(QuerySolutionNode* node) {
+bool QueryPlannerCommon::scanDirectionsEqual(QuerySolutionNode* node, int direction) {
+    StageType type = node->getType();
+
+    boost::optional<int> scanDir;
+    if (STAGE_IXSCAN == type) {
+        IndexScanNode* isn = static_cast<IndexScanNode*>(node);
+        scanDir = isn->direction;
+    } else if (STAGE_DISTINCT_SCAN == type) {
+        DistinctNode* dn = static_cast<DistinctNode*>(node);
+        scanDir = dn->direction;
+    } else if (STAGE_COLLSCAN == type) {
+        CollectionScanNode* collScan = static_cast<CollectionScanNode*>(node);
+        scanDir = collScan->direction;
+    } else {
+        // We shouldn't encounter a sort stage.
+        invariant(!isSortStageType(type));
+    }
+
+    // If we found something with a direction, and the direction doesn't match, we return false.
+    if (scanDir && scanDir != direction) {
+        return false;
+    }
+
+    for (size_t i = 0; i < node->children.size(); ++i) {
+        if (!scanDirectionsEqual(node->children[i].get(), direction)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void QueryPlannerCommon::reverseScans(QuerySolutionNode* node, bool reverseCollScans) {
     StageType type = node->getType();
 
     if (STAGE_IXSCAN == type) {
@@ -48,7 +92,8 @@ void QueryPlannerCommon::reverseScans(QuerySolutionNode* node) {
         isn->bounds = isn->bounds.reverse();
 
         invariant(isn->bounds.isValidFor(isn->index.keyPattern, isn->direction),
-                  str::stream() << "Invalid bounds: " << redact(isn->bounds.toString()));
+                  str::stream() << "Invalid bounds: "
+                                << redact(isn->bounds.toString(isn->index.collator != nullptr)));
 
         // TODO: we can just negate every value in the already computed properties.
         isn->computeProperties();
@@ -59,21 +104,43 @@ void QueryPlannerCommon::reverseScans(QuerySolutionNode* node) {
         dn->bounds = dn->bounds.reverse();
 
         invariant(dn->bounds.isValidFor(dn->index.keyPattern, dn->direction),
-                  str::stream() << "Invalid bounds: " << redact(dn->bounds.toString()));
+                  str::stream() << "Invalid bounds: "
+                                << redact(dn->bounds.toString(dn->index.collator != nullptr)));
 
         dn->computeProperties();
     } else if (STAGE_SORT_MERGE == type) {
         // reverse direction of comparison for merge
         MergeSortNode* msn = static_cast<MergeSortNode*>(node);
         msn->sort = reverseSortObj(msn->sort);
+    } else if (reverseCollScans && STAGE_COLLSCAN == type) {
+        CollectionScanNode* collScan = static_cast<CollectionScanNode*>(node);
+        collScan->direction *= -1;
     } else {
-        invariant(STAGE_SORT != type);
-        // This shouldn't be here...
+        // Reversing scans is done in order to determine whether or not we need to add an explicit
+        // SORT stage. There shouldn't already be one present in the plan.
+        invariant(!isSortStageType(type));
     }
 
     for (size_t i = 0; i < node->children.size(); ++i) {
-        reverseScans(node->children[i]);
+        reverseScans(node->children[i].get(), reverseCollScans);
     }
+}
+
+boost::optional<int> QueryPlannerCommon::determineClusteredScanDirection(
+    const CanonicalQuery& query, const QueryPlannerParams& params) {
+    if (params.clusteredInfo && query.getSortPattern() &&
+        CollatorInterface::collatorsMatch(params.clusteredCollectionCollator,
+                                          query.getCollator())) {
+        BSONObj kp = clustered_util::getSortPattern(params.clusteredInfo->getIndexSpec());
+        if (QueryPlannerCommon::providesSort(query, kp)) {
+            return 1;
+        } else if (QueryPlannerCommon::providesSort(query,
+                                                    QueryPlannerCommon::reverseSortObj(kp))) {
+            return -1;
+        }
+    }
+
+    return boost::none;
 }
 
 }  // namespace mongo

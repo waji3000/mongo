@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,18 +27,54 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/field_ref.h"
-
+#include <boost/container/small_vector.hpp>
+#include <boost/container/vector.hpp>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+// IWYU pragma: no_include "ext/alloc_traits.h"
 #include <algorithm>
-#include <cctype>
+#include <type_traits>
 
+#include "mongo/bson/util/builder.h"
+#include "mongo/db/field_ref.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/ctype.h"
 
 namespace mongo {
 
-const size_t FieldRef::kReserveAhead;
+namespace {
+enum class NumericPathComponentResult {
+    kNumericOrDollar,
+    kConsecutiveNumbers,
+    kNonNumericOrDollar
+};
+
+NumericPathComponentResult checkNumericOrDollarPathComponent(const FieldRef& path,
+                                                             size_t pathIdx,
+                                                             StringData pathComponent) {
+    if (pathComponent == "$"_sd) {
+        return NumericPathComponentResult::kNumericOrDollar;
+    }
+
+    if (FieldRef::isNumericPathComponentLenient(pathComponent)) {
+        // Peek ahead to see if the next component is also all digits. This implies that the
+        // update is attempting to create a numeric field name which would violate the
+        // "ambiguous field name in array" constraint for multi-key indexes. Break early in this
+        // case and conservatively return that this path affects the prefix of the consecutive
+        // numerical path components. For instance, an input such as 'a.0.1.b.c' would return
+        // the canonical index path of 'a'.
+        if ((pathIdx + 1) < path.numParts() &&
+            FieldRef::isNumericPathComponentLenient(path.getPart(pathIdx + 1))) {
+            return NumericPathComponentResult::kConsecutiveNumbers;
+        }
+        return NumericPathComponentResult::kNumericOrDollar;
+    }
+
+    return NumericPathComponentResult::kNonNumericOrDollar;
+}
+
+}  // namespace
 
 FieldRef::FieldRef(StringData path) {
     parse(path);
@@ -55,12 +90,15 @@ void FieldRef::parse(StringData path) {
     // We guarantee that accesses through getPart() will be valid while 'this' is. So we
     // keep a copy in a local sting.
 
-    _dotted = path.toString();
+    _dotted = ValidatedPathString{path.toString()};
+    tassert(1589700,
+            "the size of the path is larger than accepted",
+            _dotted.get().size() <= BSONObjMaxInternalSize);
 
     // Separate the field parts using '.' as a delimiter.
-    std::string::iterator beg = _dotted.begin();
-    std::string::iterator cur = beg;
-    const std::string::iterator end = _dotted.end();
+    std::string::const_iterator beg = _dotted.get().begin();
+    std::string::const_iterator cur = beg;
+    const std::string::const_iterator end = _dotted.get().end();
     while (true) {
         if (cur != end && *cur != '.') {
             cur++;
@@ -77,7 +115,7 @@ void FieldRef::parse(StringData path) {
         // instead reach the break statement.
 
         if (cur != beg) {
-            size_t offset = beg - _dotted.begin();
+            size_t offset = beg - _dotted.get().begin();
             size_t len = cur - beg;
             appendParsedPart(StringView{offset, len});
         } else {
@@ -93,38 +131,28 @@ void FieldRef::parse(StringData path) {
     }
 }
 
-void FieldRef::setPart(size_t i, StringData part) {
-    dassert(i < _size);
+void FieldRef::setPart(FieldIndex i, StringData part) {
+    dassert(i < _parts.size());
 
     if (_replacements.empty()) {
-        _replacements.resize(_size);
+        _replacements.resize(_parts.size());
     }
 
-    _replacements[i] = part.toString();
-    if (i < kReserveAhead) {
-        _fixed[i] = boost::none;
-    } else {
-        _variable[getIndex(i)] = boost::none;
-    }
+    _replacements[i] = ValidatedPathString{part.toString()};
+    _parts[i] = boost::none;
 }
 
 void FieldRef::appendPart(StringData part) {
     if (_replacements.empty()) {
-        _replacements.resize(_size);
+        _replacements.resize(_parts.size());
     }
 
-    _replacements.push_back(part.toString());
-
-    if (_size < kReserveAhead) {
-        _fixed[_size] = boost::none;
-    } else {
-        _variable.push_back(boost::none);
-    }
-    _size++;
+    _replacements.push_back(ValidatedPathString{part.toString()});
+    _parts.push_back(boost::none);
 }
 
 void FieldRef::removeLastPart() {
-    if (_size == 0) {
+    if (_parts.size() == 0) {
         return;
     }
 
@@ -132,64 +160,64 @@ void FieldRef::removeLastPart() {
         _replacements.pop_back();
     }
 
-    if (_size > kReserveAhead) {
-        dassert(_variable.size() == _size - kReserveAhead);
-        _variable.pop_back();
-    }
+    _parts.pop_back();
+}
 
-    _size--;
+void FieldRef::removeFirstPart() {
+    if (_parts.size() == 0) {
+        return;
+    }
+    for (size_t i = 0; i + 1 < _parts.size(); ++i) {
+        setPart(i, getPart(i + 1));
+    }
+    removeLastPart();
 }
 
 size_t FieldRef::appendParsedPart(FieldRef::StringView part) {
-    if (_size < kReserveAhead) {
-        _fixed[_size] = part;
-    } else {
-        _variable.push_back(part);
-    }
-    _size++;
+    _parts.push_back(part);
     _cachedSize++;
-    return _size;
+    return _parts.size();
 }
 
 void FieldRef::reserialize() const {
+    auto parts = _parts.size();
     std::string nextDotted;
     // Reserve some space in the string. We know we will have, at minimum, a character for
     // each component we are writing, and a dot for each component, less one. We don't want
     // to reserve more, since we don't want to forfeit the SSO if it is applicable.
-    nextDotted.reserve((_size > 0) ? (_size * 2) - 1 : 0);
+    nextDotted.reserve((parts > 0) ? (parts * 2) - 1 : 0);
 
     // Concatenate the fields to a new string
-    for (size_t i = 0; i != _size; ++i) {
+    for (size_t i = 0; i != _parts.size(); ++i) {
         if (i > 0)
             nextDotted.append(1, '.');
         const StringData part = getPart(i);
-        nextDotted.append(part.rawData(), part.size());
+        nextDotted.append(part.data(), part.size());
     }
 
     // Make the new string our contents
-    _dotted.swap(nextDotted);
+    _dotted = ValidatedPathString{std::move(nextDotted)};
 
     // Before we reserialize, it's possible that _cachedSize != _size because parts were added or
     // removed. This reserialization process reconciles the components in our cached string
     // (_dotted) with the modified path.
-    _cachedSize = _size;
+    _cachedSize = parts;
 
     // Fixup the parts to refer to the new string
-    std::string::const_iterator where = _dotted.begin();
-    const std::string::const_iterator end = _dotted.end();
-    for (size_t i = 0; i != _size; ++i) {
-        boost::optional<StringView>& part =
-            (i < kReserveAhead) ? _fixed[i] : _variable[getIndex(i)];
-        const size_t size = part ? part->len : _replacements[i].size();
+    std::string::const_iterator where = _dotted.get().begin();
+    const std::string::const_iterator end = _dotted.get().end();
+    for (size_t i = 0; i != parts; ++i) {
+        boost::optional<StringView>& part = _parts[i];
+        const size_t size = part ? part->len : _replacements[i].get().size();
 
         // There is one case where we expect to see the "where" iterator to be at "end" here: we
         // are at the last part of the FieldRef and that part is the empty string. In that case, we
         // need to make sure we do not dereference the "where" iterator.
-        invariant(where != end || (size == 0 && i == _size - 1));
+        invariant(where != end || (size == 0 && i == parts - 1));
         if (!size) {
             part = StringView{};
         } else {
-            std::size_t offset = where - _dotted.begin();
+            std::size_t offset = where - _dotted.get().begin();
             part = StringView{offset, size};
         }
         where += size;
@@ -204,44 +232,53 @@ void FieldRef::reserialize() const {
     _replacements.clear();
 }
 
-StringData FieldRef::getPart(size_t i) const {
-    invariant(i < _size);
-
-    const boost::optional<StringView>& part =
-        (i < kReserveAhead) ? _fixed[i] : _variable[getIndex(i)];
+StringData FieldRef::getPart(FieldIndex i) const {
+    // boost::container::small_vector already checks that the index `i` is in bounds, so we don't
+    // bother checking here. If we change '_parts' to a different container implementation
+    // that no longer performs a bounds check, we should add one here.
+    static_assert(
+        std::is_same<
+            decltype(_parts),
+            boost::container::small_vector<boost::optional<StringView>, kFewDottedFieldParts>>());
+    const boost::optional<StringView>& part = _parts[i];
     if (part) {
-        return part->toStringData(_dotted);
+        return part->toStringData(_dotted.get());
     } else {
-        return StringData(_replacements[i]);
+        return StringData(_replacements[i].get());
     }
 }
 
 bool FieldRef::isPrefixOf(const FieldRef& other) const {
     // Can't be a prefix if the size is equal to or larger.
-    if (_size >= other._size) {
+    if (_parts.size() >= other._parts.size()) {
         return false;
     }
 
     // Empty FieldRef is not a prefix of anything.
-    if (_size == 0) {
+    if (_parts.size() == 0) {
         return false;
     }
 
     size_t common = commonPrefixSize(other);
-    return common == _size && other._size > common;
+    return common == _parts.size() && other._parts.size() > common;
 }
 
 bool FieldRef::isPrefixOfOrEqualTo(const FieldRef& other) const {
     return isPrefixOf(other) || *this == other;
 }
 
-size_t FieldRef::commonPrefixSize(const FieldRef& other) const {
-    if (_size == 0 || other._size == 0) {
+bool FieldRef::fullyOverlapsWith(const FieldRef& other) const {
+    auto common = commonPrefixSize(other);
+    return common && (common == numParts() || common == other.numParts());
+}
+
+FieldIndex FieldRef::commonPrefixSize(const FieldRef& other) const {
+    if (_parts.size() == 0 || other._parts.size() == 0) {
         return 0;
     }
 
-    size_t maxPrefixSize = std::min(_size - 1, other._size - 1);
-    size_t prefixSize = 0;
+    FieldIndex maxPrefixSize = std::min(_parts.size() - 1, other._parts.size() - 1);
+    FieldIndex prefixSize = 0;
 
     while (prefixSize <= maxPrefixSize) {
         if (getPart(prefixSize) != other.getPart(prefixSize)) {
@@ -260,11 +297,81 @@ bool FieldRef::isNumericPathComponentStrict(StringData component) {
 
 bool FieldRef::isNumericPathComponentLenient(StringData component) {
     return !component.empty() &&
-        std::all_of(component.begin(), component.end(), [](auto c) { return std::isdigit(c); });
+        std::all_of(component.begin(), component.end(), [](auto c) { return ctype::isDigit(c); });
 }
 
-bool FieldRef::isNumericPathComponentStrict(size_t i) const {
+bool FieldRef::isNumericPathComponentStrict(FieldIndex i) const {
     return FieldRef::isNumericPathComponentStrict(getPart(i));
+}
+
+bool FieldRef::isNumericPathComponentLenient(FieldIndex i) const {
+    return FieldRef::isNumericPathComponentLenient(getPart(i));
+}
+
+bool FieldRef::pathOverlaps(const FieldRef& path, const FieldRef& indexedPath) {
+    size_t pathIdx = 0;
+    size_t indexedPathIdx = 0;
+
+    while (pathIdx < path.numParts() && indexedPathIdx < indexedPath.numParts()) {
+        auto pathComponent = path.getPart(pathIdx);
+
+        // The first part of the path must always be a valid field name, since it's not possible to
+        // store a top-level array or '$' field name in a document.
+        if (pathIdx > 0) {
+            NumericPathComponentResult res =
+                checkNumericOrDollarPathComponent(path, pathIdx, pathComponent);
+            if (res == NumericPathComponentResult::kNumericOrDollar) {
+                ++pathIdx;
+                continue;
+            }
+            if (res == NumericPathComponentResult::kConsecutiveNumbers) {
+                // This case implies that the update is attempting to create a numeric field name
+                // which would violate the "ambiguous field name in array" constraint for multi-key
+                // indexes. Break early in this case and conservatively return that this path
+                // affects the prefix of the consecutive numerical path components. For instance, an
+                // input path such as 'a.0.1.b.c' would match indexed path of 'a.d'.
+                return true;
+            }
+        }
+
+        StringData indexedPathComponent = indexedPath.getPart(indexedPathIdx);
+        if (pathComponent != indexedPathComponent) {
+            return false;
+        }
+
+        ++pathIdx;
+        ++indexedPathIdx;
+    }
+
+    return true;
+}
+
+FieldRef FieldRef::getCanonicalIndexField(const FieldRef& path) {
+    if (path.numParts() <= 1)
+        return path;
+
+    // The first part of the path must always be a valid field name, since it's not possible to
+    // store a top-level array or '$' field name in a document.
+    FieldRef buf(path.getPart(0));
+    for (size_t i = 1; i < path.numParts(); ++i) {
+        auto pathComponent = path.getPart(i);
+
+        NumericPathComponentResult res = checkNumericOrDollarPathComponent(path, i, pathComponent);
+        if (res == NumericPathComponentResult::kNumericOrDollar) {
+            continue;
+        }
+        if (res == NumericPathComponentResult::kConsecutiveNumbers) {
+            break;
+        }
+
+        buf.appendPart(pathComponent);
+    }
+
+    return buf;
+}
+
+bool FieldRef::isComponentPartOfCanonicalizedIndexPath(StringData pathComponent) {
+    return pathComponent != "$"_sd && !FieldRef::isNumericPathComponentLenient(pathComponent);
 }
 
 bool FieldRef::hasNumericPathComponents() const {
@@ -275,8 +382,8 @@ bool FieldRef::hasNumericPathComponents() const {
     return false;
 }
 
-std::set<size_t> FieldRef::getNumericPathComponents(size_t startPart) const {
-    std::set<size_t> numericPathComponents;
+std::set<FieldIndex> FieldRef::getNumericPathComponents(FieldIndex startPart) const {
+    std::set<FieldIndex> numericPathComponents;
     for (auto i = startPart; i < numParts(); ++i) {
         if (isNumericPathComponentStrict(i))
             numericPathComponents.insert(i);
@@ -284,30 +391,30 @@ std::set<size_t> FieldRef::getNumericPathComponents(size_t startPart) const {
     return numericPathComponents;
 }
 
-StringData FieldRef::dottedField(size_t offset) const {
+StringData FieldRef::dottedField(FieldIndex offset) const {
     return dottedSubstring(offset, numParts());
 }
 
-StringData FieldRef::dottedSubstring(size_t startPart, size_t endPart) const {
-    if (_size == 0 || startPart >= endPart || endPart > numParts())
+StringData FieldRef::dottedSubstring(FieldIndex startPart, FieldIndex endPart) const {
+    if (_parts.size() == 0 || startPart >= endPart || endPart > numParts())
         return StringData();
 
-    if (!_replacements.empty() || _size != _cachedSize)
+    if (!_replacements.empty() || _parts.size() != _cachedSize)
         reserialize();
-    dassert(_replacements.empty() && _size == _cachedSize);
+    dassert(_replacements.empty() && _parts.size() == _cachedSize);
 
-    StringData result(_dotted);
+    StringData result(_dotted.get());
 
     // Fast-path if we want the whole thing
     if (startPart == 0 && endPart == numParts())
         return result;
 
     size_t startChar = 0;
-    for (size_t i = 0; i < startPart; ++i) {
+    for (FieldIndex i = 0; i < startPart; ++i) {
         startChar += getPart(i).size() + 1;  // correct for '.'
     }
     size_t endChar = startChar;
-    for (size_t i = startPart; i < endPart; ++i) {
+    for (FieldIndex i = startPart; i < endPart; ++i) {
         endChar += getPart(i).size() + 1;
     }
     // correct for last '.'
@@ -320,13 +427,13 @@ StringData FieldRef::dottedSubstring(size_t startPart, size_t endPart) const {
 bool FieldRef::equalsDottedField(StringData other) const {
     StringData rest = other;
 
-    for (size_t i = 0; i < _size; i++) {
+    for (size_t i = 0; i < _parts.size(); i++) {
         StringData part = getPart(i);
 
-        if (!rest.startsWith(part))
+        if (!rest.starts_with(part))
             return false;
 
-        if (i == _size - 1)
+        if (i == _parts.size() - 1)
             return rest.size() == part.size();
 
         // make sure next thing is a dot
@@ -343,16 +450,16 @@ bool FieldRef::equalsDottedField(StringData other) const {
 }
 
 int FieldRef::compare(const FieldRef& other) const {
-    const size_t toCompare = std::min(_size, other._size);
-    for (size_t i = 0; i < toCompare; i++) {
+    const FieldIndex toCompare = std::min(_parts.size(), other._parts.size());
+    for (FieldIndex i = 0; i < toCompare; i++) {
         if (getPart(i) == other.getPart(i)) {
             continue;
         }
         return getPart(i) < other.getPart(i) ? -1 : 1;
     }
 
-    const size_t rest = _size - toCompare;
-    const size_t otherRest = other._size - toCompare;
+    const FieldIndex rest = _parts.size() - toCompare;
+    const FieldIndex otherRest = other._parts.size() - toCompare;
     if ((rest == 0) && (otherRest == 0)) {
         return 0;
     } else if (rest < otherRest) {
@@ -363,9 +470,8 @@ int FieldRef::compare(const FieldRef& other) const {
 }
 
 void FieldRef::clear() {
-    _size = 0;
     _cachedSize = 0;
-    _variable.clear();
+    _parts.clear();
     _dotted.clear();
     _replacements.clear();
 }

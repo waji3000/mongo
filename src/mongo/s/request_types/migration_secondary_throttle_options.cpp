@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,13 +27,23 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <boost/none.hpp>
+#include <cstdint>
+#include <utility>
+#include <variant>
 
-#include "mongo/s/request_types/migration_secondary_throttle_options.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
 
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/db/write_concern_options.h"
+#include "mongo/s/request_types/migration_secondary_throttle_options.h"
 
 namespace mongo {
 namespace {
@@ -57,7 +66,7 @@ MigrationSecondaryThrottleOptions MigrationSecondaryThrottleOptions::create(
 MigrationSecondaryThrottleOptions MigrationSecondaryThrottleOptions::createWithWriteConcern(
     const WriteConcernOptions& writeConcern) {
     // Optimize on write concern, which makes no difference
-    if (writeConcern.wNumNodes <= 1 && writeConcern.wMode.empty()) {
+    if (holds_alternative<int64_t>(writeConcern.w) && get<int64_t>(writeConcern.w) <= 1) {
         return MigrationSecondaryThrottleOptions(kOff, boost::none);
     }
 
@@ -99,20 +108,23 @@ StatusWith<MigrationSecondaryThrottleOptions> MigrationSecondaryThrottleOptions:
         }
 
         if (secondaryThrottle != kOn) {
-            return Status(ErrorCodes::UnsupportedFormat,
-                          "Cannot specify write concern when secondaryThrottle is not set");
+            // Ignore the specified writeConcern, since it won't be used.  This is necessary
+            // to normalize the otherwise non-standard way that moveChunk uses writeConcern (ie.
+            // only using it when secondaryThrottle: true), so that shardsvrs can enforce always
+            // receiving writeConcern on internalClient connections (at the ServiceEntryPoint
+            // layer).
+            return MigrationSecondaryThrottleOptions(secondaryThrottle, boost::none);
         }
 
         writeConcernBSON = writeConcernElem.Obj().getOwned();
     }
 
-    invariant(writeConcernBSON.is_initialized());
+    invariant(writeConcernBSON.has_value());
 
     // Make sure the write concern parses correctly
-    WriteConcernOptions writeConcern;
-    Status status = writeConcern.parse(*writeConcernBSON);
-    if (!status.isOK()) {
-        return status;
+    auto sw = WriteConcernOptions::parse(*writeConcernBSON);
+    if (!sw.isOK()) {
+        return sw.getStatus();
     }
 
     return MigrationSecondaryThrottleOptions(secondaryThrottle, std::move(writeConcernBSON));
@@ -139,23 +151,18 @@ MigrationSecondaryThrottleOptions::createFromBalancerConfig(const BSONObj& obj) 
     if (!status.isOK())
         return status;
 
-    WriteConcernOptions writeConcern;
-    Status writeConcernParseStatus = writeConcern.parse(elem.Obj());
-    if (!writeConcernParseStatus.isOK()) {
-        return writeConcernParseStatus;
+    auto sw = WriteConcernOptions::parse(elem.Obj());
+    if (!sw.isOK()) {
+        return sw.getStatus();
     }
-
-    return MigrationSecondaryThrottleOptions::createWithWriteConcern(writeConcern);
+    return MigrationSecondaryThrottleOptions::createWithWriteConcern(sw.getValue());
 }
 
 WriteConcernOptions MigrationSecondaryThrottleOptions::getWriteConcern() const {
     invariant(_secondaryThrottle != kOff);
     invariant(_writeConcernBSON);
 
-    WriteConcernOptions writeConcern;
-    fassert(34414, writeConcern.parse(*_writeConcernBSON));
-
-    return writeConcern;
+    return fassert(34414, WriteConcernOptions::parse(*_writeConcernBSON));
 }
 
 void MigrationSecondaryThrottleOptions::append(BSONObjBuilder* builder) const {

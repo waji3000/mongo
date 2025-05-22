@@ -1,6 +1,3 @@
-// fts_util.h
-
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -34,7 +31,7 @@
 
 #include <string>
 
-#include "mongo/db/jsobj.h"
+#include "mongo/bson/bsontypes.h"
 
 namespace mongo {
 
@@ -49,5 +46,5 @@ enum TextIndexVersion {
     TEXT_INDEX_VERSION_2 = 2,        // Index format with ASCII support and murmur hashing.
     TEXT_INDEX_VERSION_3 = 3,        // Current index format with basic Unicode support.
 };
-}
-}
+}  // namespace fts
+}  // namespace mongo

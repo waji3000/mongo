@@ -7,9 +7,10 @@
  *     dropTarget: <if true, creates target collection that will be dropped. Default: false>,
  * }
  */
-var RenameAcrossDatabasesTest = function(options) {
-    'use strict';
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {reconfig} from "jstests/replsets/rslib.js";
 
+export var RenameAcrossDatabasesTest = function(options) {
     if (!(this instanceof RenameAcrossDatabasesTest)) {
         return new RenameAcrossDatabasesTest(options);
     }
@@ -31,9 +32,6 @@ var RenameAcrossDatabasesTest = function(options) {
      */
     this.run = function() {
         const options = this.options;
-
-        load('jstests/replsets/rslib.js');
-
         let nodes = [{}, {}, {}];
         if (options.nodes) {
             assert.eq(nodes.length, options.nodes.length);
@@ -48,16 +46,28 @@ var RenameAcrossDatabasesTest = function(options) {
         replTest.startSet();
         replTest.initiate();
 
+        // This test performs a reconfig that will change the implicit default write concern
+        // from {w: "majority"} to {w: 1}. In order for this reconfig to succeed, we must first
+        // set the cluster-wide write concern.
+        assert.commandWorked(replTest.getPrimary().adminCommand({
+            setDefaultRWConcern: 1,
+            defaultWriteConcern: {w: "majority"},
+            writeConcern: {w: "majority"}
+        }));
+
         // If provided in 'options', we set the featureCompatibilityVersion. We do this prior to
         // adding any other members to the replica set.
         if (options.setFeatureCompatibilityVersion) {
-            assert.commandWorked(replTest.getPrimary().adminCommand(
-                {setFeatureCompatibilityVersion: options.setFeatureCompatibilityVersion}));
+            assert.commandWorked(replTest.getPrimary().adminCommand({
+                setFeatureCompatibilityVersion: options.setFeatureCompatibilityVersion,
+                confirm: true
+            }));
         }
 
         for (let i = 1; i < nodes.length; ++i) {
             replTest.add(nodes[i]);
         }
+        replTest.waitForAllNewlyAddedRemovals();
 
         const conns = replTest.nodes;
         const hosts = replTest.nodeList();
@@ -68,18 +78,18 @@ var RenameAcrossDatabasesTest = function(options) {
             protocolVersion: 1,
             members: [
                 {
-                  _id: 0,
-                  host: hosts[0],
+                    _id: 0,
+                    host: hosts[0],
                 },
                 {
-                  _id: 1,
-                  host: hosts[1],
-                  priority: 0,
+                    _id: 1,
+                    host: hosts[1],
+                    priority: 0,
                 },
                 {
-                  _id: 2,
-                  host: hosts[2],
-                  arbiterOnly: true,
+                    _id: 2,
+                    host: hosts[2],
+                    arbiterOnly: true,
                 },
             ],
             version: nextVersion,
@@ -105,7 +115,7 @@ var RenameAcrossDatabasesTest = function(options) {
         // options.dropTarget is true.
         const dropTarget = options.dropTarget || false;
         if (dropTarget) {
-            assert.writeOK(targetColl.insert({_id: 1000, target: 1}));
+            assert.commandWorked(targetColl.insert({_id: 1000, target: 1}));
             assert.commandWorked(targetColl.createIndex({target: 1}));
         }
 
@@ -116,7 +126,7 @@ var RenameAcrossDatabasesTest = function(options) {
         const numDocs = 10;
         _testLog('Inserting ' + numDocs + ' documents into source collection.');
         for (let i = 0; i < numDocs; ++i) {
-            assert.writeOK(sourceColl.insert({_id: i, source: 1}));
+            assert.commandWorked(sourceColl.insert({_id: i, source: 1}));
         }
         const numNonIdIndexes = 3;
         _testLog('Creating ' + numNonIdIndexes + ' indexes.');
@@ -155,10 +165,10 @@ var RenameAcrossDatabasesTest = function(options) {
         _testLog('Checking oplogs and dbhashes after renaming collection.');
         replTest.awaitReplication();
         replTest.checkOplogs(testName);
+        replTest.checkPreImageCollection(testName);
         replTest.checkReplicatedDataHashes(testName);
 
         _testLog('Test completed. Stopping replica set.');
         replTest.stopSet();
     };
-
 };

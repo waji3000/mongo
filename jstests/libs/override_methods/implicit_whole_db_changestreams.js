@@ -7,12 +7,13 @@
  * 'noPassthrough' flag, are passed through as-is.
  */
 
-load("jstests/libs/fixture_helpers.js");  // For FixtureHelpers.
+import {FixtureHelpers} from "jstests/libs/fixture_helpers.js";
+import {ChangeStreamWatchMode} from "jstests/libs/query/change_stream_util.js";
 
 // Helper function which tests can call to explicitly request that the command not be modified by
 // the passthrough code. When defined, ChangeStreamTest will adopt this as its default runCommand
 // implementation to allow individual tests to exempt themselves from modification.
-const changeStreamPassthroughAwareRunCommand = (db, cmdObj, noPassthrough) =>
+globalThis.changeStreamPassthroughAwareRunCommand = (db, cmdObj, noPassthrough) =>
     db.runCommand(cmdObj, undefined, undefined, noPassthrough);
 
 // Defines a set of functions to validate incoming $changeStream requests and transform
@@ -20,7 +21,7 @@ const changeStreamPassthroughAwareRunCommand = (db, cmdObj, noPassthrough) =>
 // runCommand override to generically upconvert $changeStream requests, and the
 // ChangeStreamPassthroughHelpers may themselves be overridden by other passthroughs in order to
 // alter the behaviour of runCommand.
-const ChangeStreamPassthroughHelpers = {
+globalThis.ChangeStreamPassthroughHelpers = {
     isValidChangeStreamRequest: function(db, cmdObj) {
         // Determine whether this command is a valid $changeStream aggregation on a single
         // collection or database.
@@ -68,7 +69,8 @@ const ChangeStreamPassthroughHelpers = {
                 $or: [
                     {"ns.db": db.getName(), "ns.coll": collName},
                     {"to.db": db.getName(), "to.coll": collName},
-                    {operationType: "invalidate"}
+                    {operationType: "endOfTransaction"},
+                    {operationType: "invalidate"},
                 ]
             }
         };
@@ -105,57 +107,62 @@ const ChangeStreamPassthroughHelpers = {
     }
 };
 
-(function() {
-    'use strict';
+const originalRunCommandImpl = DB.prototype._runCommandImpl;
+const originalRunCommand = DB.prototype.runCommand;
 
-    const originalRunCommandImpl = DB.prototype._runCommandImpl;
-    const originalRunCommand = DB.prototype.runCommand;
+const upconvertedCursors = new Set();
 
-    const upconvertedCursors = new Set();
+const passthroughRunCommandImpl = function(dbName, cmdObj, options) {
+    // Check whether this command is an upconvertable $changeStream request. If the command is an
+    // explain, we check the wrapped command object.
+    let csCmdObj = (cmdObj.explain ? cmdObj.explain : cmdObj);
+    const upconvertCursor =
+        globalThis.ChangeStreamPassthroughHelpers.isUpconvertableChangeStreamRequest(this,
+                                                                                     csCmdObj);
+    if (upconvertCursor) {
+        [dbName, csCmdObj] =
+            globalThis.ChangeStreamPassthroughHelpers.upconvertChangeStreamRequest(this, csCmdObj);
+    }
 
-    const db = null;
+    // If this is an explain, put the upconverted agg back into the explain command.
+    if (cmdObj.explain) {
+        cmdObj.explain = csCmdObj;
+    } else {
+        cmdObj = csCmdObj;
+    }
 
-    const passthroughRunCommandImpl = function(dbName, cmdObj, options) {
-        // Check whether this command is an upconvertable $changeStream request.
-        const upconvertCursor =
-            ChangeStreamPassthroughHelpers.isUpconvertableChangeStreamRequest(this, cmdObj);
-        if (upconvertCursor) {
-            [dbName, cmdObj] =
-                ChangeStreamPassthroughHelpers.upconvertChangeStreamRequest(this, cmdObj);
-        }
+    // If the command is a getMore, it may be a $changeStream that we upconverted to run
+    // whole-db. Ensure that we update the 'collection' field to be the collectionless
+    // namespace.
+    if (cmdObj && cmdObj.getMore && upconvertedCursors.has(cmdObj.getMore.toString())) {
+        [dbName, cmdObj] =
+            globalThis.ChangeStreamPassthroughHelpers.upconvertGetMoreRequest(this, cmdObj);
+    }
 
-        // If the command is a getMore, it may be a $changeStream that we upconverted to run
-        // whole-db. Ensure that we update the 'collection' field to be the collectionless
-        // namespace.
-        if (cmdObj && cmdObj.getMore && upconvertedCursors.has(cmdObj.getMore.toString())) {
-            [dbName, cmdObj] = ChangeStreamPassthroughHelpers.upconvertGetMoreRequest(this, cmdObj);
-        }
+    // Pass the modified command to the original runCommand implementation.
+    const res = originalRunCommandImpl.apply(this, [dbName, cmdObj, options]);
 
-        // Pass the modified command to the original runCommand implementation.
-        const res = originalRunCommandImpl.apply(this, [dbName, cmdObj, options]);
+    // Record the upconverted cursor ID so that we can adjust subsequent getMores.
+    if (upconvertCursor && res.cursor && res.cursor.id > 0) {
+        upconvertedCursors.add(res.cursor.id.toString());
+    }
 
-        // Record the upconverted cursor ID so that we can adjust subsequent getMores.
-        if (upconvertCursor && res.cursor && res.cursor.id > 0) {
-            upconvertedCursors.add(res.cursor.id.toString());
-        }
+    return res;
+};
 
-        return res;
-    };
+// Redirect the Collection's 'watch' function to use the whole-DB version. Although calls to the
+// shell helpers will ultimately resolve to the overridden runCommand anyway, we need to
+// override the helpers to ensure that the DB.watch function itself is exercised by the
+// passthrough wherever Collection.watch is called.
+DBCollection.prototype.watch = function(pipeline, options) {
+    pipeline = Object.assign([], pipeline);
+    pipeline.unshift(
+        globalThis.ChangeStreamPassthroughHelpers.nsMatchFilter(this.getDB(), this.getName()));
+    return this.getDB().watch(pipeline, options);
+};
 
-    // Redirect the Collection's 'watch' function to use the whole-DB version. Although calls to the
-    // shell helpers will ultimately resolve to the overridden runCommand anyway, we need to
-    // override the helpers to ensure that the DB.watch function itself is exercised by the
-    // passthrough wherever Collection.watch is called.
-    DBCollection.prototype.watch = function(pipeline, options) {
-        pipeline = Object.assign([], pipeline);
-        pipeline.unshift(
-            ChangeStreamPassthroughHelpers.nsMatchFilter(this.getDB(), this.getName()));
-        return this.getDB().watch(pipeline, options);
-    };
-
-    // Override DB.runCommand to use the custom or original _runCommandImpl.
-    DB.prototype.runCommand = function(cmdObj, extra, queryOptions, noPassthrough) {
-        this._runCommandImpl = (noPassthrough ? originalRunCommandImpl : passthroughRunCommandImpl);
-        return originalRunCommand.apply(this, [cmdObj, extra, queryOptions]);
-    };
-}());
+// Override DB.runCommand to use the custom or original _runCommandImpl.
+DB.prototype.runCommand = function(cmdObj, extra, queryOptions, noPassthrough) {
+    this._runCommandImpl = (noPassthrough ? originalRunCommandImpl : passthroughRunCommandImpl);
+    return originalRunCommand.apply(this, [cmdObj, extra, queryOptions]);
+};

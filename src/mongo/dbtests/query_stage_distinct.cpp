@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,45 +27,66 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <cstddef>
+#include <set>
+#include <string>
+#include <utility>
+#include <vector>
 
-#include "mongo/client/dbclient_cursor.h"
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/catalog/collection.h"
-#include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/client.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/exec/distinct_scan.h"
 #include "mongo/db/exec/plan_stage.h"
-#include "mongo/db/json.h"
+#include "mongo/db/exec/working_set.h"
+#include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/query/index_bounds.h"
 #include "mongo/db/query/index_bounds_builder.h"
+#include "mongo/db/query/interval.h"
 #include "mongo/db/query/plan_executor.h"
-#include "mongo/dbtests/dbtests.h"
+#include "mongo/db/service_context.h"
+#include "mongo/dbtests/dbtests.h"  // IWYU pragma: keep
+#include "mongo/unittest/unittest.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/intrusive_counter.h"
 
 /**
  * This file tests db/exec/distinct.cpp
  */
 
+namespace mongo {
 namespace QueryStageDistinct {
 
-static const NamespaceString nss{"unittests.QueryStageDistinct"};
+static const NamespaceString nss =
+    NamespaceString::createNamespaceString_forTest("unittests.QueryStageDistinct");
 
 class DistinctBase {
 public:
-    DistinctBase() : _client(&_opCtx) {}
+    DistinctBase()
+        : _expCtx(ExpressionContextBuilder{}.opCtx(&_opCtx).ns(nss).build()), _client(&_opCtx) {}
 
     virtual ~DistinctBase() {
-        _client.dropCollection(nss.ns());
+        _client.dropCollection(nss);
     }
 
     void addIndex(const BSONObj& obj) {
-        ASSERT_OK(dbtests::createIndex(&_opCtx, nss.ns(), obj));
+        ASSERT_OK(dbtests::createIndex(&_opCtx, nss.ns_forTest(), obj));
     }
 
     void insert(const BSONObj& obj) {
-        _client.insert(nss.ns(), obj);
+        _client.insert(nss, obj);
     }
 
     /**
@@ -83,7 +103,7 @@ public:
         WorkingSetID invalid = WorkingSet::INVALID_ID;
         ASSERT_NOT_EQUALS(invalid, wsid);
 
-        WorkingSetMember* member = ws.get(wsid);
+        auto member = ws.get(wsid);
 
         // Distinct hack execution is always covered.
         // Key value is retrieved from working set key data
@@ -99,6 +119,7 @@ public:
 protected:
     const ServiceContext::UniqueOperationContext _txnPtr = cc().makeOperationContext();
     OperationContext& _opCtx = *_txnPtr;
+    boost::intrusive_ptr<ExpressionContext> _expCtx;
 
 private:
     DBDirectClient _client;
@@ -108,7 +129,7 @@ private:
 // Tests distinct with single key indices.
 class QueryStageDistinctBasic : public DistinctBase {
 public:
-    virtual ~QueryStageDistinctBasic() {}
+    ~QueryStageDistinctBasic() override {}
 
     void run() {
         // Insert a ton of documents with a: 1
@@ -125,14 +146,15 @@ public:
         addIndex(BSON("a" << 1));
 
         AutoGetCollectionForReadCommand ctx(&_opCtx, nss);
-        Collection* coll = ctx.getCollection();
+        const CollectionPtr& coll = ctx.getCollection();
 
         // Set up the distinct stage.
-        std::vector<IndexDescriptor*> indexes;
-        coll->getIndexCatalog()->findIndexesByKeyPattern(&_opCtx, BSON("a" << 1), false, &indexes);
+        std::vector<const IndexDescriptor*> indexes;
+        coll->getIndexCatalog()->findIndexesByKeyPattern(
+            &_opCtx, BSON("a" << 1), IndexCatalog::InclusionPolicy::kReady, &indexes);
         ASSERT_EQ(indexes.size(), 1U);
 
-        DistinctParams params{&_opCtx, *indexes[0]};
+        DistinctParams params{&_opCtx, coll, indexes[0]};
         params.scanDirection = 1;
         // Distinct-ing over the 0-th field of the keypattern.
         params.fieldNo = 0;
@@ -143,7 +165,7 @@ public:
         params.bounds.fields.push_back(oil);
 
         WorkingSet ws;
-        DistinctScan distinct(&_opCtx, std::move(params), &ws);
+        DistinctScan distinct(_expCtx.get(), &coll, std::move(params), &ws);
 
         WorkingSetID wsid;
         // Get our first result.
@@ -174,7 +196,7 @@ public:
 // Tests distinct with multikey indices.
 class QueryStageDistinctMultiKey : public DistinctBase {
 public:
-    virtual ~QueryStageDistinctMultiKey() {}
+    ~QueryStageDistinctMultiKey() override {}
 
     void run() {
         // Insert a ton of documents with a: [1, 2, 3]
@@ -191,17 +213,17 @@ public:
         addIndex(BSON("a" << 1));
 
         AutoGetCollectionForReadCommand ctx(&_opCtx, nss);
-        Collection* coll = ctx.getCollection();
+        const CollectionPtr& coll = ctx.getCollection();
 
         // Set up the distinct stage.
-        std::vector<IndexDescriptor*> indexes;
-        coll->getIndexCatalog()->findIndexesByKeyPattern(&_opCtx, BSON("a" << 1), false, &indexes);
-        verify(indexes.size() == 1);
+        std::vector<const IndexDescriptor*> indexes;
+        coll->getIndexCatalog()->findIndexesByKeyPattern(
+            &_opCtx, BSON("a" << 1), IndexCatalog::InclusionPolicy::kReady, &indexes);
+        MONGO_verify(indexes.size() == 1);
 
-        DistinctParams params{&_opCtx, *indexes[0]};
+        DistinctParams params{&_opCtx, coll, indexes[0]};
         ASSERT_TRUE(params.isMultiKey);
 
-        verify(params.accessMethod);
         params.scanDirection = 1;
         // Distinct-ing over the 0-th field of the keypattern.
         params.fieldNo = 0;
@@ -212,7 +234,7 @@ public:
         params.bounds.fields.push_back(oil);
 
         WorkingSet ws;
-        DistinctScan distinct(&_opCtx, std::move(params), &ws);
+        DistinctScan distinct(_expCtx.get(), &coll, std::move(params), &ws);
 
         // We should see each number in the range [1, 6] exactly once.
         std::set<int> seen;
@@ -259,14 +281,14 @@ public:
         addIndex(BSON("a" << 1 << "b" << 1));
 
         AutoGetCollectionForReadCommand ctx(&_opCtx, nss);
-        Collection* coll = ctx.getCollection();
+        const CollectionPtr& coll = ctx.getCollection();
 
-        std::vector<IndexDescriptor*> indices;
+        std::vector<const IndexDescriptor*> indices;
         coll->getIndexCatalog()->findIndexesByKeyPattern(
-            &_opCtx, BSON("a" << 1 << "b" << 1), false, &indices);
+            &_opCtx, BSON("a" << 1 << "b" << 1), IndexCatalog::InclusionPolicy::kReady, &indices);
         ASSERT_EQ(1U, indices.size());
 
-        DistinctParams params{&_opCtx, *indices[0]};
+        DistinctParams params{&_opCtx, coll, indices[0]};
 
         params.scanDirection = 1;
         params.fieldNo = 1;
@@ -281,7 +303,7 @@ public:
         params.bounds.fields.push_back(bOil);
 
         WorkingSet ws;
-        DistinctScan distinct(&_opCtx, std::move(params), &ws);
+        DistinctScan distinct(_expCtx.get(), &coll, std::move(params), &ws);
 
         WorkingSetID wsid;
         PlanStage::StageState state;
@@ -289,8 +311,6 @@ public:
         std::vector<int> seen;
 
         while (PlanStage::IS_EOF != (state = distinct.work(&wsid))) {
-            ASSERT_NE(PlanStage::FAILURE, state);
-            ASSERT_NE(PlanStage::DEAD, state);
             if (PlanStage::ADVANCED == state) {
                 seen.push_back(getIntFieldDotted(ws, wsid, "b"));
             }
@@ -307,17 +327,18 @@ public:
 // XXX: add a test case with bounds where skipping to the next key gets us a result that's not
 // valid w.r.t. our query.
 
-class All : public Suite {
+class All : public unittest::OldStyleSuiteSpecification {
 public:
-    All() : Suite("query_stage_distinct") {}
+    All() : OldStyleSuiteSpecification("query_stage_distinct") {}
 
-    void setupTests() {
+    void setupTests() override {
         add<QueryStageDistinctBasic>();
         add<QueryStageDistinctMultiKey>();
         add<QueryStageDistinctCompoundIndex>();
     }
 };
 
-SuiteInstance<All> queryStageDistinctAll;
+unittest::OldStyleSuiteInitializer<All> queryStageDistinctAll;
 
 }  // namespace QueryStageDistinct
+}  // namespace mongo

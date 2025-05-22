@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,11 +27,13 @@
  *    it in the license file.
  */
 
-#include "mongo/base/data_range.h"
+#include <boost/move/utility_core.hpp>
+
 #include "mongo/base/data_range_cursor.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
-
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
@@ -46,26 +47,26 @@ TEST(BSONObjDataType, ConstDataTypeRangeBSON) {
         BSONObjBuilder b;
         b.append("a", 1);
 
-        ASSERT_OK(drc.writeAndAdvance(b.obj()));
+        ASSERT_OK(drc.writeAndAdvanceNoThrow(b.obj()));
     }
     {
         BSONObjBuilder b;
         b.append("b", "fooo");
 
-        ASSERT_OK(drc.writeAndAdvance(b.obj()));
+        ASSERT_OK(drc.writeAndAdvanceNoThrow(b.obj()));
     }
     {
         BSONObjBuilder b;
         b.append("c", 3);
 
-        ASSERT_OK(drc.writeAndAdvance(b.obj()));
+        ASSERT_OK(drc.writeAndAdvanceNoThrow(b.obj()));
     }
 
     ConstDataRangeCursor cdrc(buf, buf + sizeof(buf));
 
-    ASSERT_EQUALS(1, cdrc.readAndAdvance<BSONObj>().getValue().getField("a").numberInt());
-    ASSERT_EQUALS("fooo", cdrc.readAndAdvance<BSONObj>().getValue().getField("b").str());
-    ASSERT_EQUALS(3, cdrc.readAndAdvance<BSONObj>().getValue().getField("c").numberInt());
+    ASSERT_EQUALS(1, cdrc.readAndAdvance<BSONObj>().getField("a").numberInt());
+    ASSERT_EQUALS("fooo", cdrc.readAndAdvance<BSONObj>().getField("b").str());
+    ASSERT_EQUALS(3, cdrc.readAndAdvance<BSONObj>().getField("c").numberInt());
 }
 
 }  // namespace mongo

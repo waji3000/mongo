@@ -4,55 +4,40 @@
 // We then confirm that a writeConcern majority write will be seen as the lastVisibleOp by a
 // majority read.
 // @tags: [requires_majority_read_concern]
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
-load("jstests/replsets/rslib.js");
+var name = 'lastOpVisible';
+var replTest = new ReplSetTest({name: name, nodes: 3, waitForKeys: true});
+replTest.startSet();
+replTest.initiate();
 
-(function() {
-    "use strict";
+var primary = replTest.getPrimary();
 
-    var name = 'lastOpVisible';
-    var replTest = new ReplSetTest(
-        {name: name, nodes: 3, nodeOptions: {enableMajorityReadConcern: ''}, waitForKeys: true});
+// Do an insert without writeConcern.
+var res = primary.getDB(name).runCommand({insert: name, documents: [{x: 1}], $replData: 1});
+assert.commandWorked(res);
+var last_op_visible = res["$replData"].lastOpVisible;
 
-    if (!startSetIfSupportsReadMajority(replTest)) {
-        jsTestLog("Skipping test since storage engine doesn't support majority read concern.");
-        replTest.stopSet();
-        return;
-    }
-    replTest.initiate();
+// A find should return the same lastVisibleOp.
+res = primary.getDB(name).runCommand({find: name, readConcern: {level: "local"}, $replData: 1});
+assert.commandWorked(res);
+assert.eq(last_op_visible, res["$replData"].lastOpVisible);
 
-    var primary = replTest.getPrimary();
+// A majority readConcern with afterOpTime: lastOpVisible should also return the same
+// lastVisibleOp.
+res = primary.getDB(name).runCommand(
+    {find: name, readConcern: {level: "majority", afterOpTime: last_op_visible}, $replData: 1});
+assert.commandWorked(res);
+assert.eq(last_op_visible, res["$replData"].lastOpVisible);
 
-    // Do an insert without writeConcern.
-    var res = primary.getDB(name).runCommandWithMetadata({insert: name, documents: [{x: 1}]},
-                                                         {"$replData": 1});
-    assert.commandWorked(res.commandReply);
-    var last_op_visible = res.commandReply["$replData"].lastOpVisible;
+// Do an insert without writeConcern.
+res = primary.getDB(name).runCommand(
+    {insert: name, documents: [{x: 1}], writeConcern: {w: "majority"}, $replData: 1});
+assert.commandWorked(res);
+last_op_visible = res["$replData"].lastOpVisible;
 
-    // A find should return the same lastVisibleOp.
-    res = primary.getDB(name).runCommandWithMetadata({find: name, readConcern: {level: "local"}},
-                                                     {"$replData": 1});
-    assert.commandWorked(res.commandReply);
-    assert.eq(last_op_visible, res.commandReply["$replData"].lastOpVisible);
-
-    // A majority readConcern with afterOpTime: lastOpVisible should also return the same
-    // lastVisibleOp.
-    res = primary.getDB(name).runCommandWithMetadata(
-        {find: name, readConcern: {level: "majority", afterOpTime: last_op_visible}},
-        {"$replData": 1});
-    assert.commandWorked(res.commandReply);
-    assert.eq(last_op_visible, res.commandReply["$replData"].lastOpVisible);
-
-    // Do an insert without writeConcern.
-    res = primary.getDB(name).runCommandWithMetadata(
-        {insert: name, documents: [{x: 1}], writeConcern: {w: "majority"}}, {"$replData": 1});
-    assert.commandWorked(res.commandReply);
-    last_op_visible = res.commandReply["$replData"].lastOpVisible;
-
-    // A majority readConcern should return the same lastVisibleOp.
-    res = primary.getDB(name).runCommandWithMetadata({find: name, readConcern: {level: "majority"}},
-                                                     {"$replData": 1});
-    assert.commandWorked(res.commandReply);
-    assert.eq(last_op_visible, res.commandReply["$replData"].lastOpVisible);
-    replTest.stopSet();
-}());
+// A majority readConcern should return the same lastVisibleOp.
+res = primary.getDB(name).runCommand({find: name, readConcern: {level: "majority"}, $replData: 1});
+assert.commandWorked(res);
+assert.eq(last_op_visible, res["$replData"].lastOpVisible);
+replTest.stopSet();

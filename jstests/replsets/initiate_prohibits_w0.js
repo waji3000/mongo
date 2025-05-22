@@ -1,7 +1,10 @@
 /*
  * Test that replSetInitiate prohibits w:0 in getLastErrorDefaults,
  * SERVER-13055.
+ * @tags: [multiversion_incompatible]
  */
+
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 var InvalidReplicaSetConfig = 93;
 

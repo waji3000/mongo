@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,7 +29,11 @@
 
 #pragma once
 
+#include <memory>
+
+#include "mongo/base/status.h"
 #include "mongo/db/fts/fts_query.h"
+#include "mongo/db/fts/fts_util.h"
 
 namespace mongo {
 namespace fts {

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,10 +29,10 @@
 
 #pragma once
 
-#include "mongo/config.h"
-
 #include <cstddef>
 #include <cstring>
+
+#include "mongo/config.h"  // IWYU pragma: keep
 
 namespace mongo {
 

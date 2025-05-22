@@ -1,6 +1,3 @@
-// fts_element_iterator.h
-
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -32,13 +29,14 @@
 
 #pragma once
 
-#include "mongo/bson/bsonobj.h"
-#include "mongo/db/fts/fts_language.h"
-#include "mongo/db/fts/fts_spec.h"
-
+#include <iosfwd>
 #include <map>
 #include <stack>
 #include <string>
+
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/fts/fts_language.h"
+#include "mongo/db/fts/fts_spec.h"
 
 namespace mongo {
 
@@ -51,7 +49,7 @@ struct FTSIteratorValue {
     FTSIteratorValue(const char* text, const FTSLanguage* language, double weight)
         : _text(text), _language(language), _weight(weight), _valid(true) {}
 
-    FTSIteratorValue() : _text(NULL), _language(), _weight(0.0), _valid(false) {}
+    FTSIteratorValue() : _text(nullptr), _language(), _weight(0.0), _valid(false) {}
 
     bool valid() const {
         return _valid;

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,8 +27,6 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/icu.h"
 
@@ -42,7 +39,7 @@ struct testCases {
     bool success;
 };
 
-TEST(ICUTest, saslPrep) {
+TEST(ICUTest, icuSaslPrep) {
     const testCases tests[] = {
         // U+0065 LATIN SMALL LETTER E + U+0301 COMBINING ACUTE ACCENT
         // U+00E9 LATIN SMALL LETTER E WITH ACUTE
@@ -65,8 +62,8 @@ TEST(ICUTest, saslPrep) {
         {"\xD8\xA7\x31", "(invalid)", false},
     };
 
-    for (const auto test : tests) {
-        auto ret = saslPrep(test.original);
+    for (const auto& test : tests) {
+        auto ret = icuSaslPrep(test.original);
         ASSERT_EQ(ret.isOK(), test.success);
         if (test.success) {
             ASSERT_OK(ret);

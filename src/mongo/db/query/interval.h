@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,8 +29,13 @@
 
 #pragma once
 
-#include "mongo/db/jsobj.h"
-#include "mongo/util/mongoutils/str.h"
+#include <string>
+
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/util/hex.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -41,29 +45,49 @@ struct Interval {
     // 'start' may not point at the first field in _intervalData.
     // 'end' may not point at the last field in _intervalData.
     // 'start' and 'end' may point at the same field.
+    // This BSON may contain elements other than the start and end elements. We cannot make any
+    // assumptions about the order of elements in this object; we should also not make any
+    // assumptions about the field names of the elements, which are not guaranteed to be empty.
     BSONObj _intervalData;
 
     // Start and End must be ordered according to the index order.
+    // For the reasons mentioned above, comparisons to 'start' and 'end' should ignore the field
+    // names of the BSONElements.
     BSONElement start;
     bool startInclusive;
 
+    // For the reasons mentioned above, comparisons to 'start' and 'end' should ignore the field
+    // names of the BSONElements.
     BSONElement end;
     bool endInclusive;
 
     /** Creates an empty interval */
     Interval();
 
-    std::string toString() const {
-        mongoutils::str::stream ss;
+    /**
+     * Generates a debug string for an interval. If interval 'hasNonSimpleCollation', then string
+     * bounds are hex-encoded.
+     */
+    std::string toString(bool hasNonSimpleCollation) const {
+        str::stream ss;
         if (startInclusive) {
             ss << "[";
         } else {
             ss << "(";
         }
-        // false means omit the field name
-        ss << start.toString(false);
+        auto boundToString = [&](BSONElement bound) {
+            if (bound.type() == BSONType::String && hasNonSimpleCollation) {
+                ss << "CollationKey(";
+                // False means omit the field name.
+                ss << "0x" << hexblob::encodeLower(bound.valueStringData());
+                ss << ")";
+            } else {
+                ss << bound.toString(false);
+            }
+        };
+        boundToString(start);
         ss << ", ";
-        ss << end.toString(false);
+        boundToString(end);
         if (endInclusive) {
             ss << "]";
         } else {
@@ -84,6 +108,9 @@ struct Interval {
 
     /** Sets the current interval to the given values (see constructor) */
     void init(BSONObj base, bool startIncluded, bool endIncluded);
+
+    Interval(
+        BSONObj base, BSONElement start, bool startInclusive, BSONElement end, bool endInclusive);
 
     /**
      * Returns true if an empty-constructed interval hasn't been init()-ialized yet
@@ -140,6 +167,16 @@ struct Interval {
      * Returns true if the interval is from MinKey to MaxKey.
      */
     bool isMinToMax() const;
+
+    /**
+     * Returns true if the interval is from MaxKey to MinKey.
+     */
+    bool isMaxToMin() const;
+
+    /**
+     * Returns true if the interval has negative and positive infinities as bounds.
+     */
+    bool isFullyOpen() const;
 
     /** Returns how 'this' compares to 'other' */
     enum IntervalComparison {

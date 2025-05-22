@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,23 +27,27 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include <boost/intrusive_ptr.hpp>
+#include <algorithm>
+#include <memory>
 #include <vector>
 
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/base/string_data.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/json.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/document_value_test_util.h"
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/pipeline/aggregation_context_fixture.h"
-#include "mongo/db/pipeline/document.h"
 #include "mongo/db/pipeline/document_source_bucket.h"
 #include "mongo/db/pipeline/document_source_group.h"
 #include "mongo/db/pipeline/document_source_mock.h"
 #include "mongo/db/pipeline/document_source_sort.h"
-#include "mongo/db/pipeline/document_value_test_util.h"
-#include "mongo/db/pipeline/value.h"
-#include "mongo/db/pipeline/value_comparator.h"
+#include "mongo/db/query/explain_options.h"
 #include "mongo/unittest/unittest.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/intrusive_counter.h"
 
 namespace mongo {
 namespace {
@@ -55,11 +58,22 @@ using std::vector;
 
 class BucketReturnsGroupAndSort : public AggregationContextFixture {
 public:
-    void testCreateFromBsonResult(BSONObj bucketSpec, Value expectedGroupExplain) {
+    void testCreateFromBsonResult(BSONObj bucketSpec,
+                                  Value expectedGroupExplain,
+                                  bool toOptimize = false) {
         list<intrusive_ptr<DocumentSource>> result =
             DocumentSourceBucket::createFromBson(bucketSpec.firstElement(), getExpCtx());
 
         ASSERT_EQUALS(result.size(), 2UL);
+
+        if (toOptimize) {
+            std::transform(result.begin(),
+                           result.end(),
+                           result.begin(),
+                           [](intrusive_ptr<DocumentSource> d) -> intrusive_ptr<DocumentSource> {
+                               return (*d).optimize();
+                           });
+        }
 
         const auto* groupStage = dynamic_cast<DocumentSourceGroup*>(result.front().get());
         ASSERT(groupStage);
@@ -69,7 +83,8 @@ public:
 
         // Serialize the DocumentSourceGroup and DocumentSourceSort from $bucket so that we can
         // check the explain output to make sure $group and $sort have the correct fields.
-        auto explain = ExplainOptions::Verbosity::kQueryPlanner;
+        auto explain = SerializationOptions{
+            .verbosity = boost::make_optional(ExplainOptions::Verbosity::kQueryPlanner)};
         vector<Value> explainedStages;
         groupStage->serializeToArray(explainedStages, explain);
         sortStage->serializeToArray(explainedStages, explain);
@@ -85,13 +100,78 @@ public:
     }
 };
 
+TEST_F(BucketReturnsGroupAndSort,
+       BucketWithAllConstantsAndGroupByConstIsCorrectlyOptimizedAfterSwitch) {
+    const auto spec = fromjson(
+        "{$bucket : {groupBy : {$const : 6}, boundaries : [ 1, 5, 8 ], default : 'other'}}");
+
+    auto expectedGroupWithOpt =
+        Value(fromjson("{_id: {$const: 5}, count: {$sum: {$const: 1}}, $willBeMerged: false}"));
+
+    testCreateFromBsonResult(spec, expectedGroupWithOpt, true);
+}
+
+TEST_F(BucketReturnsGroupAndSort,
+       BucketWithAllConstantFalsesAndGroupByConstIsCorrectlyOptimizedAfterSwitch) {
+    const auto spec = fromjson(
+        "{$bucket : {groupBy : {$const : 9}, boundaries : [ 1, 5, 8 ], default : 'other'}}");
+
+    auto expectedGroupWithOpt = Value(
+        fromjson("{_id: {$const: 'other'}, count: {$sum: {$const: 1}}, $willBeMerged: false}"));
+
+    testCreateFromBsonResult(spec, expectedGroupWithOpt, true);
+}
+
+TEST_F(BucketReturnsGroupAndSort,
+       BucketWithAllConstantFalsesAndNoDefaultThrowsUassertErrorWhenOptimized) {
+    const auto spec = fromjson("{$bucket : {groupBy : {$const : 9}, boundaries : [ 1, 5, 8 ]}}");
+
+    list<intrusive_ptr<DocumentSource>> result =
+        DocumentSourceBucket::createFromBson(spec.firstElement(), getExpCtx());
+
+    ASSERT_EQUALS(result.size(), 2UL);
+
+    list<intrusive_ptr<DocumentSource>> result_opt;
+    result_opt.resize(result.size());
+
+    ASSERT_THROWS_CODE(
+        std::transform(result.begin(),
+                       result.end(),
+                       result_opt.begin(),
+                       [](intrusive_ptr<DocumentSource> d) -> intrusive_ptr<DocumentSource> {
+                           return (*d).optimize();
+                       }),
+        AssertionException,
+        40069);
+}
+
+TEST_F(BucketReturnsGroupAndSort, BucketWithAllConstantsIsCorrectlyOptimizedAfterSwitch) {
+    const auto spec = fromjson(
+        "{$bucket : {groupBy : {$add: [2, 4]}, boundaries : [ 1, 5, 8 ], default : 'other'}}");
+
+    auto expectedGroupWithOpt =
+        Value(fromjson("{_id: {$const: 5}, count: {$sum: {$const: 1}}, $willBeMerged: false}"));
+
+    testCreateFromBsonResult(spec, expectedGroupWithOpt, true);
+}
+
+TEST_F(BucketReturnsGroupAndSort,
+       BucketWithAllConstantsAndNoDefaultIsCorrectlyOptimizedAfterSwitch) {
+    const auto spec = fromjson("{$bucket : {groupBy : {$add: [2, 4]}, boundaries : [ 1, 5, 8 ]}}");
+
+    auto expectedGroupWithOpt =
+        Value(fromjson("{_id: {$const: 5}, count: {$sum: {$const: 1}}, $willBeMerged: false}"));
+
+    testCreateFromBsonResult(spec, expectedGroupWithOpt, true);
+}
+
 TEST_F(BucketReturnsGroupAndSort, BucketUsesDefaultOutputWhenNoOutputSpecified) {
     const auto spec =
         fromjson("{$bucket : {groupBy :'$x', boundaries : [ 0, 2 ], default : 'other'}}");
-    auto expectedGroupExplain =
-        Value(fromjson("{_id : {$switch : {branches : [{case : {$and : [{$gte : ['$x', {$const : "
-                       "0}]}, {$lt : ['$x', {$const : 2}]}]}, then : {$const : 0}}], default : "
-                       "{$const : 'other'}}}, count : {$sum : {$const : 1}}}"));
+    auto expectedGroupExplain = Value(
+        fromjson("{_id : {$switch : {branches : [{case : {$and : [{$gte : ['$x', {$const : "
+                 "0}]}, {$lt : ['$x', {$const : 2}]}]}, then : {$const : 0}}], default : "
+                 "{$const : 'other'}}}, count : {$sum : {$const : 1}}, $willBeMerged: false}"));
 
     testCreateFromBsonResult(spec, expectedGroupExplain);
 }
@@ -101,7 +181,8 @@ TEST_F(BucketReturnsGroupAndSort, BucketSucceedsWhenOutputSpecified) {
         "{$bucket : {groupBy : '$x', boundaries : [0, 2], output : { number : {$sum : 1}}}}");
     auto expectedGroupExplain = Value(fromjson(
         "{_id : {$switch : {branches : [{case : {$and : [{$gte : ['$x', {$const : 0}]}, {$lt : "
-        "['$x', {$const : 2}]}]}, then : {$const : 0}}]}}, number : {$sum : {$const : 1}}}"));
+        "['$x', {$const : 2}]}]}, then : {$const : 0}}]}}, number : {$sum : {$const : 1}}, "
+        "$willBeMerged: false}"));
 
     testCreateFromBsonResult(spec, expectedGroupExplain);
 }
@@ -110,7 +191,8 @@ TEST_F(BucketReturnsGroupAndSort, BucketSucceedsWhenNoDefaultSpecified) {
     const auto spec = fromjson("{$bucket : { groupBy : '$x', boundaries : [0, 2]}}");
     auto expectedGroupExplain = Value(fromjson(
         "{_id : {$switch : {branches : [{case : {$and : [{$gte : ['$x', {$const : 0}]}, {$lt : "
-        "['$x', {$const : 2}]}]}, then : {$const : 0}}]}}, count : {$sum : {$const : 1}}}"));
+        "['$x', {$const : 2}]}]}, then : {$const : 0}}]}}, count : {$sum : {$const : 1}}, "
+        "$willBeMerged: false}"));
 
     testCreateFromBsonResult(spec, expectedGroupExplain);
 }
@@ -119,7 +201,8 @@ TEST_F(BucketReturnsGroupAndSort, BucketSucceedsWhenBoundariesAreSameCanonicalTy
     const auto spec = fromjson("{$bucket : {groupBy : '$x', boundaries : [0, 1.5]}}");
     auto expectedGroupExplain = Value(fromjson(
         "{_id : {$switch : {branches : [{case : {$and : [{$gte : ['$x', {$const : 0}]}, {$lt : "
-        "['$x', {$const : 1.5}]}]}, then : {$const : 0}}]}},count : {$sum : {$const : 1}}}"));
+        "['$x', {$const : 1.5}]}]}, then : {$const : 0}}]}},count : {$sum : {$const : 1}}, "
+        "$willBeMerged: false}"));
 
     testCreateFromBsonResult(spec, expectedGroupExplain);
 }
@@ -128,7 +211,8 @@ TEST_F(BucketReturnsGroupAndSort, BucketSucceedsWhenBoundariesAreConstantExpress
     const auto spec = fromjson("{$bucket : {groupBy : '$x', boundaries : [0, {$add : [4, 5]}]}}");
     auto expectedGroupExplain = Value(fromjson(
         "{_id : {$switch : {branches : [{case : {$and : [{$gte : ['$x', {$const : 0}]}, {$lt : "
-        "['$x', {$const : 9}]}]}, then : {$const : 0}}]}}, count : {$sum : {$const : 1}}}"));
+        "['$x', {$const : 9}]}]}, then : {$const : 0}}]}}, count : {$sum : {$const : 1}}, "
+        "$willBeMerged: false}"));
 
     testCreateFromBsonResult(spec, expectedGroupExplain);
 }
@@ -139,7 +223,7 @@ TEST_F(BucketReturnsGroupAndSort, BucketSucceedsWhenDefaultIsConstantExpression)
     auto expectedGroupExplain =
         Value(fromjson("{_id : {$switch : {branches : [{case : {$and : [{$gte : ['$x', {$const :"
                        "0}]}, {$lt : ['$x', {$const : 1}]}]}, then : {$const : 0}}], default : "
-                       "{$const : 9}}}, count : {$sum : {$const : 1}}}"));
+                       "{$const : 9}}}, count : {$sum : {$const : 1}}, $willBeMerged: false}"));
 
     testCreateFromBsonResult(spec, expectedGroupExplain);
 }
@@ -150,9 +234,24 @@ TEST_F(BucketReturnsGroupAndSort, BucketSucceedsWithMultipleBoundaryValues) {
         Value(fromjson("{_id : {$switch : {branches : [{case : {$and : [{$gte : ['$x', {$const : "
                        "0}]}, {$lt : ['$x', {$const : 1}]}]}, then : {$const : 0}}, {case : {$and "
                        ": [{$gte : ['$x', {$const : 1}]}, {$lt : ['$x', {$const : 2}]}]}, then : "
-                       "{$const : 1}}]}}, count : {$sum : {$const : 1}}}"));
+                       "{$const : 1}}]}}, count : {$sum : {$const : 1}}, $willBeMerged: false}"));
 
     testCreateFromBsonResult(spec, expectedGroupExplain);
+}
+
+TEST_F(BucketReturnsGroupAndSort, BucketWithEmptyGroupByStrDoesNotAccessPastEndOfString) {
+    // Verify that {groupBy: ''} is rejected _without_ attempting to read past the end of the empty
+    // string.
+    const auto spec =
+        fromjson("{$bucket : {groupBy : '', boundaries : [ 1, 5, 8 ], default : 'other'}}");
+
+    // Under a debug build, this would previously fail if an empty str for groupBy led to access
+    // past the end of the string, with pos() > size() in StringData::operator[].
+    // Verify that this reaches the intended uassert, rejecting the empty string, _without_ first
+    // trying to read past the end of the string.
+    ASSERT_THROWS_CODE(DocumentSourceBucket::createFromBson(spec.firstElement(), getExpCtx()),
+                       AssertionException,
+                       40202);
 }
 
 class InvalidBucketSpec : public AggregationContextFixture {
@@ -281,7 +380,7 @@ TEST_F(InvalidBucketSpec, SwitchFailsForBucketWhenNoDefaultSpecified) {
     ASSERT(sortStage);
 
     auto doc = Document{{"x", 4}};
-    auto source = DocumentSourceMock::create(doc);
+    auto source = DocumentSourceMock::createForTest(doc, getExpCtx());
     groupStage->setSource(source.get());
     ASSERT_THROWS_CODE(groupStage->getNext(), AssertionException, 40066);
 }

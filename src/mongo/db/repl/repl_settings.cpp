@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,36 +27,32 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
 
-#include "mongo/platform/basic.h"
+#include <cstddef>
+#include <utility>
 
+
+#include "mongo/db/repl/repl_server_parameters_gen.h"
 #include "mongo/db/repl/repl_settings.h"
-#include "mongo/db/server_parameters.h"
+#include "mongo/util/assert_util.h"
 
-#include "mongo/util/log.h"
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
+
 
 namespace mongo {
 namespace repl {
-namespace {
 
-// Tells the server to perform replication recovery as a standalone.
-constexpr bool recoverFromOplogAsStandaloneDefault = false;
-MONGO_EXPORT_STARTUP_SERVER_PARAMETER(recoverFromOplogAsStandalone,
-                                      bool,
-                                      recoverFromOplogAsStandaloneDefault);
-
-}  // namespace
 
 std::string ReplSettings::ourSetName() const {
+    invariant(!_isServerless);
     size_t sl = _replSetString.find('/');
     if (sl == std::string::npos)
         return _replSetString;
     return _replSetString.substr(0, sl);
 }
 
-bool ReplSettings::usingReplSets() const {
-    return !_replSetString.empty();
+bool ReplSettings::isReplSet() const {
+    return _isServerless || !_replSetString.empty() || _shouldAutoInitiate;
 }
 
 /**
@@ -69,19 +64,24 @@ long long ReplSettings::getOplogSizeBytes() const {
 }
 
 std::string ReplSettings::getReplSetString() const {
+    invariant(!_isServerless);
     return _replSetString;
+}
+
+bool ReplSettings::isServerless() const {
+    return _isServerless;
 }
 
 bool ReplSettings::shouldRecoverFromOplogAsStandalone() {
     return recoverFromOplogAsStandalone;
 }
 
-ReplSettings::IndexPrefetchConfig ReplSettings::getPrefetchIndexMode() const {
-    return _prefetchIndexMode;
+bool ReplSettings::shouldSkipOplogSampling() {
+    return skipOplogSampling;
 }
 
-bool ReplSettings::isPrefetchIndexModeSet() const {
-    return _prefetchIndexMode != IndexPrefetchConfig::UNINITIALIZED;
+bool ReplSettings::shouldAutoInitiate() const {
+    return _shouldAutoInitiate;
 }
 
 /**
@@ -93,25 +93,18 @@ void ReplSettings::setOplogSizeBytes(long long oplogSizeBytes) {
 }
 
 void ReplSettings::setReplSetString(std::string replSetString) {
-    _replSetString = replSetString;
+    invariant(!_isServerless);
+    _replSetString = std::move(replSetString);
 }
 
-void ReplSettings::setPrefetchIndexMode(std::string prefetchIndexModeString) {
-    if (prefetchIndexModeString.empty()) {
-        _prefetchIndexMode = IndexPrefetchConfig::UNINITIALIZED;
-    } else {
-        if (prefetchIndexModeString == "none")
-            _prefetchIndexMode = IndexPrefetchConfig::PREFETCH_NONE;
-        else if (prefetchIndexModeString == "_id_only")
-            _prefetchIndexMode = IndexPrefetchConfig::PREFETCH_ID_ONLY;
-        else if (prefetchIndexModeString == "all")
-            _prefetchIndexMode = IndexPrefetchConfig::PREFETCH_ALL;
-        else {
-            _prefetchIndexMode = IndexPrefetchConfig::PREFETCH_ALL;
-            warning() << "unrecognized indexPrefetchMode setting \"" << prefetchIndexModeString
-                      << "\", defaulting to \"all\"";
-        }
-    }
+void ReplSettings::setServerlessMode() {
+    invariant(_replSetString.empty());
+    _isServerless = true;
+}
+
+void ReplSettings::setShouldAutoInitiate() {
+    invariant(!_isServerless);
+    _shouldAutoInitiate = true;
 }
 
 }  // namespace repl

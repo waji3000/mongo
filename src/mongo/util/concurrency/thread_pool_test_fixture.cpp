@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,11 +27,7 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include "mongo/util/concurrency/thread_pool_test_fixture.h"
-
-#include "mongo/base/status.h"
 
 namespace mongo {
 

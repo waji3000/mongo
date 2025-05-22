@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,45 +27,43 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/catalog/health_log.h"
+
+#include <cstdint>
+
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/oid.h"
+#include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/catalog/health_log_gen.h"
-#include "mongo/db/concurrency/write_conflict_exception.h"
-#include "mongo/db/db_raii.h"
+#include "mongo/db/namespace_string.h"
 
 namespace mongo {
 
 namespace {
-const ServiceContext::Decoration<HealthLog> getHealthLog =
-    ServiceContext::declareDecoration<HealthLog>();
-
 const int64_t kDefaultHealthlogSize = 100'000'000;
 
 CollectionOptions getOptions(void) {
     CollectionOptions options;
     options.capped = true;
     options.cappedSize = kDefaultHealthlogSize;
+    options.setNoIdIndex();
     return options;
 }
-}
+}  // namespace
 
-HealthLog::HealthLog() : _writer(nss, getOptions(), kMaxBufferSize) {}
+HealthLog::HealthLog()
+    : _writer(NamespaceString::kLocalHealthLogNamespace,
+              getOptions(),
+              kMaxBufferSize,
+              // Writing to the 'local' database is permitted on all nodes, not just the primary.
+              true /*retryOnReplStateChangeInterruption*/) {}
 
-void HealthLog::startup(void) {
+void HealthLog::startup() {
     _writer.startup(std::string("healthlog writer"));
 }
 
-void HealthLog::shutdown(void) {
+void HealthLog::shutdown() {
     _writer.shutdown();
-}
-
-HealthLog& HealthLog::get(ServiceContext* svcCtx) {
-    return getHealthLog(svcCtx);
-}
-
-HealthLog& HealthLog::get(OperationContext* opCtx) {
-    return getHealthLog(opCtx->getServiceContext());
 }
 
 bool HealthLog::log(const HealthLogEntry& entry) {
@@ -77,6 +74,4 @@ bool HealthLog::log(const HealthLogEntry& entry) {
     entry.serialize(&builder);
     return _writer.insertDocument(builder.obj());
 }
-
-const NamespaceString HealthLog::nss("local", "system.healthlog");
-}
+}  // namespace mongo

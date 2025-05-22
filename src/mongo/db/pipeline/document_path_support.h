@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,14 +29,18 @@
 
 #pragma once
 
+#include <functional>
 #include <vector>
 
-#include "mongo/db/pipeline/document.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/exec/document_value/value_comparator.h"
+#include "mongo/db/pipeline/dependencies.h"
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/field_path.h"
-#include "mongo/db/pipeline/value.h"
-#include "mongo/db/pipeline/value_comparator.h"
-#include "mongo/stdx/functional.h"
 
 namespace mongo {
 namespace document_path_support {
@@ -51,7 +54,7 @@ namespace document_path_support {
  */
 void visitAllValuesAtPath(const Document& doc,
                           const FieldPath& path,
-                          stdx::function<void(const Value&)> callback);
+                          std::function<void(const Value&)> callback);
 
 /**
  * Returns the element at 'path' in 'doc', or a missing Value if the path does not fully exist.
@@ -64,7 +67,14 @@ StatusWith<Value> extractElementAlongNonArrayPath(const Document& doc, const Fie
 /**
  * Extracts 'paths' from the input document and returns a BSON object containing only those paths.
  */
-BSONObj documentToBsonWithPaths(const Document&, const std::set<std::string>& paths);
+void documentToBsonWithPaths(const Document&, const OrderedPathSet& paths, BSONObjBuilder* builder);
+
+template <typename BSONTraits = BSONObj::DefaultSizeTrait>
+BSONObj documentToBsonWithPaths(const Document& input, const OrderedPathSet& paths) {
+    BSONObjBuilder outputBuilder;
+    documentToBsonWithPaths(input, paths, &outputBuilder);
+    return outputBuilder.obj<BSONTraits>();
+}
 
 /**
  * Extracts 'paths' from the input document to a flat document.

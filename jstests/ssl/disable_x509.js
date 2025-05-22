@@ -4,9 +4,9 @@ var CLIENT_USER = "C=US,ST=New York,L=New York City,O=MongoDB,OU=KernelUser,CN=c
 
 var conn = MongoRunner.runMongod({
     auth: "",
-    sslMode: "requireSSL",
-    sslPEMKeyFile: "jstests/libs/server.pem",
-    sslCAFile: "jstests/libs/ca.pem"
+    tlsMode: "requireTLS",
+    tlsCertificateKeyFile: "jstests/libs/server.pem",
+    tlsCAFile: "jstests/libs/ca.pem"
 });
 
 // Find out if this build supports the authenticationMechanisms startup parameter.
@@ -16,7 +16,7 @@ if (cmdOut.ok) {
     MongoRunner.stopMongod(conn);
     conn = MongoRunner.runMongod(
         {restart: conn, setParameter: "authenticationMechanisms=MONGODB-X509"});
-    external = conn.getDB("$external");
+    let external = conn.getDB("$external");
 
     // Add user using localhost exception
     external.createUser({
@@ -29,6 +29,7 @@ if (cmdOut.ok) {
 
     // Localhost exception should not be in place anymore
     assert.throws(function() {
+        // eslint-disable-next-line
         test.foo.findOne();
     }, [], "read without login");
 

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,11 +29,12 @@
 
 #pragma once
 
+#include <cstdint>
+#include <string>
 #include <wiredtiger.h>
 
-#include "mongo/db/operation_context.h"
-#include "mongo/db/storage/wiredtiger/wiredtiger_recovery_unit.h"
-#include "mongo/db/storage/wiredtiger/wiredtiger_session_cache.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_managed_session.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_session.h"
 
 namespace mongo {
 
@@ -44,15 +44,34 @@ namespace mongo {
  */
 class WiredTigerCursor {
 public:
-    WiredTigerCursor(const std::string& uri,
-                     uint64_t tableID,
-                     bool allowOverwrite,
-                     OperationContext* opCtx);
+    struct Params {
+        // The table id this cursor will operate on.
+        uint64_t tableID{0};
+        bool isCheckpoint{false};
+        // When 'true', data read from disk should not be kept in the storage engine cache.
+        bool readOnce{false};
+        bool allowOverwrite{false};
+        bool random{false};
+    };
+
+    /**
+     * If 'allowOverwrite' is true, insert operations will not return an error if the record
+     * already exists, and update/remove operations will not return error if the record does not
+     * exist.
+     *
+     * If 'random' is true, every next calls will yield records in a random order.
+     */
+    WiredTigerCursor(Params params, const std::string& uri, WiredTigerSession& session);
+
+    // Prevent duplication of the logical owned-ness of the cursors via move or copy.
+    WiredTigerCursor(WiredTigerCursor&&) = delete;
+    WiredTigerCursor(const WiredTigerCursor&) = delete;
+    WiredTigerCursor& operator=(WiredTigerCursor&&) = delete;
+    WiredTigerCursor& operator=(const WiredTigerCursor&) = delete;
 
     ~WiredTigerCursor();
 
     WT_CURSOR* get() const {
-        // TODO(SERVER-16816): assertInActiveTxn();
         return _cursor;
     }
 
@@ -61,21 +80,51 @@ public:
     }
 
     WiredTigerSession* getSession() {
-        return _session;
+        return &_session;
     }
 
-    void reset();
-
-    void assertInActiveTxn() const {
-        _ru->assertInActiveTxn();
+    /**
+     *  Returns the checkpoint ID for checkpoint cursors, otherwise 0.
+     */
+    uint64_t getCheckpointId() const {
+        return _cursor->checkpoint_id(_cursor);
     }
 
 protected:
     uint64_t _tableID;
-    WiredTigerRecoveryUnit* _ru;
-    WiredTigerSession* _session;
-    bool _readOnce;
+    bool _isCheckpoint;
+    WiredTigerSession& _session;
+    std::string _config;
 
     WT_CURSOR* _cursor = nullptr;  // Owned
 };
-}
+
+/**
+ * An owning object wrapper for a WT_SESSION and WT_CURSOR configured for bulk loading when
+ * possible. The cursor is created and closed independently of the cursor cache, which does not
+ * store bulk cursors. It uses its own session to avoid hijacking an existing transaction in the
+ * current session.
+ */
+class WiredTigerBulkLoadCursor {
+public:
+    WiredTigerBulkLoadCursor(OperationContext* opCtx,
+                             WiredTigerSession& outerSession,
+                             const std::string& indexUri);
+
+    ~WiredTigerBulkLoadCursor() {
+        _cursor->close(_cursor);
+    }
+
+    WT_CURSOR* get() const {
+        return _cursor;
+    }
+
+    WT_CURSOR* operator->() const {
+        return get();
+    }
+
+private:
+    WiredTigerManagedSession const _session;
+    WT_CURSOR* _cursor = nullptr;  // Owned
+};
+}  // namespace mongo

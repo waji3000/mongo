@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,12 +29,14 @@
 
 #pragma once
 
+#include <memory>
 #include <string>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/status.h"
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/user_name.h"
+#include "mongo/db/client.h"
+#include "mongo/db/operation_context.h"
 
 namespace mongo {
 
@@ -52,12 +53,7 @@ class AuthzSessionExternalState {
     AuthzSessionExternalState& operator=(const AuthzSessionExternalState&) = delete;
 
 public:
-    static MONGO_DECLARE_SHIM(
-        (AuthorizationManager * authzManager)->std::unique_ptr<AuthzSessionExternalState>) create;
-
     virtual ~AuthzSessionExternalState();
-
-    AuthorizationManager& getAuthorizationManager();
 
     // Returns true if this connection should be treated as if it has full access to do
     // anything, regardless of the current auth state.  Currently the reasons why this could be
@@ -82,13 +78,10 @@ public:
 
 protected:
     // This class should never be instantiated directly.
-    AuthzSessionExternalState(AuthorizationManager* authzManager);
+    AuthzSessionExternalState(Client* client);
 
-    // Pointer to the authorization manager associated with the authorization session
-    // that owns this object.
-    //
-    // TODO(schwerin): Eliminate this back pointer.
-    AuthorizationManager* _authzManager;
+    // Pointer to the client that owns the owning AuthorizationSession.
+    Client* _client;
 };
 
 }  // namespace mongo

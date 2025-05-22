@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,16 +27,19 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
+#include <memory>
+#include <string>
+#include <zlib.h>
 
-#include "mongo/platform/basic.h"
+#include <boost/move/utility_core.hpp>
+#include <zconf.h>
 
-#include "mongo/base/init.h"
-#include "mongo/stdx/memory.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/base/init.h"  // IWYU pragma: keep
+#include "mongo/base/initializer.h"
+#include "mongo/base/status.h"
 #include "mongo/transport/message_compressor_registry.h"
 #include "mongo/transport/message_compressor_zlib.h"
-
-#include <zlib.h>
 
 namespace mongo {
 
@@ -85,7 +87,6 @@ MONGO_INITIALIZER_GENERAL(ZlibMessageCompressorInit,
                           ("AllCompressorsRegistered"))
 (InitializerContext* context) {
     auto& compressorRegistry = MessageCompressorRegistry::get();
-    compressorRegistry.registerImplementation(stdx::make_unique<ZlibMessageCompressor>());
-    return Status::OK();
+    compressorRegistry.registerImplementation(std::make_unique<ZlibMessageCompressor>());
 }
 }  // namespace mongo

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,14 +27,19 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <fmt/format.h>
+#include <memory>
+#include <string>
 
-#include "mongo/db/s/start_chunk_clone_request.h"
-
-#include "mongo/base/status_with.h"
+#include "mongo/base/status.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobjbuilder.h"
-#include "mongo/db/jsobj.h"
-#include "mongo/s/shard_id.h"
+#include "mongo/db/client.h"
+#include "mongo/db/s/start_chunk_clone_request.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/session/logical_session_id_helpers.h"
+#include "mongo/db/shard_id.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
@@ -45,12 +49,22 @@ using unittest::assertGet;
 namespace {
 
 TEST(StartChunkCloneRequest, CreateAsCommandComplete) {
+    auto serviceContext = ServiceContext::make();
+    auto client = serviceContext->getService()->makeClient("TestClient");
+    auto opCtx = client->makeOperationContext();
+
     MigrationSessionId sessionId = MigrationSessionId::generate("shard0001", "shard0002");
+    UUID migrationId = UUID::gen();
+    auto lsid = makeLogicalSessionId(opCtx.get());
+    TxnNumber txnNumber = 0;
 
     BSONObjBuilder builder;
     StartChunkCloneRequest::appendAsCommand(
         &builder,
-        NamespaceString("TestDB.TestColl"),
+        NamespaceString::createNamespaceString_forTest("TestDB.TestColl"),
+        migrationId,
+        lsid,
+        txnNumber,
         sessionId,
         assertGet(ConnectionString::parse("TestDonorRS/Donor1:12345,Donor2:12345,Donor3:12345")),
         ShardId("shard0001"),
@@ -63,10 +77,14 @@ TEST(StartChunkCloneRequest, CreateAsCommandComplete) {
     BSONObj cmdObj = builder.obj();
 
     auto request = assertGet(StartChunkCloneRequest::createFromCommand(
-        NamespaceString(cmdObj["_recvChunkStart"].String()), cmdObj));
+        NamespaceString::createNamespaceString_forTest(cmdObj["_recvChunkStart"].String()),
+        cmdObj));
 
-    ASSERT_EQ("TestDB.TestColl", request.getNss().ns());
+    ASSERT_EQ("TestDB.TestColl", request.getNss().ns_forTest());
     ASSERT_EQ(sessionId.toString(), request.getSessionId().toString());
+    ASSERT_EQ(migrationId, request.getMigrationId());
+    ASSERT_EQ(lsid, request.getLsid());
+    ASSERT_EQ(txnNumber, request.getTxnNumber());
     ASSERT(sessionId.matches(request.getSessionId()));
     ASSERT_EQ(
         assertGet(ConnectionString::parse("TestDonorRS/Donor1:12345,Donor2:12345,Donor3:12345"))

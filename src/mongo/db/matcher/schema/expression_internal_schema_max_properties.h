@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,6 +29,16 @@
 
 #pragma once
 
+#include <memory>
+#include <string>
+#include <utility>
+
+#include "mongo/base/clonable_ptr.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/db/matcher/expression.h"
+#include "mongo/db/matcher/expression_visitor.h"
 #include "mongo/db/matcher/schema/expression_internal_schema_num_properties.h"
 
 namespace mongo {
@@ -41,31 +50,28 @@ namespace mongo {
 class InternalSchemaMaxPropertiesMatchExpression final
     : public InternalSchemaNumPropertiesMatchExpression {
 public:
-    explicit InternalSchemaMaxPropertiesMatchExpression(long long numProperties)
+    explicit InternalSchemaMaxPropertiesMatchExpression(
+        long long numProperties, clonable_ptr<ErrorAnnotation> annotation = nullptr)
         : InternalSchemaNumPropertiesMatchExpression(MatchType::INTERNAL_SCHEMA_MAX_PROPERTIES,
                                                      numProperties,
-                                                     "$_internalSchemaMaxProperties") {}
+                                                     "$_internalSchemaMaxProperties",
+                                                     std::move(annotation)) {}
 
-    bool matches(const MatchableDocument* doc, MatchDetails* details) const final {
-        BSONObj obj = doc->toBSON();
-        return (obj.nFields() <= numProperties());
-    }
-
-    bool matchesSingleElement(const BSONElement& elem,
-                              MatchDetails* details = nullptr) const final {
-        if (elem.type() != BSONType::Object) {
-            return false;
-        }
-        return (elem.embeddedObject().nFields() <= numProperties());
-    }
-
-    virtual std::unique_ptr<MatchExpression> shallowClone() const final {
-        auto maxProperties =
-            stdx::make_unique<InternalSchemaMaxPropertiesMatchExpression>(numProperties());
+    std::unique_ptr<MatchExpression> clone() const final {
+        auto maxProperties = std::make_unique<InternalSchemaMaxPropertiesMatchExpression>(
+            numProperties(), _errorAnnotation);
         if (getTag()) {
             maxProperties->setTag(getTag()->clone());
         }
-        return std::move(maxProperties);
+        return maxProperties;
+    }
+
+    void acceptVisitor(MatchExpressionMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(MatchExpressionConstVisitor* visitor) const final {
+        visitor->visit(this);
     }
 };
 }  // namespace mongo

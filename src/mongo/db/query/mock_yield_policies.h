@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -36,22 +35,49 @@
 namespace mongo {
 
 /**
+ * A base class from which all mocked yield policy implementations used for testing should derive.
+ */
+class MockYieldPolicy : public PlanYieldPolicy {
+public:
+    MockYieldPolicy(OperationContext* opCtx,
+                    ClockSource* clockSource,
+                    PlanYieldPolicy::YieldPolicy policy,
+                    std::variant<const Yieldable*, YieldThroughAcquisitions> yieldable)
+        : PlanYieldPolicy(opCtx, policy, clockSource, 0, Milliseconds{0}, yieldable, nullptr) {}
+
+private:
+    void saveState(OperationContext* opCtx) final {
+        MONGO_UNREACHABLE;
+    }
+
+    void restoreState(OperationContext* opCtx,
+                      const Yieldable* yieldable,
+                      RestoreContext::RestoreType restoreType) final {
+        MONGO_UNREACHABLE;
+    }
+};
+
+/**
  * A custom yield policy that always reports the plan should yield, and always returns
  * ErrorCodes::ExceededTimeLimit from yield().
  */
-class AlwaysTimeOutYieldPolicy : public PlanYieldPolicy {
+class AlwaysTimeOutYieldPolicy final : public MockYieldPolicy {
 public:
-    AlwaysTimeOutYieldPolicy(PlanExecutor* exec)
-        : PlanYieldPolicy(exec, PlanExecutor::YieldPolicy::ALWAYS_TIME_OUT) {}
+    AlwaysTimeOutYieldPolicy(OperationContext* opCtx,
+                             ClockSource* cs,
+                             std::variant<const Yieldable*, YieldThroughAcquisitions> yieldable)
+        : MockYieldPolicy(opCtx, cs, PlanYieldPolicy::YieldPolicy::ALWAYS_TIME_OUT, yieldable) {}
 
-    AlwaysTimeOutYieldPolicy(ClockSource* cs)
-        : PlanYieldPolicy(PlanExecutor::YieldPolicy::ALWAYS_TIME_OUT, cs) {}
-
-    bool shouldYieldOrInterrupt() override {
+    bool doShouldYieldOrInterrupt(OperationContext*) override {
         return true;
     }
 
-    Status yieldOrInterrupt(stdx::function<void()> whileYieldingFn) override {
+    Status yieldOrInterrupt(
+        OperationContext*,
+        const std::function<void()>& whileYieldingFn,
+        RestoreContext::RestoreType restoreType,
+        const std::function<void()>& afterSnapshotAbandonFn = nullptr) override {
+
         return {ErrorCodes::ExceededTimeLimit, "Using AlwaysTimeOutYieldPolicy"};
     }
 };
@@ -60,20 +86,48 @@ public:
  * A custom yield policy that always reports the plan should yield, and always returns
  * ErrorCodes::QueryPlanKilled from yield().
  */
-class AlwaysPlanKilledYieldPolicy : public PlanYieldPolicy {
+class AlwaysPlanKilledYieldPolicy final : public MockYieldPolicy {
 public:
-    AlwaysPlanKilledYieldPolicy(PlanExecutor* exec)
-        : PlanYieldPolicy(exec, PlanExecutor::YieldPolicy::ALWAYS_MARK_KILLED) {}
+    AlwaysPlanKilledYieldPolicy(OperationContext* opCtx,
+                                ClockSource* cs,
+                                std::variant<const Yieldable*, YieldThroughAcquisitions> yieldable)
+        : MockYieldPolicy(opCtx, cs, PlanYieldPolicy::YieldPolicy::ALWAYS_MARK_KILLED, yieldable) {}
 
-    AlwaysPlanKilledYieldPolicy(ClockSource* cs)
-        : PlanYieldPolicy(PlanExecutor::YieldPolicy::ALWAYS_MARK_KILLED, cs) {}
-
-    bool shouldYieldOrInterrupt() override {
+    bool doShouldYieldOrInterrupt(OperationContext*) override {
         return true;
     }
 
-    Status yieldOrInterrupt(stdx::function<void()> whileYieldingFn) override {
+    Status yieldOrInterrupt(
+        OperationContext*,
+        const std::function<void()>& whileYieldingFn,
+        RestoreContext::RestoreType restoreType,
+        const std::function<void()>& afterSnapshotAbandonFn = nullptr) override {
         return {ErrorCodes::QueryPlanKilled, "Using AlwaysPlanKilledYieldPolicy"};
+    }
+};
+
+/**
+ * A yield policy for testing which never reports that the plan should yield, as
+ * 'shouldYieldOrInterrupt()' always returns false.
+ */
+class NoopYieldPolicy final : public MockYieldPolicy {
+public:
+    NoopYieldPolicy(OperationContext* opCtx,
+                    ClockSource* clockSource,
+                    std::variant<const Yieldable*, YieldThroughAcquisitions> yieldable)
+        : MockYieldPolicy(
+              opCtx, clockSource, PlanYieldPolicy::YieldPolicy::INTERRUPT_ONLY, yieldable) {}
+
+    bool doShouldYieldOrInterrupt(OperationContext*) override {
+        return false;
+    }
+
+    Status yieldOrInterrupt(
+        OperationContext*,
+        const std::function<void()>& whileYieldingFn,
+        RestoreContext::RestoreType restoreType,
+        const std::function<void()>& afterSnapshotAbandonFn = nullptr) override {
+        MONGO_UNREACHABLE;
     }
 };
 

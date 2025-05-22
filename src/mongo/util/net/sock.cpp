@@ -1,6 +1,3 @@
-// @file sock.cpp
-
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,17 +27,15 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
-
-#include "mongo/platform/basic.h"
 
 #include "mongo/util/net/sock.h"
 
 #include <algorithm>
+#include <fmt/format.h>
 
 #if !defined(_WIN32)
 #include <arpa/inet.h>
-#include <errno.h>
+#include <cerrno>
 #include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
@@ -60,18 +55,20 @@
 
 #include "mongo/config.h"
 #include "mongo/db/server_options.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/background.h"
 #include "mongo/util/concurrency/value.h"
 #include "mongo/util/debug_util.h"
-#include "mongo/util/fail_point_service.h"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/hex.h"
-#include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
-#include "mongo/util/net/private/socket_poll.h"
 #include "mongo/util/net/socket_exception.h"
 #include "mongo/util/net/socket_utils.h"
 #include "mongo/util/net/ssl_manager.h"
+#include "mongo/util/str.h"
 #include "mongo/util/winutil.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
+
 
 namespace mongo {
 
@@ -99,41 +96,46 @@ bool setBlock(int fd, bool block) {
 #endif
 }
 
-void networkWarnWithDescription(const Socket& socket, StringData call, int errorCode = -1) {
-#ifdef _WIN32
-    if (errorCode == -1) {
-        errorCode = WSAGetLastError();
-    }
-#endif
-    auto ewd = errnoWithDescription(errorCode);
-    warning() << "Failed to connect to " << socket.remoteAddr().getAddr() << ":"
-              << socket.remoteAddr().getPort() << ", in(" << call << "), reason: " << ewd;
+void networkWarnWithDescription(const Socket& socket,
+                                StringData call,
+                                std::error_code ec = lastSocketError()) {
+    LOGV2_WARNING(23190,
+                  "Failed to connect to remote host",
+                  "remoteSocketAddress"_attr = socket.remoteAddr().getAddr(),
+                  "remoteSocketAddressPort"_attr = socket.remoteAddr().getPort(),
+                  "call"_attr = call,
+                  "error"_attr = errorMessage(ec));
 }
 
 const double kMaxConnectTimeoutMS = 5000;
 
 void setSockTimeouts(int sock, double secs) {
-    bool report = shouldLog(logger::LogSeverity::Debug(4));
-    DEV report = true;
+    bool report =
+        shouldLog(MONGO_LOGV2_DEFAULT_COMPONENT, logv2::LogSeverity::Debug(4)) || kDebugBuild;
 #if defined(_WIN32)
     DWORD timeout = secs * 1000;  // Windows timeout is a DWORD, in milliseconds.
     int status =
         setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<char*>(&timeout), sizeof(DWORD));
-    if (report && (status == SOCKET_ERROR))
-        log() << "unable to set SO_RCVTIMEO: " << errnoWithDescription(WSAGetLastError());
+    if (report && (status == SOCKET_ERROR)) {
+        auto ec = lastSocketError();
+        LOGV2(23177, "Unable to set SO_RCVTIMEO", "reason"_attr = errorMessage(ec));
+    }
     status =
         setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<char*>(&timeout), sizeof(DWORD));
-    DEV if (report && (status == SOCKET_ERROR)) log() << "unable to set SO_SNDTIMEO: "
-                                                      << errnoWithDescription(WSAGetLastError());
+    if (kDebugBuild && report && (status == SOCKET_ERROR)) {
+        auto ec = lastSocketError();
+        LOGV2(23178, "Unable to set SO_SNDTIME0", "reason"_attr = errorMessage(ec));
+    }
 #else
     struct timeval tv;
     tv.tv_sec = (int)secs;
     tv.tv_usec = (int)((long long)(secs * 1000 * 1000) % (1000 * 1000));
     bool ok = setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (char*)&tv, sizeof(tv)) == 0;
     if (report && !ok)
-        log() << "unable to set SO_RCVTIMEO";
+        LOGV2(23179, "unable to set SO_RCVTIMEO");
     ok = setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (char*)&tv, sizeof(tv)) == 0;
-    DEV if (report && !ok) log() << "unable to set SO_SNDTIMEO";
+    if (kDebugBuild && report && !ok)
+        LOGV2(23180, "unable to set SO_SNDTIMEO");
 #endif
 }
 
@@ -147,35 +149,46 @@ void disableNagle(int sock) {
     const int level = SOL_SOCKET;
 #endif
 
-    if (setsockopt(sock, level, TCP_NODELAY, (char*)&x, sizeof(x)))
-        error() << "disableNagle failed: " << errnoWithDescription();
+    if (setsockopt(sock, level, TCP_NODELAY, (char*)&x, sizeof(x))) {
+        auto ec = lastSocketError();
+        LOGV2_ERROR(23195, "DisableNagle failed", "error"_attr = errorMessage(ec));
+    }
 
 #ifdef SO_KEEPALIVE
-    if (setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, (char*)&x, sizeof(x)))
-        error() << "SO_KEEPALIVE failed: " << errnoWithDescription();
+    if (setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, (char*)&x, sizeof(x))) {
+        auto ec = lastSocketError();
+        LOGV2_ERROR(23196, "SO_KEEPALIVE failed", "error"_attr = errorMessage(ec));
+    }
 #endif
 
-    setSocketKeepAliveParams(sock);
-}
-
-int socketGetLastError() {
-#ifdef _WIN32
-    return WSAGetLastError();
-#else
-    return errno;
-#endif
+    setSocketKeepAliveParams(sock, logv2::LogSeverity::Error());
 }
 
 SockAddr getLocalAddrForBoundSocketFd(int fd) {
     SockAddr result;
-    int rc = getsockname(fd, result.raw(), &result.addressSize);
-    if (rc != 0) {
-        warning() << "Could not resolve local address for socket with fd " << fd << ": "
-                  << getAddrInfoStrError(socketGetLastError());
+    if (getsockname(fd, result.raw(), &result.addressSize)) {
+        auto ec = lastSocketError();
+        LOGV2_WARNING(23191,
+                      "Could not resolve local address for socket with fd",
+                      "fd"_attr = fd,
+                      "error"_attr = errorMessage(ec));
         result = SockAddr();
     }
     return result;
 }
+
+#ifdef _WIN32
+
+int socketPoll(pollfd* fdarray, unsigned long nfds, int timeout) {
+    return WSAPoll(fdarray, nfds, timeout);
+}
+
+#else
+
+int socketPoll(pollfd* fdarray, unsigned long nfds, int timeout) {
+    return ::poll(fdarray, nfds, timeout);
+}
+#endif
 
 }  // namespace
 
@@ -193,18 +206,18 @@ Socket::Socket(int fd, const SockAddr& remote)
     : _fd(fd),
       _remote(remote),
       _timeout(0),
-      _lastValidityCheckAtSecs(time(0)),
-      _logLevel(logger::LogSeverity::Log()) {
+      _lastValidityCheckAtSecs(time(nullptr)),
+      _logLevel(logv2::LogSeverity::Log()) {
     _init();
     if (fd >= 0) {
         _local = getLocalAddrForBoundSocketFd(_fd);
     }
 }
 
-Socket::Socket(double timeout, logger::LogSeverity ll) : _logLevel(ll) {
+Socket::Socket(double timeout, logv2::LogSeverity ll) : _logLevel(ll) {
     _fd = INVALID_SOCKET;
     _timeout = timeout;
-    _lastValidityCheckAtSecs = time(0);
+    _lastValidityCheckAtSecs = time(nullptr);
     _init();
 }
 
@@ -217,7 +230,7 @@ void Socket::_init() {
     _bytesIn = 0;
     _awaitingHandshake = true;
 #ifdef MONGO_CONFIG_SSL
-    _sslManager = 0;
+    _sslManager = nullptr;
 #endif
 }
 
@@ -264,15 +277,15 @@ SSLPeerInfo Socket::doSSLHandshake(const char* firstBytes, int len) {
         _sslConnection.get(), "", HostAndPort());
 }
 
-std::string Socket::getSNIServerName() const {
-    if (!_sslConnection)
-        return "";
-
-    return _sslConnection->getSNIServerName();
-}
 #endif
 
-bool Socket::connect(SockAddr& remote) {
+bool Socket::connect(const SockAddr& remote) {
+    const Milliseconds connectTimeoutMillis(static_cast<int64_t>(
+        _timeout > 0 ? std::min(kMaxConnectTimeoutMS, (_timeout * 1000)) : kMaxConnectTimeoutMS));
+    return connect(remote, connectTimeoutMillis);
+}
+
+bool Socket::connect(const SockAddr& remote, Milliseconds connectTimeoutMillis) {
     _remote = remote;
 
     _fd = ::socket(remote.getType(), SOCK_STREAM, 0);
@@ -286,21 +299,19 @@ bool Socket::connect(SockAddr& remote) {
         return false;
     }
 
-    const Milliseconds connectTimeoutMillis(static_cast<int64_t>(
-        _timeout > 0 ? std::min(kMaxConnectTimeoutMS, (_timeout * 1000)) : kMaxConnectTimeoutMS));
     const Date_t expiration = Date_t::now() + connectTimeoutMillis;
-
     bool connectSucceeded = ::connect(_fd, _remote.raw(), _remote.addressSize) == 0;
 
     if (!connectSucceeded) {
+        auto ec = lastSocketError();
 #ifdef _WIN32
-        if (WSAGetLastError() != WSAEWOULDBLOCK) {
-            networkWarnWithDescription(*this, "connect");
+        if (ec != systemError(WSAEWOULDBLOCK)) {
+            networkWarnWithDescription(*this, "connect", ec);
             return false;
         }
 #else
-        if (errno != EINTR && errno != EINPROGRESS) {
-            networkWarnWithDescription(*this, "connect");
+        if (ec != posixError(EINTR) && ec != posixError(EINPROGRESS)) {
+            networkWarnWithDescription(*this, "connect", ec);
             return false;
         }
 #endif
@@ -331,9 +342,11 @@ bool Socket::connect(SockAddr& remote) {
 #endif
             // No activity for the full duration of the timeout.
             if (pollReturn == 0) {
-                warning() << "Failed to connect to " << _remote.getAddr() << ":"
-                          << _remote.getPort() << " after " << connectTimeoutMillis
-                          << " milliseconds, giving up.";
+                LOGV2_WARNING(23192,
+                              "Failed to connect to remote host. Giving up",
+                              "remoteAddr"_attr = _remote.getAddr(),
+                              "remotePort"_attr = _remote.getPort(),
+                              "connectTimeout"_attr = connectTimeoutMillis);
                 return false;
             }
 
@@ -346,7 +359,8 @@ bool Socket::connect(SockAddr& remote) {
                 return false;
             }
             if (optVal != 0) {
-                networkWarnWithDescription(*this, "checking socket for error after poll", optVal);
+                networkWarnWithDescription(
+                    *this, "checking socket for error after poll", systemError(optVal));
                 return false;
             }
 
@@ -398,7 +412,7 @@ int Socket::_send(const char* data, int len, const char* context) {
 void Socket::send(const char* data, int len, const char* context) {
     while (len > 0) {
         int ret = -1;
-        if (MONGO_FAIL_POINT(throwSockExcep)) {
+        if (MONGO_unlikely(throwSockExcep.shouldFail())) {
 #if defined(_WIN32)
             WSASetLastError(WSAENETUNREACH);
 #else
@@ -461,7 +475,7 @@ void Socket::send(const vector<pair<char*, int>>& data, const char* context) {
 
     while (meta.msg_iovlen > 0) {
         int ret = -1;
-        if (MONGO_FAIL_POINT(throwSockExcep)) {
+        if (MONGO_unlikely(throwSockExcep.shouldFail())) {
 #if defined(_WIN32)
             WSASetLastError(WSAENETUNREACH);
 #else
@@ -494,7 +508,7 @@ void Socket::send(const vector<pair<char*, int>>& data, const char* context) {
 void Socket::recv(char* buf, int len) {
     while (len > 0) {
         int ret = -1;
-        if (MONGO_FAIL_POINT(throwSockExcep)) {
+        if (MONGO_unlikely(throwSockExcep.shouldFail())) {
 #if defined(_WIN32)
             WSASetLastError(WSAENETUNREACH);
 #else
@@ -536,52 +550,66 @@ int Socket::_recv(char* buf, int max) {
 }
 
 void Socket::handleSendError(int ret, const char* context) {
+    const auto ec = lastSocketError();
+    auto isTimeoutCode = [](std::error_code e) {
 #if defined(_WIN32)
-    const int mongo_errno = WSAGetLastError();
-    if (mongo_errno == WSAETIMEDOUT && _timeout != 0) {
+        return e == systemError(WSAETIMEDOUT);
 #else
-    const int mongo_errno = errno;
-    if ((mongo_errno == EAGAIN || mongo_errno == EWOULDBLOCK) && _timeout != 0) {
+        return e == posixError(EAGAIN) || e == posixError(EWOULDBLOCK);
 #endif
-        LOG(_logLevel) << "Socket " << context << " send() timed out " << remoteString();
+    };
+    if (isTimeoutCode(ec) && _timeout != 0) {
+        LOGV2_DEBUG(23181,
+                    _logLevel.toInt(),
+                    "Socket send() to remote host timed out",
+                    "context"_attr = context,
+                    "remoteHost"_attr = remoteString());
         throwSocketError(SocketErrorKind::SEND_TIMEOUT, remoteString());
-    } else if (mongo_errno != EINTR) {
-        LOG(_logLevel) << "Socket " << context << " send() " << errnoWithDescription(mongo_errno)
-                       << ' ' << remoteString();
+    } else if (ec != posixError(EINTR)) {
+        LOGV2_DEBUG(23182,
+                    _logLevel.toInt(),
+                    "Socket send() to remote host failed",
+                    "context"_attr = context,
+                    "error"_attr = errorMessage(ec),
+                    "remoteHost"_attr = remoteString());
         throwSocketError(SocketErrorKind::SEND_ERROR, remoteString());
     }
-}
+}  // namespace mongo
 
 void Socket::handleRecvError(int ret, int len) {
     if (ret == 0) {
-        LOG(3) << "Socket recv() conn closed? " << remoteString();
+        LOGV2_DEBUG(23183,
+                    3,
+                    "Socket recv() failed; connection may have been closed",
+                    "remoteHost"_attr = remoteString());
         throwSocketError(SocketErrorKind::CLOSED, remoteString());
     }
 
-// ret < 0
-#if defined(_WIN32)
-    int e = WSAGetLastError();
-#else
-    int e = errno;
+    // ret < 0
+    auto ec = lastSocketError();
 #if defined(EINTR)
-    if (e == EINTR) {
+    if (ec == posixError(EINTR)) {
         return;
     }
 #endif
-#endif
 
+    if ((ec == posixError(EAGAIN)
 #if defined(_WIN32)
-    // Windows
-    if ((e == EAGAIN || e == WSAETIMEDOUT) && _timeout > 0) {
-#else
-    if (e == EAGAIN && _timeout > 0) {
+         || ec == systemError(WSAETIMEDOUT)
 #endif
+             ) &&
+        _timeout > 0) {
         // this is a timeout
-        LOG(_logLevel) << "Socket recv() timeout  " << remoteString();
+        LOGV2_DEBUG(
+            23184, _logLevel.toInt(), "Socket recv() timeout", "remoteHost"_attr = remoteString());
         throwSocketError(SocketErrorKind::RECV_TIMEOUT, remoteString());
     }
 
-    LOG(_logLevel) << "Socket recv() " << errnoWithDescription(e) << " " << remoteString();
+    LOGV2_DEBUG(23185,
+                _logLevel.toInt(),
+                "Socket recv() error",
+                "error"_attr = errorMessage(ec),
+                "remoteHost"_attr = remoteString());
     throwSocketError(SocketErrorKind::RECV_ERROR, remoteString());
 }
 
@@ -612,10 +640,8 @@ bool Socket::isStillConnected() {
 
     if (errorPollIntervalSecs < 0)
         return true;
-    if (!isPollSupported())
-        return true;  // nothing we can do
 
-    time_t now = time(0);
+    time_t now = time(nullptr);
     time_t idleTimeSecs = now - _lastValidityCheckAtSecs;
 
     // Only check once every 5 secs
@@ -634,17 +660,25 @@ bool Socket::isStillConnected() {
     // Poll( info[], size, timeout ) - timeout == 0 => nonblocking
     int nEvents = socketPoll(&pollInfo, 1, 0);
 
-    LOG(2) << "polling for status of connection to " << remoteString() << ", "
-           << (nEvents == 0 ? "no events" : nEvents == -1 ? "error detected" : "event detected");
+    auto ec = lastSocketError();
+    LOGV2_DEBUG(23186,
+                2,
+                "Polling for status of connection to remote host",
+                "remoteHost"_attr = remoteString(),
+                "errorOrEventDetected"_attr = (nEvents == 0        ? "no events"
+                                                   : nEvents == -1 ? "error detected"
+                                                                   : "event detected"));
 
     if (nEvents == 0) {
         // No events incoming, return still connected AFAWK
         return true;
     } else if (nEvents < 0) {
         // Poll itself failed, this is weird, warn and log errno
-        warning() << "Socket poll() failed during connectivity check"
-                  << " (idle " << idleTimeSecs << " secs,"
-                  << " remote host " << remoteString() << ")" << causedBy(errnoWithDescription());
+        LOGV2_WARNING(23193,
+                      "Socket poll() to remote host failed during connectivity check",
+                      "idleTimeSecs"_attr = idleTimeSecs,
+                      "remoteHost"_attr = remoteString(),
+                      "error"_attr = causedBy(errorMessage(ec)));
 
         // Return true since it's not clear that we're disconnected.
         return true;
@@ -666,53 +700,63 @@ bool Socket::isStillConnected() {
         int recvd = ::recv(_fd, testBuf, testBufLength, portRecvFlags);
 
         if (recvd < 0) {
+            auto ec = lastSocketError();
             // An error occurred during recv, warn and log errno
-            warning() << "Socket recv() failed during connectivity check"
-                      << " (idle " << idleTimeSecs << " secs,"
-                      << " remote host " << remoteString() << ")"
-                      << causedBy(errnoWithDescription());
+            LOGV2_WARNING(23194,
+                          "Socket recv() failed during connectivity check",
+                          "idleTimeSecs"_attr = idleTimeSecs,
+                          "remoteHost"_attr = remoteString(),
+                          "error"_attr = causedBy(errorMessage(ec)));
         } else if (recvd > 0) {
             // We got nonzero data from this socket, very weird?
             // Log and warn at runtime, log and abort at devtime
             // TODO: Dump the data to the log somehow?
-            error() << "Socket found pending " << recvd
-                    << " bytes of data during connectivity check"
-                    << " (idle " << idleTimeSecs << " secs,"
-                    << " remote host " << remoteString() << ")";
-            DEV {
-                std::string hex = hexdump(testBuf, recvd);
-                error() << "Hex dump of stale log data: " << hex;
+            LOGV2_ERROR(23197,
+                        "Socket found pending bytes of data during connectivity check to remote "
+                        "host",
+                        "recvd"_attr = recvd,
+                        "idleTimeSecs"_attr = idleTimeSecs,
+                        "remoteHost"_attr = remoteString());
+            if (kDebugBuild) {
+                LOGV2_ERROR(
+                    23198, "Hex dump of stale log data", "hex"_attr = hexdump(testBuf, recvd));
             }
             dassert(false);
         } else {
             // recvd == 0, socket closed remotely, just return false
-            LOG(0) << "Socket closed remotely, no longer connected"
-                   << " (idle " << idleTimeSecs << " secs,"
-                   << " remote host " << remoteString() << ")";
+            LOGV2(23187,
+                  "Socket closed remotely, no longer connected to remote host",
+                  "idleTimeSecs"_attr = idleTimeSecs,
+                  "remoteHost"_attr = remoteString());
         }
     } else if (pollInfo.revents & POLLHUP) {
         // A hangup has occurred on this socket
-        LOG(0) << "Socket hangup detected, no longer connected"
-               << " (idle " << idleTimeSecs << " secs,"
-               << " remote host " << remoteString() << ")";
+        LOGV2(23188,
+              "Socket hangup detected, no longer connected to remote host",
+              "idleTimeSecs"_attr = idleTimeSecs,
+              "remoteHost"_attr = remoteString());
     } else if (pollInfo.revents & POLLERR) {
         // An error has occurred on this socket
-        LOG(0) << "Socket error detected, no longer connected"
-               << " (idle " << idleTimeSecs << " secs,"
-               << " remote host " << remoteString() << ")";
+        LOGV2(23189,
+              "Socket error detected, no longer connected to remote host",
+              "idleTimeSecs"_attr = idleTimeSecs,
+              "remoteHost"_attr = remoteString());
     } else if (pollInfo.revents & POLLNVAL) {
         // Socket descriptor itself is weird
         // Log and warn at runtime, log and abort at devtime
-        error() << "Socket descriptor detected as invalid"
-                << " (idle " << idleTimeSecs << " secs,"
-                << " remote host " << remoteString() << ")";
+        LOGV2_ERROR(23199,
+                    "Socket descriptor detected as invalid",
+                    "idleTimeSecs"_attr = idleTimeSecs,
+                    "remoteHost"_attr = remoteString());
         dassert(false);
     } else {
         // Don't know what poll is saying here
         // Log and warn at runtime, log and abort at devtime
-        error() << "Socket had unknown event (" << static_cast<int>(pollInfo.revents) << ")"
-                << " (idle " << idleTimeSecs << " secs,"
-                << " remote host " << remoteString() << ")";
+        LOGV2_ERROR(23200,
+                    "Socket had unknown event",
+                    "pollEvents"_attr = static_cast<int>(pollInfo.revents),
+                    "idleTimeSecs"_attr = idleTimeSecs,
+                    "remoteString"_attr = remoteString());
         dassert(false);
     }
 

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,15 +27,13 @@
  *    it in the license file.
  */
 
-#include "mongo/db/field_ref_set.h"
-
 #include "mongo/db/field_ref.h"
+#include "mongo/db/field_ref_set.h"
 #include "mongo/unittest/unittest.h"
 
-namespace {
+namespace mongo {
 
-using mongo::FieldRef;
-using mongo::FieldRefSet;
+namespace {
 
 TEST(EmptySet, Normal) {
     // insert "b"
@@ -44,17 +41,17 @@ TEST(EmptySet, Normal) {
     FieldRef bSimple("b");
     const FieldRef* conflict;
     ASSERT_TRUE(fieldSet.insert(&bSimple, &conflict));
-    ASSERT_EQUALS(static_cast<const FieldRef*>(NULL), conflict);
+    ASSERT_EQUALS(static_cast<const FieldRef*>(nullptr), conflict);
 
     // insert "a", OK
     FieldRef aSimple("a");
     ASSERT_TRUE(fieldSet.insert(&aSimple, &conflict));
-    ASSERT_EQUALS(static_cast<const FieldRef*>(NULL), conflict);
+    ASSERT_EQUALS(static_cast<const FieldRef*>(nullptr), conflict);
 
     // insert "c", OK
     FieldRef cSimple("c");
     ASSERT_TRUE(fieldSet.insert(&cSimple, &conflict));
-    ASSERT_EQUALS(static_cast<const FieldRef*>(NULL), conflict);
+    ASSERT_EQUALS(static_cast<const FieldRef*>(nullptr), conflict);
 }
 
 TEST(EmptySet, Conflict) {
@@ -63,7 +60,7 @@ TEST(EmptySet, Conflict) {
     FieldRef aDotB("a.b");
     const FieldRef* conflict;
     ASSERT_TRUE(fieldSet.insert(&aDotB, &conflict));
-    ASSERT_EQUALS(static_cast<const FieldRef*>(NULL), conflict);
+    ASSERT_EQUALS(static_cast<const FieldRef*>(nullptr), conflict);
 
     // insert "a", conflicts with "a.b"
     FieldRef prefix("a");
@@ -83,7 +80,7 @@ TEST(EmptySet, EmptyField) {
     FieldRef empty;
     const FieldRef* conflict;
     ASSERT_TRUE(fieldSet.insert(&empty, &conflict));
-    ASSERT_EQUALS(static_cast<const FieldRef*>(NULL), conflict);
+    ASSERT_EQUALS(static_cast<const FieldRef*>(nullptr), conflict);
 
     ASSERT_FALSE(fieldSet.insert(&empty, &conflict));
     ASSERT_EQUALS(empty, *conflict);
@@ -96,24 +93,24 @@ TEST(NotEmptySet, Normal) {
     FieldRef bDotE("b.e");
     const FieldRef* conflict;
     ASSERT_TRUE(fieldSet.insert(&bDotC, &conflict));
-    ASSERT_EQUALS(static_cast<const FieldRef*>(NULL), conflict);
+    ASSERT_EQUALS(static_cast<const FieldRef*>(nullptr), conflict);
     ASSERT_TRUE(fieldSet.insert(&bDotE, &conflict));
-    ASSERT_EQUALS(static_cast<const FieldRef*>(NULL), conflict);
+    ASSERT_EQUALS(static_cast<const FieldRef*>(nullptr), conflict);
 
     // insert "a" before, OK
     FieldRef aSimple("a");
     ASSERT_TRUE(fieldSet.insert(&aSimple, &conflict));
-    ASSERT_EQUALS(static_cast<const FieldRef*>(NULL), conflict);
+    ASSERT_EQUALS(static_cast<const FieldRef*>(nullptr), conflict);
 
     // insert "b.d" in the middle, OK
     FieldRef bDotD("b.d");
     ASSERT_TRUE(fieldSet.insert(&bDotD, &conflict));
-    ASSERT_EQUALS(static_cast<const FieldRef*>(NULL), conflict);
+    ASSERT_EQUALS(static_cast<const FieldRef*>(nullptr), conflict);
 
     // insert "c" after, OK
     FieldRef cSimple("c");
     ASSERT_TRUE(fieldSet.insert(&cSimple, &conflict));
-    ASSERT_EQUALS(static_cast<const FieldRef*>(NULL), conflict);
+    ASSERT_EQUALS(static_cast<const FieldRef*>(nullptr), conflict);
 }
 
 TEST(NotEmpty, Conflict) {
@@ -123,9 +120,9 @@ TEST(NotEmpty, Conflict) {
     FieldRef bDotE("b.e");
     const FieldRef* conflict;
     ASSERT_TRUE(fieldSet.insert(&bDotC, &conflict));
-    ASSERT_EQUALS(static_cast<const FieldRef*>(NULL), conflict);
+    ASSERT_EQUALS(static_cast<const FieldRef*>(nullptr), conflict);
     ASSERT_TRUE(fieldSet.insert(&bDotE, &conflict));
-    ASSERT_EQUALS(static_cast<const FieldRef*>(NULL), conflict);
+    ASSERT_EQUALS(static_cast<const FieldRef*>(nullptr), conflict);
 
     // insert "b" before, conflicts "b.c"
     FieldRef bSimple("b");
@@ -143,4 +140,47 @@ TEST(NotEmpty, Conflict) {
     ASSERT_EQUALS(bDotE, *conflict);
 }
 
-}  // unnamed namespace
+TEST(FieldRefSetWithStorageTest, ManagesFieldRefLifetime) {
+    FieldRefSetWithStorage fieldRefSet;
+    FieldRef ref("a.b");
+
+    fieldRefSet.keepShortest(ref);
+    ASSERT_EQUALS("{a.b}", fieldRefSet.toString());
+
+    // Re-use 'ref', and verify that the set still contains the previous FieldRef.
+    ref.parse("b.c"_sd);
+    fieldRefSet.keepShortest(ref);
+    ASSERT_EQUALS("{a.b, b.c}", fieldRefSet.toString());
+}
+
+TEST(FieldRefSetWithStorageTest, InsertRemovesConflictsByKeepingShortest) {
+    FieldRefSetWithStorage fieldRefSet;
+    FieldRef ref("a.b");
+
+    fieldRefSet.keepShortest(ref);
+    ASSERT_EQUALS("{a.b}", fieldRefSet.toString());
+
+    ref.parse("a"_sd);
+    fieldRefSet.keepShortest(ref);
+    ASSERT_EQUALS("{a}", fieldRefSet.toString());
+}
+
+TEST(FieldRefSetWithStorageTest, InsertRemovesMultipleConflicts) {
+    FieldRefSetWithStorage fieldRefSet;
+    FieldRef ref("a.b");
+
+    fieldRefSet.keepShortest(ref);
+    ASSERT_EQUALS("{a.b}", fieldRefSet.toString());
+
+    ref.parse("a.c"_sd);
+    fieldRefSet.keepShortest(ref);
+    ASSERT_EQUALS("{a.b, a.c}", fieldRefSet.toString());
+
+    // Inserting 'a' should remove both conflicts with longer paths.
+    ref.parse("a"_sd);
+    fieldRefSet.keepShortest(ref);
+    ASSERT_EQUALS("{a}", fieldRefSet.toString());
+}
+
+}  // namespace
+}  // namespace mongo

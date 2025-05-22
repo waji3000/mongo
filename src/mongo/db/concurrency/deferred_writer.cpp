@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,17 +27,34 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kWrite
-
 #include "mongo/db/concurrency/deferred_writer.h"
+
+#include <boost/move/utility_core.hpp>
+#include <compare>
+#include <functional>
+#include <mutex>
+#include <utility>
+
+#include <boost/none.hpp>
+
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/catalog/create_collection.h"
 #include "mongo/db/client.h"
-#include "mongo/db/concurrency/write_conflict_exception.h"
-#include "mongo/db/db_raii.h"
+#include "mongo/db/concurrency/exception_util.h"
+#include "mongo/db/concurrency/lock_manager_defs.h"
+#include "mongo/db/dbhelpers.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/util/concurrency/idle_thread_block.h"
+#include "mongo/db/repl/read_concern_args.h"
+#include "mongo/db/shard_role.h"
+#include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/db/transaction_resources.h"
+#include "mongo/logv2/log.h"
+#include "mongo/s/database_version.h"
+#include "mongo/s/shard_version.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/concurrency/thread_pool.h"
-#include "mongo/util/log.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kWrite
 
 namespace mongo {
 
@@ -48,7 +64,7 @@ auto kLogInterval = stdx::chrono::minutes(1);
 
 void DeferredWriter::_logFailure(const Status& status) {
     if (TimePoint::clock::now() - _lastLogged > kLogInterval) {
-        log() << "Unable to write to collection " << _nss.toString() << ": " << status.toString();
+        LOGV2(20516, "Unable to write to collection", logAttrs(_nss), "error"_attr = status);
         _lastLogged = stdx::chrono::system_clock::now();
     }
 }
@@ -56,8 +72,11 @@ void DeferredWriter::_logFailure(const Status& status) {
 void DeferredWriter::_logDroppedEntry() {
     _droppedEntries += 1;
     if (TimePoint::clock::now() - _lastLoggedDrop > kLogInterval) {
-        log() << "Deferred write buffer for " << _nss.toString() << " is full. " << _droppedEntries
-              << " entries have been dropped.";
+        LOGV2(20517,
+              "Deferred write buffer for {namespace} is full. {droppedEntries} entries have been "
+              "dropped.",
+              logAttrs(_nss),
+              "droppedEntries"_attr = _droppedEntries);
         _lastLoggedDrop = stdx::chrono::system_clock::now();
         _droppedEntries = 0;
     }
@@ -68,49 +87,50 @@ Status DeferredWriter::_makeCollection(OperationContext* opCtx) {
     builder.append("create", _nss.coll());
     builder.appendElements(_collectionOptions.toBSON());
     try {
-        return createCollection(opCtx, _nss.db().toString(), builder.obj().getOwned());
+        return createCollection(opCtx, _nss.dbName(), builder.obj().getOwned());
     } catch (const DBException& exception) {
         return exception.toStatus();
     }
 }
 
-StatusWith<std::unique_ptr<AutoGetCollection>> DeferredWriter::_getCollection(
-    OperationContext* opCtx) {
-    std::unique_ptr<AutoGetCollection> agc;
-    agc = stdx::make_unique<AutoGetCollection>(opCtx, _nss, MODE_IX);
+StatusWith<CollectionAcquisition> DeferredWriter::_getCollection(OperationContext* opCtx) {
+    while (true) {
+        {
+            auto collection =
+                acquireCollection(opCtx,
+                                  CollectionAcquisitionRequest(
+                                      _nss,
+                                      PlacementConcern{boost::none, ShardVersion::UNSHARDED()},
+                                      repl::ReadConcernArgs::get(opCtx),
+                                      AcquisitionPrerequisites::kWrite),
+                                  MODE_IX);
+            if (collection.exists()) {
+                return std::move(collection);
+            }
+        }
 
-    while (!agc->getCollection()) {
-        // Release the previous AGC's lock before trying to rebuild the collection.
-        agc.reset();
+        // Release the lockS before trying to rebuild the collection.
         Status status = _makeCollection(opCtx);
-
         if (!status.isOK()) {
             return status;
         }
-
-        agc = stdx::make_unique<AutoGetCollection>(opCtx, _nss, MODE_IX);
     }
-
-    return std::move(agc);
 }
 
-void DeferredWriter::_worker(InsertStatement stmt) {
+Status DeferredWriter::_worker(BSONObj doc) noexcept try {
     auto uniqueOpCtx = Client::getCurrent()->makeOperationContext();
     OperationContext* opCtx = uniqueOpCtx.get();
     auto result = _getCollection(opCtx);
 
     if (!result.isOK()) {
-        _logFailure(result.getStatus());
-        return;
+        return result.getStatus();
     }
 
-    auto agc = std::move(result.getValue());
+    const auto collection = std::move(result.getValue());
 
-    Collection& collection = *agc->getCollection();
-
-    Status status = writeConflictRetry(opCtx, "deferred insert", _nss.ns(), [&] {
+    Status status = writeConflictRetry(opCtx, "deferred insert", _nss, [&] {
         WriteUnitOfWork wuow(opCtx);
-        Status status = collection.insertDocument(opCtx, stmt, nullptr, false);
+        Status status = Helpers::insert(opCtx, collection, doc);
         if (!status.isOK()) {
             return status;
         }
@@ -121,21 +141,23 @@ void DeferredWriter::_worker(InsertStatement stmt) {
 
     stdx::lock_guard<stdx::mutex> lock(_mutex);
 
-    _numBytes -= stmt.doc.objsize();
-
-    // If a write to a deferred collection fails, periodically tell the log.
-    if (!status.isOK()) {
-        _logFailure(status);
-    }
+    _numBytes -= doc.objsize();
+    return status;
+} catch (const DBException& e) {
+    return e.toStatus();
 }
 
-DeferredWriter::DeferredWriter(NamespaceString nss, CollectionOptions opts, int64_t maxSize)
+DeferredWriter::DeferredWriter(NamespaceString nss,
+                               CollectionOptions opts,
+                               int64_t maxSize,
+                               bool retryOnReplStateChangeInterruption)
     : _collectionOptions(opts),
       _maxNumBytes(maxSize),
       _nss(nss),
       _numBytes(0),
       _droppedEntries(0),
-      _lastLogged(TimePoint::clock::now() - kLogInterval) {}
+      _lastLogged(TimePoint::clock::now() - kLogInterval),
+      _retryOnReplStateChangeInterruption(retryOnReplStateChangeInterruption) {}
 
 DeferredWriter::~DeferredWriter() {}
 
@@ -147,8 +169,10 @@ void DeferredWriter::startup(std::string workerName) {
     options.threadNamePrefix = workerName;
     options.minThreads = 0;
     options.maxThreads = 1;
-    options.onCreateThread = [](const std::string& name) { Client::initThread(name); };
-    _pool = stdx::make_unique<ThreadPool>(options);
+    options.onCreateThread = [](const std::string& name) {
+        Client::initThread(name, getGlobalServiceContext()->getService(ClusterRole::ShardServer));
+    };
+    _pool = std::make_unique<ThreadPool>(options);
     _pool->startup();
 }
 
@@ -171,15 +195,30 @@ bool DeferredWriter::insertDocument(BSONObj obj) {
 
     // Check if we're allowed to insert this object.
     if (_numBytes + obj.objsize() >= _maxNumBytes) {
-        // If not, drop it.  We always drop new entries rather than old ones; that way the caller
-        // knows at the time of the call that the entry was dropped.
+        // If not, drop it.  We always drop new entries rather than old ones; that way the
+        // caller knows at the time of the call that the entry was dropped.
         _logDroppedEntry();
         return false;
     }
 
     // Add the object to the buffer.
     _numBytes += obj.objsize();
-    fassert(40588, _pool->schedule([this, obj] { _worker(InsertStatement(obj.getOwned())); }));
+    _pool->schedule([this, obj](auto status) {
+        fassert(40588, status);
+        bool retryable;
+        int numRetries = 5;
+        do {
+            retryable = false;
+            auto workerStatus = _worker(obj.getOwned());
+            if (workerStatus.isOK()) {
+                break;
+            }
+
+            _logFailure(workerStatus);
+            retryable = _retryOnReplStateChangeInterruption &&
+                workerStatus.code() == ErrorCodes::InterruptedDueToReplStateChange;
+        } while (retryable && numRetries-- > 0);
+    });
     return true;
 }
 

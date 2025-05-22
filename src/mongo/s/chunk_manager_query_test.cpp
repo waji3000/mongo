@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,23 +27,83 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
-
-#include "mongo/platform/basic.h"
-
+#include <memory>
 #include <set>
+#include <string>
+#include <utility>
+#include <vector>
 
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/json.h"
+#include "mongo/bson/oid.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/pipeline/expression_context_for_test.h"
+#include "mongo/db/query/collation/collator_factory_interface.h"
+#include "mongo/db/query/collation/collator_interface.h"
 #include "mongo/db/query/collation/collator_interface_mock.h"
+#include "mongo/db/shard_id.h"
+#include "mongo/s/catalog/type_chunk.h"
+#include "mongo/s/catalog_cache.h"
 #include "mongo/s/catalog_cache_test_fixture.h"
 #include "mongo/s/chunk_manager.h"
-#include "mongo/util/log.h"
+#include "mongo/s/chunk_version.h"
+#include "mongo/s/chunks_test_util.h"
+#include "mongo/s/database_version.h"
+#include "mongo/s/shard_key_pattern.h"
+#include "mongo/s/shard_key_pattern_query_util.h"
+#include "mongo/unittest/unittest.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/intrusive_counter.h"
+#include "mongo/util/uuid.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 namespace mongo {
 namespace {
 
-const NamespaceString kNss("TestDB", "TestColl");
+PseudoRandom _random{SecureRandom().nextInt64()};
 
-class ChunkManagerQueryTest : public CatalogCacheTestFixture {
+using shard_key_pattern_query_util::QueryTargetingInfo;
+
+const NamespaceString kNss = NamespaceString::createNamespaceString_forTest("TestDB", "TestColl");
+
+boost::optional<Chunk> findPreviousOwnedChunk(auto chunkIt,
+                                              const std::vector<std::shared_ptr<ChunkInfo>>& chunks,
+                                              Timestamp clusterTime,
+                                              ShardId shardId) {
+    auto prev = chunkIt;
+    while (prev != chunks.begin()) {
+        prev = std::prev(prev);
+        if ((*prev)->getShardIdAt(clusterTime) == shardId) {
+            return Chunk(*(prev->get()), clusterTime);
+        }
+    }
+    return boost::none;
+}
+
+boost::optional<Chunk> findNextOwnedChunk(auto chunkIt,
+                                          const std::vector<std::shared_ptr<ChunkInfo>>& chunks,
+                                          Timestamp clusterTime,
+                                          ShardId shardId) {
+    auto next = chunkIt;
+    while (next != std::prev(chunks.end())) {
+        next = std::next(next);
+        if ((*next)->getShardIdAt(clusterTime) == shardId) {
+            return Chunk(*(next->get()), clusterTime);
+        }
+    }
+    return boost::none;
+}
+
+class ChunkManagerQueryTest : public RouterCatalogCacheTestFixture {
 protected:
     void runGetShardIdsForRangeTest(const BSONObj& shardKey,
                                     bool unique,
@@ -53,10 +112,12 @@ protected:
                                     const BSONObj& max,
                                     const std::set<ShardId>& expectedShardIds) {
         const ShardKeyPattern shardKeyPattern(shardKey);
-        auto chunkManager = makeChunkManager(kNss, shardKeyPattern, nullptr, false, splitPoints);
+        auto chunkManager =
+            makeCollectionRoutingInfo(kNss, shardKeyPattern, nullptr, false, splitPoints, {})
+                .getChunkManager();
 
         std::set<ShardId> shardIds;
-        chunkManager->getShardIdsForRange(min, max, &shardIds);
+        chunkManager.getShardIdsForRange(min, max, &shardIds);
 
         _assertShardIdsMatch(expectedShardIds, shardIds);
     }
@@ -67,15 +128,33 @@ protected:
                       const std::vector<BSONObj>& splitPoints,
                       const BSONObj& query,
                       const BSONObj& queryCollation,
-                      const std::set<ShardId>& expectedShardIds) {
+                      const std::set<ShardId>& expectedShardIds,
+                      QueryTargetingInfo expectedQueryTargetingInfo) {
         const ShardKeyPattern shardKeyPattern(shardKey);
         auto chunkManager =
-            makeChunkManager(kNss, shardKeyPattern, std::move(defaultCollator), false, splitPoints);
+            makeCollectionRoutingInfo(
+                kNss, shardKeyPattern, std::move(defaultCollator), false, splitPoints, {})
+                .getChunkManager();
 
         std::set<ShardId> shardIds;
-        chunkManager->getShardIdsForQuery(operationContext(), query, queryCollation, &shardIds);
+        QueryTargetingInfo info;
 
+        auto&& cif = [&]() {
+            if (queryCollation.isEmpty()) {
+                return std::unique_ptr<CollatorInterface>{};
+            } else {
+                return uassertStatusOK(CollatorFactoryInterface::get(getServiceContext())
+                                           ->makeFromBSON(queryCollation));
+            }
+        }();
+        auto expCtx =
+            make_intrusive<ExpressionContextForTest>(operationContext(), kNss, std::move(cif));
+        getShardIdsAndChunksForQuery(expCtx, query, queryCollation, chunkManager, &shardIds, &info);
         _assertShardIdsMatch(expectedShardIds, shardIds);
+        // Test coverage for chunk ranges is provided in ChunkManagerTest and
+        // ShardKeyPatternQueryUtilTest. ShardKeyPatternQueryUtilTest includes specific cases
+        // related to update and delete queries.
+        ASSERT_EQ(expectedQueryTargetingInfo.desc, info.desc);
     }
 
 private:
@@ -123,37 +202,36 @@ TEST_F(ChunkManagerQueryTest, GetShardIdsForRangeMinAndMaxAreTheSameAtLastChunkM
 }
 
 TEST_F(ChunkManagerQueryTest, EmptyQuerySingleShard) {
-    runQueryTest(BSON("a" << 1), nullptr, false, {}, BSONObj(), BSONObj(), {ShardId("0")});
+    runQueryTest(BSON("a" << 1),
+                 nullptr,
+                 false,
+                 {},
+                 BSONObj(),
+                 BSONObj(),
+                 {ShardId("0")},
+                 {QueryTargetingInfo::Description::kMinKeyToMaxKey, {}});
 }
 
 TEST_F(ChunkManagerQueryTest, EmptyQueryMultiShard) {
     runQueryTest(BSON("a" << 1),
                  nullptr,
                  false,
-                 {BSON("a"
-                       << "x"),
-                  BSON("a"
-                       << "y"),
-                  BSON("a"
-                       << "z")},
+                 {BSON("a" << "x"), BSON("a" << "y"), BSON("a" << "z")},
                  BSONObj(),
                  BSONObj(),
-                 {ShardId("0"), ShardId("1"), ShardId("2"), ShardId("3")});
+                 {ShardId("0"), ShardId("1"), ShardId("2"), ShardId("3")},
+                 {QueryTargetingInfo::Description::kMinKeyToMaxKey, {}});
 }
 
 TEST_F(ChunkManagerQueryTest, UniversalRangeMultiShard) {
     runQueryTest(BSON("a" << 1),
                  nullptr,
                  false,
-                 {BSON("a"
-                       << "x"),
-                  BSON("a"
-                       << "y"),
-                  BSON("a"
-                       << "z")},
+                 {BSON("a" << "x"), BSON("a" << "y"), BSON("a" << "z")},
                  BSON("b" << 1),
                  BSONObj(),
-                 {ShardId("0"), ShardId("1"), ShardId("2"), ShardId("3")});
+                 {ShardId("0"), ShardId("1"), ShardId("2"), ShardId("3")},
+                 {QueryTargetingInfo::Description::kMinKeyToMaxKey, {}});
 }
 
 TEST_F(ChunkManagerQueryTest, EqualityRangeSingleShard) {
@@ -161,71 +239,54 @@ TEST_F(ChunkManagerQueryTest, EqualityRangeSingleShard) {
                  nullptr,
                  false,
                  {},
-                 BSON("a"
-                      << "x"),
+                 BSON("a" << "x"),
                  BSONObj(),
-                 {ShardId("0")});
+                 {ShardId("0")},
+                 {QueryTargetingInfo::Description::kSingleKey, {}});
 }
 
 TEST_F(ChunkManagerQueryTest, EqualityRangeMultiShard) {
     runQueryTest(BSON("a" << 1),
                  nullptr,
                  false,
-                 {BSON("a"
-                       << "x"),
-                  BSON("a"
-                       << "y"),
-                  BSON("a"
-                       << "z")},
-                 BSON("a"
-                      << "y"),
+                 {BSON("a" << "x"), BSON("a" << "y"), BSON("a" << "z")},
+                 BSON("a" << "y"),
                  BSONObj(),
-                 {ShardId("2")});
+                 {ShardId("2")},
+                 {QueryTargetingInfo::Description::kSingleKey, {}});
 }
 
 TEST_F(ChunkManagerQueryTest, SetRangeMultiShard) {
     runQueryTest(BSON("a" << 1),
                  nullptr,
                  false,
-                 {BSON("a"
-                       << "x"),
-                  BSON("a"
-                       << "y"),
-                  BSON("a"
-                       << "z")},
+                 {BSON("a" << "x"), BSON("a" << "y"), BSON("a" << "z")},
                  fromjson("{a:{$in:['u','y']}}"),
                  BSONObj(),
-                 {ShardId("0"), ShardId("2")});
+                 {ShardId("0"), ShardId("2")},
+                 {QueryTargetingInfo::Description::kMultipleKeys, {}});
 }
 
 TEST_F(ChunkManagerQueryTest, GTRangeMultiShard) {
     runQueryTest(BSON("a" << 1),
                  nullptr,
                  false,
-                 {BSON("a"
-                       << "x"),
-                  BSON("a"
-                       << "y"),
-                  BSON("a"
-                       << "z")},
+                 {BSON("a" << "x"), BSON("a" << "y"), BSON("a" << "z")},
                  BSON("a" << GT << "x"),
                  BSONObj(),
-                 {ShardId("1"), ShardId("2"), ShardId("3")});
+                 {ShardId("1"), ShardId("2"), ShardId("3")},
+                 {QueryTargetingInfo::Description::kMultipleKeys, {}});
 }
 
 TEST_F(ChunkManagerQueryTest, GTERangeMultiShard) {
     runQueryTest(BSON("a" << 1),
                  nullptr,
                  false,
-                 {BSON("a"
-                       << "x"),
-                  BSON("a"
-                       << "y"),
-                  BSON("a"
-                       << "z")},
+                 {BSON("a" << "x"), BSON("a" << "y"), BSON("a" << "z")},
                  BSON("a" << GTE << "x"),
                  BSONObj(),
-                 {ShardId("1"), ShardId("2"), ShardId("3")});
+                 {ShardId("1"), ShardId("2"), ShardId("3")},
+                 {QueryTargetingInfo::Description::kMultipleKeys, {}});
 }
 
 TEST_F(ChunkManagerQueryTest, LTRangeMultiShard) {
@@ -234,75 +295,55 @@ TEST_F(ChunkManagerQueryTest, LTRangeMultiShard) {
     runQueryTest(BSON("a" << 1),
                  nullptr,
                  false,
-                 {BSON("a"
-                       << "x"),
-                  BSON("a"
-                       << "y"),
-                  BSON("a"
-                       << "z")},
+                 {BSON("a" << "x"), BSON("a" << "y"), BSON("a" << "z")},
                  BSON("a" << LT << "y"),
                  BSONObj(),
-                 {ShardId("0"), ShardId("1"), ShardId("2")});
+                 {ShardId("0"), ShardId("1"), ShardId("2")},
+                 {QueryTargetingInfo::Description::kMultipleKeys, {}});
 }
 
 TEST_F(ChunkManagerQueryTest, LTERangeMultiShard) {
     runQueryTest(BSON("a" << 1),
                  nullptr,
                  false,
-                 {BSON("a"
-                       << "x"),
-                  BSON("a"
-                       << "y"),
-                  BSON("a"
-                       << "z")},
+                 {BSON("a" << "x"), BSON("a" << "y"), BSON("a" << "z")},
                  BSON("a" << LTE << "y"),
                  BSONObj(),
-                 {ShardId("0"), ShardId("1"), ShardId("2")});
+                 {ShardId("0"), ShardId("1"), ShardId("2")},
+                 {QueryTargetingInfo::Description::kMultipleKeys, {}});
 }
 
 TEST_F(ChunkManagerQueryTest, OrEqualities) {
     runQueryTest(BSON("a" << 1),
                  nullptr,
                  false,
-                 {BSON("a"
-                       << "x"),
-                  BSON("a"
-                       << "y"),
-                  BSON("a"
-                       << "z")},
+                 {BSON("a" << "x"), BSON("a" << "y"), BSON("a" << "z")},
                  fromjson("{$or:[{a:'u'},{a:'y'}]}"),
                  BSONObj(),
-                 {ShardId("0"), ShardId("2")});
+                 {ShardId("0"), ShardId("2")},
+                 {QueryTargetingInfo::Description::kMultipleKeys, {}});
 }
 
 TEST_F(ChunkManagerQueryTest, OrEqualityInequality) {
     runQueryTest(BSON("a" << 1),
                  nullptr,
                  false,
-                 {BSON("a"
-                       << "x"),
-                  BSON("a"
-                       << "y"),
-                  BSON("a"
-                       << "z")},
+                 {BSON("a" << "x"), BSON("a" << "y"), BSON("a" << "z")},
                  fromjson("{$or:[{a:'u'},{a:{$gte:'y'}}]}"),
                  BSONObj(),
-                 {ShardId("0"), ShardId("2"), ShardId("3")});
+                 {ShardId("0"), ShardId("2"), ShardId("3")},
+                 {QueryTargetingInfo::Description::kMultipleKeys, {}});
 }
 
 TEST_F(ChunkManagerQueryTest, OrEqualityInequalityUnhelpful) {
     runQueryTest(BSON("a" << 1),
                  nullptr,
                  false,
-                 {BSON("a"
-                       << "x"),
-                  BSON("a"
-                       << "y"),
-                  BSON("a"
-                       << "z")},
+                 {BSON("a" << "x"), BSON("a" << "y"), BSON("a" << "z")},
                  fromjson("{$or:[{a:'u'},{a:{$gte:'zz'}},{}]}"),
                  BSONObj(),
-                 {ShardId("0"), ShardId("1"), ShardId("2"), ShardId("3")});
+                 {ShardId("0"), ShardId("1"), ShardId("2"), ShardId("3")},
+                 {QueryTargetingInfo::Description::kMinKeyToMaxKey, {}});
 }
 
 TEST_F(ChunkManagerQueryTest, UnsatisfiableRangeSingleShard) {
@@ -312,67 +353,52 @@ TEST_F(ChunkManagerQueryTest, UnsatisfiableRangeSingleShard) {
                  {},
                  BSON("a" << GT << "x" << LT << "x"),
                  BSONObj(),
-                 {ShardId("0")});
+                 {ShardId("0")},
+                 {QueryTargetingInfo::Description::kMultipleKeys, {}});
 }
 
 TEST_F(ChunkManagerQueryTest, UnsatisfiableRangeMultiShard) {
     runQueryTest(BSON("a" << 1),
                  nullptr,
                  false,
-                 {BSON("a"
-                       << "x"),
-                  BSON("a"
-                       << "y"),
-                  BSON("a"
-                       << "z")},
+                 {BSON("a" << "x"), BSON("a" << "y"), BSON("a" << "z")},
                  BSON("a" << GT << "x" << LT << "x"),
                  BSONObj(),
-                 {ShardId("0")});
+                 {ShardId("0")},
+                 {QueryTargetingInfo::Description::kMultipleKeys, {}});
 }
 
 TEST_F(ChunkManagerQueryTest, EqualityThenUnsatisfiable) {
     runQueryTest(BSON("a" << 1 << "b" << 1),
                  nullptr,
                  false,
-                 {BSON("a"
-                       << "x"),
-                  BSON("a"
-                       << "y"),
-                  BSON("a"
-                       << "z")},
+                 {BSON("a" << "x"), BSON("a" << "y"), BSON("a" << "z")},
                  BSON("a" << 1 << "b" << GT << 4 << LT << 4),
                  BSONObj(),
-                 {ShardId("0")});
+                 {ShardId("0")},
+                 {QueryTargetingInfo::Description::kMultipleKeys, {}});
 }
 
 TEST_F(ChunkManagerQueryTest, InequalityThenUnsatisfiable) {
     runQueryTest(BSON("a" << 1 << "b" << 1),
                  nullptr,
                  false,
-                 {BSON("a"
-                       << "x"),
-                  BSON("a"
-                       << "y"),
-                  BSON("a"
-                       << "z")},
+                 {BSON("a" << "x"), BSON("a" << "y"), BSON("a" << "z")},
                  BSON("a" << GT << 1 << "b" << GT << 4 << LT << 4),
                  BSONObj(),
-                 {ShardId("0")});
+                 {ShardId("0")},
+                 {QueryTargetingInfo::Description::kMultipleKeys, {}});
 }
 
 TEST_F(ChunkManagerQueryTest, OrEqualityUnsatisfiableInequality) {
     runQueryTest(BSON("a" << 1),
                  nullptr,
                  false,
-                 {BSON("a"
-                       << "x"),
-                  BSON("a"
-                       << "y"),
-                  BSON("a"
-                       << "z")},
+                 {BSON("a" << "x"), BSON("a" << "y"), BSON("a" << "z")},
                  fromjson("{$or:[{a:'x'},{a:{$gt:'u',$lt:'u'}},{a:{$gte:'y'}}]}"),
                  BSONObj(),
-                 {ShardId("1"), ShardId("2"), ShardId("3")});
+                 {ShardId("1"), ShardId("2"), ShardId("3")},
+                 {QueryTargetingInfo::Description::kMultipleKeys, {}});
 }
 
 TEST_F(ChunkManagerQueryTest, InMultiShard) {
@@ -383,110 +409,251 @@ TEST_F(ChunkManagerQueryTest, InMultiShard) {
                  BSON("a" << BSON("$in" << BSON_ARRAY(0 << 5 << 10)) << "b"
                           << BSON("$in" << BSON_ARRAY(0 << 5 << 25))),
                  BSONObj(),
-                 {ShardId("0"), ShardId("1"), ShardId("2")});
+                 {ShardId("0"), ShardId("1"), ShardId("2")},
+                 {QueryTargetingInfo::Description::kMultipleKeys, {}});
 }
 
 TEST_F(ChunkManagerQueryTest, CollationStringsMultiShard) {
     runQueryTest(BSON("a" << 1),
                  nullptr,
                  false,
-                 {BSON("a"
-                       << "x"),
-                  BSON("a"
-                       << "y"),
-                  BSON("a"
-                       << "z")},
-                 BSON("a"
-                      << "y"),
-                 BSON("locale"
-                      << "mock_reverse_string"),
-                 {ShardId("0"), ShardId("1"), ShardId("2"), ShardId("3")});
+                 {BSON("a" << "x"), BSON("a" << "y"), BSON("a" << "z")},
+                 BSON("a" << "y"),
+                 BSON("locale" << "mock_reverse_string"),
+                 {ShardId("0"), ShardId("1"), ShardId("2"), ShardId("3")},
+                 {QueryTargetingInfo::Description::kMinKeyToMaxKey, {}});
 }
 
 TEST_F(ChunkManagerQueryTest, DefaultCollationStringsMultiShard) {
     runQueryTest(
         BSON("a" << 1),
-        stdx::make_unique<CollatorInterfaceMock>(CollatorInterfaceMock::MockType::kReverseString),
+        std::make_unique<CollatorInterfaceMock>(CollatorInterfaceMock::MockType::kReverseString),
         false,
-        {BSON("a"
-              << "x"),
-         BSON("a"
-              << "y"),
-         BSON("a"
-              << "z")},
-        BSON("a"
-             << "y"),
-        BSON("locale"
-             << "mock_reverse_string"),
-        {ShardId("0"), ShardId("1"), ShardId("2"), ShardId("3")});
+        {BSON("a" << "x"), BSON("a" << "y"), BSON("a" << "z")},
+        BSON("a" << "y"),
+        BSON("locale" << "mock_reverse_string"),
+        {ShardId("0"), ShardId("1"), ShardId("2"), ShardId("3")},
+        {QueryTargetingInfo::Description::kMinKeyToMaxKey, {}});
 }
 
 TEST_F(ChunkManagerQueryTest, SimpleCollationStringsMultiShard) {
     runQueryTest(
         BSON("a" << 1),
-        stdx::make_unique<CollatorInterfaceMock>(CollatorInterfaceMock::MockType::kReverseString),
+        std::make_unique<CollatorInterfaceMock>(CollatorInterfaceMock::MockType::kReverseString),
         false,
-        {BSON("a"
-              << "x"),
-         BSON("a"
-              << "y"),
-         BSON("a"
-              << "z")},
-        BSON("a"
-             << "y"),
-        BSON("locale"
-             << "simple"),
-        {ShardId("2")});
+        {BSON("a" << "x"), BSON("a" << "y"), BSON("a" << "z")},
+        BSON("a" << "y"),
+        BSON("locale" << "simple"),
+        {ShardId("2")},
+        {QueryTargetingInfo::Description::kSingleKey, {}});
 }
 
 TEST_F(ChunkManagerQueryTest, CollationNumbersMultiShard) {
     runQueryTest(
         BSON("a" << 1),
-        stdx::make_unique<CollatorInterfaceMock>(CollatorInterfaceMock::MockType::kReverseString),
+        std::make_unique<CollatorInterfaceMock>(CollatorInterfaceMock::MockType::kReverseString),
         false,
-        {BSON("a"
-              << "x"),
-         BSON("a"
-              << "y"),
-         BSON("a"
-              << "z")},
+        {BSON("a" << "x"), BSON("a" << "y"), BSON("a" << "z")},
         BSON("a" << 5),
-        BSON("locale"
-             << "mock_reverse_string"),
-        {ShardId("0")});
+        BSON("locale" << "mock_reverse_string"),
+        {ShardId("0")},
+        {QueryTargetingInfo::Description::kSingleKey, {}});
 }
 
 TEST_F(ChunkManagerQueryTest, DefaultCollationNumbersMultiShard) {
     runQueryTest(
         BSON("a" << 1),
-        stdx::make_unique<CollatorInterfaceMock>(CollatorInterfaceMock::MockType::kReverseString),
+        std::make_unique<CollatorInterfaceMock>(CollatorInterfaceMock::MockType::kReverseString),
         false,
-        {BSON("a"
-              << "x"),
-         BSON("a"
-              << "y"),
-         BSON("a"
-              << "z")},
+        {BSON("a" << "x"), BSON("a" << "y"), BSON("a" << "z")},
         BSON("a" << 5),
         BSONObj(),
-        {ShardId("0")});
+        {ShardId("0")},
+        {QueryTargetingInfo::Description::kSingleKey, {}});
 }
 
 TEST_F(ChunkManagerQueryTest, SimpleCollationNumbersMultiShard) {
     runQueryTest(
         BSON("a" << 1),
-        stdx::make_unique<CollatorInterfaceMock>(CollatorInterfaceMock::MockType::kReverseString),
+        std::make_unique<CollatorInterfaceMock>(CollatorInterfaceMock::MockType::kReverseString),
         false,
-        {BSON("a"
-              << "x"),
-         BSON("a"
-              << "y"),
-         BSON("a"
-              << "z")},
+        {BSON("a" << "x"), BSON("a" << "y"), BSON("a" << "z")},
         BSON("a" << 5),
-        BSON("locale"
-             << "simple"),
-        {ShardId("0")});
+        BSON("locale" << "simple"),
+        {ShardId("0")},
+        {QueryTargetingInfo::Description::kSingleKey, {}});
+}
+
+TEST_F(ChunkManagerQueryTest, SnapshotQueryWithMoreShardsThanLatestMetadata) {
+    const auto uuid = UUID::gen();
+    const auto epoch = OID::gen();
+    ChunkVersion version({epoch, Timestamp(1, 1)}, {1, 0});
+
+    ChunkType chunk0(uuid, {BSON("x" << MINKEY), BSON("x" << 0)}, version, ShardId("0"));
+    chunk0.setName(OID::gen());
+
+    version.incMajor();
+    ChunkType chunk1(uuid, {BSON("x" << 0), BSON("x" << MAXKEY)}, version, ShardId("1"));
+    chunk1.setName(OID::gen());
+
+    auto oldRoutingTable = RoutingTableHistory::makeNew(kNss,
+                                                        uuid,
+                                                        BSON("x" << 1),
+                                                        false, /* unsplittable */
+                                                        nullptr,
+                                                        false,
+                                                        epoch,
+                                                        Timestamp(1, 1),
+                                                        boost::none /* timeseriesFields */,
+                                                        boost::none /* reshardingFields */,
+
+                                                        true,
+                                                        {chunk0, chunk1});
+
+    // Simulate move chunk {x: 0} to shard 0. Effectively moving all remaining chunks to shard 0.
+    version.incMajor();
+    chunk1.setVersion(version);
+    chunk1.setShard(chunk0.getShard());
+    chunk1.setOnCurrentShardSince(Timestamp(20, 0));
+    chunk1.setHistory({ChunkHistory(*chunk1.getOnCurrentShardSince(), ShardId("0")),
+                       ChunkHistory(Timestamp(1, 0), ShardId("1"))});
+
+    ChunkManager chunkManager(makeStandaloneRoutingTableHistory(
+                                  oldRoutingTable.makeUpdated(boost::none /* timeseriesFields */,
+                                                              boost::none /* reshardingFields */,
+                                                              true,
+                                                              false, /* unsplittable */
+                                                              {chunk1})),
+                              Timestamp(5, 0));
+
+    std::set<ShardId> shardIds;
+    chunkManager.getShardIdsForRange(BSON("x" << MINKEY), BSON("x" << MAXKEY), &shardIds);
+    ASSERT_EQ(2, shardIds.size());
+
+    const auto expCtx = make_intrusive<ExpressionContextForTest>();
+    shardIds.clear();
+    getShardIdsForQuery(expCtx, BSON("x" << BSON("$gt" << -20)), {}, chunkManager, &shardIds);
+    ASSERT_EQ(2, shardIds.size());
+}
+
+TEST_F(ChunkManagerQueryTest, TestKeyBelongsToShard) {
+    const auto uuid = UUID::gen();
+    const auto epoch = OID::gen();
+    const Timestamp collTimestamp{1, 1};
+    auto chunkVec = chunks_test_util::genRandomChunkVector(
+        uuid, epoch, collTimestamp, 30 /* maxNumChunks */, 1 /* minNumChunks */);
+    auto chunks = chunks_test_util::toChunkInfoPtrVector(chunkVec);
+
+    Timestamp clusterTime{Date_t::now()};
+
+    // Collect all shards that own chunks at the times we're interested in.
+    std::set<ShardId> shards;
+    for (auto&& chunk : chunks) {
+        shards.insert(chunk->getShardIdAt(clusterTime));
+    }
+    ASSERT_GTE(shards.size(), 1);
+
+    // Pick some random shard.
+    ShardId thisShard;
+    auto shardIt = shards.begin();
+    std::advance(shardIt, _random.nextInt64(shards.size()));
+    thisShard = *shardIt;
+
+    // Create a bare-bones chunk map/ routing table history so we can test belongs logic.
+    KeyPattern shardKeyPattern{chunks_test_util::kShardKeyPattern};
+    auto rt = RoutingTableHistory::makeNew(kNss,
+                                           uuid,
+                                           shardKeyPattern,
+                                           false, /* unsplittable */
+                                           nullptr,
+                                           false,
+                                           epoch,
+                                           collTimestamp,
+                                           boost::none /* timeseriesFields */,
+                                           boost::none /* reshardingFields */,
+                                           true,
+                                           chunkVec);
+    ChunkManager cm(makeStandaloneRoutingTableHistory(std::move(rt)), clusterTime);
+
+    auto chunkIt = chunks.begin();
+    while (chunkIt != chunks.end()) {
+        auto shardId = (*chunkIt)->getShardIdAt(clusterTime);
+
+        // Pick some random shard that this chunk doesn't belong to.
+        ShardId otherShard("notAShard");
+        if (shards.size() > 1) {
+            shards.erase(shardId);
+            shardIt = shards.begin();
+            std::advance(shardIt, _random.nextInt64(shards.size()));
+            otherShard = *shardIt;
+            shards.insert(shardId);
+        }
+
+        // Find previous owned chunk of 'otherShard' (if any) for 'otherShard'.
+        auto expectedPrevChunk = findPreviousOwnedChunk(chunkIt, chunks, clusterTime, otherShard);
+
+        // Find next owned chunk of 'otherShard' (if any) for 'otherShard'.
+        auto expectedNextChunk = findNextOwnedChunk(chunkIt, chunks, clusterTime, otherShard);
+
+        // Pick a random shard key in the chunk.
+        auto shardKey = chunks_test_util::calculateIntermediateShardKey(
+            (*chunkIt)->getMin(), (*chunkIt)->getMax(), 0.2 /* minKeyProb */);
+
+        // Validate shard key is correctly identified as being owned by its shard & the same chunk
+        // is found as the one we are curently looking at.
+        ASSERT(cm.keyBelongsToShard(shardKey, shardId));
+        {
+            auto out = cm.nearestOwnedChunk(shardKey, shardId, ChunkMap::Direction::Forward);
+            ASSERT(out.containsShardKey);
+            ASSERT(out.nearestOwnedChunk);
+            ASSERT_BSONOBJ_EQ(out.nearestOwnedChunk->getMin(), (*chunkIt)->getMin());
+            ASSERT_BSONOBJ_EQ(out.nearestOwnedChunk->getMax(), (*chunkIt)->getMax());
+            ASSERT_EQ(out.nearestOwnedChunk->getShardId(), (*chunkIt)->getShardId());
+        }
+
+        // Repeat for reverse direction.
+        {
+            auto out = cm.nearestOwnedChunk(shardKey, shardId, ChunkMap::Direction::Backward);
+            ASSERT(out.containsShardKey);
+            ASSERT(out.nearestOwnedChunk);
+            ASSERT_BSONOBJ_EQ(out.nearestOwnedChunk->getMin(), (*chunkIt)->getMin());
+            ASSERT_BSONOBJ_EQ(out.nearestOwnedChunk->getMax(), (*chunkIt)->getMax());
+            ASSERT_EQ(out.nearestOwnedChunk->getShardId(), (*chunkIt)->getShardId());
+        }
+
+        // Validate that if we use a different shard id, shard key is identified as an orphan, and
+        // the correct next/previous chunk is returned (we cannot return the same chunk here).
+        ASSERT_FALSE(cm.keyBelongsToShard(shardKey, otherShard));
+        {
+            auto out = cm.nearestOwnedChunk(shardKey, otherShard, ChunkMap::Direction::Forward);
+            ASSERT_FALSE(out.containsShardKey);
+            if (expectedNextChunk) {
+                ASSERT(out.nearestOwnedChunk);
+                ASSERT_BSONOBJ_EQ(out.nearestOwnedChunk->getMin(), expectedNextChunk->getMin());
+                ASSERT_BSONOBJ_EQ(out.nearestOwnedChunk->getMax(), expectedNextChunk->getMax());
+                ASSERT_EQ(out.nearestOwnedChunk->getShardId(), expectedNextChunk->getShardId());
+            } else {
+                ASSERT_FALSE(out.nearestOwnedChunk);
+            }
+        }
+
+        // Repeat for reverse direction.
+        {
+            auto out = cm.nearestOwnedChunk(shardKey, otherShard, ChunkMap::Direction::Backward);
+            ASSERT_FALSE(out.containsShardKey);
+            if (expectedPrevChunk) {
+                ASSERT(out.nearestOwnedChunk);
+                ASSERT_BSONOBJ_EQ(out.nearestOwnedChunk->getMin(), expectedPrevChunk->getMin());
+                ASSERT_BSONOBJ_EQ(out.nearestOwnedChunk->getMax(), expectedPrevChunk->getMax());
+                ASSERT_EQ(out.nearestOwnedChunk->getShardId(), expectedPrevChunk->getShardId());
+            } else {
+                ASSERT_FALSE(out.nearestOwnedChunk);
+            }
+        }
+
+        // Test the next chunk.
+        chunkIt = std::next(chunkIt);
+    }
 }
 
 }  // namespace

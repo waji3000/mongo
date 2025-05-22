@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,27 +27,36 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <js/RootingAPI.h>
+#include <map>
+#include <string>
+#include <utility>
+#include <vector>
 
-#include "mongo/scripting/mozjs/uri.h"
+#include <js/CallArgs.h>
+#include <js/PropertySpec.h>
+#include <js/TypeDecls.h>
 
-#include <algorithm>
-#include <iterator>
-
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/client/mongo_uri.h"
 #include "mongo/scripting/mozjs/implscope.h"
+#include "mongo/scripting/mozjs/internedstring.h"
 #include "mongo/scripting/mozjs/objectwrapper.h"
+#include "mongo/scripting/mozjs/uri.h"
 #include "mongo/scripting/mozjs/valuereader.h"
 #include "mongo/scripting/mozjs/valuewriter.h"
-#include "mongo/scripting/mozjs/wrapconstrainedmethod.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/scripting/mozjs/wrapconstrainedmethod.h"  // IWYU pragma: keep
+#include "mongo/util/assert_util.h"
+#include "mongo/util/net/hostandport.h"
 
 namespace mongo {
 namespace mozjs {
 
 const JSFunctionSpec URIInfo::methods[2] = {
-    MONGO_ATTACH_JS_CONSTRAINED_METHOD(toString, URIInfo), JS_FS_END,
+    MONGO_ATTACH_JS_CONSTRAINED_METHOD(toString, URIInfo),
+    JS_FS_END,
 };
 
 const char* const URIInfo::className = "MongoURI";
@@ -71,7 +79,7 @@ void URIInfo::construct(JSContext* cx, JS::CallArgs args) {
     auto parsed = uassertStatusOK(sw);
 
     BSONArrayBuilder serversBuilder;
-    for (const auto hp : parsed.getServers()) {
+    for (const auto& hp : parsed.getServers()) {
         BSONObjBuilder b;
         b.append("server", hp.toString());
         b.append("host", hp.host());
@@ -83,7 +91,7 @@ void URIInfo::construct(JSContext* cx, JS::CallArgs args) {
 
     BSONObjBuilder optsBuilder;
     for (const auto& kvpair : parsed.getOptions()) {
-        optsBuilder.append(kvpair.first, kvpair.second);
+        optsBuilder.append(kvpair.first.original(), kvpair.second);
     }
 
     JS::RootedObject thisv(cx);

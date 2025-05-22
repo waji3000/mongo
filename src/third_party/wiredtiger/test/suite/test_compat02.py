@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Public Domain 2014-2018 MongoDB, Inc.
+# Public Domain 2014-present MongoDB, Inc.
 # Public Domain 2008-2014 WiredTiger, Inc.
 #
 # This is free and unencumbered software released into the public domain.
@@ -29,10 +29,8 @@
 # test_compat02.py
 # Check compatibility API
 
-import fnmatch, os
 import wiredtiger, wttest
 from suite_subprocess import suite_subprocess
-from wtdataset import SimpleDataSet, simple_key
 from wtscenario import make_scenarios
 
 class test_compat02(wttest.WiredTigerTestCase, suite_subprocess):
@@ -45,7 +43,7 @@ class test_compat02(wttest.WiredTigerTestCase, suite_subprocess):
     # Declare the log versions that do and do not have prevlsn.
     # Log version 1 does not have the prevlsn record.
     # Log version 2 introduced that record.
-    # Log version 3 continues to have that record.
+    # Log versions 3 and higher continue to have that record.
     min_logv = 2
 
     # Test detecting a not-yet-existing log version. This should
@@ -56,31 +54,61 @@ class test_compat02(wttest.WiredTigerTestCase, suite_subprocess):
     # The API uses only the major and minor numbers but accepts with
     # and without the patch number. Test one on release and the
     # required minimum just for testing of parsing.
-    #
+
     compat_create = [
-        ('def', dict(create_rel='none', log_create=3)),
+        ('def', dict(create_rel='none', log_create=5)),
+        ('120', dict(create_rel="12.0", log_create=5)),
+        ('113', dict(create_rel="11.3", log_create=5)),
+        ('112', dict(create_rel="11.2", log_create=5)),
+        ('111', dict(create_rel="11.1", log_create=5)),
+        ('110', dict(create_rel="11.0", log_create=5)),
+        ('100', dict(create_rel="10.0", log_create=5)),
+        ('33', dict(create_rel="3.3", log_create=4)),
+        ('32', dict(create_rel="3.2", log_create=3)),
         ('31', dict(create_rel="3.1", log_create=3)),
         ('30', dict(create_rel="3.0", log_create=2)),
         ('26', dict(create_rel="2.6", log_create=1)),
     ]
+
     compat_release = [
-        ('def_rel', dict(rel='none', log_rel=3)),
+        ('def_rel', dict(rel='none', log_rel=5)),
+        ('120_rel', dict(rel="12.0", log_rel=5)),
+        ('113_rel', dict(rel="11.3", log_rel=5)),
+        ('112_rel', dict(rel="11.2", log_rel=5)),
+        ('111_rel', dict(rel="11.1", log_rel=5)),
+        ('110_rel', dict(rel="11.0", log_rel=5)),
+        ('100_rel', dict(rel="10.0", log_rel=5)),
+        ('33_rel', dict(rel="3.3", log_rel=4)),
+        ('32_rel', dict(rel="3.2", log_rel=3)),
         ('31_rel', dict(rel="3.1", log_rel=3)),
         ('30_rel', dict(rel="3.0", log_rel=2)),
         ('26_rel', dict(rel="2.6", log_rel=1)),
         ('26_patch_rel', dict(rel="2.6.1", log_rel=1)),
     ]
+
+    # Only the maximum version should exist below for each log version
+    # i.e. even though 3.1 is also log_max=3 3.2 is above it and also
+    # log_max=3 as such we don't need 3.1 in this list.
+    # However the exemption to this rule is versions which include a patch
+    # number as the patch number will get removed in the conn_reconfig.c
+    # This rule exemption applies to the minimum version check as well.
     compat_max = [
         ('future_max', dict(max_req=future_rel, log_max=future_logv)),
-        ('def_max', dict(max_req='none', log_max=3)),
-        ('31_max', dict(max_req="3.1", log_max=3)),
+        ('def_max', dict(max_req='none', log_max=5)),
+        ('120_max', dict(max_req="12.0", log_max=5)),
+        ('33_max', dict(max_req="3.3", log_max=4)),
+        ('32_max', dict(max_req="3.2", log_max=3)),
         ('30_max', dict(max_req="3.0", log_max=2)),
         ('26_max', dict(max_req="2.6", log_max=1)),
         ('26_patch_max', dict(max_req="2.6.1", log_max=1)),
     ]
+
+    # Only the minimum version should exist below for each log version.
     compat_min = [
         ('future_min', dict(min_req=future_rel, log_min=future_logv)),
-        ('def_min', dict(min_req='none', log_min=3)),
+        ('def_min', dict(min_req='none', log_min=5)),
+        ('100_min', dict(min_req="10.0", log_min=5)),
+        ('33_min', dict(min_req="3.3", log_min=4)),
         ('31_min', dict(min_req="3.1", log_min=3)),
         ('30_min', dict(min_req="3.0", log_min=2)),
         ('26_min', dict(min_req="2.6", log_min=1)),
@@ -90,12 +118,14 @@ class test_compat02(wttest.WiredTigerTestCase, suite_subprocess):
         ('basecfg_true', dict(basecfg='true')),
         ('basecfg_false', dict(basecfg='false')),
     ]
-    scenarios = make_scenarios(compat_create, compat_release, compat_min, compat_max, base_config)
+
+    scenarios = make_scenarios(compat_create, compat_release, compat_min, compat_max, base_config,
+                               prune=100, prunelong=100000)
 
     def conn_config(self):
-        # Set archive false on the home directory.
+        # Set remove=false on the home directory.
         config_str = 'config_base=%s,' % self.basecfg
-        log_str = 'log=(archive=false,enabled,file_max=%s),' % self.logmax
+        log_str = 'log=(enabled,file_max=%s,remove=false),' % self.logmax
         compat_str = ''
         if (self.create_rel != 'none'):
             compat_str += 'compatibility=(release="%s"),' % self.create_rel
@@ -121,6 +151,13 @@ class test_compat02(wttest.WiredTigerTestCase, suite_subprocess):
         # version. That configuration needs an existing database for it to be
         # useful. Test for success or failure based on the relative versions
         # configured.
+
+        # Turn on checkpoint verbose to debug a rare occurrence of a test
+        # hanging, most likely during the checkpoint of conn.close.
+        self.pr("Closing connection")
+        self.conn.reconfigure('verbose=(checkpoint)')
+        with self.expectedStdoutPattern('.'):
+            self.conn.close()
         compat_str = ''
         if (self.max_req != 'none'):
             compat_str += 'compatibility=(require_max="%s"),' % self.max_req
@@ -128,16 +165,14 @@ class test_compat02(wttest.WiredTigerTestCase, suite_subprocess):
             compat_str += 'compatibility=(require_min="%s"),' % self.min_req
         if (self.rel != 'none'):
             compat_str += 'compatibility=(release="%s"),' % self.rel
-        self.conn.close()
-        log_str = 'log=(enabled,file_max=%s,archive=false),' % self.logmax
+        log_str = 'log=(enabled,file_max=%s,remove=false),' % self.logmax
         restart_config = log_str + compat_str
         self.pr("Restart conn " + restart_config)
-        #
+
         # We have a lot of error cases. There are too many and they are
         # dependent on the order of the library code so don't check specific
         # error messages. So just determine if an error should occur and
         # make sure it does.
-        #
         if ((self.log_min >= self.future_logv) or
           (self.log_max >= self.future_logv) or
           (self.max_req != 'none' and self.log_max < self.log_rel) or
@@ -157,6 +192,3 @@ class test_compat02(wttest.WiredTigerTestCase, suite_subprocess):
             self.pr("EXPECT SUCCESS")
             conn = self.wiredtiger_open('.', restart_config)
             conn.close()
-
-if __name__ == '__main__':
-    wttest.run()

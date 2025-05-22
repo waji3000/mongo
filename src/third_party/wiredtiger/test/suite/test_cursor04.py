@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Public Domain 2014-2018 MongoDB, Inc.
+# Public Domain 2014-present MongoDB, Inc.
 # Public Domain 2008-2014 WiredTiger, Inc.
 #
 # This is free and unencumbered software released into the public domain.
@@ -40,7 +40,6 @@ class test_cursor04(wttest.WiredTigerTestCase):
 
     scenarios = make_scenarios([
         ('row', dict(tablekind='row', uri='table')),
-        ('lsm-row', dict(tablekind='row', uri='lsm')),
         ('col', dict(tablekind='col', uri='table')),
         ('fix', dict(tablekind='fix', uri='table'))
     ])
@@ -82,7 +81,7 @@ class test_cursor04(wttest.WiredTigerTestCase):
         if self.tablekind == 'row':
             return 'key' + str(i).zfill(5)  # return key00001, key00002, etc.
         else:
-            return long(i+1)
+            return self.recno(i+1)
 
     def genvalue(self, i):
         if self.tablekind == 'fix':
@@ -185,6 +184,3 @@ class test_cursor04(wttest.WiredTigerTestCase):
         self.expect_either(cursor, 8, 11)
 
         cursor.close()
-
-if __name__ == '__main__':
-    wttest.run()

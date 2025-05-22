@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,28 +27,35 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <type_traits>
+#include <utility>
 
-#include "mongo/s/catalog/type_shard.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
 
+#include "mongo/base/error_codes.h"
 #include "mongo/base/status_with.h"
+#include "mongo/bson/bsonelement.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
 #include "mongo/bson/util/bson_extract.h"
-#include "mongo/s/grid.h"
+#include "mongo/s/catalog/type_shard.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
-
-const NamespaceString ShardType::ConfigNS("config.shards");
 
 const BSONField<std::string> ShardType::name("_id");
 const BSONField<std::string> ShardType::host("host");
 const BSONField<bool> ShardType::draining("draining");
-const BSONField<long long> ShardType::maxSizeMB("maxSize");
 const BSONField<BSONArray> ShardType::tags("tags");
 const BSONField<ShardType::ShardState> ShardType::state("state");
+const BSONField<Timestamp> ShardType::topologyTime("topologyTime");
+const BSONField<long long> ShardType::replSetConfigVersion("replSetConfigVersion");
+
+ShardType::ShardType(std::string name, std::string host, std::vector<std::string> tags)
+    : _name(std::move(name)), _host(std::move(host)), _tags(std::move(tags)) {}
 
 StatusWith<ShardType> ShardType::fromBSON(const BSONObj& source) {
     ShardType shard;
@@ -77,19 +83,6 @@ StatusWith<ShardType> ShardType::fromBSON(const BSONObj& source) {
             shard._draining = isShardDraining;
         } else if (status == ErrorCodes::NoSuchKey) {
             // draining field can be mssing in which case it is presumed false
-        } else {
-            return status;
-        }
-    }
-
-    {
-        long long shardMaxSizeMB;
-        // maxSizeMB == 0 means there's no limitation to space usage.
-        Status status = bsonExtractIntegerField(source, maxSizeMB.name(), &shardMaxSizeMB);
-        if (status.isOK()) {
-            shard._maxSizeMB = shardMaxSizeMB;
-        } else if (status == ErrorCodes::NoSuchKey) {
-            // maxSizeMB field can be missing in which case it is presumed false
         } else {
             return status;
         }
@@ -136,22 +129,51 @@ StatusWith<ShardType> ShardType::fromBSON(const BSONObj& source) {
         }
     }
 
+    {
+        Timestamp shardTopologyTime;
+        Status status = bsonExtractTimestampField(source, topologyTime.name(), &shardTopologyTime);
+        if (status.isOK()) {
+            shard._topologyTime = shardTopologyTime;
+        } else if (status == ErrorCodes::NoSuchKey) {
+            // topologyTime field can be mssing in which case it is presumed to be an uninitialized
+            // timestamp
+        } else {
+            return status;
+        }
+    }
+
+    {
+        long long shardReplSetConfigVersion;
+        Status status = bsonExtractIntegerField(
+            source, replSetConfigVersion.name(), &shardReplSetConfigVersion);
+        if (status.isOK()) {
+            shard._replSetConfigVersion = shardReplSetConfigVersion;
+        } else if (status == ErrorCodes::NoSuchKey) {
+            // replSetConfigVersion field can be missing in which case it is presumed to be
+            // uninitialized.
+        } else {
+            return status;
+        }
+    }
+
     return shard;
 }
 
 Status ShardType::validate() const {
-    if (!_name.is_initialized() || _name->empty()) {
+    if (!_name.has_value() || _name->empty()) {
         return Status(ErrorCodes::NoSuchKey,
                       str::stream() << "missing " << name.name() << " field");
     }
 
-    if (!_host.is_initialized() || _host->empty()) {
+    if (!_host.has_value() || _host->empty()) {
         return Status(ErrorCodes::NoSuchKey,
                       str::stream() << "missing " << host.name() << " field");
     }
 
-    if (_maxSizeMB.is_initialized() && getMaxSizeMB() < 0) {
-        return Status(ErrorCodes::BadValue, str::stream() << "maxSize can't be negative");
+    if (_replSetConfigVersion != kUninitializedReplSetConfigVersion &&
+        getReplSetConfigVersion() < 0) {
+        return Status(ErrorCodes::BadValue,
+                      str::stream() << "replSetConfigVersion can't be negative");
     }
 
     return Status::OK();
@@ -166,12 +188,14 @@ BSONObj ShardType::toBSON() const {
         builder.append(host(), getHost());
     if (_draining)
         builder.append(draining(), getDraining());
-    if (_maxSizeMB)
-        builder.append(maxSizeMB(), getMaxSizeMB());
     if (_tags)
         builder.append(tags(), getTags());
     if (_state)
         builder.append(state(), static_cast<std::underlying_type<ShardState>::type>(getState()));
+    if (_topologyTime)
+        builder.append(topologyTime(), getTopologyTime());
+    if (_replSetConfigVersion)
+        builder.append(replSetConfigVersion(), getReplSetConfigVersion());
 
     return builder.obj();
 }
@@ -193,18 +217,24 @@ void ShardType::setDraining(const bool isDraining) {
     _draining = isDraining;
 }
 
-void ShardType::setMaxSizeMB(const long long maxSizeMB) {
-    invariant(maxSizeMB >= 0);
-    _maxSizeMB = maxSizeMB;
-}
-
 void ShardType::setTags(const std::vector<std::string>& tags) {
     invariant(tags.size() > 0);
     _tags = tags;
 }
+
 void ShardType::setState(const ShardState state) {
-    invariant(!_state.is_initialized());
+    invariant(!_state.has_value());
     _state = state;
+}
+
+void ShardType::setTopologyTime(const Timestamp& topologyTime) {
+    invariant(!_topologyTime);
+    _topologyTime = topologyTime;
+}
+
+void ShardType::setReplSetConfigVersion(const long long replSetConfigVersion) {
+    invariant(replSetConfigVersion >= 0);
+    _replSetConfigVersion = replSetConfigVersion;
 }
 
 }  // namespace mongo

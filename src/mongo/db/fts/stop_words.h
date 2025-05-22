@@ -1,6 +1,3 @@
-// stop_words.h
-
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -33,9 +30,13 @@
 
 #pragma once
 
+#include <cstddef>
 #include <set>
 #include <string>
 
+#include <absl/container/node_hash_map.h>
+
+#include "mongo/base/string_data.h"
 #include "mongo/db/fts/fts_language.h"
 #include "mongo/util/string_map.h"
 
@@ -44,7 +45,8 @@ namespace mongo {
 namespace fts {
 
 class StopWords {
-    MONGO_DISALLOW_COPYING(StopWords);
+    StopWords(const StopWords&) = delete;
+    StopWords& operator=(const StopWords&) = delete;
 
 public:
     StopWords();
@@ -63,5 +65,5 @@ public:
 private:
     StringMap<bool> _words;  // Used as a set. The values have no meaning.
 };
-}
-}
+}  // namespace fts
+}  // namespace mongo

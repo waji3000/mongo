@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,17 +27,17 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <memory>
+#include <utility>
 
 #include "mongo/db/fts/fts_query_noop.h"
 
-#include "mongo/stdx/memory.h"
 
 namespace mongo {
 namespace fts {
 
 std::unique_ptr<FTSQuery> FTSQueryNoop::clone() const {
-    auto clonedQuery = stdx::make_unique<FTSQueryNoop>();
+    auto clonedQuery = std::make_unique<FTSQueryNoop>();
     clonedQuery->setQuery(getQuery());
     clonedQuery->setLanguage(getLanguage());
     clonedQuery->setCaseSensitive(getCaseSensitive());

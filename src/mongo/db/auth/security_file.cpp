@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,22 +27,29 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kAccessControl
-
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/auth/security_key.h"
 
 #include <algorithm>
-#include <cctype>
+#include <cerrno>
+#include <cstring>
+#include <functional>
+#include <iterator>
 #include <string>
 #include <sys/stat.h>
 #include <vector>
 
-#include "mongo/base/status_with.h"
-#include "mongo/util/mongoutils/str.h"
+#include <boost/move/utility_core.hpp>
+#include <yaml-cpp/exceptions.h>
+#include <yaml-cpp/node/detail/iterator.h>
+#include <yaml-cpp/node/impl.h>
+#include <yaml-cpp/node/iterator.h>
+#include <yaml-cpp/node/node.h>
+#include <yaml-cpp/node/parse.h>
 
-#include "yaml-cpp/yaml.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 namespace {
@@ -75,8 +81,8 @@ StatusWith<std::vector<std::string>> readSecurityFile(const std::string& filenam
     // check obvious file errors
     if (stat(filename.c_str(), &stats) == -1) {
         return Status(ErrorCodes::InvalidPath,
-                      str::stream() << "Error reading file " << filename << ": "
-                                    << strerror(errno));
+                      str::stream()
+                          << "Error reading file " << filename << ": " << strerror(errno));
     }
 
 #if !defined(_WIN32)

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -32,10 +31,15 @@
 
 #include <memory>
 
+#include "mongo/db/exec/plan_stage.h"
+#include "mongo/db/exec/plan_stats.h"
 #include "mongo/db/exec/requires_collection_stage.h"
-#include "mongo/db/jsobj.h"
+#include "mongo/db/exec/working_set.h"
 #include "mongo/db/matcher/expression.h"
-#include "mongo/db/record_id.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/query/plan_executor.h"
+#include "mongo/db/query/stage_types.h"
+#include "mongo/db/storage/record_store.h"
 
 namespace mongo {
 
@@ -51,15 +55,15 @@ class SeekableRecordCursor;
  */
 class FetchStage : public RequiresCollectionStage {
 public:
-    FetchStage(OperationContext* opCtx,
+    FetchStage(ExpressionContext* expCtx,
                WorkingSet* ws,
-               PlanStage* child,
+               std::unique_ptr<PlanStage> child,
                const MatchExpression* filter,
-               const Collection* collection);
+               VariantCollectionPtrOrAcquisition collection);
 
-    ~FetchStage();
+    ~FetchStage() override;
 
-    bool isEOF() final;
+    bool isEOF() const final;
     StageState doWork(WorkingSetID* out) final;
 
     void doDetachFromOperationContext() final;
@@ -69,16 +73,16 @@ public:
         return STAGE_FETCH;
     }
 
-    std::unique_ptr<PlanStageStats> getStats();
+    std::unique_ptr<PlanStageStats> getStats() override;
 
     const SpecificStats* getSpecificStats() const final;
 
     static const char* kStageType;
 
 protected:
-    void saveState(RequiresCollTag) final;
+    void doSaveStateRequiresCollection() final;
 
-    void restoreState(RequiresCollTag) final;
+    void doRestoreStateRequiresCollection() final;
 
 private:
     /**

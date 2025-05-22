@@ -1,13 +1,16 @@
-load("jstests/readonly/lib/read_only_test.js");
+import {runReadOnlyTest} from "jstests/readonly/lib/read_only_test.js";
 
 runReadOnlyTest(function() {
-    'use strict';
     return {
         name: 'write_ops',
         load: function(writableCollection) {
-            assert.writeOK(writableCollection.insert({_id: 0, x: 1}));
+            assert.commandWorked(writableCollection.insert({_id: 0, x: 1}));
         },
         exec: function(readableCollection) {
+            // Refresh the cluster's collection sharding state in order to have a predictable error
+            // returned from the failed writes, otherwhise MultipleErrorsOcurred might be returned
+            // if any shard is stale
+            readableCollection.count();
             // Test that insert fails.
             assert.writeErrorWithCode(
                 readableCollection.insert({x: 2}),

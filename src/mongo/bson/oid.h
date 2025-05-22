@@ -1,6 +1,3 @@
-// oid.h
-
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -32,12 +29,20 @@
 
 #pragma once
 
+#include <cstdint>
+#include <cstring>
+#include <iosfwd>
 #include <string>
+#include <sys/types.h>
 
 #include "mongo/base/data_range.h"
 #include "mongo/base/data_view.h"
 #include "mongo/base/static_assert.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
 #include "mongo/bson/util/builder.h"
+#include "mongo/bson/util/builder_fwd.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
@@ -75,21 +80,12 @@ class SecureRandom;
  */
 class OID {
 public:
-    /**
-     * Functor compatible with std::hash for std::unordered_{map,set}
-     * Warning: The hash function is subject to change. Do not use in cases where hashes need
-     *          to be consistent across versions.
-     */
-    struct Hasher {
-        size_t operator()(const OID& oid) const;
-    };
-
     OID() : _data() {}
 
     enum { kOIDSize = 12, kTimestampSize = 4, kInstanceUniqueSize = 5, kIncrementSize = 3 };
 
-    /** init from a 24 char hex std::string */
-    explicit OID(const std::string& s) {
+    /** init from a 24 char hex string */
+    explicit OID(StringData s) {
         init(s);
     }
 
@@ -144,31 +140,24 @@ public:
     }
 
     /**
+     * This method creates and initializes an OID from a string,
+     * returning a bad Status on failure.
+     */
+    static StatusWith<OID> parse(StringData input);
+
+    /**
      * This method creates and initializes an OID from a string, throwing a BadValue exception if
      * the string is not a valid OID.
      */
     static OID createFromString(StringData input) {
-        uassert(ErrorCodes::BadValue,
-                str::stream() << "Invalid string length for parsing to OID, expected 24 but found "
-                              << input.size(),
-                input.size() == 24);
-        for (auto digit : input) {
-            uassert(ErrorCodes::BadValue,
-                    str::stream() << "Invalid character found in hex string: " << digit,
-                    ('0' <= digit && digit <= '9') || ('a' <= digit && digit <= 'f') ||
-                        ('A' <= digit && digit <= 'F'));
-        }
-
-        OID result;
-        result.init(input.toString());
-        return result;
+        return uassertStatusOK(parse(input));
     }
 
     /** sets the contents to a new oid / randomized value */
     void init();
 
     /** init from a 24 char hex std::string */
-    void init(const std::string& s);
+    void init(StringData s);
 
     /** Set to the min/max OID that could be generated at given timestamp. */
     void init(Date_t date, bool max = false);
@@ -190,10 +179,28 @@ public:
     }
 
     /**
+     * Functor compatible with std::hash for std::unordered_{map,set}
+     * Warning: The hash function is subject to change. Do not use in cases where hashes need
+     *          to be consistent across versions.
+     */
+    struct Hasher {
+        size_t operator()(const OID& oid) const;
+    };
+
+    /**
      * this is not consistent
      * do not store on disk
      */
     void hash_combine(size_t& seed) const;
+
+    /**
+     * Hash function compatible with absl::Hash for absl::unordered_{map,set}
+     */
+    template <typename H>
+    friend H AbslHashValue(H h, const OID& oid) {
+        const auto& d = oid._data;
+        return H::combine(std::move(h), toStdStringViewForInterop({d, sizeof(d)}));
+    }
 
     /** call this after a fork to update the process id */
     static void justForked();
@@ -229,7 +236,7 @@ public:
     }
 
     ConstDataRange toCDR() const {
-        return ConstDataRange(_data, kOIDSize);
+        return ConstDataRange(_data);
     }
 
 private:
@@ -258,13 +265,7 @@ inline StringBuilder& operator<<(StringBuilder& s, const OID& o) {
     See <http://dochub.mongodb.org/core/mongodbextendedjson>
     for details.
 */
-enum JsonStringFormat {
-    /** strict RFC format */
-    Strict,
-    /** 10gen format, which is close to JS format.  This form is understandable by
-        javascript running inside the Mongo server via $where, mr, etc... */
-    TenGen,
-};
+enum JsonStringFormat { ExtendedCanonicalV2_0_0, ExtendedRelaxedV2_0_0, LegacyStrict };
 
 inline bool operator==(const OID& lhs, const OID& rhs) {
     return lhs.compare(rhs) == 0;

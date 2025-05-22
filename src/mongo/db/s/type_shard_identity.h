@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -32,9 +31,11 @@
 
 #include <string>
 
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/client/connection_string.h"
-#include "mongo/db/jsobj.h"
-#include "mongo/db/s/add_shard_cmd_gen.h"
+#include "mongo/db/s/type_shard_identity_gen.h"
 
 namespace mongo {
 
@@ -68,8 +69,13 @@ public:
     /**
      * Returns OK if all fields have been set. Otherwise, returns NoSuchKey
      * and information about the first field that is missing.
+     *
+     * If fassert is true, validate will fassert if the server's cluster role matches the shard
+     * identity document. This is intended to shutdown a server whose cluster role differs from the
+     * primary and prevents a replica set from running with mixed cluster roles. See SERVER-80249
+     * for more information.
      */
-    Status validate() const;
+    Status validate(bool fassert = false) const;
 
     /**
      * Returns an update object that can be used to update the config server field of the

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,63 +27,132 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/client/connection_string.h"
-
-#include <list>
 #include <memory>
+#include <mutex>
+#include <string>
+#include <type_traits>
+#include <utility>
+#include <vector>
 
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/client/client_api_version_parameters_gen.h"
+#include "mongo/client/connection_string.h"
+#include "mongo/client/dbclient_base.h"
+#include "mongo/client/dbclient_connection.h"
 #include "mongo/client/dbclient_rs.h"
 #include "mongo/client/mongo_uri.h"
-#include "mongo/stdx/memory.h"
+#include "mongo/config.h"  // IWYU pragma: keep
+#include "mongo/logv2/log.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/log.h"
+#include "mongo/util/net/ssl_options.h"
+
+#ifdef MONGO_CONFIG_GRPC
+#include "mongo/client/dbclient_grpc_stream.h"
+#endif
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
+
 
 namespace mongo {
 
 stdx::mutex ConnectionString::_connectHookMutex;
-ConnectionString::ConnectionHook* ConnectionString::_connectHook = NULL;
+ConnectionString::ConnectionHook* ConnectionString::_connectHook = nullptr;
 
-std::unique_ptr<DBClientBase> ConnectionString::connect(StringData applicationName,
-                                                        std::string& errmsg,
-                                                        double socketTimeout,
-                                                        const MongoURI* uri) const {
+StatusWith<std::unique_ptr<DBClientBase>> ConnectionString::connect(
+    StringData applicationName,
+    double socketTimeout,
+    const MongoURI* uri,
+    const ClientAPIVersionParameters* apiParameters,
+    const TransientSSLParams* transientSSLParams) const {
     MongoURI newURI{};
     if (uri) {
         newURI = *uri;
     }
 
     switch (_type) {
-        case MASTER: {
+        case ConnectionType::kStandalone: {
+            Status lastError =
+                Status(ErrorCodes::BadValue,
+                       "Invalid standalone connection string with empty server list.");
             for (const auto& server : _servers) {
-                auto c = stdx::make_unique<DBClientConnection>(true, 0, newURI);
+                std::unique_ptr<DBClientSession> c;
+#ifdef MONGO_CONFIG_GRPC
+                if (newURI.isGRPC()) {
+                    c = std::make_unique<DBClientGRPCStream>(
+                        /* authToken */ boost::none,
+                        /* autoReconnect */ true,
+                        /* socket timeout */ 0,
+                        newURI,
+                        DBClientGRPCStream::HandshakeValidationHook(),
+                        apiParameters);
+                } else
+#endif
+                {
+                    c = std::make_unique<DBClientConnection>(
+                        /* autoReconnect */ true,
+                        /* socket timeout */ 0,
+                        newURI,
+                        DBClientConnection::HandshakeValidationHook(),
+                        apiParameters);
+                    c->setSoTimeout(socketTimeout);
+                }
 
-                c->setSoTimeout(socketTimeout);
-                LOG(1) << "creating new connection to:" << server;
-                if (!c->connect(server, applicationName, errmsg)) {
+#ifdef MONGO_CONFIG_GRPC
+                LOGV2_DEBUG(8050201,
+                            1,
+                            "Creating new connection",
+                            "hostAndPort"_attr = server,
+                            "gRPC"_attr = newURI.isGRPC());
+#else
+                LOGV2_DEBUG(20109, 1, "Creating new connection", "hostAndPort"_attr = server);
+#endif
+
+                try {
+                    c->connect(server,
+                               applicationName,
+                               transientSSLParams ? boost::make_optional(*transientSSLParams)
+                                                  : boost::none);
+                } catch (const DBException& e) {
+                    lastError = e.toStatus();
                     continue;
                 }
-                LOG(1) << "connected connection!";
+
+#ifdef MONGO_CONFIG_SSL
+                invariant((transientSSLParams != nullptr) == c->isUsingTransientSSLParams());
+#endif
+                LOGV2_DEBUG(20110, 1, "Connected connection!");
                 return std::move(c);
             }
-            return nullptr;
+            return lastError;
         }
 
-        case SET: {
-            auto set = stdx::make_unique<DBClientReplicaSet>(
-                _setName, _servers, applicationName, socketTimeout, std::move(newURI));
-            if (!set->connect()) {
-                errmsg = "connect failed to replica set ";
-                errmsg += toString();
-                return nullptr;
+        case ConnectionType::kReplicaSet: {
+            auto set = std::make_unique<DBClientReplicaSet>(_replicaSetName,
+                                                            _servers,
+                                                            applicationName,
+                                                            socketTimeout,
+                                                            std::move(newURI),
+                                                            apiParameters);
+            auto status = set->connect();
+            if (!status.isOK()) {
+                return status.withReason(status.reason() + ", " + toString());
             }
+
+#ifdef MONGO_CONFIG_SSL
+            invariant(!set->isUsingTransientSSLParams());  // Not implemented.
+#endif
             return std::move(set);
         }
 
-        case CUSTOM: {
+        case ConnectionType::kCustom: {
             // Lock in case other things are modifying this at the same time
             stdx::lock_guard<stdx::mutex> lk(_connectHookMutex);
 
@@ -96,20 +164,28 @@ std::unique_ptr<DBClientBase> ConnectionString::connect(StringData applicationNa
                     _connectHook);
 
             // Double-checked lock, since this will never be active during normal operation
-            auto replacementConn = _connectHook->connect(*this, errmsg, socketTimeout);
+            std::string errmsg;
+            auto replacementConn =
+                _connectHook->connect(*this, errmsg, socketTimeout, apiParameters);
 
-            log() << "replacing connection to " << this->toString() << " with "
-                  << (replacementConn ? replacementConn->getServerAddress() : "(empty)");
+            LOGV2(20111,
+                  "Replacing connection string",
+                  "oldConnString"_attr = this->toString(),
+                  "newConnString"_attr =
+                      (replacementConn ? replacementConn->getServerAddress() : "(empty)"));
 
-            return replacementConn;
+            if (replacementConn) {
+                return std::move(replacementConn);
+            }
+            return Status(ErrorCodes::HostUnreachable, "Connection hook error: " + errmsg);
         }
 
-        case LOCAL:
-        case INVALID:
+        case ConnectionType::kLocal:
+        case ConnectionType::kInvalid:
             MONGO_UNREACHABLE;
     }
 
     MONGO_UNREACHABLE;
 }
 
-}  // namepspace mongo
+}  // namespace mongo

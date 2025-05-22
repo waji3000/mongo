@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,40 +27,203 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
 
-#include "mongo/platform/basic.h"
+#include <string>
 
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/client/connection_string.h"
+#include "mongo/client/read_preference.h"
 #include "mongo/db/audit.h"
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
-#include "mongo/db/auth/privilege.h"
+#include "mongo/db/auth/resource_pattern.h"
+#include "mongo/db/client.h"
+#include "mongo/db/cluster_role.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/feature_compatibility_version.h"
-#include "mongo/db/namespace_string.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/repl/read_concern_args.h"
-#include "mongo/db/repl/repl_set_config.h"
+#include "mongo/db/repl/read_concern_level.h"
 #include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/s/add_shard_coordinator.h"
 #include "mongo/db/s/config/sharding_catalog_manager.h"
-#include "mongo/s/catalog/type_shard.h"
-#include "mongo/s/grid.h"
-#include "mongo/s/request_types/add_shard_request_type.h"
-#include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/db/server_options.h"
+#include "mongo/db/server_parameter.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/tenant_id.h"
+#include "mongo/logv2/log.h"
+#include "mongo/s/client/shard.h"
+#include "mongo/s/request_types/add_shard_gen.h"
+#include "mongo/s/sharding_feature_flags_gen.h"
+#include "mongo/util/assert_util.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
+
 
 namespace mongo {
-namespace {
-
-using std::string;
-
-const long long kMaxSizeMBDefault = 0;
 
 /**
  * Internal sharding command run on config servers to add a shard to the cluster.
  */
-class ConfigSvrAddShardCommand : public BasicCommand {
+class ConfigSvrAddShardCommand : public TypedCommand<ConfigSvrAddShardCommand> {
 public:
-    ConfigSvrAddShardCommand() : BasicCommand("_configsvrAddShard") {}
+    using Request = ConfigsvrAddShard;
+    using Response = AddShardResponse;
+
+    class Invocation final : public InvocationBase {
+    public:
+        using InvocationBase::InvocationBase;
+
+        Response typedRun(OperationContext* opCtx) {
+            opCtx->setAlwaysInterruptAtStepDownOrUp_UNSAFE();
+
+            uassert(ErrorCodes::IllegalOperation,
+                    "_configsvrAddShard can only be run on config servers",
+                    serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer));
+            CommandHelpers::uassertCommandRunWithMajority(Request::kCommandName,
+                                                          opCtx->getWriteConcern());
+
+            // Set the operation context read concern level to local for reads into the config
+            // database.
+            repl::ReadConcernArgs::get(opCtx) =
+                repl::ReadConcernArgs(repl::ReadConcernLevel::kLocalReadConcern);
+
+            const auto target = request().getCommandParameter();
+            const auto name = request().getName()
+                ? boost::make_optional(request().getName()->toString())
+                : boost::none;
+
+            auto replCoord = repl::ReplicationCoordinator::get(opCtx);
+            auto validationStatus = _validate(target, replCoord->getConfig().isLocalHostAllowed());
+            uassertStatusOK(validationStatus);
+
+            audit::logAddShard(Client::getCurrent(), name ? name.value() : "", target.toString());
+
+            // TODO(SERVER-97816): remove DDL locking and move the fcv upgrade checking logic to the
+            // coordinator
+            boost::optional<DDLLockManager::ScopedCollectionDDLLock> ddlLock{
+                boost::in_place_init,
+                opCtx,
+                NamespaceString::kConfigsvrShardsNamespace,
+                "addShard",
+                LockMode::MODE_X};
+            boost::optional<FixedFCVRegion> fcvRegion{boost::in_place_init, opCtx};
+            const auto fcvSnapshot = (*fcvRegion)->acquireFCVSnapshot();
+
+            // (Generic FCV reference): These FCV checks should exist across LTS binary versions.
+            uassert(ErrorCodes::ConflictingOperationInProgress,
+                    "Cannot add shard while in upgrading/downgrading FCV state",
+                    !fcvSnapshot.isUpgradingOrDowngrading());
+
+            if (feature_flags::gUseTopologyChangeCoordinators.isEnabled(
+                    VersionContext::getDecoration(opCtx), fcvSnapshot)) {
+                return _runNewPath(opCtx, ddlLock, fcvRegion, target, name);
+            }
+
+            return _runOldPath(opCtx, *fcvRegion, target, name);
+        }
+
+    private:
+        Response _runOldPath(OperationContext* opCtx,
+                             const FixedFCVRegion& fcvRegion,
+                             const mongo::ConnectionString& target,
+                             boost::optional<std::string> name) {
+            StatusWith<std::string> addShardResult = ShardingCatalogManager::get(opCtx)->addShard(
+                opCtx, fcvRegion, name ? &(name.value()) : nullptr, target, false);
+
+            Status status = addShardResult.getStatus();
+
+            if (!status.isOK()) {
+                LOGV2(21920,
+                      "addShard request failed",
+                      "request"_attr = request(),
+                      "error"_attr = status);
+                uassertStatusOK(status);
+            }
+
+            Response result;
+            result.setShardAdded(addShardResult.getValue());
+
+            return result;
+        }
+
+        Response _runNewPath(OperationContext* opCtx,
+                             boost::optional<DDLLockManager::ScopedCollectionDDLLock>& ddlLock,
+                             boost::optional<FixedFCVRegion>& fcvRegion,
+                             const mongo::ConnectionString& target,
+                             boost::optional<std::string> name) {
+            invariant(ddlLock);
+            invariant(fcvRegion);
+
+            // Since the addShardCoordinator will call functions that will take the FixedFCVRegion
+            // the ordering of locks will be DDLLock, FcvLock. We want to maintain this lock
+            // ordering to avoid deadlocks. If we only take the FixedFCVRegion before creating the
+            // addShardCoordinator, then if it starts to run before we can release the
+            // FixedFCVRegion the lock ordering will be reversed (FcvLock, DDLLock). It is safe to
+            // take the DDLLock before create the coordinator, as it will only prevent the running
+            // of the coordinator while we hold the FixedFCVRegion (FcvLock, DDLLock -> waiting for
+            // DDLLock in coordinator). After this we release the locks in reversed order, so we are
+            // sure that we are not holding the FixedFCVRegion while we acquire the DDLLock.
+            const auto addShardCoordinator = AddShardCoordinator::create(
+                opCtx, *fcvRegion, target, name, /*isConfigShard*/ false);
+
+            fcvRegion.reset();
+            ddlLock.reset();
+
+            const auto finalName = addShardCoordinator->getResult(opCtx);
+
+            Response result;
+            result.setShardAdded(finalName);
+
+            return result;
+        }
+
+        bool supportsWriteConcern() const override {
+            return true;
+        }
+
+        NamespaceString ns() const override {
+            return {};
+        }
+
+        void doCheckAuthorization(OperationContext* opCtx) const override {
+            uassert(ErrorCodes::Unauthorized,
+                    "Unauthorized",
+                    AuthorizationSession::get(opCtx->getClient())
+                        ->isAuthorizedForActionsOnResource(
+                            ResourcePattern::forClusterResource(request().getDbName().tenantId()),
+                            ActionType::internal));
+        }
+
+        static Status _validate(const ConnectionString& target, bool allowLocalHost) {
+            // Check that if one of the new shard's hosts is localhost, we are allowed to use
+            // localhost as a hostname. (Using localhost requires that every server in the cluster
+            // uses localhost).
+            for (const auto& serverAddr : target.getServers()) {
+                if (serverAddr.isLocalHost() != allowLocalHost) {
+                    std::string errmsg = str::stream()
+                        << "Can't use localhost as a shard since all shards need to"
+                        << " communicate. Either use all shards and configdbs in localhost"
+                        << " or all in actual IPs. host: " << serverAddr.toString()
+                        << " isLocalHost:" << serverAddr.isLocalHost();
+                    return Status(ErrorCodes::InvalidOptions, errmsg);
+                }
+            }
+            return Status::OK();
+        }
+    };
+
+    bool skipApiVersionCheck() const override {
+        // Internal command (server to server).
+        return true;
+    }
 
     std::string help() const override {
         return "Internal command, which is exported by the sharding config server. Do not call "
@@ -75,71 +237,7 @@ public:
     bool adminOnly() const override {
         return true;
     }
+};
+MONGO_REGISTER_COMMAND(ConfigSvrAddShardCommand).forShard();
 
-    bool supportsWriteConcern(const BSONObj& cmd) const override {
-        return true;
-    }
-
-    Status checkAuthForCommand(Client* client,
-                               const std::string& dbname,
-                               const BSONObj& cmdObj) const override {
-        if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
-                ResourcePattern::forClusterResource(), ActionType::internal)) {
-            return Status(ErrorCodes::Unauthorized, "Unauthorized");
-        }
-        return Status::OK();
-    }
-
-    bool run(OperationContext* opCtx,
-             const std::string& unusedDbName,
-             const BSONObj& cmdObj,
-             BSONObjBuilder& result) override {
-        uassert(ErrorCodes::IllegalOperation,
-                "_configsvrAddShard can only be run on config servers",
-                serverGlobalParams.clusterRole == ClusterRole::ConfigServer);
-
-        // Set the operation context read concern level to local for reads into the config database.
-        repl::ReadConcernArgs::get(opCtx) =
-            repl::ReadConcernArgs(repl::ReadConcernLevel::kLocalReadConcern);
-
-        auto swParsedRequest = AddShardRequest::parseFromConfigCommand(cmdObj);
-        uassertStatusOK(swParsedRequest.getStatus());
-        auto parsedRequest = std::move(swParsedRequest.getValue());
-
-        auto replCoord = repl::ReplicationCoordinator::get(opCtx);
-        auto rsConfig = replCoord->getConfig();
-
-        auto validationStatus = parsedRequest.validate(rsConfig.isLocalHostAllowed());
-        uassertStatusOK(validationStatus);
-
-        uassert(ErrorCodes::InvalidOptions,
-                str::stream() << "addShard must be called with majority writeConcern, got "
-                              << cmdObj,
-                opCtx->getWriteConcern().wMode == WriteConcernOptions::kMajority);
-
-        audit::logAddShard(Client::getCurrent(),
-                           parsedRequest.hasName() ? parsedRequest.getName() : "",
-                           parsedRequest.getConnString().toString(),
-                           parsedRequest.hasMaxSize() ? parsedRequest.getMaxSize()
-                                                      : kMaxSizeMBDefault);
-
-        StatusWith<string> addShardResult = ShardingCatalogManager::get(opCtx)->addShard(
-            opCtx,
-            parsedRequest.hasName() ? &parsedRequest.getName() : nullptr,
-            parsedRequest.getConnString(),
-            parsedRequest.hasMaxSize() ? parsedRequest.getMaxSize() : kMaxSizeMBDefault);
-
-        if (!addShardResult.isOK()) {
-            log() << "addShard request '" << parsedRequest << "'"
-                  << "failed" << causedBy(addShardResult.getStatus());
-            uassertStatusOK(addShardResult.getStatus());
-        }
-
-        result << "shardAdded" << addShardResult.getValue();
-
-        return true;
-    }
-} configsvrAddShardCmd;
-
-}  // namespace
 }  // namespace mongo

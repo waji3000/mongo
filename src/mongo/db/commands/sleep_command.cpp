@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,25 +27,40 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#include <string>
 
-#include "mongo/platform/basic.h"
-
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/concurrency/d_concurrency.h"
-#include "mongo/util/log.h"
+#include "mongo/db/concurrency/lock_manager_defs.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/service_context.h"
+#include "mongo/logv2/log.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/clock_source.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/scopeguard.h"
+#include "mongo/util/str.h"
+#include "mongo/util/time_support.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 namespace mongo {
 
-/* for diagnostic / testing purposes. Enabled via command line. */
+/* For diagnostic / testing purposes. Enabled via command line. See docs/test_commands.md. */
 class CmdSleep : public BasicCommand {
 public:
-    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+    bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
 
-    virtual bool adminOnly() const {
+    bool adminOnly() const override {
         return true;
     }
 
@@ -59,81 +73,161 @@ public:
                "If neither 'secs' nor 'millis' is set, command will sleep for 10 seconds. "
                "If both are set, command will sleep for the sum of 'secs' and 'millis.'\n"
                "   w:<bool> (deprecated: use 'lock' instead) if true, takes a write lock.\n"
-               "   lock: r, w, none. If r or w, db will block under a lock. Defaults to r."
+               "   lock: r, ir, w, iw, none. If r or w, db will block under a lock.\n"
+               "   If ir or iw, db will block under an intent lock. Defaults to ir."
                " 'lock' and 'w' may not both be set.\n"
                "   secs:<seconds> Amount of time to sleep, in seconds.\n"
-               "   millis:<milliseconds> Amount of time to sleep, in ms.\n";
+               "   millis:<milliseconds> Amount of time to sleep, in ms.\n"
+               "'seconds' may be used as an alias for 'secs'.\n";
     }
 
     // No auth needed because it only works when enabled via command line.
-    virtual void addRequiredPrivileges(const std::string& dbname,
-                                       const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) const {}
+    Status checkAuthForOperation(OperationContext*,
+                                 const DatabaseName&,
+                                 const BSONObj&) const override {
+        return Status::OK();
+    }
 
+    /**
+     * An empty 'ns' causes the global lock to be taken.
+     * A 'ns' that contains <db> causes only the rstl/global/database locks to be taken.
+     * A complete 'ns' <coll>.<db> causes the rstl/global/database/collection locks to be taken.
+     *
+     * Any higher level locks are taken in the appropriate MODE_IS or MODE_IX to match 'mode'.
+     */
     void _sleepInLock(mongo::OperationContext* opCtx,
                       long long millis,
                       LockMode mode,
-                      const StringData& ns) {
+                      StringData ns) {
         if (ns.empty()) {
-            Lock::GlobalLock lk(opCtx, mode, opCtx->getDeadline(), Lock::InterruptBehavior::kThrow);
+            Lock::GlobalLock lk(opCtx, mode, Date_t::max(), Lock::InterruptBehavior::kThrow);
+            LOGV2(6001601,
+                  "Global lock acquired by sleep command.",
+                  "lockMode"_attr = modeName(mode));
             opCtx->sleepFor(Milliseconds(millis));
-        } else if (nsIsDbOnly(ns)) {
-            uassert(50961, "lockTarget is not a valid namespace", NamespaceString::validDBName(ns));
-            Lock::DBLock lk(opCtx, ns, mode, opCtx->getDeadline());
-            opCtx->sleepFor(Milliseconds(millis));
-        } else {
-            uassert(50962,
-                    "lockTarget is not a valid namespace",
-                    NamespaceString::validCollectionComponent(ns));
-            Lock::CollectionLock lk(opCtx->lockState(), ns, mode, opCtx->getDeadline());
-            opCtx->sleepFor(Milliseconds(millis));
+            return;
         }
+        // This is not ran in multitenancy since sleep is an internal testing command.
+        auto nss =
+            NamespaceStringUtil::deserialize(boost::none, ns, SerializationContext::stateDefault());
+        uassert(50961, "lockTarget is not a valid namespace", DatabaseName::isValid(nss.dbName()));
+
+        auto dbMode = mode;
+        if (!nss.isDbOnly()) {
+            // Only acquire minimum dbLock mode required for collection lock acquisition.
+            dbMode = isSharedLockMode(mode) ? MODE_IS : MODE_IX;
+        }
+
+        Lock::DBLock dbLock(opCtx, nss.dbName(), dbMode, Date_t::max());
+
+        if (nss.isDbOnly()) {
+            LOGV2(6001602,
+                  "Database lock acquired by sleep command.",
+                  "lockMode"_attr = modeName(dbMode));
+            opCtx->sleepFor(Milliseconds(millis));
+            return;
+        }
+
+        // Need to acquire DBLock before attempting to acquire a collection lock.
+        uassert(50962,
+                "lockTarget is not a valid namespace",
+                NamespaceString::validCollectionComponent(nss));
+        Lock::CollectionLock collLock(opCtx, nss, mode, Date_t::max());
+        LOGV2(6001603,
+              "Collection lock acquired by sleep command.",
+              "lockMode"_attr = modeName(mode));
+        opCtx->sleepFor(Milliseconds(millis));
+    }
+
+    void _sleepInRSTL(mongo::OperationContext* opCtx, long long millis) {
+        Lock::ResourceLock rstl(opCtx, resourceIdReplicationStateTransitionLock, MODE_X);
+        LOGV2(6001600, "RSTL MODE_X lock acquired by sleep command.");
+        opCtx->sleepFor(Milliseconds(millis));
     }
 
     CmdSleep() : BasicCommand("sleep") {}
     bool run(OperationContext* opCtx,
-             const std::string& ns,
+             const DatabaseName&,
              const BSONObj& cmdObj,
-             BSONObjBuilder& result) {
-        log() << "test only command sleep invoked";
-        long long millis = 0;
+             BSONObjBuilder& result) override {
+        LOGV2(20504, "Test-only command 'sleep' invoked");
+        long long msToSleep = 0;
 
-        if (cmdObj["secs"] || cmdObj["millis"]) {
-            if (cmdObj["secs"]) {
-                uassert(34344, "'secs' must be a number.", cmdObj["secs"].isNumber());
-                millis += cmdObj["secs"].numberLong() * 1000;
+        if (cmdObj["secs"] || cmdObj["seconds"] || cmdObj["millis"]) {
+            uassert(51153,
+                    "Only one of 'secs' and 'seconds' may be specified",
+                    !(cmdObj["secs"] && cmdObj["seconds"]));
+
+            if (auto secsElem = cmdObj["secs"]) {
+                uassert(34344, "'secs' must be a number.", secsElem.isNumber());
+                msToSleep += secsElem.safeNumberLong() * 1000;
+            } else if (auto secondsElem = cmdObj["seconds"]) {
+                uassert(51154, "'seconds' must be a number.", secondsElem.isNumber());
+                msToSleep += secondsElem.safeNumberLong() * 1000;
             }
-            if (cmdObj["millis"]) {
-                uassert(34345, "'millis' must be a number.", cmdObj["millis"].isNumber());
-                millis += cmdObj["millis"].numberLong();
-            }
-        } else {
-            millis = 10 * 1000;
-        }
 
-        StringData lockTarget;
-        if (cmdObj["lockTarget"]) {
-            lockTarget = cmdObj["lockTarget"].checkAndGetStringData();
-        }
-
-        if (!cmdObj["lock"]) {
-            // Legacy implementation
-            if (cmdObj.getBoolField("w")) {
-                _sleepInLock(opCtx, millis, MODE_X, lockTarget);
-            } else {
-                _sleepInLock(opCtx, millis, MODE_S, lockTarget);
+            if (auto millisElem = cmdObj["millis"]) {
+                uassert(34345, "'millis' must be a number.", millisElem.isNumber());
+                msToSleep += millisElem.safeNumberLong();
             }
         } else {
-            uassert(34346, "Only one of 'w' and 'lock' may be set.", !cmdObj["w"]);
+            msToSleep = 10 * 1000;
+        }
 
-            std::string lock(cmdObj.getStringField("lock"));
-            if (lock == "none") {
-                opCtx->sleepFor(Milliseconds(millis));
-            } else if (lock == "w") {
-                _sleepInLock(opCtx, millis, MODE_X, lockTarget);
+        auto now = opCtx->getServiceContext()->getFastClockSource()->now();
+        auto deadline = now + Milliseconds(msToSleep);
+
+        // Note that if the system clock moves _backwards_ (which has been known to happen), this
+        // could result in a much longer sleep than requested. Since this command is only used for
+        // testing, we're okay with this imprecision.
+        while (deadline > now) {
+            Milliseconds msRemaining = deadline - now;
+
+            // If the clock moves back by an absurd amount then uassert.
+            Milliseconds threshold(10000);
+            uassert(31173,
+                    str::stream() << "Clock must have moved backwards by at least " << threshold
+                                  << " ms during sleep command",
+                    msRemaining.count() < msToSleep + threshold.count());
+
+            ON_BLOCK_EXIT(
+                [&now, opCtx] { now = opCtx->getServiceContext()->getFastClockSource()->now(); });
+
+            StringData lockTarget;
+            if (cmdObj["lockTarget"]) {
+                lockTarget = cmdObj["lockTarget"].checkAndGetStringData();
+            }
+
+            if (lockTarget == "RSTL") {
+                _sleepInRSTL(opCtx, msRemaining.count());
+                continue;
+            }
+
+            if (!cmdObj["lock"]) {
+                // The caller may specify either 'w' as true or false to take a global X lock or
+                // global S lock, respectively.
+                if (cmdObj.getBoolField("w")) {
+                    _sleepInLock(opCtx, msRemaining.count(), MODE_X, lockTarget);
+                } else {
+                    _sleepInLock(opCtx, msRemaining.count(), MODE_S, lockTarget);
+                }
             } else {
-                uassert(34347, "'lock' must be one of 'r', 'w', 'none'.", lock == "r");
-                _sleepInLock(opCtx, millis, MODE_S, lockTarget);
+                uassert(34346, "Only one of 'w' and 'lock' may be set.", !cmdObj["w"]);
+
+                std::string lock(cmdObj.getStringField("lock"));
+                if (lock == "none") {
+                    opCtx->sleepFor(Milliseconds(msRemaining));
+                } else if (lock == "w") {
+                    _sleepInLock(opCtx, msRemaining.count(), MODE_X, lockTarget);
+                } else if (lock == "iw") {
+                    _sleepInLock(opCtx, msRemaining.count(), MODE_IX, lockTarget);
+                } else if (lock == "r") {
+                    _sleepInLock(opCtx, msRemaining.count(), MODE_S, lockTarget);
+                } else {
+                    uassert(
+                        34347, "'lock' must be one of 'r', 'ir', 'w', 'iw', 'none'.", lock == "ir");
+                    _sleepInLock(opCtx, msRemaining.count(), MODE_IS, lockTarget);
+                }
             }
         }
 
@@ -142,7 +236,16 @@ public:
 
         return true;
     }
+
+    ReadWriteType getReadWriteType() const override {
+        return ReadWriteType::kRead;
+    }
+
+    bool allowedWithSecurityToken() const override {
+        // This is a test only command, we can safely allow it with multi-tenancy.
+        return true;
+    }
 };
 
-MONGO_REGISTER_TEST_COMMAND(CmdSleep);
-}  // namespace
+MONGO_REGISTER_COMMAND(CmdSleep).testOnly().forShard();
+}  // namespace mongo

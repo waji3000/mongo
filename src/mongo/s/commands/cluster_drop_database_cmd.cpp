@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,77 +27,109 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
 
-#include "mongo/platform/basic.h"
+#include <memory>
+#include <set>
 
+#include "mongo/base/error_codes.h"
 #include "mongo/base/status.h"
+#include "mongo/client/read_preference.h"
+#include "mongo/db/auth/action_type.h"
+#include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/drop_database_gen.h"
+#include "mongo/db/generic_argument_util.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/service_context.h"
+#include "mongo/executor/remote_command_response.h"
+#include "mongo/rpc/get_status_from_command_result.h"
+#include "mongo/rpc/op_msg.h"
+#include "mongo/s/async_requests_sender.h"
 #include "mongo/s/catalog_cache.h"
-#include "mongo/s/client/shard_registry.h"
+#include "mongo/s/client/shard.h"
+#include "mongo/s/cluster_commands_helpers.h"
 #include "mongo/s/grid.h"
-#include "mongo/util/log.h"
+#include "mongo/s/request_types/sharded_ddl_commands_gen.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/database_name_util.h"
 #include "mongo/util/scopeguard.h"
+#include "mongo/util/str.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
+
 
 namespace mongo {
 namespace {
 
-class DropDatabaseCmd : public BasicCommand {
+class DropDatabaseCmd : public DropDatabaseCmdVersion1Gen<DropDatabaseCmd> {
 public:
-    DropDatabaseCmd() : BasicCommand("dropDatabase") {}
-
-    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const final {
         return AllowedOnSecondary::kAlways;
     }
+    class Invocation final : public InvocationBaseGen {
+    public:
+        using InvocationBaseGen::InvocationBaseGen;
+        bool supportsWriteConcern() const final {
+            return true;
+        }
+        NamespaceString ns() const final {
+            return NamespaceString(request().getDbName());
+        }
+        void doCheckAuthorization(OperationContext* opCtx) const final {
+            uassert(ErrorCodes::Unauthorized,
+                    str::stream() << "Not authorized to drop database '"
+                                  << request().getDbName().toStringForErrorMsg() << "'",
+                    AuthorizationSession::get(opCtx->getClient())
+                        ->isAuthorizedForActionsOnNamespace(ns(), ActionType::dropDatabase));
+        }
+        Reply typedRun(OperationContext* opCtx) final {
+            auto dbName = request().getDbName();
 
-    bool adminOnly() const override {
-        return false;
-    }
+            uassert(ErrorCodes::IllegalOperation,
+                    "Cannot drop the config database",
+                    dbName != DatabaseName::kConfig);
+            uassert(ErrorCodes::IllegalOperation,
+                    "Cannot drop the admin database",
+                    dbName != DatabaseName::kAdmin);
+            uassert(ErrorCodes::BadValue,
+                    "Must pass 1 as the 'dropDatabase' parameter",
+                    request().getCommandParameter() == 1);
 
-    bool supportsWriteConcern(const BSONObj& cmd) const override {
-        return true;
-    }
+            try {
+                const CachedDatabaseInfo dbInfo =
+                    uassertStatusOK(Grid::get(opCtx)->catalogCache()->getDatabase(opCtx, dbName));
 
-    void addRequiredPrivileges(const std::string& dbname,
-                               const BSONObj& cmdObj,
-                               std::vector<Privilege>* out) const override {
-        ActionSet actions;
-        actions.addAction(ActionType::dropDatabase);
-        out->push_back(Privilege(ResourcePattern::forDatabaseName(dbname), actions));
-    }
+                // Invalidate the database metadata so the next access kicks off a full reload, even
+                // if sending the command to the config server fails due to e.g. a NetworkError.
+                ON_BLOCK_EXIT(
+                    [opCtx, dbName] { Grid::get(opCtx)->catalogCache()->purgeDatabase(dbName); });
 
-    bool run(OperationContext* opCtx,
-             const std::string& dbname,
-             const BSONObj& cmdObj,
-             BSONObjBuilder& result) override {
-        uassert(ErrorCodes::IllegalOperation,
-                "Cannot drop the config database",
-                dbname != NamespaceString::kConfigDb);
+                // Send it to the primary shard
+                ShardsvrDropDatabase dropDatabaseCommand;
+                dropDatabaseCommand.setDbName(dbName);
+                generic_argument_util::setMajorityWriteConcern(dropDatabaseCommand,
+                                                               &opCtx->getWriteConcern());
 
-        uassert(ErrorCodes::BadValue,
-                "have to pass 1 as db parameter",
-                cmdObj.firstElement().isNumber() && cmdObj.firstElement().number() == 1);
+                auto cmdResponse = executeCommandAgainstDatabasePrimaryOnlyAttachingDbVersion(
+                    opCtx,
+                    dbName,
+                    dbInfo,
+                    dropDatabaseCommand.toBSON(),
+                    ReadPreferenceSetting(ReadPreference::PrimaryOnly),
+                    Shard::RetryPolicy::kIdempotent);
 
-        // Invalidate the database metadata so the next access kicks off a full reload, even if
-        // sending the command to the config server fails due to e.g. a NetworkError.
-        ON_BLOCK_EXIT([opCtx, dbname] { Grid::get(opCtx)->catalogCache()->purgeDatabase(dbname); });
-
-        // Send _configsvrDropDatabase to the config server.
-        auto configShard = Grid::get(opCtx)->shardRegistry()->getConfigShard();
-        auto cmdResponse = uassertStatusOK(configShard->runCommandWithFixedRetryAttempts(
-            opCtx,
-            ReadPreferenceSetting(ReadPreference::PrimaryOnly),
-            "admin",
-            CommandHelpers::appendMajorityWriteConcern(CommandHelpers::appendPassthroughFields(
-                cmdObj, BSON("_configsvrDropDatabase" << dbname))),
-            Shard::RetryPolicy::kIdempotent));
-
-        CommandHelpers::filterCommandReplyForPassthrough(cmdResponse.response, &result);
-        return true;
-    }
-
-} clusterDropDatabaseCmd;
+                const auto remoteResponse = uassertStatusOK(cmdResponse.swResponse);
+                uassertStatusOK(getStatusFromCommandResult(remoteResponse.data));
+            } catch (const ExceptionFor<ErrorCodes::NamespaceNotFound>&) {
+                // If the namespace isn't found, treat the drop as a success
+            }
+            return {};
+        }
+    };
+};
+MONGO_REGISTER_COMMAND(DropDatabaseCmd).forRouter();
 
 }  // namespace
 }  // namespace mongo

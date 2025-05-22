@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,11 +27,16 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <cstdint>
 
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/db/exec/mutable_bson/algorithm.h"
+#include "mongo/db/exec/mutable_bson/document.h"
 #include "mongo/db/update/bit_node.h"
-
-#include "mongo/bson/mutable/algorithm.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -61,9 +65,7 @@ Status BitNode::init(BSONElement modExpr, const boost::intrusive_ptr<ExpressionC
             return Status(ErrorCodes::BadValue,
                           str::stream()
                               << "The $bit modifier only supports 'and', 'or', and 'xor', not '"
-                              << payloadFieldName
-                              << "' which is an unknown operator: {"
-                              << curOp
+                              << payloadFieldName << "' which is an unknown operator: {" << curOp
                               << "}");
         }
 
@@ -71,9 +73,7 @@ Status BitNode::init(BSONElement modExpr, const boost::intrusive_ptr<ExpressionC
             return Status(ErrorCodes::BadValue,
                           str::stream()
                               << "The $bit modifier field must be an Integer(32/64 bit); a '"
-                              << typeName(curOp.type())
-                              << "' is not supported here: {"
-                              << curOp
+                              << typeName(curOp.type()) << "' is not supported here: {" << curOp
                               << "}");
         }
 
@@ -91,18 +91,15 @@ Status BitNode::init(BSONElement modExpr, const boost::intrusive_ptr<ExpressionC
     return Status::OK();
 }
 
-ModifierNode::ModifyResult BitNode::updateExistingElement(
-    mutablebson::Element* element, std::shared_ptr<FieldRef> elementPath) const {
+ModifierNode::ModifyResult BitNode::updateExistingElement(mutablebson::Element* element,
+                                                          const FieldRef& elementPath) const {
     if (!element->isIntegral()) {
         mutablebson::Element idElem =
             mutablebson::findFirstChildNamed(element->getDocument().root(), "_id");
         uasserted(ErrorCodes::BadValue,
                   str::stream() << "Cannot apply $bit to a value of non-integral type."
-                                << idElem.toString()
-                                << " has the field "
-                                << element->getFieldName()
-                                << " of non-integer type "
-                                << typeName(element->getType()));
+                                << idElem.toString() << " has the field " << element->getFieldName()
+                                << " of non-integer type " << typeName(element->getType()));
     }
 
     SafeNum value = applyOpList(element->getValueSafeNum());

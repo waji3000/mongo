@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,22 +27,16 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <boost/smart_ptr/intrusive_ptr.hpp>
 
-#include "mongo/db/pipeline/accumulator.h"
-
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/pipeline/accumulation_statement.h"
-#include "mongo/db/pipeline/value.h"
+#include "mongo/db/pipeline/accumulator.h"
+#include "mongo/db/pipeline/expression_context.h"
 
 namespace mongo {
 
-using boost::intrusive_ptr;
-
-REGISTER_ACCUMULATOR(first, AccumulatorFirst::create);
-
-const char* AccumulatorFirst::getOpName() const {
-    return "$first";
-}
+REGISTER_ACCUMULATOR(first, genericParseSingleExpressionAccumulator<AccumulatorFirst>);
 
 void AccumulatorFirst::processInternal(const Value& input, bool merging) {
     /* only remember the first value seen */
@@ -51,7 +44,8 @@ void AccumulatorFirst::processInternal(const Value& input, bool merging) {
         // can't use pValue.missing() since we want the first value even if missing
         _haveFirst = true;
         _first = input;
-        _memUsageBytes = sizeof(*this) + input.getApproximateSize() - sizeof(Value);
+        _memUsageTracker.set(sizeof(*this) + input.getApproximateSize() - sizeof(Value));
+        _needsInput = false;
     }
 }
 
@@ -59,20 +53,15 @@ Value AccumulatorFirst::getValue(bool toBeMerged) {
     return _first;
 }
 
-AccumulatorFirst::AccumulatorFirst(const boost::intrusive_ptr<ExpressionContext>& expCtx)
-    : Accumulator(expCtx), _haveFirst(false) {
-    _memUsageBytes = sizeof(*this);
+AccumulatorFirst::AccumulatorFirst(ExpressionContext* const expCtx)
+    : AccumulatorState(expCtx), _haveFirst(false) {
+    _memUsageTracker.set(sizeof(*this));
 }
 
 void AccumulatorFirst::reset() {
     _haveFirst = false;
     _first = Value();
-    _memUsageBytes = sizeof(*this);
+    _memUsageTracker.set(sizeof(*this));
 }
 
-
-intrusive_ptr<Accumulator> AccumulatorFirst::create(
-    const boost::intrusive_ptr<ExpressionContext>& expCtx) {
-    return new AccumulatorFirst(expCtx);
-}
-}
+}  // namespace mongo

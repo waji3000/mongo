@@ -1,0 +1,145 @@
+version: 1.0.0
+options:
+  no_parent_owners: true
+filters:
+  - "aggregation*":
+    approvers:
+      - 10gen/query
+  - "aggregation_disabled_optimization.yml":
+    approvers:
+      - 10gen/query-optimization
+  - "aggregation_repeat_queries_multiplan_single_solutions.yml":
+    approvers:
+      - 10gen/query-optimization
+  - "aggregation_unsplittable_collections_on_random_shard_passthrough*":
+    approvers:
+      - 10gen/query-optimization
+  - "aggregation_facet_unwind_passthrough.yml":
+    approvers:
+      - 10gen/query-execution-classic
+  - "aggregation_sharded_collections_causally_consistent_passthrough.yml":
+    approvers:
+      - 10gen/query-execution-classic
+  - "aggregation_secondary_reads.yml":
+    approvers:
+      - 10gen/query-execution-classic
+  - "benchmarks_abt_lowering.yml":
+    approvers:
+      - 10gen/query-execution-sbe
+  - "benchmarks_expression.yml":
+    approvers:
+      - 10gen/query-execution-classic
+  - "benchmarks_expression_sbe.yml":
+    approvers:
+      - 10gen/query-execution-sbe
+  - "benchmarks_query.yml":
+    approvers:
+      - 10gen/query
+  - "bulk_write*":
+    approvers:
+      - 10gen/query-execution-write-exec
+  - "bulk_write_multi_op_sharded_collections_jscore_passthrough.yml":
+    approvers:
+      - 10gen/query-execution-router
+  - "change_streams*":
+    approvers:
+      - 10gen/query-execution-change-streams
+  - "clustered_collection_passthrough.yml":
+    approvers:
+      - 10gen/query-execution
+  - "core_wildcard_indexes.yml":
+    approvers:
+      - 10gen/query-execution-write-exec
+  - "fle*":
+    approvers:
+      - 10gen/query-integration-extensions
+  - "json_schema.yml":
+    approvers:
+      - 10gen/query-execution
+  - "query_stats*":
+    approvers:
+      - 10gen/query-integration-observability
+  - "query_tester_self_test.yml":
+    approvers:
+      - 10gen/query-optimization
+  - "search*":
+    approvers:
+      - 10gen/query-integration-search
+  - "sharding_clustered_collections.yml":
+    approvers:
+      - 10gen/query-execution-router
+  - "unittests_query.yml":
+    approvers:
+      - 10gen/query
+  - "update_fuzzer*":
+    approvers:
+      - 10gen/query-execution-write-exec
+  - "vector_search*":
+    approvers:
+      - 10gen/query-integration-search
+  - "query_golden*":
+    approvers:
+      - 10gen/query-optimization
+  - "queryable_wt*":
+    approvers:
+      - 10gen/server-backup-restore
+  - "read_only*":
+    approvers:
+      - 10gen/server-rss-sydney
+  - "no_passthrough_network*":
+    approvers:
+      - 10gen/server-networking-and-observability
+  - "cwrwc*":
+    approvers:
+      - 10gen/server-rw-concerns
+  - "fcv*":
+    approvers:
+      - 10gen/server-fcv
+  - "jstestfuzz_replication*":
+    approvers:
+      - 10gen/server-jstest-infra
+  - "magic_restore*":
+    approvers:
+      - 10gen/server-recovery
+  - "mongot*":
+    approvers:
+      - 10gen/query-integration-search
+  - "multiversion*":
+    approvers:
+      - 10gen/server-jstest-infra
+  - "replica_sets*":
+    approvers:
+      - 10gen/server-jstest-infra
+  - "read_concern*":
+    approvers:
+      - 10gen/server-rw-concerns
+  - "retryable_writes*":
+    approvers:
+      - 10gen/server-transactions
+  - "rollback*":
+    approvers:
+      - 10gen/server-recovery
+  - "*txn*":
+    approvers:
+      - 10gen/server-transactions
+  - "write_concern*":
+    approvers:
+      - 10gen/server-rw-concerns
+  - "unified_write_executor.yml":
+    approvers:
+      - 10gen/query-execution-router
+  - "sharding_unified_write_executor.yml":
+    approvers:
+      - 10gen/query-execution-router
+  - "sharded_collections_jscore_passthrough_with_config_transitions_and_add_remove_shard.yml":
+    approvers:
+      - 10gen/server-catalog-and-routing
+  - "sharding_jscore_passthrough_with_config_transitions_and_add_remove_shard.yml":
+    approvers:
+      - 10gen/server-catalog-and-routing
+  - "jstestfuzz_sharded_with_config_transitions_and_add_remove_shard.yml":
+    approvers:
+      - 10gen/server-catalog-and-routing
+  - "query_correctness_query_shape_hash_stability_generated_test.yml":
+    approvers:
+      - 10gen/query-execution-query-settings

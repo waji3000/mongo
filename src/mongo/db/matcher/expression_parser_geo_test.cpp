@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,38 +27,28 @@
  *    it in the license file.
  */
 
-#include "mongo/unittest/unittest.h"
+#include <memory>
 
-#include "mongo/db/matcher/expression_parser.h"
+#include <boost/smart_ptr/intrusive_ptr.hpp>
 
-#include "mongo/db/jsobj.h"
-#include "mongo/db/json.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/json.h"
 #include "mongo/db/matcher/expression.h"
 #include "mongo/db/matcher/expression_geo.h"
+#include "mongo/db/matcher/expression_parser.h"
 #include "mongo/db/matcher/extensions_callback_noop.h"
+#include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/expression_context_for_test.h"
+#include "mongo/unittest/unittest.h"
+#include "mongo/util/intrusive_counter.h"
 
 namespace mongo {
-
-TEST(MatchExpressionParserGeo, WithinBox) {
-    BSONObj query = fromjson("{a:{$within:{$box:[{x: 4, y:4},[6,6]]}}}");
-
-    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    StatusWithMatchExpression result = MatchExpressionParser::parse(
-        query, expCtx, ExtensionsCallbackNoop(), MatchExpressionParser::kAllowAllSpecialFeatures);
-    ASSERT_TRUE(result.isOK());
-
-    ASSERT(!result.getValue()->matchesBSON(fromjson("{a: [3,4]}")));
-    ASSERT(result.getValue()->matchesBSON(fromjson("{a: [4,4]}")));
-    ASSERT(result.getValue()->matchesBSON(fromjson("{a: [5,5]}")));
-    ASSERT(result.getValue()->matchesBSON(fromjson("{a: [5,5.1]}")));
-    ASSERT(result.getValue()->matchesBSON(fromjson("{a: {x: 5, y:5.1}}")));
-}
 
 TEST(MatchExpressionParserGeoNear, ParseNear) {
     BSONObj query = fromjson(
         "{loc:{$near:{$maxDistance:100, "
-        "$geometry:{type:\"Point\", coordinates:[0,0]}}}}");
+        "$geometry:{type:\"Point\", coordinates:[5,7]}}}}");
 
     boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
     StatusWithMatchExpression result = MatchExpressionParser::parse(
@@ -71,6 +60,9 @@ TEST(MatchExpressionParserGeoNear, ParseNear) {
 
     GeoNearMatchExpression* gnexp = static_cast<GeoNearMatchExpression*>(exp);
     ASSERT_EQUALS(gnexp->getData().maxDistance, 100);
+    ASSERT_EQUALS(gnexp->getData().centroid->crs, CRS::SPHERE);
+    ASSERT_EQUALS(gnexp->getData().centroid->oldPoint.x, 5);
+    ASSERT_EQUALS(gnexp->getData().centroid->oldPoint.y, 7);
 }
 
 // $near must be the only field in the expression object.
@@ -94,7 +86,7 @@ TEST(MatchExpressionParserGeoNear, ParseNearExtraField) {
 //   $maxDistance: <distance in radians>
 // }
 TEST(MatchExpressionParserGeoNear, ParseValidNear) {
-    BSONObj query = fromjson("{loc: {$near: [0,0], $maxDistance: 100, $minDistance: 50}}");
+    BSONObj query = fromjson("{loc: {$near: [1,0], $maxDistance: 100, $minDistance: 50}}");
 
     boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
     StatusWithMatchExpression result = MatchExpressionParser::parse(
@@ -107,6 +99,9 @@ TEST(MatchExpressionParserGeoNear, ParseValidNear) {
     GeoNearMatchExpression* gnexp = static_cast<GeoNearMatchExpression*>(exp);
     ASSERT_EQ(gnexp->getData().maxDistance, 100);
     ASSERT_EQ(gnexp->getData().minDistance, 50);
+    ASSERT_EQUALS(gnexp->getData().centroid->crs, CRS::FLAT);
+    ASSERT_EQ(gnexp->getData().centroid->oldPoint.x, 1);
+    ASSERT_EQ(gnexp->getData().centroid->oldPoint.y, 0);
 }
 
 TEST(MatchExpressionParserGeoNear, ParseInvalidNear) {
@@ -200,7 +195,7 @@ TEST(MatchExpressionParserGeoNear, ParseInvalidNear) {
 }
 
 TEST(MatchExpressionParserGeoNear, ParseValidGeoNear) {
-    BSONObj query = fromjson("{loc: {$geoNear: [0,0], $maxDistance: 100, $minDistance: 50}}");
+    BSONObj query = fromjson("{loc: {$geoNear: [0,10], $maxDistance: 100, $minDistance: 50}}");
 
     boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
     StatusWithMatchExpression result = MatchExpressionParser::parse(
@@ -213,6 +208,30 @@ TEST(MatchExpressionParserGeoNear, ParseValidGeoNear) {
     GeoNearMatchExpression* gnexp = static_cast<GeoNearMatchExpression*>(exp);
     ASSERT_EQ(gnexp->getData().maxDistance, 100);
     ASSERT_EQ(gnexp->getData().minDistance, 50);
+    ASSERT_EQUALS(gnexp->getData().centroid->crs, CRS::FLAT);
+    ASSERT_EQUALS(gnexp->getData().centroid->oldPoint.x, 0);
+    ASSERT_EQUALS(gnexp->getData().centroid->oldPoint.y, 10);
+}
+
+TEST(MatchExpressionParserGeoNear, ParseValidGeoNearLegacyCoordinates) {
+    // Although this is very misleading, this is a legal way to query near the point [5,10]
+    // with a max distance of 2.
+    BSONObj query =
+        fromjson("{loc: {$geoNear: {$geometry: 5, $maxDistance: 10, $minDistance: 2}}}");
+
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    StatusWithMatchExpression result = MatchExpressionParser::parse(
+        query, expCtx, ExtensionsCallbackNoop(), MatchExpressionParser::kAllowAllSpecialFeatures);
+    ASSERT_TRUE(result.isOK());
+
+    MatchExpression* exp = result.getValue().get();
+    ASSERT_EQ(MatchExpression::GEO_NEAR, exp->matchType());
+
+    GeoNearMatchExpression* gnexp = static_cast<GeoNearMatchExpression*>(exp);
+    ASSERT_EQ(gnexp->getData().maxDistance, 2);
+    ASSERT_EQUALS(gnexp->getData().centroid->crs, CRS::FLAT);
+    ASSERT_EQ(gnexp->getData().centroid->oldPoint.x, 5);
+    ASSERT_EQ(gnexp->getData().centroid->oldPoint.y, 10);
 }
 
 TEST(MatchExpressionParserGeoNear, ParseInvalidGeoNear) {
@@ -263,10 +282,19 @@ TEST(MatchExpressionParserGeoNear, ParseInvalidGeoNear) {
                                                    MatchExpressionParser::kAllowAllSpecialFeatures)
                           .getStatus());
     }
+    {
+        BSONObj query = fromjson("{loc: {$geoNear: [0,0], $invalidArgument: 0}}");
+        boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+        ASSERT_NOT_OK(MatchExpressionParser::parse(query,
+                                                   expCtx,
+                                                   ExtensionsCallbackNoop(),
+                                                   MatchExpressionParser::kAllowAllSpecialFeatures)
+                          .getStatus());
+    }
 }
 
 TEST(MatchExpressionParserGeoNear, ParseValidNearSphere) {
-    BSONObj query = fromjson("{loc: {$nearSphere: [0,0], $maxDistance: 100, $minDistance: 50}}");
+    BSONObj query = fromjson("{loc: {$nearSphere: [0,1], $maxDistance: 100, $minDistance: 50}}");
 
     boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
     StatusWithMatchExpression result = MatchExpressionParser::parse(
@@ -279,6 +307,9 @@ TEST(MatchExpressionParserGeoNear, ParseValidNearSphere) {
     GeoNearMatchExpression* gnexp = static_cast<GeoNearMatchExpression*>(exp);
     ASSERT_EQ(gnexp->getData().maxDistance, 100);
     ASSERT_EQ(gnexp->getData().minDistance, 50);
+    ASSERT_EQUALS(gnexp->getData().centroid->crs, CRS::SPHERE);
+    ASSERT_EQ(gnexp->getData().centroid->oldPoint.x, 0);
+    ASSERT_EQ(gnexp->getData().centroid->oldPoint.y, 1);
 }
 
 TEST(MatchExpressionParserGeoNear, ParseInvalidNearSphere) {

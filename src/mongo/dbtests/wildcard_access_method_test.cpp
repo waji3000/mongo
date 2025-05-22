@@ -27,11 +27,18 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <utility>
+#include <vector>
 
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/bson/json.h"
-#include "mongo/db/index/wildcard_access_method.h"
+#include "mongo/db/field_ref.h"
+#include "mongo/db/query/index_bounds.h"
+#include "mongo/db/query/interval.h"
 #include "mongo/db/query/query_planner_test_lib.h"
+#include "mongo/db/query/wildcard_multikey_paths.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
@@ -43,14 +50,14 @@ void assertCorrectMultikeyMetadataPathBoundsGenerated(StringData field,
 
     OrderedIntervalList orderedIntervalList;
     FieldRef fieldRef(field);
-    orderedIntervalList.intervals =
-        WildcardAccessMethod::getMultikeyPathIndexIntervalsForField(std::move(fieldRef));
+    orderedIntervalList.intervals = getMultikeyPathIndexIntervalsForField(std::move(fieldRef));
 
     indexBounds.fields.push_back(std::move(orderedIntervalList));
 
     const bool kDoNotRelaxBoundsCheck = false;
     ASSERT(QueryPlannerTestLib::boundsMatch(
-        expectedBounds, std::move(indexBounds), kDoNotRelaxBoundsCheck));
+               expectedBounds, std::move(indexBounds), kDoNotRelaxBoundsCheck)
+               .isOK());
 }
 
 TEST(WildcardAccessMethodTest, FieldGeneratesExpectedMultikeyPathBounds) {

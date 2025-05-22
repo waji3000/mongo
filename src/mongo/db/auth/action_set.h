@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -32,9 +31,11 @@
 
 #include <bitset>
 #include <initializer_list>
+#include <string>
 #include <vector>
 
 #include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
 #include "mongo/db/auth/action_type.h"
 
 namespace mongo {
@@ -47,16 +48,21 @@ namespace mongo {
  */
 class ActionSet {
 public:
-    ActionSet() : _actions(0) {}
+    ActionSet() = default;
     ActionSet(std::initializer_list<ActionType> actions);
 
-    void addAction(const ActionType& action);
+    // Parse a human-readable set of ActionTypes into a bitset of actions.
+    // unrecognizedActions will be populated with a copy of any unexpected action, if present.
+    static ActionSet parseFromStringVector(const std::vector<StringData>& actions,
+                                           std::vector<std::string>* unrecognizedActions = nullptr);
+
+    void addAction(ActionType action);
     void addAllActionsFromSet(const ActionSet& actionSet);
     void addAllActions();
 
     // Removes action from the set.  Also removes the "anyAction" action, if present.
     // Note: removing the "anyAction" action does *not* remove all other actions.
-    void removeAction(const ActionType& action);
+    void removeAction(ActionType action);
     void removeAllActionsFromSet(const ActionSet& actionSet);
     void removeAllActions();
 
@@ -68,7 +74,10 @@ public:
         return this->_actions == other._actions;
     }
 
-    bool contains(const ActionType& action) const;
+    bool contains(ActionType action) const;
+
+    // Returns true if this action set contains the entire other action set
+    bool contains(const ActionSet& other) const;
 
     // Returns true only if this ActionSet contains all the actions present in the 'other'
     // ActionSet.
@@ -78,27 +87,17 @@ public:
     std::string toString() const;
 
     // Returns a vector of strings representing the actions in the ActionSet.
-    std::vector<std::string> getActionsAsStrings() const;
+    // The storage for these StringDatas comes from IDL constexpr definitions for
+    // ActionTypes and is therefore guaranteed for the life of the process.
+    std::vector<StringData> getActionsAsStringDatas() const;
 
-    // Takes a comma-separated std::string of action type std::string representations and returns
-    // an int bitmask of the actions.
-    static Status parseActionSetFromString(const std::string& actionsString, ActionSet* result);
-
-    // Takes a vector of action type std::string representations and writes into *result an
-    // ActionSet of all valid actions encountered.
-    // If it encounters any actions that it doesn't recognize, will put those into
-    // *unrecognizedActions, while still returning the valid actions in *result, and returning OK.
-    static Status parseActionSetFromStringVector(const std::vector<std::string>& actionsVector,
-                                                 ActionSet* result,
-                                                 std::vector<std::string>* unrecognizedActions);
+    friend bool operator==(const ActionSet& lhs, const ActionSet& rhs) {
+        return lhs.equals(rhs);
+    }
 
 private:
     // bitmask of actions this privilege grants
-    std::bitset<ActionType::NUM_ACTION_TYPES> _actions;
+    std::bitset<kNumActionTypes> _actions;
 };
-
-static inline bool operator==(const ActionSet& lhs, const ActionSet& rhs) {
-    return lhs.equals(rhs);
-}
 
 }  // namespace mongo

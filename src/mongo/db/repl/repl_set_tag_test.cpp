@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -29,6 +28,7 @@
  */
 
 #include "mongo/db/repl/repl_set_tag.h"
+
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
@@ -88,7 +88,7 @@ TEST(ReplSetTagConfigTest, MakeAndFindTags) {
 
 class ReplSetTagMatchTest : public unittest::Test {
 public:
-    void setUp() {
+    void setUp() override {
         dcNY = tagConfig.makeTag("dc", "ny");
         dcVA = tagConfig.makeTag("dc", "va");
         dcRI = tagConfig.makeTag("dc", "ri");

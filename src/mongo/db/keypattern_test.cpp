@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,7 +29,11 @@
 
 #include "mongo/db/keypattern.h"
 
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/stdx/type_traits.h"
 #include "mongo/unittest/unittest.h"
+#include "mongo/util/assert_util.h"
 
 namespace {
 
@@ -124,14 +127,8 @@ TEST(KeyPattern, GlobalMinMax) {
     ASSERT_BSONOBJ_EQ(KeyPattern(BSON("a" << 1 << "b" << -1.0f)).globalMax(),
                       BSON("a" << MAXKEY << "b" << MINKEY));
 
-    ASSERT_BSONOBJ_EQ(KeyPattern(BSON("a"
-                                      << "hashed"))
-                          .globalMin(),
-                      BSON("a" << MINKEY));
-    ASSERT_BSONOBJ_EQ(KeyPattern(BSON("a"
-                                      << "hashed"))
-                          .globalMax(),
-                      BSON("a" << MAXKEY));
+    ASSERT_BSONOBJ_EQ(KeyPattern(BSON("a" << "hashed")).globalMin(), BSON("a" << MINKEY));
+    ASSERT_BSONOBJ_EQ(KeyPattern(BSON("a" << "hashed")).globalMax(), BSON("a" << MAXKEY));
 
     //
     // Nested KeyPatterns
@@ -143,4 +140,4 @@ TEST(KeyPattern, GlobalMinMax) {
     ASSERT_BSONOBJ_EQ(KeyPattern(BSON("a.b.c" << -1)).globalMin(), BSON("a.b.c" << MAXKEY));
     ASSERT_BSONOBJ_EQ(KeyPattern(BSON("a.b.c" << -1)).globalMax(), BSON("a.b.c" << MINKEY));
 }
-}
+}  // namespace

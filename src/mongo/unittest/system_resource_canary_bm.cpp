@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,9 +27,10 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include <benchmark/benchmark.h>
+#include <cstddef>
+#include <cstdint>
+#include <memory>
 
 #include "mongo/util/assert_util.h"
 #include "mongo/util/processinfo.h"
@@ -95,11 +95,11 @@ class CacheLatencyTest : public benchmark::Fixture {
     // Fixture for CPU Cache and RAM latency test. Adapted from lmbench's lat_mem_rd test.
 public:
     // Array of pointers used as a linked list.
-    std::unique_ptr<char* []> data;
+    std::unique_ptr<char*[]> data;
 
     void SetUp(benchmark::State& state) override {
         if (state.thread_index == 0) {
-            fassert(data.get() == nullptr, "'data' is not null");
+            fassert(9097910, !data);
 
             /*
              * Create a circular list of pointers using a simple striding
@@ -108,7 +108,7 @@ public:
             const int arrLength = state.range(0);
             int counter = 0;
 
-            data = std::make_unique<char* []>(arrLength);
+            data = std::make_unique<char*[]>(arrLength);
 
             char** arr = data.get();
 
@@ -126,7 +126,7 @@ public:
 
     void TearDown(benchmark::State& state) override {
         if (state.thread_index == 0) {
-            fassert(data.get() != nullptr, "'data' is null");
+            fassert(9097911, !!data);
             data.reset();
         }
     }
@@ -138,7 +138,7 @@ BENCHMARK_DEFINE_F(CacheLatencyTest, BM_CacheLatency)(benchmark::State& state) {
     size_t counter = arrLength / (kStrideBytes * 100) + 1;
 
     for (auto keepRunning : state) {
-        char** dummyResult = 0;  // Dummy result to prevent the loop from being optimized out.
+        char** dummyResult = nullptr;  // Dummy result to prevent the loop from being optimized out.
         char** ptrToNextLinkedListNode = reinterpret_cast<char**>(data.get()[0]);
 
         for (size_t i = 0; i < counter; ++i) {

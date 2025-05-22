@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -49,6 +48,15 @@ using DoubleDouble = std::pair<double, double>;
  */
 class DoubleDoubleSummation {
 public:
+    DoubleDoubleSummation() = default;
+
+    /**
+     * Factory method.
+     */
+    static constexpr DoubleDoubleSummation create(double sum, double addend) {
+        return DoubleDoubleSummation(sum, addend);
+    }
+
     /**
      * Adds x to the sum, keeping track of a compensation amount to be subtracted later.
      */
@@ -92,9 +100,9 @@ public:
      * Summations of even extremely long series of 32-bit and 64-bit integers should be exact.
      */
     Decimal128 getDecimal() const {
-        return std::isnan(_sum) ? Decimal128(_special, Decimal128::kRoundTo34Digits)
-                                : Decimal128(_sum, Decimal128::kRoundTo34Digits)
-                                      .add(Decimal128(_addend, Decimal128::kRoundTo34Digits));
+        return !std::isfinite(_sum) ? Decimal128(_special, Decimal128::kRoundTo34Digits)
+                                    : Decimal128(_sum, Decimal128::kRoundTo34Digits)
+                                          .add(Decimal128(_addend, Decimal128::kRoundTo34Digits));
     }
 
     /**
@@ -152,5 +160,8 @@ private:
     // Simple sum to be returned if _sum is NaN. This addresses infinities turning into NaNs when
     // using compensated addition.
     double _special = 0.0;
+
+    constexpr DoubleDoubleSummation(double sum, double addend)
+        : _sum(sum), _addend(addend), _special(sum) {}
 };
 }  // namespace mongo

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -31,8 +30,8 @@
 #pragma once
 
 #include <string>
+#include <utility>
 
-#include "mongo/base/disallow_copying.h"
 
 namespace mongo {
 namespace unittest {
@@ -41,7 +40,8 @@ namespace unittest {
  * An RAII temporary directory that deletes itself and all contents files on scope exit.
  */
 class TempDir {
-    MONGO_DISALLOW_COPYING(TempDir);
+    TempDir(const TempDir&) = delete;
+    TempDir& operator=(const TempDir&) = delete;
 
 public:
     /**
@@ -64,14 +64,21 @@ public:
      */
     ~TempDir();
 
-    const std::string& path() {
+    /**
+     * Release the path encapsulated by this TempDir to be cleaned up by the caller as necessary.
+     *
+     * A released TempDir is left with an empty path, and its destructor will perform no cleanup.
+     */
+    std::string release() noexcept {
+        return std::exchange(_path, {});
+    }
+
+    const std::string& path() const {
         return _path;
     }
 
     /**
-     * Set the path where TempDir() will create temporary directories. This is a workaround
-     * for situations where you might want to log, but you've not yet run the MONGO_INITIALIZERs,
-     * and should be removed if ever command line parsing is seperated from MONGO_INITIALIZERs.
+     * Set the path where TempDir() will create temporary directories.
      */
     static void setTempPath(std::string tempPath);
 

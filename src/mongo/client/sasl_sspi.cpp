@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,9 +29,6 @@
 
 #ifdef _WIN32
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
-
-#include "mongo/platform/basic.h"
 
 #include <sasl/sasl.h>
 #include <sasl/saslplug.h>
@@ -40,10 +36,12 @@
 #include "mongo/base/init.h"
 #include "mongo/base/status.h"
 #include "mongo/client/sasl_sspi_options.h"
-#include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/scopeguard.h"
+#include "mongo/util/str.h"
 #include "mongo/util/text.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
 
 extern "C" int plain_client_plug_init(const sasl_utils_t* utils,
                                       int maxversion,
@@ -90,23 +88,21 @@ void HandleLastError(const sasl_utils_t* utils, DWORD errCode, const char* msg) 
     char* err;
     if (!FormatMessageA(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM |
                             FORMAT_MESSAGE_IGNORE_INSERTS,
-                        NULL,
+                        nullptr,
                         errCode,
                         MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
                         (LPSTR)&err,
                         0,
-                        NULL)) {
+                        nullptr)) {
         return;
     }
 
-    std::string buffer(mongoutils::str::stream() << "SSPI: " << msg << ": " << err);
+    std::string buffer(str::stream() << "SSPI: " << msg << ": " << err);
     saslSetError(utils, buffer);
     LocalFree(err);
 }
 
-int sspiClientMechNew(void* glob_context,
-                      sasl_client_params_t* cparams,
-                      void** conn_context) throw() {
+int sspiClientMechNew(void* glob_context, sasl_client_params_t* cparams, void** conn_context) {
     // Prepare auth identity to pass to AcquireCredentialsHandle
     SEC_WINNT_AUTH_IDENTITY authIdentity;
     authIdentity.Flags = SEC_WINNT_AUTH_IDENTITY_UNICODE;
@@ -151,10 +147,10 @@ int sspiClientMechNew(void* glob_context,
 
     // Fetch password, if available.
     authIdentity.PasswordLength = 0;
-    authIdentity.Password = NULL;
+    authIdentity.Password = nullptr;
     std::wstring utf16Password;
 
-    sasl_secret_t* password = NULL;
+    sasl_secret_t* password = nullptr;
     sasl_getsecret_t* pass_cb;
     void* pass_context;
     ret = cparams->utils->getcallback(
@@ -175,15 +171,16 @@ int sspiClientMechNew(void* glob_context,
     std::unique_ptr<SspiConnContext> pcctx(new SspiConnContext());
     pcctx->userPlusRealm = userPlusRealm;
     TimeStamp ignored;
-    SECURITY_STATUS status = AcquireCredentialsHandleW(NULL,  // principal
-                                                       const_cast<LPWSTR>(L"kerberos"),
-                                                       SECPKG_CRED_OUTBOUND,
-                                                       NULL,           // LOGON id
-                                                       &authIdentity,  // auth data
-                                                       NULL,           // get key fn
-                                                       NULL,           // get key arg
-                                                       &pcctx->cred,
-                                                       &ignored);
+    SECURITY_STATUS status =
+        AcquireCredentialsHandleW(nullptr,  // principal
+                                  const_cast<LPWSTR>(L"kerberos"),
+                                  SECPKG_CRED_OUTBOUND,
+                                  nullptr,                                          // LOGON id
+                                  authIdentity.Password ? &authIdentity : nullptr,  // auth data
+                                  nullptr,                                          // get key fn
+                                  nullptr,                                          // get key arg
+                                  &pcctx->cred,
+                                  &ignored);
     if (status != SEC_E_OK) {
         HandleLastError(cparams->utils, status, "AcquireCredentialsHandle");
         return SASL_FAIL;
@@ -192,30 +189,27 @@ int sspiClientMechNew(void* glob_context,
     pcctx->haveCred = true;
 
     // Compose target name token. First, verify that a hostname has been provided.
-    if (cparams->serverFQDN == NULL || strlen(cparams->serverFQDN) == 0) {
+    if (cparams->serverFQDN == nullptr || strlen(cparams->serverFQDN) == 0) {
         saslSetError(cparams->utils, "SSPI: no serverFQDN");
         return SASL_FAIL;
     }
 
     // Then obtain all potential FQDNs for the hostname.
     std::string canonName = cparams->serverFQDN;
-    auto fqdns = getHostFQDNs(cparams->serverFQDN, saslSSPIGlobalParams.canonicalization);
-    if (!fqdns.empty()) {
+    auto fqdnsSW = getHostFQDNs(cparams->serverFQDN, saslSSPIGlobalParams.canonicalization);
+    if (fqdnsSW.isOK() && !fqdnsSW.getValue().empty()) {
         // PTR records should point to the canonical name. If there's more than one, warn and
         // arbitrarily use the last entry.
+        auto fqdns = fqdnsSW.getValue();
         if (fqdns.size() > 1) {
-            std::stringstream ss;
-            ss << "Found multiple PTR records while performing reverse DNS: [ ";
-            for (const std::string& fqdn : fqdns) {
-                ss << fqdn << " ";
-            }
-            ss << "]";
-            warning() << ss.str();
+            LOGV2_WARNING(23933,
+                          "Found multiple PTR records while performing reverse DNS",
+                          "records"_attr = fqdns);
         }
         canonName = std::move(fqdns.back());
         fqdns.pop_back();
     } else if (saslSSPIGlobalParams.canonicalization != HostnameCanonicalizationMode::kNone) {
-        warning() << "Was unable to acquire an FQDN";
+        LOGV2_WARNING(23934, "Was unable to acquire an FQDN");
     }
 
     pcctx->nameToken = toWideString(cparams->service) + L'/' + toWideString(canonName.c_str());
@@ -247,9 +241,9 @@ int sspiValidateServerSecurityLayerOffering(SspiConnContext* pcctx,
 
     wrapBufs[1].cbBuffer = 0;
     wrapBufs[1].BufferType = SECBUFFER_DATA;
-    wrapBufs[1].pvBuffer = NULL;
+    wrapBufs[1].pvBuffer = nullptr;
 
-    SECURITY_STATUS status = DecryptMessage(&pcctx->ctx, &wrapBufDesc, 0, NULL);
+    SECURITY_STATUS status = DecryptMessage(&pcctx->ctx, &wrapBufDesc, 0, nullptr);
     if (status != SEC_E_OK) {
         HandleLastError(cparams->utils, status, "DecryptMessage");
         return SASL_FAIL;
@@ -358,9 +352,9 @@ int sspiClientMechStep(void* conn_context,
                        sasl_interact_t** prompt_need,
                        const char** clientout,
                        unsigned* clientoutlen,
-                       sasl_out_params_t* oparams) throw() {
+                       sasl_out_params_t* oparams) {
     SspiConnContext* pcctx = static_cast<SspiConnContext*>(conn_context);
-    *clientout = NULL;
+    *clientout = nullptr;
     *clientoutlen = 0;
 
     if (pcctx->authComplete) {
@@ -387,36 +381,36 @@ int sspiClientMechStep(void* conn_context,
     outbuf.ulVersion = SECBUFFER_VERSION;
     outbuf.cBuffers = 1;
     outbuf.pBuffers = outBufs;
-    outBufs[0].pvBuffer = NULL;
+    outBufs[0].pvBuffer = nullptr;
     outBufs[0].cbBuffer = 0;
     outBufs[0].BufferType = SECBUFFER_TOKEN;
 
     ULONG contextAttr = 0;
     SECURITY_STATUS status =
         InitializeSecurityContextW(&pcctx->cred,
-                                   pcctx->haveCtxt ? &pcctx->ctx : NULL,
+                                   pcctx->haveCtxt ? &pcctx->ctx : nullptr,
                                    const_cast<wchar_t*>(pcctx->nameToken.c_str()),
                                    ISC_REQ_ALLOCATE_MEMORY | ISC_REQ_MUTUAL_AUTH,
                                    0,
                                    SECURITY_NETWORK_DREP,
-                                   (pcctx->haveCtxt ? &inbuf : NULL),
+                                   (pcctx->haveCtxt ? &inbuf : nullptr),
                                    0,
                                    &pcctx->ctx,
                                    &outbuf,
                                    &contextAttr,
-                                   NULL);
+                                   nullptr);
 
     if (status != SEC_E_OK && status != SEC_I_CONTINUE_NEEDED) {
         HandleLastError(cparams->utils, status, "InitializeSecurityContext");
         return SASL_FAIL;
     }
 
-    ON_BLOCK_EXIT(FreeContextBuffer, outbuf.pBuffers[0].pvBuffer);
+    ON_BLOCK_EXIT([&] { FreeContextBuffer(outbuf.pBuffers[0].pvBuffer); });
     pcctx->haveCtxt = true;
 
     if (status == SEC_E_OK) {
         // Send back nothing and wait for the server to reply with the security capabilities
-        *clientout = NULL;
+        *clientout = nullptr;
         *clientoutlen = 0;
         pcctx->authComplete = true;
         return SASL_CONTINUE;
@@ -440,19 +434,18 @@ sasl_client_plug_t sspiClientPlugin[] = {
     {sspiPluginName, /* mechanism name */
      112, /* TODO: (taken from gssapi) best mech additional security layer strength factor */
      SASL_SEC_NOPLAINTEXT /* eam: copied from gssapi */
-         |
-         SASL_SEC_NOACTIVE | SASL_SEC_NOANONYMOUS | SASL_SEC_MUTUAL_AUTH |
+         | SASL_SEC_NOACTIVE | SASL_SEC_NOANONYMOUS | SASL_SEC_MUTUAL_AUTH |
          SASL_SEC_PASS_CREDENTIALS, /* security_flags */
      SASL_FEAT_NEEDSERVERFQDN | SASL_FEAT_WANT_CLIENT_FIRST | SASL_FEAT_ALLOWS_PROXY,
-     NULL, /* required prompt ids, NULL = user/pass only */
-     NULL, /* global state for mechanism */
+     nullptr, /* required prompt ids, nullptr = user/pass only */
+     nullptr, /* global state for mechanism */
      sspiClientMechNew,
      sspiClientMechStep,
      sspiClientMechDispose,
      sspiClientMechFree,
-     NULL,
-     NULL,
-     NULL}};
+     nullptr,
+     nullptr,
+     nullptr}};
 
 int sspiClientPluginInit(const sasl_utils_t* utils,
                          int max_version,
@@ -477,33 +470,27 @@ int sspiClientPluginInit(const sasl_utils_t* utils,
  * created.
  */
 MONGO_INITIALIZER_WITH_PREREQUISITES(SaslSspiClientPlugin,
-                                     ("CyrusSaslAllocatorsAndMutexes", "CyrusSaslClientContext"))
+                                     ("CyrusSaslAllocatorsAndMutexesClient",
+                                      "CyrusSaslClientContext"))
 (InitializerContext*) {
     int ret = sasl_client_add_plugin(sspiPluginName, sspiClientPluginInit);
     if (SASL_OK != ret) {
-        return Status(ErrorCodes::UnknownError,
-                      mongoutils::str::stream() << "could not add SASL Client SSPI plugin "
-                                                << sspiPluginName
-                                                << ": "
-                                                << sasl_errstring(ret, NULL, NULL));
+        uasserted(ErrorCodes::UnknownError,
+                  str::stream() << "could not add SASL Client SSPI plugin " << sspiPluginName
+                                << ": " << sasl_errstring(ret, nullptr, nullptr));
     }
-
-    return Status::OK();
 }
 
 MONGO_INITIALIZER_WITH_PREREQUISITES(SaslPlainClientPlugin,
-                                     ("CyrusSaslAllocatorsAndMutexes", "CyrusSaslClientContext"))
+                                     ("CyrusSaslAllocatorsAndMutexesClient",
+                                      "CyrusSaslClientContext"))
 (InitializerContext*) {
     int ret = sasl_client_add_plugin("PLAIN", plain_client_plug_init);
     if (SASL_OK != ret) {
-        return Status(ErrorCodes::UnknownError,
-                      mongoutils::str::stream() << "Could not add SASL Client PLAIN plugin "
-                                                << sspiPluginName
-                                                << ": "
-                                                << sasl_errstring(ret, NULL, NULL));
+        uasserted(ErrorCodes::UnknownError,
+                  str::stream() << "Could not add SASL Client PLAIN plugin " << sspiPluginName
+                                << ": " << sasl_errstring(ret, nullptr, nullptr));
     }
-
-    return Status::OK();
 }
 
 }  // namespace

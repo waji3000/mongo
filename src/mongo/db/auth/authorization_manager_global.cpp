@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,77 +27,104 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <memory>
+#include <string>
+#include <utility>
 
-#include "mongo/base/disallow_copying.h"
-#include "mongo/base/init.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/client/internal_auth.h"
+#include "mongo/config.h"  // IWYU pragma: keep
+#include "mongo/db/auth/authorization_client_handle.h"
 #include "mongo/db/auth/authorization_manager.h"
-#include "mongo/db/auth/authz_manager_external_state.h"
+#include "mongo/db/auth/authorization_manager_factory.h"
+#include "mongo/db/auth/authorization_manager_global_parameters_gen.h"
+#include "mongo/db/auth/cluster_auth_mode.h"
+#include "mongo/db/auth/security_key.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/server_options.h"
-#include "mongo/db/server_parameters.h"
 #include "mongo/db/service_context.h"
-#include "mongo/stdx/memory.h"
+#include "mongo/db/tenant_id.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/net/ssl_manager.h"
+#include "mongo/util/net/ssl_types.h"
 
 namespace mongo {
 namespace {
 
-const std::string kAuthSchemaVersionServerParameter = "authSchemaVersion";
+ServiceContext::ConstructorActionRegisterer setClusterAuthMode(
+    "SetClusterAuthMode", [](ServiceContext* serviceContext) {
+        // Officially set the ClusterAuthMode for this ServiceContext
+        if (!ClusterAuthMode::get(serviceContext)
+                 .equals(serverGlobalParams.startupClusterAuthMode)) {
+            ClusterAuthMode::set(serviceContext, serverGlobalParams.startupClusterAuthMode);
+        }
+    });
 
-class AuthzVersionParameter : public ServerParameter {
-    MONGO_DISALLOW_COPYING(AuthzVersionParameter);
+Service::ConstructorActionRegisterer createAuthorizationManager(
+    "CreateAuthorizationManager",
+    {"OIDGeneration", "EndStartupOptionStorage"},
+    [](Service* service) {
+        const auto clusterAuthMode = serverGlobalParams.startupClusterAuthMode;
+        const auto authIsEnabled =
+            serverGlobalParams.authState == ServerGlobalParams::AuthState::kEnabled;
 
-public:
-    AuthzVersionParameter(ServerParameterSet* sps, const std::string& name);
-    virtual void append(OperationContext* opCtx, BSONObjBuilder& b, const std::string& name);
-    virtual Status set(const BSONElement& newValueElement);
-    virtual Status setFromString(const std::string& str);
-};
+        std::unique_ptr<AuthorizationManager> authzManager;
 
-MONGO_INITIALIZER_GENERAL(AuthzSchemaParameter,
-                          MONGO_NO_PREREQUISITES,
-                          ("BeginStartupOptionParsing"))
-(InitializerContext*) {
-    new AuthzVersionParameter(ServerParameterSet::getGlobal(), kAuthSchemaVersionServerParameter);
-    return Status::OK();
-}
+        if (service->role().hasExclusively(ClusterRole::RouterServer)) {
+            authzManager = globalAuthzManagerFactory->createRouter(service);
+        } else {
+            authzManager = globalAuthzManagerFactory->createShard(service);
+            auth::AuthorizationBackendInterface::set(
+                service, globalAuthzManagerFactory->createBackendInterface(service));
+        }
 
-AuthzVersionParameter::AuthzVersionParameter(ServerParameterSet* sps, const std::string& name)
-    : ServerParameter(sps, name, false, false) {}
+        authzManager->setAuthEnabled(authIsEnabled);
+        authzManager->setShouldValidateAuthSchemaOnStartup(gStartupAuthSchemaValidation);
 
-void AuthzVersionParameter::append(OperationContext* opCtx,
-                                   BSONObjBuilder& b,
-                                   const std::string& name) {
-    int authzVersion;
-    uassertStatusOK(AuthorizationManager::get(opCtx->getServiceContext())
-                        ->getAuthorizationVersion(opCtx, &authzVersion));
-    b.append(name, authzVersion);
-}
+        // Auto-enable auth unless we are in mixed auth/no-auth or clusterAuthMode was not provided.
+        // clusterAuthMode defaults to "keyFile" if a --keyFile parameter is provided.
+        if (clusterAuthMode.isDefined() && !serverGlobalParams.transitionToAuth) {
+            authzManager->setAuthEnabled(true);
+        }
+        AuthorizationManager::set(service, std::move(authzManager));
 
-Status AuthzVersionParameter::set(const BSONElement& newValueElement) {
-    return Status(ErrorCodes::InternalError, "set called on unsettable server parameter");
-}
+        if (clusterAuthMode.allowsKeyFile()) {
+            // Load up the keys if we allow key files authentication.
+            const auto gotKeys = setUpSecurityKey(serverGlobalParams.keyFile, clusterAuthMode);
+            uassert(5579201, "Unable to acquire security key[s]", gotKeys);
+        }
 
-Status AuthzVersionParameter::setFromString(const std::string& newValueString) {
-    return Status(ErrorCodes::InternalError, "set called on unsettable server parameter");
-}
+        if (clusterAuthMode.sendsX509()) {
+        // Send x509 authentication if we can.
+#ifdef MONGO_CONFIG_SSL
+            auth::setInternalUserAuthParams(auth::createInternalX509AuthDocument(
+                boost::optional<StringData>{SSLManagerCoordinator::get()
+                                                ->getSSLManager()
+                                                ->getSSLConfiguration()
+                                                .clientSubjectName.toString()}));
+#endif
+        }
+    },
+    [](Service* service) { AuthorizationManager::set(service, nullptr); });
 
 }  // namespace
 
-MONGO_EXPORT_STARTUP_SERVER_PARAMETER(startupAuthSchemaValidation, bool, true);
+void AuthzVersionParameter::append(OperationContext* opCtx,
+                                   BSONObjBuilder* b,
+                                   StringData name,
+                                   const boost::optional<TenantId>&) {
+    b->append(name, AuthorizationManager::schemaVersion28SCRAM);
+}
 
-ServiceContext::ConstructorActionRegisterer createAuthorizationManager(
-    "CreateAuthorizationManager",
-    {"OIDGeneration",
-     "EndStartupOptionStorage",
-     MONGO_SHIM_DEPENDENCY(AuthorizationManager::create)},
-    [](ServiceContext* service) {
-        auto authzManager = AuthorizationManager::create();
-        authzManager->setAuthEnabled(serverGlobalParams.authState ==
-                                     ServerGlobalParams::AuthState::kEnabled);
-        authzManager->setShouldValidateAuthSchemaOnStartup(startupAuthSchemaValidation);
-        AuthorizationManager::set(service, std::move(authzManager));
-    });
+Status AuthzVersionParameter::setFromString(StringData newValueString,
+                                            const boost::optional<TenantId>&) {
+    return {ErrorCodes::InternalError, "set called on unsettable server parameter"};
+}
 
 }  // namespace mongo

@@ -11,13 +11,6 @@ set -e
 # assumption that other factors of the environment will influence the execution
 # time by less than 20%.
 
-
-# need to enable long tests to run test_rwlock 
-export TESTUTIL_ENABLE_LONG_TESTS=1
-
-# We will run only when long tests are enabled.
-test "$TESTUTIL_ENABLE_LONG_TESTS" = "1" || exit 0
-
 EXIT_SUCCESS=0
 EXIT_FAILURE=1
 
@@ -28,7 +21,6 @@ RUN_OS=$(uname -s)
 # if we don't control the execution time this test is not effective
 CPU_SET=0-1
 echo "test read write lock for time shifting using libfaketime"
-
 
 # check for program arguements, if not present, print usage
 if [ -z $1 ]
@@ -49,10 +41,21 @@ then
     exit $EXIT_FAILURE
 fi
 
+# Locate Wiredtiger home directory.
+# If RW_LOCK_FILE isn't set, default to using the build directory this script resides under
+# under. Our CMake build will sync a copy of this script to the build directory the 'test_rwlock'
+# binary is created under. Note this assumes we are executing a copy of the script that lives under
+# the build directory. Otherwise passing the binary path is required.
+: ${RW_LOCK_FILE:=$(dirname $0)/test_rwlock}
+[ -x ${RW_LOCK_FILE} ] || {
+    echo "fail: unable to locate rwlock test binary"
+    exit 1
+}
+
 SEC1=`date +%s`
 if [ "$RUN_OS" = "Darwin" ]
 then
-    ./test_rwlock
+    $RW_LOCK_FILE
 elif [ "$RUN_OS" = "Linux" ]
 then
     if [ -z $2 ]
@@ -61,7 +64,7 @@ then
     else
         CPU_SET=$2
     fi
-    taskset -c $CPU_SET ./test_rwlock
+    taskset -c $CPU_SET $RW_LOCK_FILE
 else
     echo "not able to decide running OS, so exiting"
     exit $EXIT_FAILURE
@@ -75,9 +78,9 @@ if [ "$RUN_OS" = "Darwin" ]
 then
     export DYLD_FORCE_FLAT_NAMESPACE=y
     export DYLD_INSERT_LIBRARIES=$1
-    ./test_rwlock &
+    $RW_LOCK_FILE &
 else
-    LD_PRELOAD=$1 taskset -c $CPU_SET ./test_rwlock &
+    LD_PRELOAD=$1 taskset -c $CPU_SET $RW_LOCK_FILE &
 fi
 
 # get pid of test run in background
@@ -88,7 +91,7 @@ echo "-$DIFF1""s" >| ~/.faketimerc
 
 wait $PID
 
-#kept echo statement here so as not to loose in cluster of test msgs. 
+#kept echo statement here so as not to loose in cluster of test msgs.
 echo "after sleeping for 5 seconds set ~/.faketimerc value as -ve $DIFF1 seconds"
 rm ~/.faketimerc
 
@@ -100,7 +103,7 @@ fi
 SEC3=`date +%s`
 DIFF2=$((SEC3 - SEC2))
 
-PERC=$((((DIFF2 - DIFF1)*100)/DIFF1)) 
+PERC=$((((DIFF2 - DIFF1)*100)/DIFF1))
 echo "execution time difference : $PERC %, less than 20% is ok"
 echo "normal execution time : $DIFF1 seconds"
 echo "fake time reduction by : $DIFF1 seconds"

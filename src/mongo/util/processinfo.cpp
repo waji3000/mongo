@@ -1,6 +1,3 @@
-// processinfo.cpp
-
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,23 +27,31 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kControl
-
-#include "mongo/platform/basic.h"
-
-#include "mongo/base/init.h"
-#include "mongo/util/processinfo.h"
 
 #include <boost/filesystem/operations.hpp>
 #include <boost/filesystem/path.hpp>
-#include <fstream>
-#include <iostream>
+#include <fstream>  // IWYU pragma: keep
+#include <system_error>
 
-#include "mongo/util/log.h"
+#include <boost/filesystem/file_status.hpp>
+// IWYU pragma: no_include "boost/system/detail/error_code.hpp"
 
-using namespace std;
+#include "mongo/base/init.h"  // IWYU pragma: keep
+#include "mongo/base/initializer.h"
+#include "mongo/logv2/log.h"
+#include "mongo/util/errno_util.h"
+#include "mongo/util/processinfo.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
+
 
 namespace mongo {
+
+namespace {
+MONGO_INITIALIZER(initApplicationInfo)(InitializerContext* context) {
+    ProcessInfo().appInfo().init(context->args());
+}
+}  // namespace
 
 class PidFileWiper {
 public:
@@ -55,22 +60,25 @@ public:
             return;
         }
 
-        ofstream out(path.c_str(), ios_base::out);
+        std::ofstream out(path.c_str(), std::ios_base::out);
         out.close();
     }
 
     bool write(const boost::filesystem::path& p) {
         path = p;
-        ofstream out(path.c_str(), ios_base::out);
-        out << ProcessId::getCurrent() << endl;
+        std::ofstream out(path.c_str(), std::ios_base::out);
+        out << ProcessId::getCurrent() << std::endl;
         if (!out.good()) {
-            auto errAndStr = errnoAndDescription();
-            if (errAndStr.first == 0) {
-                log() << "ERROR: Cannot write pid file to " << path.string()
-                      << ": Unable to determine OS error";
+            auto ec = lastSystemError();
+            if (!ec) {
+                LOGV2(23329,
+                      "ERROR: Cannot write pid file to {path_string}: Unable to determine OS error",
+                      "path_string"_attr = path.string());
             } else {
-                log() << "ERROR: Cannot write pid file to " << path.string() << ": "
-                      << errAndStr.second;
+                LOGV2(23330,
+                      "ERROR: Cannot write pid file to {path_string}: {errAndStr_second}",
+                      "path_string"_attr = path.string(),
+                      "errAndStr_second"_attr = errorMessage(ec));
             }
         } else {
             boost::system::error_code ec;
@@ -80,8 +88,10 @@ public:
                     boost::filesystem::group_read | boost::filesystem::others_read,
                 ec);
             if (ec) {
-                log() << "Could not set permissions on pid file " << path.string() << ": "
-                      << ec.message();
+                LOGV2(23331,
+                      "Could not set permissions on pid file {path_string}: {ec_message}",
+                      "path_string"_attr = path.string(),
+                      "ec_message"_attr = ec.message());
                 return false;
             }
         }
@@ -92,7 +102,7 @@ private:
     boost::filesystem::path path;
 } pidFileWiper;
 
-bool writePidFile(const string& path) {
+bool writePidFile(const std::string& path) {
     return pidFileWiper.write(path);
 }
 }  // namespace mongo

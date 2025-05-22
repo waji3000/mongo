@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -31,13 +30,19 @@
 #pragma once
 
 #include <array>
+#include <climits>
+#include <cstddef>
 #include <cstdint>
 #include <iostream>
 #include <string>
+#include <type_traits>
 #include <utility>
 
-#include "mongo/config.h"
-
+#include "mongo/base/data_type.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/config.h"  // IWYU pragma: keep
 #include "mongo/util/assert_util.h"
 
 namespace mongo {
@@ -72,10 +77,15 @@ public:
     static const Decimal128 kPositiveNaN;
     static const Decimal128 kNegativeNaN;
 
-    static const uint32_t kMaxBiasedExponent = 6143 + 6144;
+    static const Decimal128 kPi;
+    static const Decimal128 kPiOver180;
+    static const Decimal128 k180OverPi;
+
+    static constexpr std::uint32_t kMaxBiasedExponent = 6143 + 6144;
     // Biased exponent of a Decimal128 with least significant digit in the units place
-    static const int32_t kExponentBias = 6143 + 33;
-    static const uint32_t kInfinityExponent = kMaxBiasedExponent + 1;  // internal convention only
+    static constexpr std::int32_t kExponentBias = 6143 + 33;
+    static constexpr std::uint32_t kInfinityExponent =
+        kMaxBiasedExponent + 1;  // internal convention only
 
     /**
      * This struct holds the raw data for IEEE 754-2008 data types
@@ -121,17 +131,17 @@ public:
         kInexact = 0x20,
     };
 
-    static bool hasFlag(std::uint32_t signalingFlags, SignalingFlag f) {
+    constexpr static bool hasFlag(std::uint32_t signalingFlags, SignalingFlag f) {
         return ((signalingFlags & f) != 0u);
     }
 
     /**
      * Returns true if a valid Decimal can be constructed from the given arguments.
      */
-    static bool isValid(uint64_t sign,
-                        uint64_t exponent,
-                        uint64_t coefficientHigh,
-                        uint64_t coefficientLow) {
+    constexpr static bool isValid(std::uint64_t sign,
+                                  std::uint64_t exponent,
+                                  std::uint64_t coefficientHigh,
+                                  std::uint64_t coefficientLow) {
         if (coefficientHigh >= 0x1ed09bead87c0 &&
             (coefficientHigh != 0x1ed09bead87c0 || coefficientLow != 0x378d8e63ffffffff)) {
             return false;
@@ -146,28 +156,31 @@ public:
     /**
      * Construct a 0E0 valued Decimal128.
      */
-    Decimal128() : _value(kNormalizedZero._value) {}
+    constexpr Decimal128()
+        : _value{0,
+                 static_cast<std::uint64_t>(Decimal128::kExponentBias)
+                     << Decimal128::kExponentFieldPos} {}
 
     /**
      * This constructor takes in a raw decimal128 type, which consists of two
      * uint64_t's. This class performs an endian check on the system to ensure
      * that the Value.high64 represents the higher 64 bits.
      */
-    explicit Decimal128(Decimal128::Value dec128Value) : _value(dec128Value) {}
+    constexpr explicit Decimal128(Decimal128::Value dec128Value) : _value(dec128Value) {}
 
     /**
      * Constructs a Decimal128 from parts, dealing with proper encoding of the combination field.
      * Assumes that the value will be inside the valid range of finite values. (No NaN/Inf, etc.)
      */
-    Decimal128(uint64_t sign, uint64_t exponent, uint64_t coefficientHigh, uint64_t coefficientLow)
-        : _value(
-              Value{coefficientLow,
-                    (sign << kSignFieldPos) | (exponent << kExponentFieldPos) | coefficientHigh}) {
-        dassert(isValid(sign, exponent, coefficientHigh, coefficientLow));
-    }
+    constexpr Decimal128(std::uint64_t sign,
+                         std::uint64_t exponent,
+                         std::uint64_t coefficientHigh,
+                         std::uint64_t coefficientLow)
+        : _value(_valueFromParts(sign, exponent, coefficientHigh, coefficientLow)) {}
 
-    explicit Decimal128(std::int32_t int32Value);
-    explicit Decimal128(std::int64_t int64Value);
+    template <typename T, typename = std::enable_if_t<std::is_integral_v<T>>>
+    constexpr explicit Decimal128(T v)
+        : Decimal128(v < 0 ? 1 : 0, kExponentBias, 0, _makeCoefficientLow(v)) {}
 
     /**
      * This constructor takes a double and constructs a Decimal128 object given a roundMode, either
@@ -194,22 +207,27 @@ public:
      * "200E9999999999" --> +Inf
      * "-200E9999999999" --> -Inf
      */
-    explicit Decimal128(std::string stringValue, RoundingMode roundMode = kRoundTiesToEven);
+    explicit Decimal128(const std::string& stringValue,
+                        RoundingMode roundMode = kRoundTiesToEven,
+                        size_t* charsConsumed = nullptr);
 
-    Decimal128(std::string stringValue,
+    Decimal128(const std::string& stringValue,
                std::uint32_t* signalingFlag,
-               RoundingMode roundMode = kRoundTiesToEven);
+               RoundingMode roundMode = kRoundTiesToEven,
+               size_t* charsConsumed = nullptr);
 
     /**
      * This function gets the inner Value struct storing a Decimal128 value.
      */
-    Value getValue() const;
+    constexpr Value getValue() const {
+        return _value;
+    }
 
     /**
      *  Extracts the biased exponent from the combination field.
      */
-    uint32_t getBiasedExponent() const {
-        const uint64_t combo = _getCombinationField();
+    constexpr std::uint32_t getBiasedExponent() const {
+        const std::uint64_t combo = _getCombinationField();
         if (combo < kCombinationNonCanonical)
             return combo >> 3;
 
@@ -222,7 +240,7 @@ public:
      * Returns the high 49 bits of the 113-bit binary encoded coefficient. Returns 0 for
      * non-canonical or non-finite numbers.
      */
-    uint64_t getCoefficientHigh() const {
+    constexpr std::uint64_t getCoefficientHigh() const {
         return _getCombinationField() < kCombinationNonCanonical
             ? _value.high64 & kCanonicalCoefficientHighFieldMask
             : 0;
@@ -232,7 +250,7 @@ public:
      * Returns the low 64 bits of the 113-bit binary encoded coefficient. Returns 0 for
      * non-canonical or non-finite numbers.
      */
-    uint64_t getCoefficientLow() const {
+    constexpr std::uint64_t getCoefficientLow() const {
         return _getCombinationField() < kCombinationNonCanonical ? _value.low64 : 0;
     }
 
@@ -242,20 +260,106 @@ public:
     Decimal128 toAbs() const;
 
     /**
+     * Returns the acos value of this.
+     */
+    Decimal128 acos(RoundingMode roundMode = kRoundTiesToEven) const;
+    Decimal128 acos(std::uint32_t* signalingFlags, RoundingMode roundMode = kRoundTiesToEven) const;
+
+    /**
+     * Returns the acosh value of this.
+     */
+    Decimal128 acosh(RoundingMode roundMode = kRoundTiesToEven) const;
+    Decimal128 acosh(std::uint32_t* signalingFlags,
+                     RoundingMode roundMode = kRoundTiesToEven) const;
+
+    /**
+     * Returns the asin value of this.
+     */
+    Decimal128 asin(RoundingMode roundMode = kRoundTiesToEven) const;
+    Decimal128 asin(std::uint32_t* signalingFlags, RoundingMode roundMode = kRoundTiesToEven) const;
+
+    /**
+     * Returns the asinh value of this.
+     */
+    Decimal128 asinh(RoundingMode roundMode = kRoundTiesToEven) const;
+    Decimal128 asinh(std::uint32_t* signalingFlags,
+                     RoundingMode roundMode = kRoundTiesToEven) const;
+
+    /**
+     * Returns the atan value of this.
+     */
+    Decimal128 atan(RoundingMode roundMode = kRoundTiesToEven) const;
+    Decimal128 atan(std::uint32_t* signalingFlags, RoundingMode roundMode = kRoundTiesToEven) const;
+
+    /**
+     * Returns the atan2(this, other) rather than atan2(other,this), which
+     * would produce different results.
+     */
+    Decimal128 atan2(const Decimal128& other, RoundingMode roundMode = kRoundTiesToEven) const;
+    Decimal128 atan2(const Decimal128& other,
+                     std::uint32_t* signalingFlags,
+                     RoundingMode roundMode = kRoundTiesToEven) const;
+
+    /**
+     * Returns the atanh value of this.
+     */
+    Decimal128 atanh(RoundingMode roundMode = kRoundTiesToEven) const;
+    Decimal128 atanh(std::uint32_t* signalingFlags,
+                     RoundingMode roundMode = kRoundTiesToEven) const;
+
+    /**
+     * Returns the cos value of this.
+     */
+    Decimal128 cos(RoundingMode roundMode = kRoundTiesToEven) const;
+    Decimal128 cos(std::uint32_t* signalingFlags, RoundingMode roundMode = kRoundTiesToEven) const;
+
+    /**
+     * Returns the cosh value of this.
+     */
+    Decimal128 cosh(RoundingMode roundMode = kRoundTiesToEven) const;
+    Decimal128 cosh(std::uint32_t* signalingFlags, RoundingMode roundMode = kRoundTiesToEven) const;
+
+    /**
+     * Returns the sin value of this.
+     */
+    Decimal128 sin(RoundingMode roundMode = kRoundTiesToEven) const;
+    Decimal128 sin(std::uint32_t* signalingFlags, RoundingMode roundMode = kRoundTiesToEven) const;
+
+    /**
+     * Returns the sinh value of this.
+     */
+    Decimal128 sinh(RoundingMode roundMode = kRoundTiesToEven) const;
+    Decimal128 sinh(std::uint32_t* signalingFlags, RoundingMode roundMode = kRoundTiesToEven) const;
+    /**
+     * Returns the tan value of this.
+     */
+    Decimal128 tan(RoundingMode roundMode = kRoundTiesToEven) const;
+    Decimal128 tan(std::uint32_t* signalingFlags, RoundingMode roundMode = kRoundTiesToEven) const;
+
+    /**
+     * Returns the tanh value of this.
+     */
+    Decimal128 tanh(RoundingMode roundMode = kRoundTiesToEven) const;
+    Decimal128 tanh(std::uint32_t* signalingFlags, RoundingMode roundMode = kRoundTiesToEven) const;
+
+
+    /**
      * Returns `this` with inverted sign bit
      */
-    Decimal128 negate() const {
-        Value negated = {_value.low64, _value.high64 ^ (1ULL << 63)};
-        return Decimal128(negated);
+    constexpr Decimal128 negate() const {
+        return Decimal128(Value{_value.low64, _value.high64 ^ (std::uint64_t{1} << 63)});
     }
 
+    Decimal128 round(RoundingMode roundMode = kRoundTiesToEven) const;
+    Decimal128 round(std::uint32_t* signalingFlags,
+                     RoundingMode roundMode = kRoundTiesToEven) const;
 
     /**
      * This set of functions converts a Decimal128 to a certain integer type with a
      * given rounding mode.
      *
-     * Each function is overloaded to provide an optional signalingFlags output parameter
-     * that can be set to one of the Decimal128::SignalingFlag enumerators:
+     * Each function is overloaded to provide an optional signalingFlags input-output parameter that
+     * will be bitwise ORed with one of the following Decimal128::SignalingFlag enumerators:
      * kNoFlag, kInvalid
      *
      * Note: The signaling flags for these functions only signal
@@ -275,8 +379,8 @@ public:
      * given rounding mode. The signaling flags for these functions will also signal
      * inexact computation.
      *
-     * Each function is overloaded to provide an optional signalingFlags output parameter
-     * that can be set to one of the Decimal128::SignalingFlag enumerators:
+     * Each function is overloaded to provide an optional signalingFlags input-output parameter that
+     * will be bitwise ORed with one of the following Decimal128::SignalingFlag enumerators:
      * kNoFlag, kInexact, kInvalid
      */
     std::int32_t toIntExact(RoundingMode roundMode = kRoundTiesToEven) const;
@@ -285,13 +389,16 @@ public:
     std::int64_t toLongExact(RoundingMode roundMode = kRoundTiesToEven) const;
     std::int64_t toLongExact(std::uint32_t* signalingFlags,
                              RoundingMode roundMode = kRoundTiesToEven) const;
+    std::uint64_t toULongExact(RoundingMode roundMode = kRoundTiesToEven) const;
+    std::uint64_t toULongExact(std::uint32_t* signalingFlags,
+                               RoundingMode roundMode = kRoundTiesToEven) const;
 
     /**
      * These functions convert decimals to doubles and have the ability to signal
      * inexact, underflow, overflow, and invalid operation.
      *
-     * This function is overloaded to provide an optional signalingFlags output parameter
-     * that can be set to one of the Decimal128::SignalingFlag enumerators:
+     * Each function is overloaded to provide an optional signalingFlags input-output parameter that
+     * will be bitwise ORed with one of the following Decimal128::SignalingFlag enumerators:
      * kNoFlag, kInexact, kUnderflow, kOverflow, kInvalid
      */
     double toDouble(RoundingMode roundMode = kRoundTiesToEven) const;
@@ -339,8 +446,8 @@ public:
      * is performed using the supplied rounding mode (defaulting to kRoundTiesToEven).
      * NaNs and infinities are handled according to the IEEE 754-2008 specification.
      *
-     * Each function is overloaded to provide an optional signalingFlags output parameter
-     * that can be set to one of the Decimal128::SignalingFlag enumerators:
+     * Each function is overloaded to provide an optional signalingFlags input-output parameter that
+     * will be bitwise ORed with one of the following Decimal128::SignalingFlag enumerators:
      * kNoFlag, kInexact, kUnderflow, kOverflow, kInvalid
      *
      * The divide operation may also set signalingFlags to kDivideByZero
@@ -364,13 +471,14 @@ public:
     Decimal128 exponential(RoundingMode roundMode = kRoundTiesToEven) const;
     Decimal128 exponential(std::uint32_t* signalingFlags,
                            RoundingMode roundMode = kRoundTiesToEven) const;
-    Decimal128 logarithm(RoundingMode roundMode = kRoundTiesToEven) const;
-    Decimal128 logarithm(std::uint32_t* signalingFlags,
-                         RoundingMode roundMode = kRoundTiesToEven) const;
-    Decimal128 logarithm(const Decimal128& other, RoundingMode roundMode = kRoundTiesToEven) const;
-    Decimal128 logarithm(const Decimal128& other,
-                         std::uint32_t* signalingFlags,
-                         RoundingMode roundMode = kRoundTiesToEven) const;
+    Decimal128 naturalLogarithm(RoundingMode roundMode = kRoundTiesToEven) const;
+    Decimal128 naturalLogarithm(std::uint32_t* signalingFlags,
+                                RoundingMode roundMode = kRoundTiesToEven) const;
+    // Calculate the logarithm with the given `base`, using this number as input. Uses fast paths
+    // for base 2 and 10.
+    // TODO SERVER-91935 convert `logarithm` and others to static methods for a more clear
+    // interface.
+    Decimal128 logarithm(const Decimal128& base, RoundingMode roundMode = kRoundTiesToEven) const;
     Decimal128 modulo(const Decimal128& other) const;
     Decimal128 modulo(const Decimal128& other, std::uint32_t* signalingFlags) const;
 
@@ -382,6 +490,8 @@ public:
     Decimal128 squareRoot(RoundingMode roundMode = kRoundTiesToEven) const;
     Decimal128 squareRoot(std::uint32_t* signalingFlags,
                           RoundingMode roundMode = kRoundTiesToEven) const;
+
+    Decimal128 scale(int n, RoundingMode roundMode = kRoundTiesToEven) const;
 
     /**
      * This function quantizes the current decimal given a quantum reference
@@ -427,24 +537,147 @@ public:
         return _value.high64 == other._value.high64 && _value.low64 == other._value.low64;
     }
 
+    constexpr Decimal128 operator-() const {
+        return negate();
+    }
+
+    constexpr Decimal128 operator+() const {
+        return *this;
+    }
+
 private:
-    static const uint8_t kSignFieldPos = 64 - 1;
-    static const uint8_t kCombinationFieldPos = kSignFieldPos - 17;
-    static const uint64_t kCombinationFieldMask = (1 << 17) - 1;
-    static const uint64_t kExponentFieldPos = kCombinationFieldPos + 3;
-    static const uint64_t kCoefficientContinuationFieldMask = (1ull << kCombinationFieldPos) - 1;
-    static const uint64_t kCombinationNonCanonical = 3 << 15;
-    static const uint64_t kCombinationInfinity = 0x1e << 12;
-    static const uint64_t kCombinationNaN = 0x1f << 12;
-    static const uint64_t kCanonicalCoefficientHighFieldMask = (1ull << 49) - 1;
+    constexpr static std::uint8_t kSignFieldPos = 64 - 1;
+    constexpr static std::uint8_t kCombinationFieldPos = kSignFieldPos - 17;
+    constexpr static std::uint64_t kCombinationFieldMask = (1 << 17) - 1;
+    constexpr static std::uint64_t kExponentFieldPos = kCombinationFieldPos + 3;
+    constexpr static std::uint64_t kCoefficientContinuationFieldMask =
+        (1ull << kCombinationFieldPos) - 1;
+    constexpr static std::uint64_t kCombinationNonCanonical = 3 << 15;
+    constexpr static std::uint64_t kCombinationInfinity = 0x1e << 12;
+    constexpr static std::uint64_t kCombinationNaN = 0x1f << 12;
+    constexpr static std::uint64_t kCanonicalCoefficientHighFieldMask = (1ull << 49) - 1;
 
     std::string _convertToScientificNotation(StringData coefficient, int adjustedExponent) const;
     std::string _convertToStandardDecimalNotation(StringData coefficient, int exponent) const;
 
-    uint64_t _getCombinationField() const {
+    /**
+     * This function quantizes the current decimal given a quantum reference without normalizing its
+     * arguments.
+     */
+    Decimal128 nonNormalizingQuantize(const Decimal128& reference,
+                                      RoundingMode roundMode = kRoundTiesToEven) const;
+    Decimal128 nonNormalizingQuantize(const Decimal128& reference,
+                                      std::uint32_t* signalingFlags,
+                                      RoundingMode roundMode = kRoundTiesToEven) const;
+
+    constexpr std::uint64_t _getCombinationField() const {
         return (_value.high64 >> kCombinationFieldPos) & kCombinationFieldMask;
+    }
+
+    constexpr static Value _valueFromParts(std::uint64_t sign,
+                                           std::uint64_t exponent,
+                                           std::uint64_t coefficientHigh,
+                                           std::uint64_t coefficientLow) {
+        // For constexpr's sake the invariant must be compiled only if !isValid().
+        if (!isValid(sign, exponent, coefficientHigh, coefficientLow)) {
+            invariant(false, "invalid arguments to Decimal128 constructor");
+        }
+
+        return Value{coefficientLow,
+                     (sign << kSignFieldPos) | (exponent << kExponentFieldPos) | coefficientHigh};
+    }
+
+    // The absolute value of constexpr `i` as a uint64_t, avoiding warnings.
+    template <typename T>
+    static constexpr std::uint64_t _makeCoefficientLow(T i) {
+        if constexpr (std::is_signed_v<T>) {
+            if (i < 0) {
+                std::make_unsigned_t<T> ui = i;
+                ui = ~ui + 1;  // Negation, without MSVC C4146.
+                return static_cast<std::uint64_t>(ui);
+            } else {
+                return static_cast<std::uint64_t>(i);
+            }
+        } else {
+            return static_cast<std::uint64_t>(i);
+        }
     }
 
     Value _value;
 };
+
+inline namespace literals {
+
+inline Decimal128 operator""_dec128(const char* s) {
+    return Decimal128(s);
+}
+
+inline Decimal128 operator""_dec128(const char* s, std::size_t len) {
+    return Decimal128(std::string(s, len));
+}
+
+inline bool operator<(const Decimal128& lhs, const Decimal128& rhs) {
+    return lhs.isLess(rhs);
+}
+
+inline bool operator<=(const Decimal128& lhs, const Decimal128& rhs) {
+    return lhs.isLessEqual(rhs);
+}
+
+inline bool operator>(const Decimal128& lhs, const Decimal128& rhs) {
+    return lhs.isGreater(rhs);
+}
+
+inline bool operator>=(const Decimal128& lhs, const Decimal128& rhs) {
+    return lhs.isGreaterEqual(rhs);
+}
+
+inline bool operator==(const Decimal128& lhs, const Decimal128& rhs) {
+    return lhs.isEqual(rhs);
+}
+
+inline bool operator!=(const Decimal128& lhs, const Decimal128& rhs) {
+    return lhs.isNotEqual(rhs);
+}
+
+}  // namespace literals
+
+template <>
+struct DataType::Handler<Decimal128> {
+    static void unsafeLoad(Decimal128* valueOut, const char* ptr, size_t* advanced);
+    static void unsafeStore(const Decimal128& valueIn, char* ptr, size_t* advanced);
+
+    static Status load(Decimal128* valueOut,
+                       const char* ptr,
+                       size_t length,
+                       size_t* advanced,
+                       std::ptrdiff_t debug_offset) {
+        if (length < kSizeOfDecimal) {
+            return Status(ErrorCodes::Overflow, "Buffer too small to hold Decimal128 value");
+        }
+
+        unsafeLoad(valueOut, ptr, advanced);
+        return Status::OK();
+    }
+
+    static Status store(const Decimal128& valueIn,
+                        char* ptr,
+                        size_t length,
+                        size_t* advanced,
+                        std::ptrdiff_t debug_offset) {
+        if (length < kSizeOfDecimal) {
+            return Status(ErrorCodes::Overflow, "Buffer too small to write Decimal128 value");
+        }
+
+        unsafeStore(valueIn, ptr, advanced);
+        return Status::OK();
+    }
+
+    static Decimal128 defaultConstruct() {
+        return Decimal128();
+    }
+
+    static constexpr size_t kSizeOfDecimal = 2 * sizeof(uint64_t);
+};
+
 }  // namespace mongo

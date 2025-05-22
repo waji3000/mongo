@@ -1,6 +1,3 @@
-// fts_util.cpp
-
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -38,5 +35,5 @@ namespace fts {
 
 const std::string INDEX_NAME = "text";
 const std::string WILDCARD = "$**";
-}
-}
+}  // namespace fts
+}  // namespace mongo

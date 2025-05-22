@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,14 +27,26 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <cstdint>
+#include <utility>
 
-#include "mongo/db/repl/oplog_interface_remote.h"
+#include <boost/cstdint.hpp>
+#include <boost/move/utility_core.hpp>
 
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/client/dbclient_base.h"
 #include "mongo/client/dbclient_cursor.h"
-#include "mongo/db/jsobj.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/query/find_command.h"
+#include "mongo/db/record_id.h"
+#include "mongo/db/repl/oplog_interface_remote.h"
+#include "mongo/db/repl/read_concern_args.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 namespace repl {
@@ -69,23 +80,27 @@ StatusWith<OplogInterface::Iterator::Value> OplogIteratorRemote::next() {
 
 OplogInterfaceRemote::OplogInterfaceRemote(HostAndPort hostAndPort,
                                            GetConnectionFn getConnection,
-                                           const std::string& collectionName,
                                            int batchSize)
-    : _hostAndPort(hostAndPort),
-      _getConnection(getConnection),
-      _collectionName(collectionName),
-      _batchSize(batchSize) {}
+    : _hostAndPort(hostAndPort), _getConnection(getConnection), _batchSize(batchSize) {}
 
 std::string OplogInterfaceRemote::toString() const {
     return _getConnection()->toString();
 }
 
 std::unique_ptr<OplogInterface::Iterator> OplogInterfaceRemote::makeIterator() const {
-    const Query query = Query().sort(BSON("$natural" << -1));
-    const BSONObj fields = BSON("ts" << 1 << "h" << 1);
+    FindCommandRequest findRequest{NamespaceString::kRsOplogNamespace};
+    findRequest.setProjection(BSON("ts" << 1 << "t" << 1LL));
+    findRequest.setSort(BSON("$natural" << -1));
+    findRequest.setBatchSize(_batchSize);
+    findRequest.setReadConcern(ReadConcernArgs::kLocal);
     return std::unique_ptr<OplogInterface::Iterator>(
-        new OplogIteratorRemote(_getConnection()->query(
-            NamespaceString(_collectionName), query, 0, 0, &fields, 0, _batchSize)));
+        new OplogIteratorRemote(_getConnection()->find(std::move(findRequest))));
+}
+
+std::unique_ptr<TransactionHistoryIteratorBase>
+OplogInterfaceRemote::makeTransactionHistoryIterator(const OpTime&, bool permitYield) const {
+    // Should never ask for remote transaction history.
+    MONGO_UNREACHABLE;
 }
 
 HostAndPort OplogInterfaceRemote::hostAndPort() const {

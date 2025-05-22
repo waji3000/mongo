@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,6 +29,7 @@
 
 #pragma once
 
+#include <cstddef>
 #include <string>
 
 #include "mongo/base/status_with.h"
@@ -41,6 +41,9 @@ namespace mongo {
  * Execute a shell command and return its output.
  * Returns CommandExecutionFailure on non-zero exit code.
  */
-StatusWith<std::string> shellExec(const std::string&, Milliseconds timeout, size_t maxlen);
+StatusWith<std::string> shellExec(const std::string&,
+                                  Milliseconds timeout,
+                                  size_t maxlen,
+                                  bool ignoreExitCode = false);
 
 }  // namespace mongo

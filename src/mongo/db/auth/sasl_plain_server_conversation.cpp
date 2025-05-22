@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,21 +27,34 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
+#include <cstddef>
+#include <cstdint>
+#include <stdexcept>
 #include <string>
+#include <vector>
 
-#include "mongo/db/auth/sasl_plain_server_conversation.h"
+#include <boost/move/utility_core.hpp>
 
-#include "mongo/base/init.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/base/init.h"  // IWYU pragma: keep
+#include "mongo/base/secure_allocator.h"
 #include "mongo/base/status.h"
 #include "mongo/base/string_data.h"
 #include "mongo/crypto/mechanism_scram.h"
+#include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/sasl_mechanism_registry.h"
+#include "mongo/db/auth/sasl_plain_server_conversation.h"
 #include "mongo/db/auth/user.h"
+#include "mongo/db/connection_health_metrics_parameter_gen.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/base64.h"
+#include "mongo/util/duration.h"
 #include "mongo/util/password_digest.h"
-#include "mongo/util/text.h"
+#include "mongo/util/read_through_cache.h"
+#include "mongo/util/str.h"
+#include "mongo/util/text.h"  // IWYU pragma: keep
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kAccessControl
 
 namespace mongo {
 namespace {
@@ -55,14 +67,15 @@ StatusWith<bool> trySCRAM(const User::CredentialData& credentials, StringData pw
     }
 
     const auto decodedSalt = base64::decode(scram.salt);
-    scram::Secrets<HashBlock> secrets(scram::Presecrets<HashBlock>(
+    scram::Secrets<HashBlock, scram::UnlockedSecretsPolicy> secrets(scram::Presecrets<HashBlock>(
         pwd.toString(),
         std::vector<std::uint8_t>(reinterpret_cast<const std::uint8_t*>(decodedSalt.c_str()),
                                   reinterpret_cast<const std::uint8_t*>(decodedSalt.c_str()) +
                                       decodedSalt.size()),
         scram.iterationCount));
-    if (scram.storedKey != base64::encode(reinterpret_cast<const char*>(secrets.storedKey().data()),
-                                          secrets.storedKey().size())) {
+    if (scram.storedKey !=
+        base64::encode(StringData(reinterpret_cast<const char*>(secrets.storedKey().data()),
+                                  secrets.storedKey().size()))) {
         return Status(ErrorCodes::AuthenticationFailed,
                       str::stream() << "Incorrect user name or password");
     }
@@ -78,7 +91,7 @@ StatusWith<std::tuple<bool, std::string>> SASLPlainServerMechanism::stepImpl(
                       "PLAIN mechanism must be used with internal users");
     }
 
-    AuthorizationManager* authManager = AuthorizationManager::get(opCtx->getServiceContext());
+    AuthorizationManager* authManager = AuthorizationManager::get(opCtx->getService());
 
     // Expecting user input on the form: [authz-id]\0authn-id\0pwd
     std::string input = inputData.toString();
@@ -121,12 +134,27 @@ StatusWith<std::tuple<bool, std::string>> SASLPlainServerMechanism::stepImpl(
         }
     } catch (std::out_of_range&) {
         return Status(ErrorCodes::AuthenticationFailed,
-                      mongoutils::str::stream() << "Incorrectly formatted PLAIN client message");
+                      str::stream() << "Incorrectly formatted PLAIN client message");
     }
 
     // The authentication database is also the source database for the user.
-    auto swUser = authManager->acquireUser(
-        opCtx, UserName(ServerMechanismBase::_principalName, _authenticationDatabase));
+    auto swUser = [&]() -> StatusWith<UserHandle> {
+        if (gEnableDetailedConnectionHealthMetricLogLines.load()) {
+            ScopedCallbackTimer timer([&](Microseconds elapsed) {
+                LOGV2(6788606,
+                      "Auth metrics report",
+                      "metric"_attr = "plain_acquireUser",
+                      "micros"_attr = elapsed.count());
+            });
+        }
+
+        auto swRequest = makeUserRequest(opCtx);
+        if (!swRequest.isOK()) {
+            return swRequest.getStatus();
+        }
+
+        return authManager->acquireUser(opCtx, std::move(swRequest.getValue()));
+    }();
 
     if (!swUser.isOK()) {
         return swUser.getStatus();

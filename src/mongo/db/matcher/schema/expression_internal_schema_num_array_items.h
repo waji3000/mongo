@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,8 +29,20 @@
 
 #pragma once
 
+#include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+#include <cstddef>
+#include <memory>
+#include <vector>
+
+#include "mongo/base/clonable_ptr.h"
 #include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/util/builder_fwd.h"
+#include "mongo/db/matcher/expression.h"
 #include "mongo/db/matcher/expression_array.h"
+#include "mongo/db/query/query_shape/serialization_options.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 
@@ -41,15 +52,18 @@ namespace mongo {
 class InternalSchemaNumArrayItemsMatchExpression : public ArrayMatchingMatchExpression {
 public:
     InternalSchemaNumArrayItemsMatchExpression(MatchType type,
-                                               StringData path,
+                                               boost::optional<StringData> path,
                                                long long numItems,
-                                               StringData name);
+                                               StringData name,
+                                               clonable_ptr<ErrorAnnotation> annotation = nullptr);
 
-    virtual ~InternalSchemaNumArrayItemsMatchExpression() {}
+    ~InternalSchemaNumArrayItemsMatchExpression() override {}
 
-    void debugString(StringBuilder& debug, int level) const final;
+    void debugString(StringBuilder& debug, int indentationLevel) const final;
 
-    void serialize(BSONObjBuilder* out) const final;
+    void appendSerializedRightHandSide(BSONObjBuilder* bob,
+                                       const SerializationOptions& opts = {},
+                                       bool includePath = true) const final;
 
     bool equivalent(const MatchExpression* other) const final;
 
@@ -58,21 +72,30 @@ public:
     }
 
     MatchExpression* getChild(size_t i) const final {
+        MONGO_UNREACHABLE_TASSERT(6400215);
+    }
+
+    void resetChild(size_t i, MatchExpression* other) override {
         MONGO_UNREACHABLE;
     }
 
-    std::vector<MatchExpression*>* getChildVector() final {
+    std::vector<std::unique_ptr<MatchExpression>>* getChildVector() final {
         return nullptr;
     }
 
-protected:
+    StringData getName() const {
+        return _name;
+    }
+
     long long numItems() const {
         return _numItems;
     }
 
 private:
     ExpressionOptimizerFunc getOptimizer() const final {
-        return [](std::unique_ptr<MatchExpression> expression) { return expression; };
+        return [](std::unique_ptr<MatchExpression> expression) {
+            return expression;
+        };
     }
 
     StringData _name;

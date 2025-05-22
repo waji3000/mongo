@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,71 +27,103 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <boost/none.hpp>
+#include <ostream>
 
-#include <string>
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
 
-#include "mongo/db/jsobj.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/bson/util/builder.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/query/write_ops/write_ops_gen.h"
+#include "mongo/db/shard_id.h"
+#include "mongo/s/chunk_version.h"
+#include "mongo/s/index_version.h"
+#include "mongo/s/shard_version.h"
+#include "mongo/s/shard_version_factory.h"
+#include "mongo/s/stale_exception.h"
 #include "mongo/s/write_ops/batched_command_response.h"
-#include "mongo/s/write_ops/write_error_detail.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
-
-using std::string;
-
 namespace {
 
-TEST(BatchedCommandResponse, Basic) {
-    BSONArray writeErrorsArray = BSON_ARRAY(
-        BSON(WriteErrorDetail::index(0) << WriteErrorDetail::errCode(ErrorCodes::IndexNotFound)
-                                        << WriteErrorDetail::errCodeName("IndexNotFound")
-                                        << WriteErrorDetail::errMessage("index 0 failed")
-                                        << WriteErrorDetail::errInfo(BSON("more info" << 1)))
-        << BSON(WriteErrorDetail::index(1)
-                << WriteErrorDetail::errCode(ErrorCodes::InvalidNamespace)
-                << WriteErrorDetail::errCodeName("InvalidNamespace")
-                << WriteErrorDetail::errMessage("index 1 failed too")
-                << WriteErrorDetail::errInfo(BSON("more info" << 1))));
+TEST(BatchedCommandResponseTest, Basic) {
+    BSONArray writeErrorsArray(
+        BSON_ARRAY(BSON("index" << 0 << "code" << ErrorCodes::IndexNotFound << "errmsg"
+                                << "index 0 failed")
+                   << BSON("index" << 1 << "code" << ErrorCodes::InvalidNamespace << "errmsg"
+                                   << "index 1 failed too")));
 
-    BSONObj writeConcernError(
-        BSON("code" << 8 << "codeName" << ErrorCodes::errorString(ErrorCodes::Error(8)) << "errmsg"
-                    << "norepl"
-                    << "errInfo"
-                    << BSON("a" << 1)));
+    BSONObj writeConcernError(BSON("code" << ErrorCodes::UnknownError << "codeName"
+                                          << "UnknownError"
+                                          << "errmsg"
+                                          << "norepl"
+                                          << "errInfo" << BSON("a" << 1)));
 
     BSONObj origResponseObj =
-        BSON(BatchedCommandResponse::n(0) << "opTime" << mongo::Timestamp(1ULL)
-                                          << BatchedCommandResponse::writeErrors()
-                                          << writeErrorsArray
-                                          << BatchedCommandResponse::writeConcernError()
-                                          << writeConcernError
-                                          << "ok"
-                                          << 1.0);
+        BSON("n" << 0 << "opTime" << mongo::Timestamp(1ULL) << "writeErrors" << writeErrorsArray
+                 << "writeConcernError" << writeConcernError << "retriedStmtIds"
+                 << BSON_ARRAY(1 << 3) << "ok" << 1.0);
 
-    string errMsg;
+    std::string errMsg;
     BatchedCommandResponse response;
-    bool ok = response.parseBSON(origResponseObj, &errMsg);
-    ASSERT_TRUE(ok);
+    ASSERT_TRUE(response.parseBSON(origResponseObj, &errMsg));
+
+    ASSERT(response.areRetriedStmtIdsSet());
+    ASSERT_EQ(response.getRetriedStmtIds().size(), 2);
+    ASSERT_EQ(response.getRetriedStmtIds()[0], 1);
+    ASSERT_EQ(response.getRetriedStmtIds()[1], 3);
 
     BSONObj genResponseObj = BSONObjBuilder(response.toBSON()).append("ok", 1.0).obj();
-
-    ASSERT_EQUALS(0, genResponseObj.woCompare(origResponseObj))
-        << "\nparsed:   " << genResponseObj  //
-        << "\noriginal: " << origResponseObj;
+    ASSERT_BSONOBJ_EQ(origResponseObj, genResponseObj);
 }
 
-TEST(BatchedCommandResponse, TooManySmallErrors) {
+TEST(BatchedCommandResponseTest, StaleConfigInfo) {
+    OID epoch = OID::gen();
+
+    StaleConfigInfo staleInfo(
+        NamespaceString::createNamespaceString_forTest("TestDB.TestColl"),
+        ShardVersionFactory::make(ChunkVersion({epoch, Timestamp(100, 0)}, {1, 0}),
+                                  boost::optional<CollectionIndexes>(boost::none)),
+        ShardVersionFactory::make(ChunkVersion({epoch, Timestamp(100, 0)}, {2, 0}),
+                                  boost::optional<CollectionIndexes>(boost::none)),
+        ShardId("TestShard"));
+
+    BSONObjBuilder builder(BSON("index" << 0 << "code" << ErrorCodes::StaleConfig << "errmsg"
+                                        << "StaleConfig error"));
+    staleInfo.serialize(&builder);
+
+    BSONArray writeErrorsArray(BSON_ARRAY(
+        builder.obj() << BSON("index" << 1 << "code" << ErrorCodes::InvalidNamespace << "errmsg"
+                                      << "index 1 failed too")));
+
+    BSONObj origResponseObj =
+        BSON("n" << 0 << "opTime" << mongo::Timestamp(1ULL) << "writeErrors" << writeErrorsArray
+                 << "retriedStmtIds" << BSON_ARRAY(1 << 3) << "ok" << 1.0);
+
+    std::string errMsg;
+    BatchedCommandResponse response;
+    ASSERT_TRUE(response.parseBSON(origResponseObj, &errMsg));
+    ASSERT_EQ(0, response.getErrDetailsAt(0).getIndex());
+    ASSERT_EQ(ErrorCodes::StaleConfig, response.getErrDetailsAt(0).getStatus().code());
+    auto extraInfo = response.getErrDetailsAt(0).getStatus().extraInfo<StaleConfigInfo>();
+    ASSERT_EQ(staleInfo.getVersionReceived(), extraInfo->getVersionReceived());
+    ASSERT_EQ(*staleInfo.getVersionWanted(), *extraInfo->getVersionWanted());
+    ASSERT_EQ(staleInfo.getShardId(), extraInfo->getShardId());
+}
+
+TEST(BatchedCommandResponseTest, TooManySmallErrors) {
     BatchedCommandResponse response;
 
     const auto bigstr = std::string(1024, 'x');
 
     for (int i = 0; i < 100'000; i++) {
-        auto errDetail = stdx::make_unique<WriteErrorDetail>();
-        errDetail->setIndex(i);
-        errDetail->setStatus({ErrorCodes::BadValue, bigstr});
-        response.addToErrDetails(errDetail.release());
+        response.addToErrDetails(write_ops::WriteError(i, {ErrorCodes::BadValue, bigstr}));
     }
 
     response.setStatus(Status::OK());
@@ -114,18 +145,15 @@ TEST(BatchedCommandResponse, TooManySmallErrors) {
     }
 }
 
-TEST(BatchedCommandResponse, TooManyBigErrors) {
+TEST(BatchedCommandResponseTest, TooManyBigErrors) {
     BatchedCommandResponse response;
 
     const auto bigstr = std::string(2'000'000, 'x');
     const auto smallstr = std::string(10, 'x');
 
     for (int i = 0; i < 100'000; i++) {
-        auto errDetail = stdx::make_unique<WriteErrorDetail>();
-        errDetail->setIndex(i);
-        errDetail->setStatus({ErrorCodes::BadValue,          //
-                              i < 10 ? bigstr : smallstr});  // Don't waste too much RAM.
-        response.addToErrDetails(errDetail.release());
+        response.addToErrDetails(write_ops::WriteError(
+            i, {ErrorCodes::BadValue, i < 10 ? bigstr : smallstr /* Don't waste too much RAM */}));
     }
 
     response.setStatus(Status::OK());
@@ -145,6 +173,35 @@ TEST(BatchedCommandResponse, TooManyBigErrors) {
             ASSERT_EQ(errDetail["errmsg"].String(), ""_sd) << i;
         }
     }
+}
+
+TEST(BatchedCommandResponseTest, CompatibilityFromWriteErrorToBatchCommandResponse) {
+    CollectionGeneration gen(OID::gen(), Timestamp(2, 0));
+    const auto versionReceived = ShardVersionFactory::make(
+        ChunkVersion(gen, {1, 0}), boost::optional<CollectionIndexes>(boost::none));
+
+    write_ops::UpdateCommandReply reply;
+    reply.getWriteCommandReplyBase().setN(1);
+    reply.getWriteCommandReplyBase().setWriteErrors(std::vector<write_ops::WriteError>{
+        write_ops::WriteError(1,
+                              Status(StaleConfigInfo(NamespaceString::createNamespaceString_forTest(
+                                                         "TestDB", "TestColl"),
+                                                     versionReceived,
+                                                     boost::none,
+                                                     ShardId("TestShard")),
+                                     "Test stale config")),
+    });
+
+    BatchedCommandResponse response;
+    ASSERT_TRUE(response.parseBSON(reply.toBSON(), nullptr));
+    ASSERT_EQ(1U, response.getErrDetails().size());
+    ASSERT_EQ(ErrorCodes::StaleConfig, response.getErrDetailsAt(0).getStatus().code());
+    ASSERT_EQ("Test stale config", response.getErrDetailsAt(0).getStatus().reason());
+    auto staleInfo = response.getErrDetailsAt(0).getStatus().extraInfo<StaleConfigInfo>();
+    ASSERT_EQ("TestDB.TestColl", staleInfo->getNss().ns_forTest());
+    ASSERT_EQ(versionReceived, staleInfo->getVersionReceived());
+    ASSERT(!staleInfo->getVersionWanted());
+    ASSERT_EQ(ShardId("TestShard"), staleInfo->getShardId());
 }
 
 }  // namespace

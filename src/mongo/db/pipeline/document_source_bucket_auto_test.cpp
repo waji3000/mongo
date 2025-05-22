@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,34 +27,44 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include <boost/intrusive_ptr.hpp>
+#include <bitset>
+#include <cmath>
+#include <cstddef>
 #include <deque>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/bsontypes.h"
 #include "mongo/bson/json.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/document_metadata_fields.h"
+#include "mongo/db/exec/document_value/document_value_test_util.h"
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/pipeline/aggregation_context_fixture.h"
 #include "mongo/db/pipeline/dependencies.h"
-#include "mongo/db/pipeline/document.h"
 #include "mongo/db/pipeline/document_source_bucket_auto.h"
 #include "mongo/db/pipeline/document_source_mock.h"
-#include "mongo/db/pipeline/document_source_sort.h"
-#include "mongo/db/pipeline/document_value_test_util.h"
-#include "mongo/db/pipeline/value.h"
+#include "mongo/db/pipeline/expression_context_for_test.h"
+#include "mongo/db/query/explain_options.h"
+#include "mongo/idl/server_parameter_test_util.h"
 #include "mongo/unittest/temp_dir.h"
 #include "mongo/unittest/unittest.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/debug_util.h"
 
 namespace mongo {
 namespace {
-using std::deque;
-using std::vector;
-using std::string;
 using boost::intrusive_ptr;
+using std::deque;
+using std::string;
+using std::vector;
 
 class BucketAutoTests : public AggregationContextFixture {
 public:
@@ -73,7 +82,7 @@ public:
             mockInputs.emplace_back(std::move(input));
         }
 
-        auto source = DocumentSourceMock::create(std::move(mockInputs));
+        auto source = DocumentSourceMock::createForTest(std::move(mockInputs), getExpCtx());
         bucketAutoStage->setSource(source.get());
 
         vector<Document> results;
@@ -90,8 +99,10 @@ public:
         assertBucketAutoType(bucketAutoStage);
 
         vector<Value> explainedStages;
-        bucketAutoStage->serializeToArray(explainedStages,
-                                          ExplainOptions::Verbosity::kQueryPlanner);
+        bucketAutoStage->serializeToArray(
+            explainedStages,
+            SerializationOptions{
+                .verbosity = boost::make_optional(ExplainOptions::Verbosity::kQueryPlanner)});
         ASSERT_EQUALS(explainedStages.size(), 1UL);
 
         Value expectedExplain = Value(expectedObj);
@@ -278,6 +289,24 @@ TEST_F(BucketAutoTests, Returns3Of10RequestedBucketsWhen3ValuesInSource) {
     ASSERT_DOCUMENT_EQ(results[2], Document(fromjson("{_id : {min : 2, max : 2}, count : 1}")));
 }
 
+TEST_F(BucketAutoTests, PopulatesLastBucketWithRemainingDocuments) {
+    auto bucketAutoSpec = fromjson("{$bucketAuto : {groupBy : '$x', buckets : 5}}");
+    auto results = getResults(bucketAutoSpec,
+                              {Document{{"x", 0}},
+                               Document{{"x", 1}},
+                               Document{{"x", 2}},
+                               Document{{"x", 3}},
+                               Document{{"x", 4}},
+                               Document{{"x", 5}},
+                               Document{{"x", 6}}});
+    ASSERT_EQUALS(results.size(), 5UL);
+    ASSERT_DOCUMENT_EQ(results[0], Document(fromjson("{_id : {min : 0, max : 1}, count : 1}")));
+    ASSERT_DOCUMENT_EQ(results[1], Document(fromjson("{_id : {min : 1, max : 2}, count : 1}")));
+    ASSERT_DOCUMENT_EQ(results[2], Document(fromjson("{_id : {min : 2, max : 3}, count : 1}")));
+    ASSERT_DOCUMENT_EQ(results[3], Document(fromjson("{_id : {min : 3, max : 4}, count : 1}")));
+    ASSERT_DOCUMENT_EQ(results[4], Document(fromjson("{_id : {min : 4, max : 6}, count : 3}")));
+}
+
 TEST_F(BucketAutoTests, EvaluatesAccumulatorsInOutputField) {
     auto bucketAutoSpec =
         fromjson("{$bucketAuto : {groupBy : '$x', buckets : 2, output : {avg : {$avg : '$x'}}}}");
@@ -318,13 +347,15 @@ TEST_F(BucketAutoTests, RespectsCanonicalTypeOrderingOfValues) {
 TEST_F(BucketAutoTests, ShouldPropagatePauses) {
     auto bucketAutoSpec = fromjson("{$bucketAuto : {groupBy : '$x', buckets : 2}}");
     auto bucketAutoStage = createBucketAuto(bucketAutoSpec);
-    auto source = DocumentSourceMock::create({Document{{"x", 1}},
-                                              DocumentSource::GetNextResult::makePauseExecution(),
-                                              Document{{"x", 2}},
-                                              Document{{"x", 3}},
-                                              DocumentSource::GetNextResult::makePauseExecution(),
-                                              Document{{"x", 4}},
-                                              DocumentSource::GetNextResult::makePauseExecution()});
+    auto source =
+        DocumentSourceMock::createForTest({Document{{"x", 1}},
+                                           DocumentSource::GetNextResult::makePauseExecution(),
+                                           Document{{"x", 2}},
+                                           Document{{"x", 3}},
+                                           DocumentSource::GetNextResult::makePauseExecution(),
+                                           Document{{"x", 4}},
+                                           DocumentSource::GetNextResult::makePauseExecution()},
+                                          getExpCtx());
     bucketAutoStage->setSource(source.get());
 
     // The $bucketAuto stage needs to consume all inputs before returning any output, so we should
@@ -351,22 +382,23 @@ TEST_F(BucketAutoTests, ShouldPropagatePauses) {
 TEST_F(BucketAutoTests, ShouldBeAbleToCorrectlySpillToDisk) {
     auto expCtx = getExpCtx();
     unittest::TempDir tempDir("DocumentSourceBucketAutoTest");
-    expCtx->tempDir = tempDir.path();
-    expCtx->allowDiskUse = true;
+    expCtx->setTempDir(tempDir.path());
+    expCtx->setAllowDiskUse(true);
     const size_t maxMemoryUsageBytes = 1000;
 
     VariablesParseState vps = expCtx->variablesParseState;
-    auto groupByExpression = ExpressionFieldPath::parse(expCtx, "$a", vps);
+    auto groupByExpression = ExpressionFieldPath::parse(expCtx.get(), "$a", vps);
 
     const int numBuckets = 2;
     auto bucketAutoStage = DocumentSourceBucketAuto::create(
-        expCtx, groupByExpression, numBuckets, {}, nullptr, maxMemoryUsageBytes);
+        expCtx, groupByExpression, numBuckets, maxMemoryUsageBytes);
 
     string largeStr(maxMemoryUsageBytes, 'x');
-    auto mock = DocumentSourceMock::create({Document{{"a", 0}, {"largeStr", largeStr}},
-                                            Document{{"a", 1}, {"largeStr", largeStr}},
-                                            Document{{"a", 2}, {"largeStr", largeStr}},
-                                            Document{{"a", 3}, {"largeStr", largeStr}}});
+    auto mock = DocumentSourceMock::createForTest({Document{{"a", 0}, {"largeStr", largeStr}},
+                                                   Document{{"a", 1}, {"largeStr", largeStr}},
+                                                   Document{{"a", 2}, {"largeStr", largeStr}},
+                                                   Document{{"a", 3}, {"largeStr", largeStr}}},
+                                                  expCtx);
     bucketAutoStage->setSource(mock.get());
 
     auto next = bucketAutoStage->getNext();
@@ -380,32 +412,42 @@ TEST_F(BucketAutoTests, ShouldBeAbleToCorrectlySpillToDisk) {
                        (Document{{"_id", Document{{"min", 2}, {"max", 3}}}, {"count", 2}}));
 
     ASSERT_TRUE(bucketAutoStage->getNext().isEOF());
+    ASSERT_TRUE(bucketAutoStage->usedDisk());
+
+    auto stats =
+        dynamic_cast<const DocumentSourceBucketAutoStats*>(bucketAutoStage->getSpecificStats());
+    ASSERT_NE(stats, nullptr);
+    ASSERT_EQ(stats->spillingStats.getSpills(), 7);
+    ASSERT_EQ(stats->spillingStats.getSpilledRecords(), 13);
+    ASSERT_EQ(stats->spillingStats.getSpilledBytes(), 13910);
+    ASSERT_GT(stats->spillingStats.getSpilledDataStorageSize(), 0);
+    ASSERT_LT(stats->spillingStats.getSpilledDataStorageSize(), 10000);
 }
 
 TEST_F(BucketAutoTests, ShouldBeAbleToPauseLoadingWhileSpilled) {
     auto expCtx = getExpCtx();
 
-    // Allow the $sort stage to spill to disk.
     unittest::TempDir tempDir("DocumentSourceBucketAutoTest");
-    expCtx->tempDir = tempDir.path();
-    expCtx->allowDiskUse = true;
+    expCtx->setTempDir(tempDir.path());
+    expCtx->setAllowDiskUse(true);
     const size_t maxMemoryUsageBytes = 1000;
 
     VariablesParseState vps = expCtx->variablesParseState;
-    auto groupByExpression = ExpressionFieldPath::parse(expCtx, "$a", vps);
+    auto groupByExpression = ExpressionFieldPath::parse(expCtx.get(), "$a", vps);
 
     const int numBuckets = 2;
     auto bucketAutoStage = DocumentSourceBucketAuto::create(
-        expCtx, groupByExpression, numBuckets, {}, nullptr, maxMemoryUsageBytes);
-    auto sort = DocumentSourceSort::create(expCtx, BSON("_id" << -1), -1, maxMemoryUsageBytes);
+        expCtx, groupByExpression, numBuckets, maxMemoryUsageBytes);
 
     string largeStr(maxMemoryUsageBytes, 'x');
-    auto mock = DocumentSourceMock::create({Document{{"a", 0}, {"largeStr", largeStr}},
-                                            DocumentSource::GetNextResult::makePauseExecution(),
-                                            Document{{"a", 1}, {"largeStr", largeStr}},
-                                            DocumentSource::GetNextResult::makePauseExecution(),
-                                            Document{{"a", 2}, {"largeStr", largeStr}},
-                                            Document{{"a", 3}, {"largeStr", largeStr}}});
+    auto mock =
+        DocumentSourceMock::createForTest({Document{{"a", 0}, {"largeStr", largeStr}},
+                                           DocumentSource::GetNextResult::makePauseExecution(),
+                                           Document{{"a", 1}, {"largeStr", largeStr}},
+                                           DocumentSource::GetNextResult::makePauseExecution(),
+                                           Document{{"a", 2}, {"largeStr", largeStr}},
+                                           Document{{"a", 3}, {"largeStr", largeStr}}},
+                                          expCtx);
     bucketAutoStage->setSource(mock.get());
 
     // There were 2 pauses, so we should expect 2 paused results before any results can be
@@ -425,6 +467,114 @@ TEST_F(BucketAutoTests, ShouldBeAbleToPauseLoadingWhileSpilled) {
                        (Document{{"_id", Document{{"min", 2}, {"max", 3}}}, {"count", 2}}));
 
     ASSERT_TRUE(bucketAutoStage->getNext().isEOF());
+    ASSERT_TRUE(bucketAutoStage->usedDisk());
+}
+
+TEST_F(BucketAutoTests, ShouldBeAbleToForceSpillWhileLoadingDocuments) {
+    auto expCtx = getExpCtx();
+
+    unittest::TempDir tempDir("DocumentSourceBucketAutoTest");
+    expCtx->setTempDir(tempDir.path());
+    expCtx->setAllowDiskUse(true);
+
+    VariablesParseState vps = expCtx->variablesParseState;
+    auto groupByExpression = ExpressionFieldPath::parse(expCtx.get(), "$a", vps);
+
+    const int numBuckets = 2;
+    auto bucketAutoStage = DocumentSourceBucketAuto::create(
+        expCtx,
+        groupByExpression,
+        numBuckets,
+        internalDocumentSourceBucketAutoMaxMemoryBytes.loadRelaxed());
+
+    string largeStr(1000, 'x');
+    auto mock =
+        DocumentSourceMock::createForTest({Document{{"a", 0}, {"largeStr", largeStr}},
+                                           DocumentSource::GetNextResult::makePauseExecution(),
+                                           Document{{"a", 1}, {"largeStr", largeStr}},
+                                           DocumentSource::GetNextResult::makePauseExecution(),
+                                           Document{{"a", 2}, {"largeStr", largeStr}},
+                                           Document{{"a", 3}, {"largeStr", largeStr}}},
+                                          expCtx);
+    bucketAutoStage->setSource(mock.get());
+
+    ASSERT_TRUE(bucketAutoStage->getNext().isPaused());
+    bucketAutoStage->forceSpill();
+    ASSERT_TRUE(bucketAutoStage->getNext().isPaused());
+
+    auto next = bucketAutoStage->getNext();
+    ASSERT_TRUE(next.isAdvanced());
+    ASSERT_DOCUMENT_EQ(next.releaseDocument(),
+                       (Document{{"_id", Document{{"min", 0}, {"max", 2}}}, {"count", 2}}));
+
+    next = bucketAutoStage->getNext();
+    ASSERT_TRUE(next.isAdvanced());
+    ASSERT_DOCUMENT_EQ(next.releaseDocument(),
+                       (Document{{"_id", Document{{"min", 2}, {"max", 3}}}, {"count", 2}}));
+
+    ASSERT_TRUE(bucketAutoStage->getNext().isEOF());
+    ASSERT_TRUE(bucketAutoStage->usedDisk());
+
+    auto stats =
+        dynamic_cast<const DocumentSourceBucketAutoStats*>(bucketAutoStage->getSpecificStats());
+    ASSERT_NE(stats, nullptr);
+    ASSERT_EQ(stats->spillingStats.getSpills(), 2);
+    ASSERT_EQ(stats->spillingStats.getSpilledRecords(), 4);
+    ASSERT_EQ(stats->spillingStats.getSpilledBytes(), 4280);
+    ASSERT_GT(stats->spillingStats.getSpilledDataStorageSize(), 0);
+    ASSERT_LT(stats->spillingStats.getSpilledDataStorageSize(),
+              stats->spillingStats.getSpilledBytes());
+}
+
+TEST_F(BucketAutoTests, ShouldBeAbleToForceSpillWhileReturningDocuments) {
+    auto expCtx = getExpCtx();
+
+    unittest::TempDir tempDir("DocumentSourceBucketAutoTest");
+    expCtx->setTempDir(tempDir.path());
+    expCtx->setAllowDiskUse(true);
+
+    VariablesParseState vps = expCtx->variablesParseState;
+    auto groupByExpression = ExpressionFieldPath::parse(expCtx.get(), "$a", vps);
+
+    const int numBuckets = 2;
+    auto bucketAutoStage = DocumentSourceBucketAuto::create(
+        expCtx,
+        groupByExpression,
+        numBuckets,
+        internalDocumentSourceBucketAutoMaxMemoryBytes.loadRelaxed());
+
+    string largeStr(1000, 'x');
+    auto mock = DocumentSourceMock::createForTest({Document{{"a", 0}, {"largeStr", largeStr}},
+                                                   Document{{"a", 1}, {"largeStr", largeStr}},
+                                                   Document{{"a", 2}, {"largeStr", largeStr}},
+                                                   Document{{"a", 3}, {"largeStr", largeStr}}},
+                                                  expCtx);
+    bucketAutoStage->setSource(mock.get());
+
+    auto next = bucketAutoStage->getNext();
+    ASSERT_TRUE(next.isAdvanced());
+    ASSERT_DOCUMENT_EQ(next.releaseDocument(),
+                       (Document{{"_id", Document{{"min", 0}, {"max", 2}}}, {"count", 2}}));
+
+    bucketAutoStage->forceSpill();
+
+    next = bucketAutoStage->getNext();
+    ASSERT_TRUE(next.isAdvanced());
+    ASSERT_DOCUMENT_EQ(next.releaseDocument(),
+                       (Document{{"_id", Document{{"min", 2}, {"max", 3}}}, {"count", 2}}));
+
+    ASSERT_TRUE(bucketAutoStage->getNext().isEOF());
+    ASSERT_TRUE(bucketAutoStage->usedDisk());
+
+    auto stats =
+        dynamic_cast<const DocumentSourceBucketAutoStats*>(bucketAutoStage->getSpecificStats());
+    ASSERT_NE(stats, nullptr);
+    ASSERT_EQ(stats->spillingStats.getSpills(), 1);
+    ASSERT_EQ(stats->spillingStats.getSpilledRecords(), 1);
+    ASSERT_EQ(stats->spillingStats.getSpilledBytes(), 1070);
+    ASSERT_GT(stats->spillingStats.getSpilledDataStorageSize(), 0);
+    ASSERT_LT(stats->spillingStats.getSpilledDataStorageSize(),
+              stats->spillingStats.getSpilledBytes());
 }
 
 TEST_F(BucketAutoTests, SourceNameIsBucketAuto) {
@@ -449,19 +599,19 @@ TEST_F(BucketAutoTests, ShouldAddDependenciesOfGroupByFieldAndComputedFields) {
     ASSERT_EQUALS(1U, dependencies.fields.count("b"));
 
     ASSERT_EQUALS(false, dependencies.needWholeDocument);
-    ASSERT_EQUALS(false, dependencies.getNeedsMetadata(DepsTracker::MetadataType::TEXT_SCORE));
+    ASSERT_EQUALS(false, dependencies.getNeedsMetadata(DocumentMetadataFields::kTextScore));
 }
 
 TEST_F(BucketAutoTests, ShouldNeedTextScoreInDependenciesFromGroupByField) {
     auto bucketAuto =
         createBucketAuto(fromjson("{$bucketAuto : {groupBy : {$meta: 'textScore'}, buckets : 2}}"));
 
-    DepsTracker dependencies(DepsTracker::MetadataAvailable::kTextScore);
+    DepsTracker dependencies(DepsTracker::kOnlyTextScore);
     ASSERT_EQUALS(DepsTracker::State::EXHAUSTIVE_ALL, bucketAuto->getDependencies(&dependencies));
     ASSERT_EQUALS(0U, dependencies.fields.size());
 
     ASSERT_EQUALS(false, dependencies.needWholeDocument);
-    ASSERT_EQUALS(true, dependencies.getNeedsMetadata(DepsTracker::MetadataType::TEXT_SCORE));
+    ASSERT_EQUALS(true, dependencies.getNeedsMetadata(DocumentMetadataFields::kTextScore));
 }
 
 TEST_F(BucketAutoTests, ShouldNeedTextScoreInDependenciesFromOutputField) {
@@ -469,7 +619,7 @@ TEST_F(BucketAutoTests, ShouldNeedTextScoreInDependenciesFromOutputField) {
         createBucketAuto(fromjson("{$bucketAuto : {groupBy : '$x', buckets : 2, output: {avg : "
                                   "{$avg : {$meta : 'textScore'}}}}}"));
 
-    DepsTracker dependencies(DepsTracker::MetadataAvailable::kTextScore);
+    DepsTracker dependencies(DepsTracker::kOnlyTextScore);
     ASSERT_EQUALS(DepsTracker::State::EXHAUSTIVE_ALL, bucketAuto->getDependencies(&dependencies));
     ASSERT_EQUALS(1U, dependencies.fields.size());
 
@@ -477,7 +627,7 @@ TEST_F(BucketAutoTests, ShouldNeedTextScoreInDependenciesFromOutputField) {
     ASSERT_EQUALS(1U, dependencies.fields.count("x"));
 
     ASSERT_EQUALS(false, dependencies.needWholeDocument);
-    ASSERT_EQUALS(true, dependencies.getNeedsMetadata(DepsTracker::MetadataType::TEXT_SCORE));
+    ASSERT_EQUALS(true, dependencies.getNeedsMetadata(DocumentMetadataFields::kTextScore));
 }
 
 TEST_F(BucketAutoTests, SerializesDefaultAccumulatorIfOutputFieldIsNotSpecified) {
@@ -514,7 +664,7 @@ TEST_F(BucketAutoTests, ShouldBeAbleToReParseSerializedStage) {
     ASSERT_EQUALS(serialization.size(), 1UL);
     ASSERT_EQUALS(serialization[0].getType(), BSONType::Object);
 
-    ASSERT_EQUALS(serialization[0].getDocument().size(), 1UL);
+    ASSERT_EQUALS(serialization[0].getDocument().computeSize(), 1ULL);
     ASSERT_EQUALS(serialization[0].getDocument()["$bucketAuto"].getType(), BSONType::Object);
 
     auto serializedBson = serialization[0].getDocument().toBson();
@@ -545,18 +695,35 @@ TEST_F(BucketAutoTests, FailsWithInvalidNumberOfBuckets) {
 
     // Use the create() helper.
     const int numBuckets = 0;
-    ASSERT_THROWS_CODE(
-        DocumentSourceBucketAuto::create(
-            getExpCtx(), ExpressionConstant::create(getExpCtx(), Value(0)), numBuckets),
-        AssertionException,
-        40243);
+    ASSERT_THROWS_CODE(DocumentSourceBucketAuto::create(
+                           getExpCtx(),
+                           ExpressionConstant::create(getExpCtxRaw(), Value(0)),
+                           numBuckets,
+                           internalDocumentSourceBucketAutoMaxMemoryBytes.loadRelaxed()),
+                       AssertionException,
+                       40243);
 }
 
-TEST_F(BucketAutoTests, FailsWithNonExpressionGroupBy) {
+TEST_F(BucketAutoTests, FailsWithNonOrInvalidExpressionGroupBy) {
     auto spec = fromjson("{$bucketAuto : {groupBy : 'test', buckets : 1}}");
     ASSERT_THROWS_CODE(createBucketAuto(spec), AssertionException, 40239);
 
     spec = fromjson("{$bucketAuto : {groupBy : {test : 'test'}, buckets : 1}}");
+    ASSERT_THROWS_CODE(createBucketAuto(spec), AssertionException, 40239);
+
+    spec = fromjson("{$bucketAuto : {groupBy : '', buckets : 1}}");
+    ASSERT_THROWS_CODE(createBucketAuto(spec), AssertionException, 40239);
+
+    spec = fromjson("{$bucketAuto : {groupBy : {}}, buckets : 1}");
+    ASSERT_THROWS_CODE(createBucketAuto(spec), AssertionException, 40239);
+
+    spec = fromjson("{$bucketAuto : {groupBy : '$'}, buckets : 1}");
+    ASSERT_THROWS_CODE(createBucketAuto(spec), AssertionException, 40239);
+
+    spec = fromjson("{$bucketAuto : {groupBy : []}, buckets : 1}");
+    ASSERT_THROWS_CODE(createBucketAuto(spec), AssertionException, 40239);
+
+    spec = fromjson("{$bucketAuto : {groupBy : null}, buckets : 1}");
     ASSERT_THROWS_CODE(createBucketAuto(spec), AssertionException, 40239);
 }
 
@@ -632,60 +799,67 @@ void assertCannotSpillToDisk(const boost::intrusive_ptr<ExpressionContext>& expC
     const size_t maxMemoryUsageBytes = 1000;
 
     VariablesParseState vps = expCtx->variablesParseState;
-    auto groupByExpression = ExpressionFieldPath::parse(expCtx, "$a", vps);
+    auto groupByExpression = ExpressionFieldPath::parse(expCtx.get(), "$a", vps);
 
     const int numBuckets = 2;
     auto bucketAutoStage = DocumentSourceBucketAuto::create(
-        expCtx, groupByExpression, numBuckets, {}, nullptr, maxMemoryUsageBytes);
+        expCtx, groupByExpression, numBuckets, maxMemoryUsageBytes);
 
     string largeStr(maxMemoryUsageBytes, 'x');
-    auto mock = DocumentSourceMock::create(
-        {Document{{"a", 0}, {"largeStr", largeStr}}, Document{{"a", 1}, {"largeStr", largeStr}}});
+    auto mock = DocumentSourceMock::createForTest(
+        {Document{{"a", 0}, {"largeStr", largeStr}}, Document{{"a", 1}, {"largeStr", largeStr}}},
+        expCtx);
     bucketAutoStage->setSource(mock.get());
 
-    ASSERT_THROWS_CODE(bucketAutoStage->getNext(), AssertionException, 16819);
+    ASSERT_THROWS_CODE(bucketAutoStage->getNext(),
+                       AssertionException,
+                       ErrorCodes::QueryExceededMemoryLimitNoDiskUseAllowed);
 }
 
 TEST_F(BucketAutoTests, ShouldFailIfBufferingTooManyDocuments) {
     auto expCtx = getExpCtx();
 
-    expCtx->allowDiskUse = false;
-    expCtx->inMongos = false;
+    expCtx->setAllowDiskUse(false);
+    expCtx->setInRouter(false);
     assertCannotSpillToDisk(expCtx);
 
-    expCtx->allowDiskUse = true;
-    expCtx->inMongos = true;
+    expCtx->setAllowDiskUse(true);
+    expCtx->setInRouter(true);
     assertCannotSpillToDisk(expCtx);
 
-    expCtx->allowDiskUse = false;
-    expCtx->inMongos = true;
+    expCtx->setAllowDiskUse(false);
+    expCtx->setInRouter(true);
     assertCannotSpillToDisk(expCtx);
 }
 
 TEST_F(BucketAutoTests, ShouldCorrectlyTrackMemoryUsageBetweenPauses) {
     auto expCtx = getExpCtx();
-    expCtx->allowDiskUse = false;
-    const size_t maxMemoryUsageBytes = 1000;
+    expCtx->setAllowDiskUse(false);
+    const size_t maxMemoryUsageBytes = 2000;
 
     VariablesParseState vps = expCtx->variablesParseState;
-    auto groupByExpression = ExpressionFieldPath::parse(expCtx, "$a", vps);
+    auto groupByExpression = ExpressionFieldPath::parse(expCtx.get(), "$a", vps);
 
     const int numBuckets = 2;
     auto bucketAutoStage = DocumentSourceBucketAuto::create(
-        expCtx, groupByExpression, numBuckets, {}, nullptr, maxMemoryUsageBytes);
+        expCtx, groupByExpression, numBuckets, maxMemoryUsageBytes);
 
-    string largeStr(maxMemoryUsageBytes / 2, 'x');
-    auto mock = DocumentSourceMock::create({Document{{"a", 0}, {"largeStr", largeStr}},
-                                            DocumentSource::GetNextResult::makePauseExecution(),
-                                            Document{{"a", 1}, {"largeStr", largeStr}},
-                                            Document{{"a", 2}, {"largeStr", largeStr}}});
+    string largeStr(maxMemoryUsageBytes / 5, 'x');
+    auto mock =
+        DocumentSourceMock::createForTest({Document{{"a", 0}, {"largeStr", largeStr}},
+                                           DocumentSource::GetNextResult::makePauseExecution(),
+                                           Document{{"a", 1}, {"largeStr", largeStr}},
+                                           Document{{"a", 2}, {"largeStr", largeStr}}},
+                                          expCtx);
     bucketAutoStage->setSource(mock.get());
 
     // The first getNext() should pause.
     ASSERT_TRUE(bucketAutoStage->getNext().isPaused());
 
     // The next should realize it's used too much memory.
-    ASSERT_THROWS_CODE(bucketAutoStage->getNext(), AssertionException, 16819);
+    ASSERT_THROWS_CODE(bucketAutoStage->getNext(),
+                       AssertionException,
+                       ErrorCodes::QueryExceededMemoryLimitNoDiskUseAllowed);
 }
 
 TEST_F(BucketAutoTests, ShouldRoundUpMaximumBoundariesWithGranularitySpecified) {
@@ -720,6 +894,25 @@ TEST_F(BucketAutoTests, ShouldRoundDownFirstMinimumBoundaryWithGranularitySpecif
     ASSERT_EQUALS(results.size(), 2UL);
     ASSERT_DOCUMENT_EQ(results[0], Document(fromjson("{_id : {min : 0.63, max : 25}, count : 3}")));
     ASSERT_DOCUMENT_EQ(results[1], Document(fromjson("{_id : {min : 25, max : 63}, count : 2}")));
+}
+
+TEST_F(BucketAutoTests, PopulatesLastBucketWithRemainingDocumentsWithGranularitySpecified) {
+    auto bucketAutoSpec =
+        fromjson("{$bucketAuto : {groupBy : '$x', buckets : 5, granularity : 'R5'}}");
+    auto results = getResults(bucketAutoSpec,
+                              {Document{{"x", 24}},
+                               Document{{"x", 15}},
+                               Document{{"x", 30}},
+                               Document{{"x", 9}},
+                               Document{{"x", 3}},
+                               Document{{"x", 7}},
+                               Document{{"x", 101}}});
+    ASSERT_EQUALS(results.size(), 5UL);
+    ASSERT_DOCUMENT_EQ(results[0], Document(fromjson("{_id : {min: 2.5, max: 4.0}, count : 1}")));
+    ASSERT_DOCUMENT_EQ(results[1], Document(fromjson("{_id : {min : 4.0, max : 10}, count : 2}")));
+    ASSERT_DOCUMENT_EQ(results[2], Document(fromjson("{_id : {min : 10, max : 16}, count : 1}")));
+    ASSERT_DOCUMENT_EQ(results[3], Document(fromjson("{_id : {min : 16, max : 25}, count : 1}")));
+    ASSERT_DOCUMENT_EQ(results[4], Document(fromjson("{_id : {min : 25, max : 160}, count : 2}")));
 }
 
 TEST_F(BucketAutoTests, ShouldAbsorbAllValuesSmallerThanAdjustedBoundaryWithGranularitySpecified) {
@@ -767,6 +960,80 @@ TEST_F(BucketAutoTests, ShouldNotRoundZeroInFirstBucketWithGranularitySpecified)
                        Document(fromjson("{_id : {min : 0.63, max : 1.6}, count : 2}")));
 }
 
+TEST_F(BucketAutoTests, AllValuesZeroWithGranularitySpecified) {
+    auto bucketAutoSpec =
+        fromjson("{$bucketAuto : {groupBy : '$x', buckets : 2, granularity : 'R5'}}");
+
+    auto results = getResults(
+        bucketAutoSpec,
+        {Document{{"x", 0}}, Document{{"x", 0}}, Document{{"x", 0}}, Document{{"x", 0}}});
+
+    ASSERT_EQUALS(results.size(), 1UL);
+    ASSERT_DOCUMENT_EQ(results[0], Document(fromjson("{_id : {min : 0, max : 0}, count : 4}")));
+}
+
+TEST_F(BucketAutoTests, MostValuesZeroWithGranularitySpecified) {
+    auto bucketAutoSpec =
+        fromjson("{$bucketAuto : {groupBy : '$x', buckets : 2, granularity : 'R5'}}");
+
+    auto results = getResults(
+        bucketAutoSpec,
+        {Document{{"x", 0}}, Document{{"x", 0}}, Document{{"x", 0}}, Document{{"x", 1}}});
+
+    ASSERT_EQUALS(results.size(), 2UL);
+    ASSERT_DOCUMENT_EQ(results[0], Document(fromjson("{_id : {min : 0, max : 0.63}, count : 3}")));
+    ASSERT_DOCUMENT_EQ(results[1],
+                       Document(fromjson("{_id : {min : 0.63, max : 1.6}, count : 1}")));
+}
+
+TEST_F(BucketAutoTests, AllValuesInfinityWithGranularitySpecified) {
+    auto bucketAutoSpec =
+        fromjson("{$bucketAuto : {groupBy : '$x', buckets : 2, granularity : 'R5'}}");
+
+    auto results = getResults(bucketAutoSpec,
+                              {Document{{"x", std::numeric_limits<double>::infinity()}},
+                               Document{{"x", std::numeric_limits<double>::infinity()}},
+                               Document{{"x", std::numeric_limits<double>::infinity()}},
+                               Document{{"x", std::numeric_limits<double>::infinity()}}});
+
+    ASSERT_EQUALS(results.size(), 1UL);
+    ASSERT_DOCUMENT_EQ(results[0],
+                       Document(fromjson("{_id : {min : Infinity, max : Infinity}, count : 4}")));
+}
+
+TEST_F(BucketAutoTests, MostValuesInfinityWithGranularitySpecified) {
+    auto bucketAutoSpec =
+        fromjson("{$bucketAuto : {groupBy : '$x', buckets : 2, granularity : 'R5'}}");
+
+    auto results = getResults(bucketAutoSpec,
+                              {Document{{"x", 1}},
+                               Document{{"x", std::numeric_limits<double>::infinity()}},
+                               Document{{"x", std::numeric_limits<double>::infinity()}},
+                               Document{{"x", std::numeric_limits<double>::infinity()}}});
+
+    ASSERT_EQUALS(results.size(), 1UL);
+    ASSERT_DOCUMENT_EQ(results[0],
+                       Document(fromjson("{_id : {min : 0.63, max : Infinity}, count : 4}")));
+}
+
+TEST_F(BucketAutoTests, OneValueInfinityWithGranularitySpecified) {
+    auto bucketAutoSpec =
+        fromjson("{$bucketAuto : {groupBy : '$x', buckets : 2, granularity : 'R5'}}");
+
+    auto results = getResults(bucketAutoSpec,
+                              {Document{{"x", 1}},
+                               Document{{"x", 1}},
+                               Document{{"x", 1}},
+                               Document{{"x", std::numeric_limits<double>::infinity()}}});
+
+    ASSERT_EQUALS(results.size(), 2UL);
+    ASSERT_DOCUMENT_EQ(results[0],
+                       Document(fromjson("{_id : {min : 0.63, max : 1.6}, count : 3}")));
+    ASSERT_DOCUMENT_EQ(results[1],
+                       Document(fromjson("{_id : {min : 1.6, max : Infinity}, count : 1}")));
+}
+
+
 TEST_F(BucketAutoTests, ShouldFailOnNaNWhenGranularitySpecified) {
     auto bucketAutoSpec =
         fromjson("{$bucketAuto : {groupBy : '$x', buckets : 2, granularity : 'R5'}}");
@@ -804,5 +1071,304 @@ TEST_F(BucketAutoTests, ShouldFailOnNegativeNumbersWhenGranularitySpecified) {
         AssertionException,
         40260);
 }
+
+TEST_F(BucketAutoTests, RedactionWithoutOutputField) {
+    auto spec = fromjson(R"({
+            $bucketAuto: {
+                groupBy: '$_id',
+                buckets: 5,
+                granularity: "R5"
+            }
+        })");
+    auto docSource = DocumentSourceBucketAuto::createFromBson(spec.firstElement(), getExpCtx());
+
+    ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
+        R"({
+            "$bucketAuto": {
+                "groupBy": "$HASH<_id>",
+                "buckets": "?number",
+                "granularity": "?string",
+                "output": {
+                    "HASH<count>": {
+                        "$sum": "?number"
+                    }
+                }
+            }
+        })",
+        redact(*docSource));
+}
+
+TEST_F(BucketAutoTests, RedactionWithOutputField) {
+    auto spec = fromjson(R"({
+            $bucketAuto: {
+                groupBy: '$year',
+                buckets: 3,
+                output: {
+                    count: { $sum: 1 },
+                    years: { $push: '$year' }
+                }
+            }})");
+    auto docSource = DocumentSourceBucketAuto::createFromBson(spec.firstElement(), getExpCtx());
+
+    ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
+        R"({
+            "$bucketAuto": {
+                "groupBy": "$HASH<year>",
+                "buckets": "?number",
+                "output": {
+                    "HASH<count>": {
+                        "$sum": "?number"
+                    },
+                    "HASH<years>": {
+                        "$push": "$HASH<year>"
+                    }
+                }
+            }
+        })",
+        redact(*docSource));
+}
+
+TEST_F(BucketAutoTests, QueryShapeReParseSerializedStage) {
+    auto expCtx = getExpCtx();
+    auto spec = fromjson(R"({
+            $bucketAuto: {
+                groupBy: '$year',
+                buckets: 3,
+                granularity: "E192",
+                output: {
+                    count: { $sum: 1 },
+                    years: { $push: '$year' }
+                }
+            }})");
+
+    auto docSource = DocumentSourceBucketAuto::createFromBson(spec.firstElement(), expCtx);
+    auto opts = SerializationOptions{LiteralSerializationPolicy::kToRepresentativeParseableValue};
+    std::vector<Value> serialized;
+    docSource->serializeToArray(serialized, opts);
+    auto serializedDocSource = serialized[0].getDocument().toBson();
+    ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
+        R"({
+            "$bucketAuto": {
+                "groupBy": "$year",
+                "buckets": 1,
+                "granularity": "R5",
+                "output": {
+                    "count": {
+                        "$sum": {
+                            "$const":1
+                        }
+                    },
+                    "years": {
+                        "$push": "$year"
+                    }
+                }
+            }
+        })",
+        serializedDocSource);
+    auto docSourceFromQueryShape =
+        DocumentSourceBucketAuto::createFromBson(serializedDocSource.firstElement(), expCtx);
+
+    vector<Value> newSerialization;
+    docSourceFromQueryShape->serializeToArray(newSerialization, opts);
+    auto newSerializedDocSource = newSerialization[0].getDocument().toBson();
+    ASSERT_BSONOBJ_EQ(serializedDocSource, newSerializedDocSource);
+}
+
+TEST_F(BucketAutoTests, BucketAutoWithPushRespectsMemoryLimit) {
+    auto spec = fromjson(R"({
+            $bucketAuto: {
+                groupBy: '$_id',
+                buckets: 1,
+                output: {
+                    array: { $push: '$arr' }
+                }
+            }})");
+
+    // In non-debug modes, each array in the 100 documents below takes up roughly 110 bytes. The
+    // infrastructure that processes each new element in the accumulator takes up roughly another
+    // 100 bytes. So we should require roughly 100 * 110 + 100 bytes for this operation to succeed,
+    // but lets round up to the nearest 500. In debug modes, each array can take up to ~136 bytes as
+    // an upper bound, while the infrastructure that processes each element in the accumulator takes
+    // up ~120 bytes. We should require 136 * 100 + 120 bytes for this operation to succeed, but
+    // we'll round up to the nearest 500 for buffer.
+    RAIIServerParameterControllerForTest queryKnobController("internalQueryMaxPushBytes",
+                                                             kDebugBuild ? 14000 : 11500);
+    std::deque<Document> docs;
+    for (size_t i = 0; i < 100; i++) {
+        docs.push_back(
+            Document(fromjson(str::stream() << "{_id : " << i << ", arr : ['string 0']}")));
+    }
+    auto results = getResults(spec, docs);
+    // Assert on the result size (1 bucket expected) to confirm we didn't run out of memory.
+    ASSERT_EQUALS(results.size(), 1UL);
+
+    // Decrease the memory limit and run again, asserting that we hit an error.
+    RAIIServerParameterControllerForTest queryKnobController2("internalQueryMaxPushBytes", 9600);
+    ASSERT_THROWS_CODE(getResults(spec, docs), AssertionException, ErrorCodes::ExceededMemoryLimit);
+}
+
+TEST_F(BucketAutoTests, BucketAutoWithConcatArraysRespectsMemoryLimit) {
+    auto spec = fromjson(R"({
+            $bucketAuto: {
+                groupBy: '$_id',
+                buckets: 1,
+                output: {
+                    array: { $concatArrays: '$arr' }
+                }
+            }})");
+
+    // In non-debug modes, each array in the 100 documents below takes up roughly 110 bytes. The
+    // infrastructure that processes each new element in the accumulator takes up roughly another
+    // 100 bytes. So we should require roughly 100 * 110 + 100 bytes for this operation to succeed,
+    // but lets round up to the nearest 500. In debug modes, each array can take up to ~136 bytes as
+    // an upper bound, while the infrastructure that processes each element in the accumulator takes
+    // up ~120 bytes. We should require 136 * 100 + 120 bytes for this operation to succeed, but
+    // we'll round up to the nearest 500 for buffer.
+    RAIIServerParameterControllerForTest queryKnobController("internalQueryMaxConcatArraysBytes",
+                                                             kDebugBuild ? 14000 : 11500);
+    std::deque<Document> docs;
+    for (size_t i = 0; i < 100; i++) {
+        docs.push_back(
+            Document(fromjson(str::stream() << "{_id : " << i << ", arr : ['string 0']}")));
+    }
+    auto results = getResults(spec, docs);
+    // Assert on the result size (1 bucket expected) to confirm we didn't run out of memory.
+    ASSERT_EQUALS(results.size(), 1UL);
+
+    // Decrease the memory limit and run again, asserting that we hit an error.
+    RAIIServerParameterControllerForTest queryKnobController2("internalQueryMaxConcatArraysBytes",
+                                                              9600);
+    ASSERT_THROWS_CODE(getResults(spec, docs), AssertionException, ErrorCodes::ExceededMemoryLimit);
+}
+
+TEST_F(BucketAutoTests, PauseBucketAutoWithConcatArrays) {
+    auto spec = fromjson(R"({
+            $bucketAuto: {
+                groupBy: '$_id',
+                buckets: 1,
+                output: {
+                    array: { $concatArrays: '$arr' }
+                }
+            }})");
+    auto bucketAutoStage = createBucketAuto(spec);
+    deque<DocumentSource::GetNextResult> mockInputs{
+        Document(fromjson("{_id: 0, arr: ['string 0']}")),
+        DocumentSource::GetNextResult::makePauseExecution(),
+        Document(fromjson("{_id: 1, arr: ['string 1']}"))};
+    auto source = DocumentSourceMock::createForTest(std::move(mockInputs), getExpCtx());
+    bucketAutoStage->setSource(source.get());
+
+    ASSERT_TRUE(bucketAutoStage->getNext().isPaused());
+    auto next = bucketAutoStage->getNext();
+    ASSERT_TRUE(next.isAdvanced());
+    auto doc = next.releaseDocument();
+    ASSERT_DOCUMENT_EQ(
+        doc, Document(fromjson("{_id: {min: 0, max: 1}, array: ['string 0', 'string 1']}")));
+    ASSERT_TRUE(bucketAutoStage->getNext().isEOF());
+}
+
+TEST_F(BucketAutoTests, PauseBucketAutoWithPush) {
+    auto spec = fromjson(R"({
+            $bucketAuto: {
+                groupBy: '$_id',
+                buckets: 1,
+                output: {
+                    array: { $push: '$arr' }
+                }
+            }})");
+    auto bucketAutoStage = createBucketAuto(spec);
+    deque<DocumentSource::GetNextResult> mockInputs{
+        Document(fromjson("{_id: 0, arr: 'string 0'}")),
+        DocumentSource::GetNextResult::makePauseExecution(),
+        Document(fromjson("{_id: 1, arr: 'string 1'}"))};
+    auto source = DocumentSourceMock::createForTest(std::move(mockInputs), getExpCtx());
+    bucketAutoStage->setSource(source.get());
+
+    ASSERT_TRUE(bucketAutoStage->getNext().isPaused());
+    auto next = bucketAutoStage->getNext();
+    ASSERT_TRUE(next.isAdvanced());
+    auto doc = next.releaseDocument();
+    ASSERT_DOCUMENT_EQ(
+        doc, Document(fromjson("{_id: {min: 0, max: 1}, array: ['string 0', 'string 1']}")));
+    ASSERT_TRUE(bucketAutoStage->getNext().isEOF());
+}
+
+TEST_F(BucketAutoTests, PauseBucketAutoWithMergeObjects) {
+    auto spec = fromjson(R"({
+            $bucketAuto: {
+                groupBy: '$_id',
+                buckets: 1,
+                output: {
+                    obj: { $mergeObjects: '$o' }
+                }
+            }})");
+    auto bucketAutoStage = createBucketAuto(spec);
+    deque<DocumentSource::GetNextResult> mockInputs{
+        Document(fromjson("{_id: 0, o: {a: 1}}")),
+        DocumentSource::GetNextResult::makePauseExecution(),
+        Document(fromjson("{_id: 1, o: {a: 2}}"))};
+    auto source = DocumentSourceMock::createForTest(std::move(mockInputs), getExpCtx());
+    bucketAutoStage->setSource(source.get());
+
+    ASSERT_TRUE(bucketAutoStage->getNext().isPaused());
+    auto next = bucketAutoStage->getNext();
+    ASSERT_TRUE(next.isAdvanced());
+    auto doc = next.releaseDocument();
+    ASSERT_DOCUMENT_EQ(doc, Document(fromjson("{_id: {min: 0, max: 1}, obj: {a: 2}}")));
+    ASSERT_TRUE(bucketAutoStage->getNext().isEOF());
+}
+
+TEST_F(BucketAutoTests, PauseBucketAutoWithFirstN) {
+    auto spec = fromjson(R"({
+            $bucketAuto: {
+                groupBy: '$_id',
+                buckets: 1,
+                output: {
+                    foo: { $firstN: {input: '$a', n: 2 }}
+                }
+            }})");
+    auto bucketAutoStage = createBucketAuto(spec);
+    deque<DocumentSource::GetNextResult> mockInputs{
+        Document(fromjson("{_id: 0, a: 1}")),
+        DocumentSource::GetNextResult::makePauseExecution(),
+        Document(fromjson("{_id: 1, a: 2}")),
+        Document(fromjson("{_id: 1, a: 3}"))};
+    auto source = DocumentSourceMock::createForTest(std::move(mockInputs), getExpCtx());
+    bucketAutoStage->setSource(source.get());
+
+    ASSERT_TRUE(bucketAutoStage->getNext().isPaused());
+    auto next = bucketAutoStage->getNext();
+    ASSERT_TRUE(next.isAdvanced());
+    auto doc = next.releaseDocument();
+    ASSERT_DOCUMENT_EQ(doc, Document(fromjson("{_id: {min: 0, max: 1}, foo: [1, 2]}")));
+    ASSERT_TRUE(bucketAutoStage->getNext().isEOF());
+}
+
+TEST_F(BucketAutoTests, PauseBucketAutoWithLastN) {
+    auto spec = fromjson(R"({
+            $bucketAuto: {
+                groupBy: '$_id',
+                buckets: 1,
+                output: {
+                    foo: { $lastN: {input: '$a', n: 2 }}
+                }
+            }})");
+    auto bucketAutoStage = createBucketAuto(spec);
+    deque<DocumentSource::GetNextResult> mockInputs{
+        Document(fromjson("{_id: 0, a: 1}")),
+        Document(fromjson("{_id: 1, a: 2}")),
+        DocumentSource::GetNextResult::makePauseExecution(),
+        Document(fromjson("{_id: 1, a: 3}"))};
+    auto source = DocumentSourceMock::createForTest(std::move(mockInputs), getExpCtx());
+    bucketAutoStage->setSource(source.get());
+
+    ASSERT_TRUE(bucketAutoStage->getNext().isPaused());
+    auto next = bucketAutoStage->getNext();
+    ASSERT_TRUE(next.isAdvanced());
+    auto doc = next.releaseDocument();
+    ASSERT_DOCUMENT_EQ(doc, Document(fromjson("{_id: {min: 0, max: 1}, foo: [2, 3]}")));
+    ASSERT_TRUE(bucketAutoStage->getNext().isEOF());
+}
+
 }  // namespace
 }  // namespace mongo

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,21 +27,20 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/executor/thread_pool_task_executor_test_fixture.h"
+#include <memory>
+#include <utility>
 
 #include "mongo/executor/thread_pool_mock.h"
-#include "mongo/stdx/memory.h"
+#include "mongo/executor/thread_pool_task_executor_test_fixture.h"
 
 namespace mongo {
 namespace executor {
 
-std::unique_ptr<ThreadPoolTaskExecutor> makeThreadPoolTestExecutor(
+std::shared_ptr<ThreadPoolTaskExecutor> makeThreadPoolTestExecutor(
     std::unique_ptr<NetworkInterfaceMock> net, ThreadPoolMock::Options options) {
     auto netPtr = net.get();
-    return stdx::make_unique<ThreadPoolTaskExecutor>(
-        stdx::make_unique<ThreadPoolMock>(netPtr, 1, std::move(options)), std::move(net));
+    return ThreadPoolTaskExecutor::create(
+        std::make_unique<ThreadPoolMock>(netPtr, 1, std::move(options)), std::move(net));
 }
 
 ThreadPoolExecutorTest::ThreadPoolExecutorTest() {}
@@ -54,7 +52,7 @@ ThreadPoolMock::Options ThreadPoolExecutorTest::makeThreadPoolMockOptions() cons
     return _options;
 }
 
-std::unique_ptr<TaskExecutor> ThreadPoolExecutorTest::makeTaskExecutor(
+std::shared_ptr<TaskExecutor> ThreadPoolExecutorTest::makeTaskExecutor(
     std::unique_ptr<NetworkInterfaceMock> net) {
     auto options = makeThreadPoolMockOptions();
     return makeThreadPoolTestExecutor(std::move(net), std::move(options));

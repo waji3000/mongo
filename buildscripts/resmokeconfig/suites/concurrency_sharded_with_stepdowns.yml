@@ -2,218 +2,121 @@ test_kind: fsm_workload_test
 
 selector:
   roots:
-  - jstests/concurrency/fsm_workloads/**/*.js
+    - jstests/concurrency/fsm_workloads/**/*.js
+    - src/mongo/db/modules/*/jstests/concurrency/fsm_workloads/*.js
   exclude_files:
-  # SERVER-13116 distinct isn't sharding aware
-  - jstests/concurrency/fsm_workloads/distinct.js
-  - jstests/concurrency/fsm_workloads/distinct_noindex.js
-  - jstests/concurrency/fsm_workloads/distinct_projection.js
+    # Disabled because MapReduce can lose cursors if the primary steps down.
 
-  # SERVER-17397 Drops of sharded namespaces may not fully succeed
-  - jstests/concurrency/fsm_workloads/create_database.js
-  - jstests/concurrency/fsm_workloads/drop_database.js
+    # Disabled due to MongoDB restrictions and/or workload restrictions
 
-  # Disabled due to SERVER-33753, '.count() without a predicate can be wrong on sharded
-  # collections'. This bug is problematic for these workloads because they assert on count()
-  # values:
-  - jstests/concurrency/fsm_workloads/agg_match.js
+    # These workloads sometimes trigger 'Could not lock auth data update lock'
+    # errors because the AuthorizationManager currently waits for only five
+    # seconds to acquire the lock for authorization documents
 
-  # $lookup and $graphLookup are not supported on sharded collections.
-  - jstests/concurrency/fsm_workloads/agg_graph_lookup.js
-  - jstests/concurrency/fsm_workloads/view_catalog_cycle_lookup.js
+    # uses >100MB of data, which can overwhelm test hosts
 
-  # Disabled due to SERVER-20057, 'Concurrent, sharded mapReduces can fail when temporary
-  # namespaces collide across mongos processes'
-  - jstests/concurrency/fsm_workloads/map_reduce_drop.js
-  - jstests/concurrency/fsm_workloads/map_reduce_inline.js
-  - jstests/concurrency/fsm_workloads/map_reduce_merge.js
-  - jstests/concurrency/fsm_workloads/map_reduce_merge_nonatomic.js
-  - jstests/concurrency/fsm_workloads/map_reduce_reduce.js
-  - jstests/concurrency/fsm_workloads/map_reduce_reduce_nonatomic.js
-  - jstests/concurrency/fsm_workloads/map_reduce_replace.js
-  - jstests/concurrency/fsm_workloads/map_reduce_replace_nonexistent.js
-  - jstests/concurrency/fsm_workloads/map_reduce_replace_remove.js
+    # compact can only be run against a standalone mongod
 
-  # Disabled due to MongoDB restrictions and/or workload restrictions
+    # can cause OOM kills on test hosts
 
-  # These workloads sometimes trigger 'Could not lock auth data update lock'
-  # errors because the AuthorizationManager currently waits for only five
-  # seconds to acquire the lock for authorization documents
-  - jstests/concurrency/fsm_workloads/auth_create_role.js
-  - jstests/concurrency/fsm_workloads/auth_create_user.js
-  - jstests/concurrency/fsm_workloads/auth_drop_role.js
-  - jstests/concurrency/fsm_workloads/auth_drop_user.js
+    # cannot createIndex after dropDatabase without sharding first
 
-  # uses >100MB of data, which can overwhelm test hosts
-  - jstests/concurrency/fsm_workloads/agg_group_external.js
-  - jstests/concurrency/fsm_workloads/agg_sort_external.js
+    # ChunkHelper directly talks to the config servers and doesn't support retries for network errors
+    - jstests/concurrency/fsm_workloads/sharded_partitioned/sharded_base_partitioned.js
+    - jstests/concurrency/fsm_workloads/sharded_partitioned/sharded_mergeChunks_partitioned.js
+    - jstests/concurrency/fsm_workloads/sharded_partitioned/sharded_moveChunk_partitioned.js
+    - jstests/concurrency/fsm_workloads/sharded_partitioned/sharded_splitChunk_partitioned.js
 
-  # compact can only be run against a standalone mongod
-  - jstests/concurrency/fsm_workloads/compact.js
-  - jstests/concurrency/fsm_workloads/compact_simultaneous_padding_bytes.js
+    # These workloads frequently time out waiting for the distributed lock to drop a sharded
+    # collection.
 
-  # convertToCapped can't be run on mongos processes
-  - jstests/concurrency/fsm_workloads/convert_to_capped_collection.js
-  - jstests/concurrency/fsm_workloads/convert_to_capped_collection_index.js
+    # Uses getmores.
 
-  # findAndModify requires a shard key
-  - jstests/concurrency/fsm_workloads/findAndModify_mixed_queue_unindexed.js
-  - jstests/concurrency/fsm_workloads/findAndModify_remove_queue_unindexed.js
-  - jstests/concurrency/fsm_workloads/findAndModify_update_collscan.js
-  - jstests/concurrency/fsm_workloads/findAndModify_update_queue.js
-  - jstests/concurrency/fsm_workloads/findAndModify_update_queue_unindexed.js
+    # Uses non retryable writes.
 
-  # remove cannot be {} for findAndModify
-  - jstests/concurrency/fsm_workloads/findAndModify_remove_queue.js
+    # Uses non retryable commands.
+    - jstests/concurrency/fsm_workloads/ddl/collMod/collMod.js
+    - jstests/concurrency/fsm_workloads/ddl/collMod/collMod_separate_collections.js
+    - jstests/concurrency/fsm_workloads/view_catalog/view_catalog.js
+    - jstests/concurrency/fsm_workloads/view_catalog/view_catalog_cycle_lookup.js
+    - jstests/concurrency/fsm_workloads/view_catalog/view_catalog_cycle_with_drop.js
 
-  # can cause OOM kills on test hosts
-  - jstests/concurrency/fsm_workloads/findAndModify_update_grow.js
+    # The auto_retry_on_network_error.js override needs to overwrite the response from drop on
+    # NamespaceNotFound, and since this workload only creates and drops collections there isn't
+    # much value in running it.
+    - jstests/concurrency/fsm_workloads/ddl/drop_collection/drop_collection.js
 
+    # serverStatus does not include transaction metrics on mongos.
 
-  # cannot ensureIndex after dropDatabase without sharding first
-  - jstests/concurrency/fsm_workloads/plan_cache_drop_database.js
+    # Uses the same transaction id across different routers, which is not allowed because when either
+    # router tries to commit, it may not know the full participant list.
 
-  # our .remove(query, {justOne: true}) calls lack shard keys
-  - jstests/concurrency/fsm_workloads/remove_single_document.js
+    # Use non-retryable commands not allowed by the network retry helper.
 
-  # The rename_* workloads are disabled since renameCollection doesn't work with sharded
-  # collections
-  - jstests/concurrency/fsm_workloads/rename_capped_collection_chain.js
-  - jstests/concurrency/fsm_workloads/rename_capped_collection_dbname_chain.js
-  - jstests/concurrency/fsm_workloads/rename_capped_collection_dbname_droptarget.js
-  - jstests/concurrency/fsm_workloads/rename_capped_collection_droptarget.js
-  - jstests/concurrency/fsm_workloads/rename_collection_chain.js
-  - jstests/concurrency/fsm_workloads/rename_collection_dbname_chain.js
-  - jstests/concurrency/fsm_workloads/rename_collection_dbname_droptarget.js
-  - jstests/concurrency/fsm_workloads/rename_collection_droptarget.js
-
-  # our update queries lack shard keys
-  - jstests/concurrency/fsm_workloads/update_upsert_multi.js
-  - jstests/concurrency/fsm_workloads/update_upsert_multi_noindex.js
-
-  # cannot use upsert command with $where with sharded collections
-  - jstests/concurrency/fsm_workloads/upsert_where.js
-
-  # stagedebug can only be run against a standalone mongod
-  - jstests/concurrency/fsm_workloads/yield_and_hashed.js
-  - jstests/concurrency/fsm_workloads/yield_and_sorted.js
-
-  # ChunkHelper directly talks to the config servers and doesn't support retries for network errors
-  - jstests/concurrency/fsm_workloads/sharded_base_partitioned.js
-  - jstests/concurrency/fsm_workloads/sharded_mergeChunks_partitioned.js
-  - jstests/concurrency/fsm_workloads/sharded_moveChunk_drop_shard_key_index.js
-  - jstests/concurrency/fsm_workloads/sharded_moveChunk_partitioned.js
-  - jstests/concurrency/fsm_workloads/sharded_splitChunk_partitioned.js
-
-  # These workloads frequently time out waiting for the distributed lock to drop a sharded
-  # collection.
-  - jstests/concurrency/fsm_workloads/kill_aggregation.js
-  - jstests/concurrency/fsm_workloads/kill_rooted_or.js
-  - jstests/concurrency/fsm_workloads/view_catalog_cycle_with_drop.js
-  - jstests/concurrency/fsm_workloads/view_catalog.js
-
-  # Uses getmores.
-  - jstests/concurrency/fsm_workloads/agg_base.js
-  - jstests/concurrency/fsm_workloads/create_index_background.js
-  - jstests/concurrency/fsm_workloads/create_index_background_partial_filter.js
-  - jstests/concurrency/fsm_workloads/create_index_background_wildcard.js
-  - jstests/concurrency/fsm_workloads/globally_managed_cursors.js
-  - jstests/concurrency/fsm_workloads/indexed_insert_ordered_bulk.js
-  - jstests/concurrency/fsm_workloads/indexed_insert_text.js
-  - jstests/concurrency/fsm_workloads/indexed_insert_unordered_bulk.js
-  - jstests/concurrency/fsm_workloads/indexed_insert_upsert.js
-  - jstests/concurrency/fsm_workloads/indexed_insert_where.js
-  - jstests/concurrency/fsm_workloads/list_indexes.js
-  - jstests/concurrency/fsm_workloads/reindex.js
-  - jstests/concurrency/fsm_workloads/reindex_background.js
-  - jstests/concurrency/fsm_workloads/remove_multiple_documents.js
-  - jstests/concurrency/fsm_workloads/remove_where.js
-  - jstests/concurrency/fsm_workloads/touch_base.js
-  - jstests/concurrency/fsm_workloads/touch_data.js
-  - jstests/concurrency/fsm_workloads/touch_index.js
-  - jstests/concurrency/fsm_workloads/touch_no_data_no_index.js
-  - jstests/concurrency/fsm_workloads/update_where.js
-  - jstests/concurrency/fsm_workloads/yield.js
-  - jstests/concurrency/fsm_workloads/yield_fetch.js
-  - jstests/concurrency/fsm_workloads/yield_rooted_or.js
-  - jstests/concurrency/fsm_workloads/yield_sort.js
-  - jstests/concurrency/fsm_workloads/yield_sort_merge.js
-  - jstests/concurrency/fsm_workloads/yield_text.js
-
-  # Uses non retryable writes.
-  - jstests/concurrency/fsm_workloads/remove_and_bulk_insert.js
-  - jstests/concurrency/fsm_workloads/update_and_bulk_insert.js
-  - jstests/concurrency/fsm_workloads/update_check_index.js
-  - jstests/concurrency/fsm_workloads/update_multifield_multiupdate.js
-  - jstests/concurrency/fsm_workloads/update_multifield_multiupdate_noindex.js
-  - jstests/concurrency/fsm_workloads/update_ordered_bulk_inc.js
-  - jstests/concurrency/fsm_workloads/yield_id_hack.js
-
-  # Uses non retryable commands.
-  - jstests/concurrency/fsm_workloads/agg_out.js
-  - jstests/concurrency/fsm_workloads/agg_sort.js
-  - jstests/concurrency/fsm_workloads/collmod.js
-  - jstests/concurrency/fsm_workloads/collmod_separate_collections.js
-  - jstests/concurrency/fsm_workloads/kill_multicollection_aggregation.js
-  - jstests/concurrency/fsm_workloads/invalidated_cursors.js
-
-  # The auto_retry_on_network_error.js override needs to overwrite the response from drop on
-  # NamespaceNotFound, and since this workload only creates and drops collections there isn't
-  # much value in running it.
-  - jstests/concurrency/fsm_workloads/drop_collection.js
-
-  # TODO (SERVER-35534) Unblacklist this workload from the concurrency stepdown suites. It fails
-  # with PooledConnectionsDropped when setFCV is run concurrently with movePrimary, which seems like
-  # it's due to a race condition in the NetworkInterfaceTL.
-  - jstests/concurrency/fsm_workloads/database_versioning.js
+    # The test may spuriously fail when run against sharded clusters, due to limitations of the
+    # infrastructure. See SERVER-77039 for full details.
 
   exclude_with_any_tags:
-  - uses_transactions
-  - requires_replication
-  - requires_non_retryable_writes
+    - requires_standalone
+    - assumes_against_mongod_not_mongos
+    - requires_replication
+    - requires_non_retryable_writes
+    - assumes_balancer_on
+    # Curop requires readConcern local.
+    - uses_curop_agg_stage
+    # mongos has no system.profile collection.
+    - requires_profiling
+    - does_not_support_stepdowns
+    - assumes_unsharded_collection
+    # TODO (SERVER-89682): Remove this
+    - requires_getmore
 
 executor:
   archive:
     hooks:
       - CheckReplDBHash
+      - CheckMetadataConsistencyInBackground
       - ValidateCollections
     tests: true
   config:
     shell_options:
-      readMode: commands
+      eval: >-
+        await import("jstests/libs/override_methods/implicitly_shard_accessed_collections.js");
       global_vars:
         TestData:
           runningWithConfigStepdowns: true
           runningWithShardStepdowns: true
-          runningWithAutoSplit: false
           runningWithBalancer: false
-          useStepdownPermittedFile: true
-          useSteppingDownFile: true
-          usingReplicaSetShards: true
+          implicitlyShardOnCreateCollectionOnly: true
+          useActionPermittedFile: [ContinuousStepdown]
   hooks:
-  - class: ContinuousStepdown
-    config_stepdown: true
-    shard_stepdown: true
-    use_stepdown_permitted_file: true
-    use_stepping_down_file: true
-    wait_for_mongos_retarget: true
-  - class: CheckReplDBHash
-  - class: ValidateCollections
-  - class: CleanupConcurrencyWorkloads
+    - class: ContinuousStepdown
+      config_stepdown: true
+      shard_stepdown: true
+      is_fsm_workload: true
+    - class: CheckShardFilteringMetadata
+    - class: CheckReplDBHash
+    - class: CheckMetadataConsistencyInBackground
+    - class: CheckOrphansDeleted
+    - class: CheckRoutingTableConsistency
+    - class: ValidateCollections # Validation can interfere with other operations, so this goes last.
+    - class: CleanupConcurrencyWorkloads
   fixture:
     class: ShardedClusterFixture
     enable_balancer: false
-    enable_autosplit: false
     mongos_options:
       set_parameters:
         enableTestCommands: 1
+        queryAnalysisSamplerConfigurationRefreshSecs: 1
     configsvr_options:
       num_nodes: 3
       all_nodes_electable: true
+      mongod_options:
+        set_parameters:
+          reshardingMinimumOperationDurationMillis: 30000 # 30 seconds
       replset_config_options:
         settings:
           catchUpTimeoutMillis: 0
-      voting_secondaries: true
     shard_options:
       all_nodes_electable: true
       mongod_options:
@@ -221,11 +124,13 @@ executor:
       replset_config_options:
         settings:
           catchUpTimeoutMillis: 0
-      voting_secondaries: true
     mongod_options:
       set_parameters:
         enableTestCommands: 1
         enableElectionHandoff: 0
+        roleGraphInvalidationIsFatal: 1
+        queryAnalysisWriterIntervalSecs: 1
+        queryAnalysisSamplerConfigurationRefreshSecs: 1
     num_rs_nodes_per_shard: 3
     num_shards: 2
     num_mongos: 2

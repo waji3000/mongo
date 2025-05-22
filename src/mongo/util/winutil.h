@@ -1,6 +1,3 @@
-// @file winutil.cpp : Windows related utility functions
-//
-//
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -29,9 +26,12 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
-//
 
 #pragma once
+
+/**
+ * Windows related utility functions
+ */
 
 #if defined(_WIN32)
 #include "text.h"
@@ -50,12 +50,12 @@ namespace windows {
 inline std::string GetErrMsg(DWORD err) {
     LPTSTR errMsg;
     ::FormatMessage(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM,
-                    NULL,
+                    nullptr,
                     err,
                     0,
                     (LPTSTR)&errMsg,
                     0,
-                    NULL);
+                    nullptr);
     std::string errMsgStr = toUtf8String(errMsg);
     ::LocalFree(errMsg);
     // FormatMessage() appends a newline to the end of error messages, we trim it because std::endl

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,9 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kControl
-
-#include "mongo/platform/basic.h"
 
 #include "mongo/util/stacktrace.h"
 
@@ -44,29 +40,38 @@
 #include <boost/optional.hpp>
 #include <cstdio>
 #include <cstdlib>
+#include <fmt/format.h>
 #include <iostream>
+#include <memory>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/init.h"
-#include "mongo/stdx/memory.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/json.h"
+#include "mongo/logv2/log.h"
+#include "mongo/stdx/mutex.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/concurrency/mutex.h"
-#include "mongo/util/log.h"
 #include "mongo/util/text.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
+
 
 namespace mongo {
 namespace {
-const auto kPathBufferSize = 1024;
+
+const size_t kPathBufferSize = 1024;
 
 // On Windows the symbol handler must be initialized at process startup and cleaned up at shutdown.
 // This class wraps up that logic and gives access to the process handle associated with the
 // symbol handler. Because access to the symbol handler API is not thread-safe, it also provides
 // a lock/unlock method so the whole symbol handler can be used with a stdx::lock_guard.
 class SymbolHandler {
-    MONGO_DISALLOW_COPYING(SymbolHandler);
+    SymbolHandler(const SymbolHandler&) = delete;
+    SymbolHandler& operator=(const SymbolHandler&) = delete;
 
 public:
     SymbolHandler() {
@@ -76,17 +81,17 @@ public:
         const auto pathSize = GetModuleFileNameW(nullptr, &modulePath.front(), modulePath.size());
         invariant(pathSize != 0);
         modulePath.resize(pathSize);
-        boost::filesystem::wpath exePath(modulePath);
+        boost::filesystem::path exePath(modulePath);
 
         std::wstringstream symbolPathBuilder;
         symbolPathBuilder << exePath.parent_path().wstring()
                           << L";C:\\Windows\\System32;C:\\Windows";
         const auto symbolPath = symbolPathBuilder.str();
 
-        BOOL ret = SymInitializeW(handle, symbolPath.c_str(), TRUE);
-        if (ret == FALSE) {
-            error() << "Stack trace initialization failed, SymInitialize failed with error "
-                    << errnoWithDescription();
+        if (!SymInitializeW(handle, symbolPath.c_str(), TRUE)) {
+            auto ec = lastSystemError();
+            LOGV2_ERROR(
+                31443, "Stack trace initialization failed", "error"_attr = errorMessage(ec));
             return;
         }
 
@@ -96,8 +101,10 @@ public:
     }
 
     ~SymbolHandler() {
-        SymSetOptions(_origOptions);
-        SymCleanup(getHandle());
+        if (_processHandle.has_value()) {
+            SymSetOptions(_origOptions);
+            SymCleanup(getHandle());
+        }
     }
 
     HANDLE getHandle() const {
@@ -132,35 +139,24 @@ MONGO_INITIALIZER(IntializeSymbolHandler)(::mongo::InitializerContext* ctx) {
     // context. The constructor of SymbolHandler does all the error handling, so we don't need to
     // do anything with the return value. Just make sure it gets called.
     SymbolHandler::instance();
-
-    // Initializing the symbol handler is not a fatal error, so we always return Status::OK() here.
-    return Status::OK();
 }
-
-}  // namespace
 
 /**
  * Get the display name of the executable module containing the specified address.
  *
  * @param process               Process handle
  * @param address               Address to find
- * @param returnedModuleName    Returned module name
  */
-static void getModuleName(HANDLE process, DWORD64 address, std::string* returnedModuleName) {
+static std::string getModuleName(HANDLE process, DWORD64 address) {
     IMAGEHLP_MODULE64 module64;
     memset(&module64, 0, sizeof(module64));
     module64.SizeOfStruct = sizeof(module64);
-    BOOL ret = SymGetModuleInfo64(process, address, &module64);
-    if (FALSE == ret) {
-        returnedModuleName->clear();
-        return;
-    }
+    if (!SymGetModuleInfo64(process, address, &module64))
+        return {};
     char* moduleName = module64.LoadedImageName;
-    char* backslash = strrchr(moduleName, '\\');
-    if (backslash) {
+    if (char* backslash = strrchr(moduleName, '\\'); backslash)
         moduleName = backslash + 1;
-    }
-    *returnedModuleName = moduleName;
+    return moduleName;
 }
 
 /**
@@ -168,36 +164,26 @@ static void getModuleName(HANDLE process, DWORD64 address, std::string* returned
  *
  * @param process               Process handle
  * @param address               Address to find
- * @param returnedSourceAndLine Returned source code file name with line number
  */
-static void getSourceFileAndLineNumber(HANDLE process,
-                                       DWORD64 address,
-                                       std::string* returnedSourceAndLine) {
+static std::pair<std::string, size_t> getSourceLocation(HANDLE process, DWORD64 address) {
     IMAGEHLP_LINE64 line64;
     memset(&line64, 0, sizeof(line64));
     line64.SizeOfStruct = sizeof(line64);
-    DWORD displacement32;
-    BOOL ret = SymGetLineFromAddr64(process, address, &displacement32, &line64);
-    if (FALSE == ret) {
-        returnedSourceAndLine->clear();
-        return;
+    DWORD offset;
+    if (!SymGetLineFromAddr64(process, address, &offset, &line64))
+        return {};
+    std::string filename = line64.FileName;
+    static constexpr const char* kDiscards[] = {R"(\src\mongo\)", R"(\src\third_party\)"};
+    for (const char* const discard : kDiscards) {
+        if (auto start = filename.find(discard); start != std::string::npos) {
+            filename.replace(0, start, "...");
+            break;
+        }
     }
-
-    std::string filename(line64.FileName);
-    std::string::size_type start = filename.find("\\src\\mongo\\");
-    if (start == std::string::npos) {
-        start = filename.find("\\src\\third_party\\");
-    }
-    if (start != std::string::npos) {
-        std::string shorter("...");
-        shorter += filename.substr(start);
-        filename.swap(shorter);
-    }
-    static const size_t bufferSize = 32;
-    std::unique_ptr<char[]> lineNumber(new char[bufferSize]);
-    _snprintf(lineNumber.get(), bufferSize, "(%u)", line64.LineNumber);
-    filename += lineNumber.get();
-    returnedSourceAndLine->swap(filename);
+    for (char& c : filename)
+        if (c == '\\')
+            c = '/';
+    return {std::move(filename), line64.LineNumber};
 }
 
 /**
@@ -206,61 +192,49 @@ static void getSourceFileAndLineNumber(HANDLE process,
  * @param process                   Process handle
  * @param address                   Address to find
  * @param symbolInfo                Caller's pre-built SYMBOL_INFO struct (for efficiency)
- * @param returnedSymbolAndOffset   Returned symbol and offset
  */
-static void getsymbolAndOffset(HANDLE process,
-                               DWORD64 address,
-                               SYMBOL_INFO* symbolInfo,
-                               std::string* returnedSymbolAndOffset) {
-    DWORD64 displacement64;
-    BOOL ret = SymFromAddr(process, address, &displacement64, symbolInfo);
-    if (FALSE == ret) {
-        *returnedSymbolAndOffset = "???";
-        return;
-    }
-    std::string symbolString(symbolInfo->Name);
-    static const size_t bufferSize = 32;
-    std::unique_ptr<char[]> symbolOffset(new char[bufferSize]);
-    _snprintf(symbolOffset.get(), bufferSize, "+0x%llux", displacement64);
-    symbolString += symbolOffset.get();
-    returnedSymbolAndOffset->swap(symbolString);
+static std::pair<std::string, size_t> getSymbolAndOffset(HANDLE process,
+                                                         DWORD64 address,
+                                                         SYMBOL_INFO* symbolInfo) {
+    DWORD64 offset;
+    if (!SymFromAddr(process, address, &offset, symbolInfo))
+        return {};
+    return {symbolInfo->Name, offset};
 }
 
 struct TraceItem {
-    std::string moduleName;
-    std::string sourceAndLine;
-    std::string symbolAndOffset;
+    uintptr_t address;
+    std::string module;
+    std::pair<std::string, size_t> source;
+    std::pair<std::string, size_t> symbol;
 };
 
-static const int maxBackTraceFrames = 100;
-
-/**
- * Print a stack backtrace for the current thread to the specified ostream.
- *
- * @param os    ostream& to receive printed stack backtrace
- */
-void printStackTrace(std::ostream& os) {
-    CONTEXT context;
-    memset(&context, 0, sizeof(context));
-    context.ContextFlags = CONTEXT_CONTROL;
-    RtlCaptureContext(&context);
-    printWindowsStackTrace(context, os);
+void appendTrace(BSONObjBuilder* bob, const std::vector<TraceItem>& traceList) {
+    auto bt = BSONArrayBuilder(bob->subarrayStart("backtrace"));
+    for (const auto& item : traceList) {
+        auto o = BSONObjBuilder(bt.subobjStart());
+        o.append("a", stack_trace_detail::Hex(item.address));
+        if (!item.module.empty())
+            o.append("module", item.module);
+        if (!item.source.first.empty()) {
+            o.append("file", item.source.first);
+            o.append("line", static_cast<int>(item.source.second));
+        }
+        if (!item.symbol.first.empty()) {
+            o.append("s", item.symbol.first);
+            o.append("s+", stack_trace_detail::Hex(item.symbol.second));
+        }
+    }
 }
 
-
-/**
- * Print stack trace (using a specified stack context) to "os"
- *
- * @param context   CONTEXT record for stack trace
- * @param os        ostream& to receive printed stack backtrace
- */
-void printWindowsStackTrace(CONTEXT& context, std::ostream& os) {
+std::vector<TraceItem> makeTraceList(CONTEXT& context) {
+    std::vector<TraceItem> traceList;
     auto& symbolHandler = SymbolHandler::instance();
     stdx::lock_guard<SymbolHandler> lk(symbolHandler);
 
     if (!symbolHandler) {
-        error() << "Stack trace failed, symbol handler returned an invalid handle.";
-        return;
+        LOGV2_ERROR(31444, "Stack trace failed, symbol handler returned an invalid handle");
+        return traceList;
     }
 
     STACKFRAME64 frame64;
@@ -291,65 +265,74 @@ void printWindowsStackTrace(CONTEXT& context, std::ostream& os) {
     symbolBuffer->SizeOfStruct = sizeof(SYMBOL_INFO);
     symbolBuffer->MaxNameLen = nameSize;
 
-    // build list
-    std::vector<TraceItem> traceList;
-    TraceItem traceItem;
-    size_t moduleWidth = 0;
-    size_t sourceWidth = 0;
-    for (size_t i = 0; i < maxBackTraceFrames; ++i) {
-        BOOL ret = StackWalk64(imageType,
-                               symbolHandler.getHandle(),
-                               GetCurrentThread(),
-                               &frame64,
-                               &context,
-                               NULL,
-                               NULL,
-                               NULL,
-                               NULL);
-        if (ret == FALSE || frame64.AddrReturn.Offset == 0) {
+    for (size_t i = 0; i < kStackTraceFrameMax; ++i) {
+        if (!StackWalk64(imageType,
+                         symbolHandler.getHandle(),
+                         GetCurrentThread(),
+                         &frame64,
+                         &context,
+                         NULL,
+                         NULL,
+                         NULL,
+                         NULL))
             break;
-        }
+        if (!frame64.AddrReturn.Offset)
+            break;
         DWORD64 address = frame64.AddrPC.Offset;
-        getModuleName(symbolHandler.getHandle(), address, &traceItem.moduleName);
-        size_t width = traceItem.moduleName.length();
-        if (width > moduleWidth) {
-            moduleWidth = width;
-        }
-        getSourceFileAndLineNumber(symbolHandler.getHandle(), address, &traceItem.sourceAndLine);
-        width = traceItem.sourceAndLine.length();
-        if (width > sourceWidth) {
-            sourceWidth = width;
-        }
-        getsymbolAndOffset(
-            symbolHandler.getHandle(), address, symbolBuffer, &traceItem.symbolAndOffset);
-        traceList.push_back(traceItem);
+        auto h = symbolHandler.getHandle();
+        traceList.push_back({static_cast<uintptr_t>(address),
+                             getModuleName(h, address),
+                             getSourceLocation(h, address),
+                             getSymbolAndOffset(h, address, symbolBuffer)});
     }
-
-    // print list
-    ++moduleWidth;
-    ++sourceWidth;
-    size_t frameCount = traceList.size();
-    for (size_t i = 0; i < frameCount; ++i) {
-        os << traceList[i].moduleName << ' ';
-        size_t width = traceList[i].moduleName.length();
-        while (width < moduleWidth) {
-            os << ' ';
-            ++width;
-        }
-        os << traceList[i].sourceAndLine << ' ';
-        width = traceList[i].sourceAndLine.length();
-        while (width < sourceWidth) {
-            os << ' ';
-            ++width;
-        }
-        os << traceList[i].symbolAndOffset << '\n';
-    }
+    return traceList;
 }
 
-// Print error message from C runtime, then fassert
-int crtDebugCallback(int, char* originalMessage, int*) {
-    StringData message(originalMessage);
-    log() << "*** C runtime error: " << message.substr(0, message.find('\n')) << ", terminating";
-    fassertFailed(17006);
+StackTrace getStackTraceImpl(CONTEXT& context) {
+    std::vector<TraceItem> traceList = makeTraceList(context);
+    if (traceList.empty()) {
+        return StackTrace(BSONObj(), "");
+    }
+
+    BSONObjBuilder bob;
+    appendTrace(&bob, traceList);
+    return StackTrace(bob.obj(), "");
 }
+}  // namespace
+
+StackTrace getStackTrace() {
+    CONTEXT context;
+    memset(&context, 0, sizeof(context));
+    context.ContextFlags = CONTEXT_CONTROL;
+    RtlCaptureContext(&context);
+
+    return getStackTraceImpl(context);
 }
+
+void printWindowsStackTrace(CONTEXT& context, StackTraceSink& sink) {
+    getStackTraceImpl(context).sink(&sink);
+}
+
+void printWindowsStackTrace(CONTEXT& context, std::ostream& os) {
+    OstreamStackTraceSink sink{os};
+    printWindowsStackTrace(context, sink);
+}
+
+void printWindowsStackTrace(CONTEXT& context) {
+    getStackTraceImpl(context).log();
+}
+
+void printStackTrace(StackTraceSink& sink) {
+    getStackTrace().sink(&sink);
+}
+
+void printStackTrace(std::ostream& os) {
+    OstreamStackTraceSink sink{os};
+    printStackTrace(sink);
+}
+
+void printStackTrace() {
+    getStackTrace().log();
+}
+
+}  // namespace mongo

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,75 +27,142 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
 
-#include "mongo/platform/basic.h"
+#include <boost/smart_ptr.hpp>
+#include <set>
+#include <utility>
 
-#include "mongo/client/remote_command_targeter_rs.h"
+#include <boost/move/utility_core.hpp>
 
+#include "mongo/base/error_codes.h"
 #include "mongo/base/status_with.h"
 #include "mongo/client/connection_string.h"
 #include "mongo/client/read_preference.h"
+#include "mongo/client/remote_command_targeter_rs.h"
 #include "mongo/client/replica_set_monitor.h"
+#include "mongo/client/replica_set_monitor_server_parameters_gen.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/service_context.h"
+#include "mongo/logv2/log.h"
+#include "mongo/platform/atomic_word.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/duration.h"
 #include "mongo/util/net/hostandport.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
+
 
 namespace mongo {
 
+namespace {
+
+/**
+ * To be used on mongod only. Returns the host and port for this mongod as specified in the current
+ * replica set configuration.
+ */
+HostAndPort getLocalHostAndPort(ServiceContext* serviceContext) {
+    auto localHostAndPort = repl::ReplicationCoordinator::get(serviceContext)->getMyHostAndPort();
+    // The host and port would be empty if the replica set configuration has not been initialized or
+    // if this mongod is no longer part of the replica set it was in. Returns a retryable error to
+    // make the external client retry.
+    uassert(ErrorCodes::HostNotFound,
+            "Cannot find the host and port for this node in the replica set configuration.",
+            !localHostAndPort.empty());
+    return localHostAndPort;
+}
+
+}  // namespace
+
 RemoteCommandTargeterRS::RemoteCommandTargeterRS(const std::string& rsName,
                                                  const std::vector<HostAndPort>& seedHosts)
-    : _rsName(rsName) {
+    : _serviceContext(getGlobalServiceContext()), _rsName(rsName) {
 
     std::set<HostAndPort> seedServers(seedHosts.begin(), seedHosts.end());
     _rsMonitor = ReplicaSetMonitor::createIfNeeded(rsName, seedServers);
 
-    LOG(1) << "Started targeter for "
-           << ConnectionString::forReplicaSet(
-                  rsName, std::vector<HostAndPort>(seedServers.begin(), seedServers.end()));
+    if (serverGlobalParams.clusterRole.has(ClusterRole::ShardServer)) {
+        auto replCoord = repl::ReplicationCoordinator::get(_serviceContext);
+        _isTargetingLocalRS = replCoord->getConfig().getReplSetName() == _rsName;
+    }
+
+    LOGV2_DEBUG(20157,
+                1,
+                "Started targeter",
+                "connectionString"_attr = ConnectionString::forReplicaSet(
+                    rsName, std::vector<HostAndPort>(seedServers.begin(), seedServers.end())));
 }
 
 ConnectionString RemoteCommandTargeterRS::connectionString() {
     return uassertStatusOK(ConnectionString::parse(_rsMonitor->getServerAddress()));
 }
 
-Future<HostAndPort> RemoteCommandTargeterRS::findHostWithMaxWait(
-    const ReadPreferenceSetting& readPref, Milliseconds maxWait) {
-    return _rsMonitor->getHostOrRefresh(readPref, maxWait);
+bool RemoteCommandTargeterRS::_mustTargetLocalHost(const ReadPreferenceSetting& readPref) const {
+    return _isTargetingLocalRS && readPref.isPretargeted;
+}
+
+SemiFuture<HostAndPort> RemoteCommandTargeterRS::findHost(const ReadPreferenceSetting& readPref,
+                                                          const CancellationToken& cancelToken) {
+    if (_mustTargetLocalHost(readPref)) {
+        return getLocalHostAndPort(_serviceContext);
+    }
+    return _rsMonitor->getHostOrRefresh(readPref, cancelToken);
+}
+
+SemiFuture<std::vector<HostAndPort>> RemoteCommandTargeterRS::findHosts(
+    const ReadPreferenceSetting& readPref, const CancellationToken& cancelToken) {
+    if (_mustTargetLocalHost(readPref)) {
+        return std::vector<HostAndPort>{getLocalHostAndPort(_serviceContext)};
+    }
+    return _rsMonitor->getHostsOrRefresh(readPref, cancelToken);
 }
 
 StatusWith<HostAndPort> RemoteCommandTargeterRS::findHost(OperationContext* opCtx,
                                                           const ReadPreferenceSetting& readPref) {
-    auto clock = opCtx->getServiceContext()->getFastClockSource();
-    auto startDate = clock->now();
-    while (true) {
-        const auto interruptStatus = opCtx->checkForInterruptNoAssert();
-        if (!interruptStatus.isOK()) {
-            return interruptStatus;
-        }
-        auto host = _rsMonitor->getHostOrRefresh(readPref, Milliseconds::zero()).getNoThrow();
-        if (host.getStatus() != ErrorCodes::FailedToSatisfyReadPreference) {
-            return host;
-        }
-        // Enforce a 20-second ceiling on the time spent looking for a host. This conforms with the
-        // behavior used throughout mongos prior to version 3.4, but is not fundamentally desirable.
-        // See comment in remote_command_targeter.h for details.
-        if (clock->now() - startDate > Seconds{20}) {
-            return host;
-        }
-        sleepFor(Milliseconds{500});
+    const auto interruptStatus = opCtx->checkForInterruptNoAssert();
+    if (!interruptStatus.isOK()) {
+        return interruptStatus;
     }
+
+    if (_mustTargetLocalHost(readPref)) {
+        return getLocalHostAndPort(_serviceContext);
+    }
+
+    bool maxTimeMsLesser = (opCtx->getRemainingMaxTimeMillis() <
+                            Milliseconds(gDefaultFindReplicaSetHostTimeoutMS.load()));
+    auto swHostAndPort =
+        _rsMonitor->getHostOrRefresh(readPref, opCtx->getCancellationToken()).getNoThrow(opCtx);
+
+    // If opCtx is interrupted, getHostOrRefresh may be canceled through the token (rather than
+    // opCtx) and therefore we may get a generic FailedToSatisfyReadPreference as tokens do not
+    // propagate errors.
+    // TODO SERVER-95226 : Check if this override is still needed.
+    if (auto status = swHostAndPort.getStatus();
+        status == ErrorCodes::FailedToSatisfyReadPreference) {
+        if (auto ctxStatus = opCtx->checkForInterruptNoAssert(); !ctxStatus.isOK()) {
+            return ctxStatus;
+        } else if (maxTimeMsLesser) {
+            return Status(ErrorCodes::MaxTimeMSExpired,
+                          str::stream() << "operation timed out: " << status.reason());
+        }
+    }
+
+    return swHostAndPort;
 }
 
-void RemoteCommandTargeterRS::markHostNotMaster(const HostAndPort& host, const Status& status) {
+void RemoteCommandTargeterRS::markHostNotPrimary(const HostAndPort& host, const Status& status) {
     invariant(_rsMonitor);
 
     _rsMonitor->failedHost(host, status);
 }
 
 void RemoteCommandTargeterRS::markHostUnreachable(const HostAndPort& host, const Status& status) {
+    invariant(_rsMonitor);
+
+    _rsMonitor->failedHost(host, status);
+}
+
+void RemoteCommandTargeterRS::markHostShuttingDown(const HostAndPort& host, const Status& status) {
     invariant(_rsMonitor);
 
     _rsMonitor->failedHost(host, status);

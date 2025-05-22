@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -53,7 +52,14 @@ struct StageConstraints {
      * A PositionRequirement stipulates what specific position the stage must occupy within the
      * pipeline, if any.
      */
-    enum class PositionRequirement { kNone, kFirst, kLast };
+    enum class PositionRequirement {
+        kNone,
+        kFirst,
+        kLast,
+        // Stages with 'kCustom' requirement must also implement the 'validatePipelinePosition()'
+        // method which is called during pipeline validation.
+        kCustom
+    };
 
     /**
      * A HostTypeRequirement defines where this stage is permitted to be executed when the
@@ -65,12 +71,18 @@ struct StageConstraints {
         // Indicates that the stage must run on the host to which it was originally sent and
         // cannot be forwarded from mongoS to the shards.
         kLocalOnly,
-        // Indicates that the stage must run on the primary shard.
-        kPrimaryShard,
+        // Indicates that the stage must run exactly once, but it is ok to forward it from the
+        // router to a shard to execute if some other stage in the pipeline needs to run on a
+        // shard. The stage provides its own data and is independent of any collection.
+        kRunOnceAnyNode,
         // Indicates that the stage must run on any participating shard.
         kAnyShard,
-        // Indicates that the stage can only run on mongoS.
-        kMongoS,
+        // Indicates that the stage can run in a router-role context.
+        kRouter,
+        // Indicates that the stage should run on all data-bearing hosts, primary and secondary, for
+        // the participating shards. This is useful for stages like $currentOp which generate
+        // node-specific metadata.
+        kAllShardHosts,
     };
 
     /**
@@ -86,10 +98,15 @@ struct StageConstraints {
 
     /**
      * A ChangeStreamRequirement determines whether a particular stage is itself a ChangeStream
-     * stage, whether it is allowed to exist in a $changeStream pipeline, or whether it is
-     * blacklisted from $changeStream.
+     * stage, whether it is allowed to exist in a $changeStream pipeline, or whether it can only
+     * exist in a change stream pipeline.
      */
-    enum class ChangeStreamRequirement { kChangeStreamStage, kWhitelist, kBlacklist };
+    enum class ChangeStreamRequirement {
+        kChangeStreamStage,    // This stage is an actual change stream stage.
+        kAllowlist,            // This stage is permitted in a change stream pipeline.
+        kDenylist,             // This stage is banned from change stream pipelines.
+        kRequiresChangeStream  // This stage is only allowed in a change stream pipeline.
+    };
 
     /**
      * A FacetRequirement indicates whether this stage may be used within a $facet pipeline.
@@ -102,41 +119,45 @@ struct StageConstraints {
      */
     enum class TransactionRequirement { kNotAllowed, kAllowed };
 
-    using DiskUseAndTransactionRequirement = std::pair<DiskUseRequirement, TransactionRequirement>;
-
     /**
-     * By default, a stage is assumed to use no disk and be allowed to run in a transaction.
+     * Indicates whether or not this stage may be run as part of a $lookup pipeline.
      */
-    static constexpr auto kDefaultDiskUseAndTransactionRequirement =
-        std::make_pair(DiskUseRequirement::kNoDiskUse, TransactionRequirement::kAllowed);
+    enum class LookupRequirement { kNotAllowed, kAllowed };
 
     /**
-     * Given a 'pipeline' of DocumentSources, resolves the container's disk use requirement and
-     * transaction requirement:
-     *
-     *  - Returns the "strictest" DiskUseRequirement reported by the stages in 'pipeline',
-     *    where the strictness order is kNone < kWritesTmpData < kWritesPersistentData. For example,
-     *    in a pipeline where all three DiskUseRequirements are present, the return value will be
-     *    DiskUseRequirement::kWritesPersistentData.
-     *
-     *  - Returns TransactionRequirement::kAllowed if and only if every DocumentSource in
-     *    'pipeline' is allowed in a transaction.
+     * Indicates whether or not this stage may be run as part of a $unionWith pipeline.
+     */
+    enum class UnionRequirement { kNotAllowed, kAllowed };
+
+    /**
+     * Returns the StageConstraints representing the strictest constraint of each type from the
+     * given pipeline. Does not compare StreamType and PositionRequirement because those values
+     * don't make sense as a property of a pipeline. Also does not compare HostTypeRequirement as
+     * there is no strict ordering of possible values. Those three values in the returned
+     * StageConstraints will always be the same as those passed in `defaultReqs`.
      */
     template <typename DocumentSourceContainer>
-    static DiskUseAndTransactionRequirement resolveDiskUseAndTransactionRequirement(
-        const DocumentSourceContainer& pipeline,
-        DiskUseAndTransactionRequirement defaultReqs = kDefaultDiskUseAndTransactionRequirement) {
-        return std::accumulate(
-            pipeline.begin(),
-            pipeline.end(),
-            defaultReqs,
-            [](const DiskUseAndTransactionRequirement& constraints, const auto& stage) {
-                const auto stageConstraints = stage->constraints();
-                const auto diskUse = std::max(constraints.first, stageConstraints.diskRequirement);
-                const auto txnReq =
-                    std::min(constraints.second, stageConstraints.transactionRequirement);
-                return std::make_pair(diskUse, txnReq);
-            });
+    static StageConstraints getStrictestConstraints(const DocumentSourceContainer& pipeline,
+                                                    const StageConstraints& defaultReqs) {
+        auto newReqs = defaultReqs;
+        for (const auto& stage : pipeline) {
+            const auto stageConstraints = stage->constraints();
+            // Skip PositionRequirement, StreamType, and HostTypeRequirement, as it doesn't make
+            // sense to compare those values.
+            newReqs.diskRequirement =
+                std::max(newReqs.diskRequirement, stageConstraints.diskRequirement);
+            newReqs.facetRequirement =
+                std::max(newReqs.facetRequirement, stageConstraints.facetRequirement);
+            newReqs.transactionRequirement =
+                std::min(newReqs.transactionRequirement, stageConstraints.transactionRequirement);
+            newReqs.lookupRequirement =
+                std::min(newReqs.lookupRequirement, stageConstraints.lookupRequirement);
+            newReqs.unionRequirement =
+                std::min(newReqs.unionRequirement, stageConstraints.unionRequirement);
+            newReqs.noFieldModifications =
+                std::min(newReqs.noFieldModifications, stageConstraints.noFieldModifications);
+        }
+        return newReqs;
     }
 
     StageConstraints(
@@ -146,31 +167,41 @@ struct StageConstraints {
         DiskUseRequirement diskRequirement,
         FacetRequirement facetRequirement,
         TransactionRequirement transactionRequirement,
-        ChangeStreamRequirement changeStreamRequirement = ChangeStreamRequirement::kBlacklist)
+        LookupRequirement lookupRequirement,
+        UnionRequirement unionRequirement,
+        ChangeStreamRequirement changeStreamRequirement = ChangeStreamRequirement::kDenylist)
         : requiredPosition(requiredPosition),
           hostRequirement(hostRequirement),
           diskRequirement(diskRequirement),
           changeStreamRequirement(changeStreamRequirement),
           facetRequirement(facetRequirement),
           transactionRequirement(transactionRequirement),
+          lookupRequirement(lookupRequirement),
+          unionRequirement(unionRequirement),
           streamType(streamType) {
         // Stages which are allowed to run in $facet must not have any position requirements.
         invariant(!(isAllowedInsideFacetStage() && requiredPosition != PositionRequirement::kNone));
 
-        // No change stream stages are permitted to run in a $facet pipeline.
+        // No change stream stages are permitted to run in a $facet or $lookup pipelines.
         invariant(!(isChangeStreamStage() && isAllowedInsideFacetStage()));
+        invariant(!(isChangeStreamStage() && isAllowedInLookupPipeline()));
+
+        // Stages which write persistent data cannot be used in a $lookup pipeline.
+        invariant(!(isAllowedInLookupPipeline() && writesPersistentData()));
+        invariant(
+            !(isAllowedInLookupPipeline() && hostRequirement == HostTypeRequirement::kRouter));
 
         // Only streaming stages are permitted in $changeStream pipelines.
         invariant(!(isAllowedInChangeStream() && streamType == StreamType::kBlocking));
 
-        // A stage which is whitelisted for $changeStream cannot have a requirement to run on a
+        // A stage which is allowlisted for $changeStream cannot have a requirement to run on a
         // shard, since it needs to be able to run on mongoS in a cluster.
-        invariant(!(changeStreamRequirement == ChangeStreamRequirement::kWhitelist &&
+        invariant(!(changeStreamRequirement == ChangeStreamRequirement::kAllowlist &&
                     (hostRequirement == HostTypeRequirement::kAnyShard ||
-                     hostRequirement == HostTypeRequirement::kPrimaryShard)));
+                     hostRequirement == HostTypeRequirement::kAllShardHosts)));
 
-        // A stage which is whitelisted for $changeStream cannot have a position requirement.
-        invariant(!(changeStreamRequirement == ChangeStreamRequirement::kWhitelist &&
+        // A stage which is allowlisted for $changeStream cannot have a position requirement.
+        invariant(!(changeStreamRequirement == ChangeStreamRequirement::kAllowlist &&
                     requiredPosition != PositionRequirement::kNone));
 
         // Change stream stages should not be permitted with readConcern level "snapshot" or
@@ -181,23 +212,30 @@ struct StageConstraints {
 
         // Stages which write data to user collections should not be permitted with readConcern
         // level "snapshot" or inside of a multi-document transaction.
-        // TODO (SERVER-36259): relax this requirement when $out (which writes persistent data)
-        // is allowed in a transaction.
+        // TODO (SERVER-36259): relax this requirement when $out and/or $merge (which write
+        // persistent data) is allowed in a transaction.
         if (diskRequirement == DiskUseRequirement::kWritesPersistentData) {
             invariant(!isAllowedInTransaction());
         }
+
+        tassert(
+            7355706,
+            "Stage can only broadcast to all shard servers if it must be the first stage in the "
+            "pipeline.",
+            hostRequirement != HostTypeRequirement::kAllShardHosts ||
+                (requiredPosition == PositionRequirement::kFirst));
     }
 
     /**
      * Returns the literal HostTypeRequirement used to initialize the StageConstraints, or the
-     * effective HostTypeRequirement (kAnyShard or kMongoS) if kLocalOnly was specified.
+     * effective HostTypeRequirement (kAnyShard or kRouter) if kLocalOnly was specified.
      */
     HostTypeRequirement resolvedHostTypeRequirement(
         const boost::intrusive_ptr<ExpressionContext>& expCtx) const {
         return (hostRequirement != HostTypeRequirement::kLocalOnly
                     ? hostRequirement
-                    : (expCtx->inMongos ? HostTypeRequirement::kMongoS
-                                        : HostTypeRequirement::kAnyShard));
+                    : (expCtx->getInRouter() ? HostTypeRequirement::kRouter
+                                             : HostTypeRequirement::kAnyShard));
     }
 
     /**
@@ -218,7 +256,7 @@ struct StageConstraints {
      * True if this stage is permitted to run in a pipeline which starts with $changeStream.
      */
     bool isAllowedInChangeStream() const {
-        return changeStreamRequirement != ChangeStreamRequirement::kBlacklist;
+        return changeStreamRequirement != ChangeStreamRequirement::kDenylist;
     }
 
     /**
@@ -230,11 +268,32 @@ struct StageConstraints {
     }
 
     /**
+     * True if this stage must run in a pipeline which starts with $changeStream.
+     */
+    bool requiresChangeStream() const {
+        return changeStreamRequirement == ChangeStreamRequirement::kRequiresChangeStream;
+    }
+
+    /**
      * Returns true if this stage is legal when the readConcern level is "snapshot" or when this
      * aggregation is being run within a multi-document transaction.
      */
     bool isAllowedInTransaction() const {
         return transactionRequirement == TransactionRequirement::kAllowed;
+    }
+
+    /**
+     * Returns true if this stage may be used inside a $lookup subpipeline.
+     */
+    bool isAllowedInLookupPipeline() const {
+        return lookupRequirement == LookupRequirement::kAllowed;
+    }
+
+    /**
+     * Returns true if this stage may be used inside a $unionWith subpipeline.
+     */
+    bool isAllowedInUnionPipeline() const {
+        return unionRequirement == UnionRequirement::kAllowed;
     }
 
     /**
@@ -245,29 +304,35 @@ struct StageConstraints {
     }
 
     // Indicates whether this stage needs to be at a particular position in the pipeline.
-    const PositionRequirement requiredPosition;
+    PositionRequirement requiredPosition;
 
     // Indicates whether this stage can only be executed on specific components of a sharded
     // cluster.
-    const HostTypeRequirement hostRequirement;
+    HostTypeRequirement hostRequirement;
 
     // Indicates whether this stage may write persistent data to disk, or may spill to temporary
     // files if its memory usage becomes excessive.
-    const DiskUseRequirement diskRequirement;
+    DiskUseRequirement diskRequirement;
 
     // Indicates whether this stage is itself a $changeStream stage, or if not whether it may
     // exist in a pipeline which begins with $changeStream.
-    const ChangeStreamRequirement changeStreamRequirement;
+    ChangeStreamRequirement changeStreamRequirement;
 
     // Indicates whether this stage may run inside a $facet stage.
-    const FacetRequirement facetRequirement;
+    FacetRequirement facetRequirement;
 
     // Indicates whether this stage is legal when the readConcern level is "snapshot" or the
     // aggregate is running inside of a multi-document transaction.
-    const TransactionRequirement transactionRequirement;
+    TransactionRequirement transactionRequirement;
+
+    // Indicates whether this stage is allowed in a $lookup subpipeline.
+    LookupRequirement lookupRequirement;
+
+    // Indicates whether this stage is allowed in a $unionWith subpipeline.
+    UnionRequirement unionRequirement;
 
     // Indicates whether this is a streaming or blocking stage.
-    const StreamType streamType;
+    StreamType streamType;
 
     // True if this stage does not generate results itself, and instead pulls inputs from an
     // input DocumentSource (via 'pSource').
@@ -284,11 +349,64 @@ struct StageConstraints {
     // $match predicates be swapped before itself.
     bool canSwapWithMatch = false;
 
-    // Neither a $sample nor a $limit can be moved before any stage which will possibly change the
-    // number of documents in the stream. Further, no stage which will change the order of documents
-    // can be swapped with a $limit or $sample, and no stage which will change behavior based on the
-    // order of documents can be swapped with a $sample because our implementation of sample will do
-    // a random sort which shuffles the order.
-    bool canSwapWithLimitAndSample = false;
+    // True if this stage can be safely swapped with a stage which alters the number of documents in
+    // the stream.
+    //
+    // For example, a $project can be safely swapped with a $skip, $limit, or $sample. But there are
+    // some cases when we cannot perform such swap:
+    // - $skip, $limit and $sample stages cannot be moved before any stage which will change the
+    //   number of documents
+    // - $skip, $limit and $sample stages cannot be swapped with any stage which will change the
+    //   order of documents
+    // - $sample cannot be swapped with stages which will change behavior based on the order of
+    //   documents because our implementation of $sample shuffles the order
+    bool canSwapWithSkippingOrLimitingStage = false;
+
+    // If true, then any stage of kind 'DocumentSourceSingleDocumentTransformation' or $redact can
+    // be swapped ahead of this stage.
+    bool canSwapWithSingleDocTransformOrRedact = false;
+
+    // Indicates that a stage is allowed within a pipeline-style update.
+    bool isAllowedWithinUpdatePipeline = false;
+
+    // Indicates that a stage requires idempotency guarantee and needs to check for existence of a
+    // field before performing a diff insert.
+    bool checkExistenceForDiffInsertOperations = false;
+
+    // If true, then this stage may only appear in the pipeline once, though it can appear at an
+    // arbitrary position. It is not necessary to consider this for stages which have a strict
+    // PositionRequirement, since the presence of a second stage will violate that constraint.
+    bool canAppearOnlyOnceInPipeline = false;
+
+    // Indicates that a stage does not modify anything to do with a sort and can be done before a
+    // following merge sort.
+    bool preservesOrderAndMetadata = false;
+
+    // If set, merge should be performed on the specified shard.
+    boost::optional<ShardId> mergeShardId = boost::none;
+
+    // If true, then this stage only retrieves and/or reorders documents from a base collection
+    // without making any modifications or transformations to the fields.
+    bool noFieldModifications = false;
+
+    bool operator==(const StageConstraints& other) const {
+        return requiredPosition == other.requiredPosition &&
+            hostRequirement == other.hostRequirement && diskRequirement == other.diskRequirement &&
+            changeStreamRequirement == other.changeStreamRequirement &&
+            facetRequirement == other.facetRequirement &&
+            transactionRequirement == other.transactionRequirement &&
+            lookupRequirement == other.lookupRequirement && streamType == other.streamType &&
+            requiresInputDocSource == other.requiresInputDocSource &&
+            isIndependentOfAnyCollection == other.isIndependentOfAnyCollection &&
+            canSwapWithMatch == other.canSwapWithMatch &&
+            canSwapWithSkippingOrLimitingStage == other.canSwapWithSkippingOrLimitingStage &&
+            canSwapWithSingleDocTransformOrRedact == other.canSwapWithSingleDocTransformOrRedact &&
+            canAppearOnlyOnceInPipeline == other.canAppearOnlyOnceInPipeline &&
+            isAllowedWithinUpdatePipeline == other.isAllowedWithinUpdatePipeline &&
+            unionRequirement == other.unionRequirement &&
+            preservesOrderAndMetadata == other.preservesOrderAndMetadata &&
+            mergeShardId == other.mergeShardId &&
+            noFieldModifications == other.noFieldModifications;
+    }
 };
 }  // namespace mongo

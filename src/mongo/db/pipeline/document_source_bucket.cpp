@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,26 +29,43 @@
 
 #include "mongo/db/pipeline/document_source_bucket.h"
 
+#include <cstddef>
+#include <vector>
+
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/exec/document_value/value_comparator.h"
 #include "mongo/db/pipeline/document_source_group.h"
 #include "mongo/db/pipeline/document_source_sort.h"
 #include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/lite_parsed_document_source.h"
+#include "mongo/db/pipeline/variables.h"
+#include "mongo/db/query/allowed_contexts.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/intrusive_counter.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
 using boost::intrusive_ptr;
-using std::vector;
 using std::list;
+using std::vector;
 
-REGISTER_MULTI_STAGE_ALIAS(bucket,
-                           LiteParsedDocumentSourceDefault::parse,
-                           DocumentSourceBucket::createFromBson);
+REGISTER_DOCUMENT_SOURCE(bucket,
+                         DocumentSourceBucket::LiteParsed::parse,
+                         DocumentSourceBucket::createFromBson,
+                         AllowedWithApiStrict::kAlways);
 
 namespace {
-intrusive_ptr<ExpressionConstant> getExpressionConstant(
-    const boost::intrusive_ptr<ExpressionContext>& expCtx,
-    BSONElement expressionElem,
-    const VariablesParseState& vps) {
+intrusive_ptr<ExpressionConstant> getExpressionConstant(ExpressionContext* const expCtx,
+                                                        BSONElement expressionElem,
+                                                        const VariablesParseState& vps) {
     auto expr = Expression::parseOperand(expCtx, expressionElem, vps)->optimize();
     return dynamic_cast<ExpressionConstant*>(expr.get());
 }
@@ -59,8 +75,7 @@ list<intrusive_ptr<DocumentSource>> DocumentSourceBucket::createFromBson(
     BSONElement elem, const intrusive_ptr<ExpressionContext>& pExpCtx) {
     uassert(40201,
             str::stream() << "Argument to $bucket stage must be an object, but found type: "
-                          << typeName(elem.type())
-                          << ".",
+                          << typeName(elem.type()) << ".",
             elem.type() == BSONType::Object);
 
     const BSONObj bucketObj = elem.embeddedObject();
@@ -80,31 +95,28 @@ list<intrusive_ptr<DocumentSource>> DocumentSourceBucket::createFromBson(
             groupByField = argument;
 
             const bool groupByIsExpressionInObject = groupByField.type() == BSONType::Object &&
-                groupByField.embeddedObject().firstElementFieldName()[0] == '$';
+                groupByField.embeddedObject().firstElementFieldNameStringData().starts_with('$');
 
-            const bool groupByIsPrefixedPath =
-                groupByField.type() == BSONType::String && groupByField.valueStringData()[0] == '$';
+            const bool groupByIsPrefixedPath = groupByField.type() == BSONType::String &&
+                groupByField.valueStringData().starts_with('$');
             uassert(40202,
                     str::stream() << "The $bucket 'groupBy' field must be defined as a $-prefixed "
                                      "path or an expression, but found: "
-                                  << groupByField.toString(false, false)
-                                  << ".",
+                                  << groupByField.toString(false, false) << ".",
                     groupByIsExpressionInObject || groupByIsPrefixedPath);
         } else if ("boundaries" == argName) {
             uassert(
                 40200,
                 str::stream() << "The $bucket 'boundaries' field must be an array, but found type: "
-                              << typeName(argument.type())
-                              << ".",
+                              << typeName(argument.type()) << ".",
                 argument.type() == BSONType::Array);
 
             for (auto&& boundaryElem : argument.embeddedObject()) {
-                auto exprConst = getExpressionConstant(pExpCtx, boundaryElem, vps);
+                auto exprConst = getExpressionConstant(pExpCtx.get(), boundaryElem, vps);
                 uassert(40191,
                         str::stream() << "The $bucket 'boundaries' field must be an array of "
                                          "constant values, but found value: "
-                                      << boundaryElem.toString(false, false)
-                                      << ".",
+                                      << boundaryElem.toString(false, false) << ".",
                         exprConst);
                 boundaryValues.push_back(exprConst->getValue());
             }
@@ -112,8 +124,7 @@ list<intrusive_ptr<DocumentSource>> DocumentSourceBucket::createFromBson(
             uassert(40192,
                     str::stream()
                         << "The $bucket 'boundaries' field must have at least 2 values, but found "
-                        << boundaryValues.size()
-                        << " value(s).",
+                        << boundaryValues.size() << " value(s).",
                     boundaryValues.size() >= 2);
 
             // Make sure that the boundaries are unique, sorted in ascending order, and have the
@@ -127,33 +138,24 @@ list<intrusive_ptr<DocumentSource>> DocumentSourceBucket::createFromBson(
                 uassert(40193,
                         str::stream() << "All values in the the 'boundaries' option to $bucket "
                                          "must have the same type. Found conflicting types "
-                                      << typeName(lower.getType())
-                                      << " and "
-                                      << typeName(upper.getType())
-                                      << ".",
+                                      << typeName(lower.getType()) << " and "
+                                      << typeName(upper.getType()) << ".",
                         lowerCanonicalType == upperCanonicalType);
                 uassert(40194,
                         str::stream()
                             << "The 'boundaries' option to $bucket must be sorted, but elements "
-                            << i - 1
-                            << " and "
-                            << i
-                            << " are not in ascending order ("
-                            << lower.toString()
-                            << " is not less than "
-                            << upper.toString()
-                            << ").",
+                            << i - 1 << " and " << i << " are not in ascending order ("
+                            << lower.toString() << " is not less than " << upper.toString() << ").",
                         pExpCtx->getValueComparator().evaluate(lower < upper));
             }
         } else if ("default" == argName) {
             // If there is a default, make sure that it parses to a constant expression then add
             // default to switch.
-            auto exprConst = getExpressionConstant(pExpCtx, argument, vps);
+            auto exprConst = getExpressionConstant(pExpCtx.get(), argument, vps);
             uassert(40195,
                     str::stream()
                         << "The $bucket 'default' field must be a constant expression, but found: "
-                        << argument.toString(false, false)
-                        << ".",
+                        << argument.toString(false, false) << ".",
                     exprConst);
 
             defaultValue = exprConst->getValue();
@@ -163,8 +165,7 @@ list<intrusive_ptr<DocumentSource>> DocumentSourceBucket::createFromBson(
             uassert(
                 40196,
                 str::stream() << "The $bucket 'output' field must be an object, but found type: "
-                              << typeName(argument.type())
-                              << ".",
+                              << typeName(argument.type()) << ".",
                 argument.type() == BSONType::Object);
 
             for (auto&& outputElem : argument.embeddedObject()) {

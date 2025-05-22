@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,30 +29,58 @@
 
 #pragma once
 
-#include "mongo/db/repl/drop_pending_collection_reaper.h"
+#include <absl/container/node_hash_map.h>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <utility>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/collection_options.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/read_write_concern_defaults_cache_lookup_mock.h"
+#include "mongo/db/record_id.h"
+#include "mongo/db/repl/member_state.h"
 #include "mongo/db/repl/oplog_entry.h"
+#include "mongo/db/repl/oplog_entry_gen.h"
 #include "mongo/db/repl/oplog_interface.h"
 #include "mongo/db/repl/oplog_interface_mock.h"
 #include "mongo/db/repl/replication_coordinator_mock.h"
 #include "mongo/db/repl/replication_process.h"
+#include "mongo/db/repl/replication_recovery.h"
 #include "mongo/db/repl/rollback_source.h"
 #include "mongo/db/repl/storage_interface_impl.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/service_context_d_test_fixture.h"
+#include "mongo/db/tenant_id.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/logv2/log_severity.h"
+#include "mongo/stdx/mutex.h"
+#include "mongo/stdx/unordered_map.h"
+#include "mongo/unittest/log_test.h"
+#include "mongo/unittest/unittest.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/net/hostandport.h"
+#include "mongo/util/uuid.h"
 
 namespace mongo {
 namespace repl {
 
-/**
- * Test fixture for both 3.4 and 3.6 rollback unit tests.
- * The fixture makes available to tests:
- * - an "ephemeralForTest" storage engine for checking results of the rollback algorithm at the
- *   storage layer. The storage engine is initialized as part of the ServiceContextForMongoD test
- *   fixture.
- */
 class RollbackTest : public ServiceContextMongoDTest {
 public:
-    RollbackTest() = default;
+    explicit RollbackTest(Options options = {}) : ServiceContextMongoDTest(std::move(options)) {}
 
     /**
      * Initializes the service context and task executor.
@@ -69,6 +96,11 @@ public:
     static Collection* _createCollection(OperationContext* opCtx,
                                          const std::string& nss,
                                          const CollectionOptions& options);
+
+    /**
+     * Inserts a single document into the collection namespace 'nss'.
+     */
+    void _insertDocument(OperationContext* opCtx, const NamespaceString& nss, const BSONObj& doc);
 
     /**
      * Inserts a document into the oplog.
@@ -90,8 +122,24 @@ public:
     /**
      * Creates an oplog entry with a recordId for a command operation.
      */
-    static std::pair<BSONObj, RecordId> makeCommandOp(
-        Timestamp ts, OptionalCollectionUUID uuid, StringData nss, BSONObj cmdObj, int recordId);
+    static std::pair<BSONObj, RecordId> makeCommandOp(Timestamp ts,
+                                                      const boost::optional<UUID>& uuid,
+                                                      const NamespaceString& nss,
+                                                      BSONObj cmdObj,
+                                                      int recordId,
+                                                      boost::optional<BSONObj> o2 = boost::none,
+                                                      boost::optional<TenantId> tid = boost::none);
+
+    /**
+     * Creates an oplog entry with a recordId for a command operation. The oplog entry will not have
+     * a "ts" or "wall" field. This is used for creating inner ops for applyOps entries.
+     */
+    static std::pair<BSONObj, RecordId> makeCommandOpForApplyOps(
+        boost::optional<UUID> uuid,
+        StringData nss,
+        BSONObj cmdObj,
+        int recordId,
+        boost::optional<BSONObj> o2 = boost::none);
 
 protected:
     // OperationContext provided to test cases for storage layer operations.
@@ -109,30 +157,35 @@ protected:
     // ReplicationProcess used to access consistency markers.
     std::unique_ptr<ReplicationProcess> _replicationProcess;
 
-    // DropPendingCollectionReaper used to clean up and roll back dropped collections.
-    DropPendingCollectionReaper* _dropPendingCollectionReaper = nullptr;
+    ReadWriteConcernDefaultsLookupMock _lookupMock;
+
+    // Increase rollback log component verbosity for unit tests.
+    unittest::MinimumLoggedSeverityGuard severityGuard{logv2::LogComponent::kReplicationRollback,
+                                                       logv2::LogSeverity::Debug(2)};
 };
 
 class RollbackTest::StorageInterfaceRollback : public StorageInterfaceImpl {
 public:
-    void setStableTimestamp(ServiceContext* serviceCtx, Timestamp snapshotName) override {
+    void setStableTimestamp(ServiceContext* serviceCtx,
+                            Timestamp snapshotName,
+                            bool force = false) override {
         stdx::lock_guard<stdx::mutex> lock(_mutex);
         _stableTimestamp = snapshotName;
     }
 
     /**
-     * If '_recoverToTimestampStatus' is non-empty, returns it. If '_recoverToTimestampStatus' is
+     * If '_recoverToTimestampStatus' is non-empty, fasserts. If '_recoverToTimestampStatus' is
      * empty, updates '_currTimestamp' to be equal to '_stableTimestamp' and returns the new value
      * of '_currTimestamp'.
      */
-    StatusWith<Timestamp> recoverToStableTimestamp(OperationContext* opCtx) override {
+    Timestamp recoverToStableTimestamp(OperationContext* opCtx) override {
         stdx::lock_guard<stdx::mutex> lock(_mutex);
         if (_recoverToTimestampStatus) {
-            return _recoverToTimestampStatus.get();
-        } else {
-            _currTimestamp = _stableTimestamp;
-            return _currTimestamp;
+            fassert(4584700, _recoverToTimestampStatus.get());
         }
+
+        _currTimestamp = _stableTimestamp;
+        return _currTimestamp;
     }
 
     bool supportsRecoverToStableTimestamp(ServiceContext* serviceCtx) const override {
@@ -141,6 +194,11 @@ public:
 
     bool supportsRecoveryTimestamp(ServiceContext* serviceCtx) const override {
         return true;
+    }
+
+    boost::optional<Timestamp> getLastStableRecoveryTimestamp(
+        ServiceContext* serviceCtx) const override {
+        return _stableTimestamp;
     }
 
     void setRecoverToTimestampStatus(Status status) {
@@ -163,13 +221,13 @@ public:
      */
     Status setCollectionCount(OperationContext* opCtx,
                               const NamespaceStringOrUUID& nsOrUUID,
-                              long long newCount) {
+                              long long newCount) override {
         stdx::lock_guard<stdx::mutex> lock(_mutex);
         if (_setCollectionCountStatus && _setCollectionCountStatusUUID &&
             nsOrUUID.uuid() == _setCollectionCountStatusUUID) {
             return *_setCollectionCountStatus;
         }
-        _newCounts[nsOrUUID.uuid().get()] = newCount;
+        _newCounts[nsOrUUID.uuid()] = newCount;
         return Status::OK();
     }
 
@@ -220,7 +278,7 @@ public:
      */
     Status setFollowerMode(const MemberState& newState) override;
 
-    Status setFollowerModeStrict(OperationContext* opCtx, const MemberState& newState) override;
+    Status setFollowerModeRollback(OperationContext* opCtx) override;
 
     /**
      * Set this to make transitioning to the given follower mode fail with the given error code.
@@ -244,56 +302,17 @@ public:
     BSONObj getLastOperation() const override;
     BSONObj findOne(const NamespaceString& nss, const BSONObj& filter) const override;
 
-    std::pair<BSONObj, NamespaceString> findOneByUUID(const std::string& db,
+    std::pair<BSONObj, NamespaceString> findOneByUUID(const DatabaseName& db,
                                                       UUID uuid,
                                                       const BSONObj& filter) const override;
 
-    void copyCollectionFromRemote(OperationContext* opCtx,
-                                  const NamespaceString& nss) const override;
-    StatusWith<BSONObj> getCollectionInfoByUUID(const std::string& db,
+    StatusWith<BSONObj> getCollectionInfoByUUID(const DatabaseName& dbName,
                                                 const UUID& uuid) const override;
     StatusWith<BSONObj> getCollectionInfo(const NamespaceString& nss) const override;
 
 private:
     std::unique_ptr<OplogInterface> _oplog;
     HostAndPort _source;
-};
-
-/**
- * Test fixture to ensure that rollback re-syncs collection options from a sync source and updates
- * the local collection options correctly. A test operates on a single test collection, and is
- * parameterized on two arguments:
- *
- * 'localCollOptions': the collection options that the local test collection is initially created
- * with.
- *
- * 'remoteCollOptionsObj': the collection options object that the sync source will respond with to
- * the rollback node when it fetches collection metadata.
- *
- * If no command is provided, a collMod operation with a 'noPadding' argument is used to trigger a
- * collection metadata resync, since the rollback of collMod operations does not take into account
- * the actual command object. It simply re-syncs all the collection options.
- */
-class RollbackResyncsCollectionOptionsTest : public RollbackTest {
-
-    class RollbackSourceWithCollectionOptions : public RollbackSourceMock {
-    public:
-        RollbackSourceWithCollectionOptions(std::unique_ptr<OplogInterface> oplog,
-                                            BSONObj collOptionsObj);
-
-        StatusWith<BSONObj> getCollectionInfoByUUID(const std::string& db,
-                                                    const UUID& uuid) const override;
-
-        BSONObj collOptionsObj;
-    };
-
-public:
-    void resyncCollectionOptionsTest(CollectionOptions localCollOptions,
-                                     BSONObj remoteCollOptionsObj,
-                                     BSONObj collModCmd,
-                                     std::string collName);
-    void resyncCollectionOptionsTest(CollectionOptions localCollOptions,
-                                     BSONObj remoteCollOptionsObj);
 };
 
 }  // namespace repl

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,18 +27,11 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <string>
 
 #include "mongo/db/fts/fts_unicode_tokenizer.h"
-
-#include "mongo/db/fts/fts_query_impl.h"
-#include "mongo/db/fts/fts_spec.h"
 #include "mongo/db/fts/stemmer.h"
 #include "mongo/db/fts/stop_words.h"
-#include "mongo/db/fts/tokenizer.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/util/mongoutils/str.h"
-#include "mongo/util/stringutils.h"
 
 namespace mongo {
 namespace fts {

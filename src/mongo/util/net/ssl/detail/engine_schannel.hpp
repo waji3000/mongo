@@ -37,6 +37,7 @@
 #include "mongo/util/net/ssl/detail/schannel.hpp"
 #include "mongo/util/net/ssl/stream_base.hpp"
 
+// This must be after all other includes
 #include "asio/detail/push_options.hpp"
 
 namespace asio {
@@ -102,6 +103,9 @@ public:
     // the type and state of the SSL session. Returns a const reference to the
     // error code object, suitable for passing to a completion handler.
     ASIO_DECL const asio::error_code& map_error_code(asio::error_code& ec) const;
+
+    // Returns the SNI from the handshake manager.
+    boost::optional<std::string> get_sni() const;
 
 private:
     // Disallow copying and assignment.

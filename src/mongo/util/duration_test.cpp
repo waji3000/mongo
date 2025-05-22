@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,9 +27,9 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <fmt/format.h>
+#include <memory>
 
-#include "mongo/stdx/chrono.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/duration.h"
 
@@ -147,6 +146,28 @@ TEST(DurationCast, OverflowingCastsThrow) {
                        ErrorCodes::DurationOverflow);
 }
 
+TEST(DurationCast, DurationCastConstexpr) {
+    // Converting from one Duration period to another is constexpr.
+    {
+        constexpr auto ms = duration_cast<Milliseconds>(Seconds(2));
+        ASSERT_EQ(2000, ms.count());
+        constexpr auto secs = duration_cast<Seconds>(ms);
+        ASSERT_EQ(2, secs.count());
+    }
+
+    // Converting from stdx::chrono::duration to Duration is constexpr.
+    {
+        constexpr auto ms = duration_cast<Milliseconds>(stdx::chrono::seconds(2));
+        ASSERT_EQ(2000, ms.count());
+    }
+
+    // Test implicit conversion constructor.
+    {
+        constexpr Milliseconds ms = Seconds(2);
+        ASSERT_EQ(2000, ms.count());
+    }
+}
+
 TEST(DurationCast, ImplicitConversionToStdxDuration) {
     auto standardMillis = Milliseconds{10}.toSystemDuration();
     ASSERT_EQUALS(Milliseconds{10}, duration_cast<Milliseconds>(standardMillis));
@@ -211,7 +232,7 @@ TEST(DurationArithmetic, MultiplyNoOverflowSucceds) {
     ASSERT_EQ(Milliseconds{150}, Milliseconds{15} * 10);
 }
 
-TEST(DurationArithmetic, MultilpyOverflowThrows) {
+TEST(DurationArithmetic, MultiplyOverflowThrows) {
     ASSERT_THROWS_CODE(Milliseconds::max() * 2, AssertionException, ErrorCodes::DurationOverflow);
     ASSERT_THROWS_CODE(2 * Milliseconds::max(), AssertionException, ErrorCodes::DurationOverflow);
     ASSERT_THROWS_CODE(Milliseconds::max() * -2, AssertionException, ErrorCodes::DurationOverflow);
@@ -224,6 +245,40 @@ TEST(DurationArithmetic, DivideNoOverflowSucceeds) {
 
 TEST(DurationArithmetic, DivideOverflowThrows) {
     ASSERT_THROWS_CODE(Milliseconds::min() / -1, AssertionException, ErrorCodes::DurationOverflow);
+}
+
+/** Calls `deduceChronoDuration<Period>(in)`, asserts that it returns `equivalent`. */
+template <typename Period = void, typename In, typename Equivalent>
+auto validateDeduce(In in, Equivalent equivalent) {
+    static constexpr bool useDefaultPeriod = std::is_same_v<Period, void>;
+    using OutPeriod = std::conditional_t<useDefaultPeriod, std::ratio<1>, Period>;
+    auto deduced = [&] {
+        if constexpr (useDefaultPeriod) {
+            return deduceChronoDuration(in);
+        } else {
+            return deduceChronoDuration<Period>(in);
+        }
+    }();
+    ASSERT((std::is_same_v<decltype(deduced), Equivalent>)) << fmt::format(
+        "expected:{}got:{}", demangleName(typeid(Equivalent)), demangleName(typeid(deduced)));
+    ASSERT_EQ(deduced.count(), equivalent.count())
+        << fmt::format("in:{}, equivalent:{}, deduced:{}", in, equivalent.count(), deduced.count());
+}
+
+TEST(DeduceChronoDuration, DefaultPeriod) {
+    validateDeduce(3600, stdx::chrono::duration<int>(3600));
+    validateDeduce(3600, stdx::chrono::duration<int>(3600));
+    validateDeduce((short)3600, stdx::chrono::duration<short>(3600));
+    validateDeduce(3600u, stdx::chrono::duration<unsigned>(3600));
+    validateDeduce(3600., stdx::chrono::duration<double>(3600));
+    validateDeduce(3600.5, stdx::chrono::duration<double>(3600.5));
+    validateDeduce(-3600.5, stdx::chrono::duration<double>(-3600.5));
+}
+
+TEST(DeduceChronoDuration, ExplicitPeriod) {
+    validateDeduce<std::milli>(123, stdx::chrono::duration<int, std::milli>(123));
+    validateDeduce<std::nano>(123, stdx::chrono::duration<int, std::nano>(123));
+    validateDeduce<std::ratio<45, 123>>(50, stdx::chrono::duration<int, std::ratio<45, 123>>(50));
 }
 
 }  // namespace

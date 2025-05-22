@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,10 +27,7 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include "mongo/util/periodic_runner_factory.h"
-
 #include "mongo/db/service_context.h"
 #include "mongo/util/periodic_runner_impl.h"
 
@@ -41,4 +37,4 @@ std::unique_ptr<PeriodicRunner> makePeriodicRunner(ServiceContext* svc) {
     return std::make_unique<PeriodicRunnerImpl>(svc, svc->getPreciseClockSource());
 }
 
-}  // namespace
+}  // namespace mongo

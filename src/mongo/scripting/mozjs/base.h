@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,6 +29,12 @@
 
 #pragma once
 
+#include <js/CallArgs.h>
+#include <js/Class.h>
+#include <js/Id.h>
+#include <js/PropertySpec.h>
+#include <js/TracingAPI.h>
+#include <js/TypeDecls.h>
 #include <jsapi.h>
 
 namespace mongo {
@@ -60,6 +65,7 @@ struct BaseInfo {
     static const JSFunctionSpec* freeFunctions;
     static const JSFunctionSpec* methods;
     static const unsigned classFlags = 0;
+    static constexpr uint32_t finalizeFlag = JSCLASS_FOREGROUND_FINALIZE;
     static void addProperty(JSContext* cx,
                             JS::HandleObject obj,
                             JS::HandleId id,
@@ -72,25 +78,25 @@ struct BaseInfo {
                             JS::ObjectOpResult& result);
     static void enumerate(JSContext* cx,
                           JS::HandleObject obj,
-                          JS::AutoIdVector& properties,
+                          JS::MutableHandleIdVector properties,
                           bool enumerableOnly);
-    static void finalize(JSFreeOp* fop, JSObject* obj);
+    static void finalize(JS::GCContext* gcCtx, JSObject* obj);
     static void getProperty(JSContext* cx,
                             JS::HandleObject obj,
                             JS::HandleId id,
+                            JS::HandleValue receiver,
                             JS::MutableHandleValue vp);
-    static void hasInstance(JSContext* cx,
-                            JS::HandleObject obj,
-                            JS::MutableHandleValue vp,
-                            bool* bp);
+
     static bool mayResolve(const JSAtomState& names, jsid id, JSObject* maybeObj);
     static void postInstall(JSContext* cx, JS::HandleObject global, JS::HandleObject proto);
     static void resolve(JSContext* cx, JS::HandleObject obj, JS::HandleId id, bool* resolvedp);
     static void setProperty(JSContext* cx,
                             JS::HandleObject obj,
                             JS::HandleId id,
-                            JS::MutableHandleValue vp,
+                            JS::HandleValue v,
+                            JS::HandleValue receiver,
                             JS::ObjectOpResult& result);
+    static void trace(JSTracer* trc, JSObject* obj);
 };
 
 }  // namespace mozjs

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,44 +27,77 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <absl/container/node_hash_map.h>
+#include <absl/meta/type_traits.h>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
 
-#include "mongo/db/pipeline/document_source.h"
-
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/feature_flag.h"
 #include "mongo/db/matcher/expression_algo.h"
+#include "mongo/db/pipeline/change_stream_constants.h"
+#include "mongo/db/pipeline/document_source.h"
+#include "mongo/db/pipeline/document_source_group.h"
 #include "mongo/db/pipeline/document_source_match.h"
+#include "mongo/db/pipeline/document_source_redact.h"
 #include "mongo/db/pipeline/document_source_sample.h"
-#include "mongo/db/pipeline/document_source_sequential_document_cache.h"
+#include "mongo/db/pipeline/document_source_single_document_transformation.h"
 #include "mongo/db/pipeline/expression_context.h"
-#include "mongo/db/pipeline/field_path.h"
-#include "mongo/db/pipeline/value.h"
+#include "mongo/db/query/explain_options.h"
+#include "mongo/logv2/log.h"
+#include "mongo/util/duration.h"
 #include "mongo/util/string_map.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
+
 
 namespace mongo {
 
-using Parser = DocumentSource::Parser;
 using boost::intrusive_ptr;
-using std::list;
-using std::string;
-using std::vector;
 
-DocumentSource::DocumentSource(const intrusive_ptr<ExpressionContext>& pCtx)
-    : pSource(NULL), pExpCtx(pCtx) {}
+StringMap<DocumentSource::ParserRegistration> DocumentSource::parserMap;
 
-namespace {
-// Used to keep track of which DocumentSources are registered under which name.
-static StringMap<Parser> parserMap;
-}  // namespace
+DocumentSource::DocumentSource(StringData stageName, const intrusive_ptr<ExpressionContext>& pCtx)
+    : Stage(stageName, pCtx) {}
 
-void DocumentSource::registerParser(string name, Parser parser) {
+void DocumentSource::registerParser(std::string name, Parser parser, FeatureFlag* featureFlag) {
     auto it = parserMap.find(name);
     massert(28707,
             str::stream() << "Duplicate document source (" << name << ") registered.",
             it == parserMap.end());
-    parserMap[name] = parser;
+    parserMap[std::move(name)] = {std::move(parser), featureFlag};
 }
 
-list<intrusive_ptr<DocumentSource>> DocumentSource::parse(
+void DocumentSource::registerParser(std::string name,
+                                    SimpleParser simpleParser,
+                                    FeatureFlag* featureFlag) {
+
+    Parser parser = [simpleParser = std::move(simpleParser)](
+                        BSONElement stageSpec, const intrusive_ptr<ExpressionContext>& expCtx)
+        -> std::list<intrusive_ptr<DocumentSource>> {
+        return {simpleParser(std::move(stageSpec), expCtx)};
+    };
+    return registerParser(std::move(name), std::move(parser), std::move(featureFlag));
+}
+
+DocumentSource::Id DocumentSource::allocateId(StringData name) {
+    static AtomicWord<Id> next{kUnallocatedId + 1};
+    auto id = next.fetchAndAdd(1);
+    LOGV2_DEBUG(9901900, 5, "Allocating DocumentSourceId", "id"_attr = id, "name"_attr = name);
+    return id;
+}
+
+bool DocumentSource::hasQuery() const {
+    return false;
+}
+
+BSONObj DocumentSource::getQuery() const {
+    MONGO_UNREACHABLE;
+}
+
+std::list<intrusive_ptr<DocumentSource>> DocumentSource::parse(
     const intrusive_ptr<ExpressionContext>& expCtx, BSONObj stageObj) {
     uassert(16435,
             "A pipeline stage specification object must contain exactly one field.",
@@ -80,12 +112,12 @@ list<intrusive_ptr<DocumentSource>> DocumentSource::parse(
             str::stream() << "Unrecognized pipeline stage name: '" << stageName << "'",
             it != parserMap.end());
 
-    return it->second(stageSpec, expCtx);
-}
+    auto& entry = it->second;
+    if (entry.featureFlag) {
+        expCtx->ignoreFeatureInParserOrRejectAndThrow(stageName, *entry.featureFlag);
+    }
 
-const char* DocumentSource::getSourceName() const {
-    static const char unknown[] = "[UNKNOWN]";
-    return unknown;
+    return it->second.parser(stageSpec, expCtx);
 }
 
 intrusive_ptr<DocumentSource> DocumentSource::optimize() {
@@ -95,154 +127,112 @@ intrusive_ptr<DocumentSource> DocumentSource::optimize() {
 namespace {
 
 /**
- * Given a set of paths 'dependencies', determines which of those paths will be modified if all
- * paths except those in 'preservedPaths' are modified.
+ * Verifies whether or not a $group is able to swap with a succeeding $match stage. While ordinarily
+ * $group can swap with a $match, it cannot if the following $match has exactly one field as the
+ * $group key and either:
+ *     (1) an $exists predicate on _id
+ *     (2) a $type predicate on _id
  *
- * For example, extractModifiedDependencies({'a', 'b', 'c.d', 'e'}, {'a', 'b.c', c'}) returns
- * {'b', 'e'}, since 'b' and 'e' are not preserved (only 'b.c' is preserved).
- */
-std::set<std::string> extractModifiedDependencies(const std::set<std::string>& dependencies,
-                                                  const std::set<std::string>& preservedPaths) {
-    std::set<std::string> modifiedDependencies;
+ * For $exists, every document will have an _id field following such a $group stage, including those
+ * whose group key was missing before the $group. As an example, the following optimization would be
+ * incorrect as the post-optimization pipeline would handle documents that had nullish _id fields
+ * differently. Thus, given such a $group and $match, this function would return false.
+ *   {$group: {_id: "$x"}}
+ *   {$match: {_id: {$exists: true}}
+ * ---->
+ *   {$match: {x: {$exists: true}}
+ *   {$group: {_id: "$x"}}
 
-    // The modified dependencies is *almost* the set difference 'dependencies' - 'preservedPaths',
-    // except that if p in 'preservedPaths' is a "path prefix" of d in 'dependencies', then 'd'
-    // should not be included in the modified dependencies.
-    for (auto&& dependency : dependencies) {
-        bool preserved = false;
-        auto firstField = FieldPath::extractFirstFieldFromDottedPath(dependency).toString();
-        // If even a prefix is preserved, the path is preserved, so search for any prefixes of
-        // 'dependency' as well. 'preservedPaths' is an *ordered* set, so we only have to search the
-        // range ['firstField', 'dependency'] to find any prefixes of 'dependency'.
-        for (auto it = preservedPaths.lower_bound(firstField);
-             it != preservedPaths.upper_bound(dependency);
-             ++it) {
-            if (*it == dependency || expression::isPathPrefixOf(*it, dependency)) {
-                preserved = true;
-                break;
-            }
-        }
-        if (!preserved) {
-            modifiedDependencies.insert(dependency);
-        }
+ * For $type, the $type operator can distinguish between values that compare equal in the $group
+ * stage, meaning documents that are regarded unequally in the $match stage are equated in the
+ * $group stage. This leads to varied results depending on the order of the $match and $group.
+ */
+bool groupMatchSwapVerified(const DocumentSourceMatch& nextMatch,
+                            const DocumentSourceGroup& thisGroup) {
+    if (thisGroup.getIdFields().size() != 1) {
+        return true;
     }
-    return modifiedDependencies;
+    return !expression::hasExistenceOrTypePredicateOnPath(*(nextMatch.getMatchExpression()),
+                                                          "_id"_sd);
 }
 
 /**
- * Returns a pair of pointers to $match stages, either of which can be null. The first entry in the
- * pair is a $match stage that can be moved before this stage, the second is a $match stage that
- * must remain after this stage.
+ * Returns 'true' if the given stage is an internal change stream stage that can appear in a router
+ * (mongoS) pipeline, or 'false' otherwise.
  */
-std::pair<boost::intrusive_ptr<DocumentSourceMatch>, boost::intrusive_ptr<DocumentSourceMatch>>
-splitMatchByModifiedFields(const boost::intrusive_ptr<DocumentSourceMatch>& match,
-                           const DocumentSource::GetModPathsReturn& modifiedPathsRet) {
-    // Attempt to move some or all of this $match before this stage.
-    std::set<std::string> modifiedPaths;
-    switch (modifiedPathsRet.type) {
-        case DocumentSource::GetModPathsReturn::Type::kNotSupported:
-            // We don't know what paths this stage might modify, so refrain from swapping.
-            return {nullptr, match};
-        case DocumentSource::GetModPathsReturn::Type::kAllPaths:
-            // This stage modifies all paths, so cannot be swapped with a $match at all.
-            return {nullptr, match};
-        case DocumentSource::GetModPathsReturn::Type::kFiniteSet:
-            modifiedPaths = std::move(modifiedPathsRet.paths);
-            break;
-        case DocumentSource::GetModPathsReturn::Type::kAllExcept: {
-            DepsTracker depsTracker;
-            match->getDependencies(&depsTracker);
-
-            auto preservedPaths = modifiedPathsRet.paths;
-            for (auto&& rename : modifiedPathsRet.renames) {
-                preservedPaths.insert(rename.first);
-            }
-            modifiedPaths = extractModifiedDependencies(depsTracker.fields, preservedPaths);
-        }
-    }
-    return match->splitSourceBy(modifiedPaths, modifiedPathsRet.renames);
+bool isChangeStreamRouterPipelineStage(StringData stageName) {
+    return change_stream_constants::kChangeStreamRouterPipelineStages.contains(stageName);
 }
-
-/**
- * If 'pathOfInterest' or some path prefix of 'pathOfInterest' is renamed, returns the new name for
- * 'pathOfInterest', otherwise returns boost::none.
- * For example, if 'renamedPaths' is {"c.d", "c"}, and 'pathOfInterest' is "c.d.f", returns "c.f".
- */
-boost::optional<std::string> findNewName(const StringMap<std::string>& renamedPaths,
-                                         std::string pathOfInterest) {
-    FieldPath fullPathOfInterest(pathOfInterest);
-    StringBuilder toLookup;
-    std::size_t pathIndex = 0;
-    while (pathIndex < fullPathOfInterest.getPathLength()) {
-        if (pathIndex != 0) {
-            toLookup << ".";
-        }
-        toLookup << fullPathOfInterest.getFieldName(pathIndex++);
-
-        auto it = renamedPaths.find(toLookup.stringData());
-        if (it != renamedPaths.end()) {
-            const auto& newPathOfPrefix = it->second;
-            // We found a rename! Note this might be a rename of the prefix of the path, so we have
-            // to add back on the suffix that was unchanged.
-            StringBuilder renamedPath;
-            renamedPath << newPathOfPrefix;
-            while (pathIndex < fullPathOfInterest.getPathLength()) {
-                renamedPath << "." << fullPathOfInterest.getFieldName(pathIndex++);
-            }
-            return {renamedPath.str()};
-        }
-    }
-    return boost::none;
-}
-
-StringMap<std::string> computeNewNamesAssumingAnyPathsNotRenamedAreUnmodified(
-    const StringMap<std::string>& renamedPaths, const std::set<std::string>& pathsOfInterest) {
-    StringMap<std::string> renameOut;
-    for (auto&& ofInterest : pathsOfInterest) {
-        if (auto newName = findNewName(renamedPaths, ofInterest)) {
-            renameOut[ofInterest] = *newName;
-        } else {
-            // This path was not renamed, assume it was unchanged and map it to itself.
-            renameOut[ofInterest] = ofInterest;
-        }
-    }
-    return renameOut;
-}
-
 }  // namespace
 
 bool DocumentSource::pushMatchBefore(Pipeline::SourceContainer::iterator itr,
                                      Pipeline::SourceContainer* container) {
-    auto nextMatch = dynamic_cast<DocumentSourceMatch*>((*std::next(itr)).get());
-    if (constraints().canSwapWithMatch && nextMatch && !nextMatch->isTextQuery()) {
-        // We're allowed to swap with a $match and the stage after us is a $match. Furthermore, the
-        // $match does not contain a text search predicate, which we do not attempt to optimize
-        // because such a $match must already be the first stage in the pipeline. We can attempt to
-        // swap the $match or part of the $match before ourselves.
-        auto splitMatch = splitMatchByModifiedFields(nextMatch, getModifiedPaths());
-        invariant(splitMatch.first || splitMatch.second);
-
-        if (splitMatch.first) {
-            // At least part of the $match can be moved before this stage. Erase the original $match
-            // and put the independent part before this stage. If splitMatch.second is not null,
-            // then there is a new $match stage to insert after ourselves which is dependent on the
-            // modified fields.
-            container->erase(std::next(itr));
-            container->insert(itr, std::move(splitMatch.first));
-            if (splitMatch.second) {
-                container->insert(std::next(itr), std::move(splitMatch.second));
-            }
-
-            return true;
-        }
+    if (!constraints().canSwapWithMatch) {
+        return false;
     }
-    return false;
+
+    auto nextStageAsMatch = dynamic_cast<DocumentSourceMatch*>((*std::next(itr)).get());
+    if (!nextStageAsMatch || nextStageAsMatch->isTextQuery()) {
+        // We do not need to attempt this optimization if the $match contains a text search
+        // predicate because, in that scenario, $match is already required to be the first stage in
+        // the pipeline.
+        return false;
+    }
+
+    // At this point:
+    // 1) The next stage after 'this' is $match.
+    // 2) The $match stage does not contain a text search predicate.
+
+    // TODO SERVER-55492: Remove the following workaround when there are rename checks for 'other'
+    // match expressions.
+    if (isChangeStreamRouterPipelineStage(this->getSourceName())) {
+        // Always move the $match stage ahead of internal change stream stages appearing in the
+        // router (mongoS) pipeline, because they do not access or modify any paths in the input
+        // document.
+        container->splice(itr, *container, std::next(itr));
+        return true;
+    }
+
+    auto thisStageAsGroup = dynamic_cast<DocumentSourceGroup*>(this);
+    if (thisStageAsGroup && !groupMatchSwapVerified(*nextStageAsMatch, *thisStageAsGroup)) {
+        return false;
+    }
+
+    auto [renameableMatchPart, nonRenameableMatchPart] =
+        DocumentSourceMatch::splitMatchByModifiedFields(nextStageAsMatch, getModifiedPaths());
+    invariant(renameableMatchPart || nonRenameableMatchPart);
+    if (!renameableMatchPart) {
+        return false;
+    }
+
+    LOGV2_DEBUG(5943503,
+                5,
+                "Swapping all or part of a $match stage in front of another stage: ",
+                "matchMovingBefore"_attr = redact(renameableMatchPart->serializeToBSONForDebug()),
+                "thisStage"_attr = redact(serializeToBSONForDebug()),
+                "matchLeftAfter"_attr = redact(
+                    nonRenameableMatchPart ? nonRenameableMatchPart->serializeToBSONForDebug()
+                                           : BSONObj()));
+
+    // At this point we know that at least part of the $match expression can be moved ahead of
+    // 'this'. So, we erase the original $match and move that renameable part ahead of 'this' stage.
+    container->erase(std::next(itr));
+    container->insert(itr, std::move(renameableMatchPart));
+
+    // If 'nonRenameableMatchPart' is not null, the 'renameableMatchPart' of the $match expression
+    // was only one component of the original $match. So, we need to create a new $match stage for
+    // the remaining 'nonRenameableMatchPart' and insert it after 'this' - effectively keeping it in
+    // its original position in the pipeline.
+    if (nonRenameableMatchPart) {
+        container->insert(std::next(itr), std::move(nonRenameableMatchPart));
+    }
+    return true;
 }
 
 bool DocumentSource::pushSampleBefore(Pipeline::SourceContainer::iterator itr,
                                       Pipeline::SourceContainer* container) {
     auto nextSample = dynamic_cast<DocumentSourceSample*>((*std::next(itr)).get());
-    if (constraints().canSwapWithLimitAndSample && nextSample) {
+    if (constraints().canSwapWithSkippingOrLimitingStage && nextSample) {
 
         container->insert(itr, std::move(nextSample));
         container->erase(std::next(itr));
@@ -252,19 +242,52 @@ bool DocumentSource::pushSampleBefore(Pipeline::SourceContainer::iterator itr,
     return false;
 }
 
+BSONObj DocumentSource::serializeToBSONForDebug() const {
+    std::vector<Value> serialized;
+    auto opts = SerializationOptions{
+        .verbosity = boost::make_optional(ExplainOptions::Verbosity::kQueryPlanner)};
+    serializeToArray(serialized, opts);
+    if (serialized.empty()) {
+        LOGV2_DEBUG(5943501,
+                    5,
+                    "warning: stage did not serialize to anything as it was trying to be printed "
+                    "for debugging");
+        return BSONObj();
+    }
+    if (serialized.size() > 1) {
+        LOGV2_DEBUG(5943502, 5, "stage serialized to multiple stages. Ignoring all but the first");
+    }
+    return serialized[0].getDocument().toBson();
+}
+
+bool DocumentSource::pushSingleDocumentTransformOrRedactBefore(
+    Pipeline::SourceContainer::iterator itr, Pipeline::SourceContainer* container) {
+    if (constraints().canSwapWithSingleDocTransformOrRedact) {
+        auto nextItr = std::next(itr);
+        if (dynamic_cast<DocumentSourceSingleDocumentTransformation*>(nextItr->get()) ||
+            dynamic_cast<DocumentSourceRedact*>(nextItr->get())) {
+            LOGV2_DEBUG(5943500,
+                        5,
+                        "Pushing a single document transform stage or a redact stage in ahead of "
+                        "the current stage: ",
+                        "singleDocTransformOrRedactStage"_attr =
+                            redact((*nextItr)->serializeToBSONForDebug()),
+                        "currentStage"_attr = redact(serializeToBSONForDebug()));
+
+            // Swap 'itr' and 'nextItr' list nodes.
+            container->splice(itr, *container, nextItr);
+            return true;
+        }
+    }
+    return false;
+}
+
 Pipeline::SourceContainer::iterator DocumentSource::optimizeAt(
     Pipeline::SourceContainer::iterator itr, Pipeline::SourceContainer* container) {
     invariant(*itr == this);
 
-    // If we are at the end of the pipeline, only optimize in the special case of a cache stage.
-    if (std::next(itr) == container->end()) {
-        return dynamic_cast<DocumentSourceSequentialDocumentCache*>(this)
-            ? doOptimizeAt(itr, container)
-            : container->end();
-    }
-
-    // Attempt to swap 'itr' with a subsequent $match or subsequent $sample.
-    if (pushMatchBefore(itr, container) || pushSampleBefore(itr, container)) {
+    // Attempt to swap 'itr' with a subsequent stage, if applicable.
+    if (attemptToPushStageBefore(itr, container)) {
         // The stage before the pushed before stage may be able to optimize further, if there is
         // such a stage.
         return std::prev(itr) == container->begin() ? std::prev(itr) : std::prev(std::prev(itr));
@@ -273,107 +296,20 @@ Pipeline::SourceContainer::iterator DocumentSource::optimizeAt(
     return doOptimizeAt(itr, container);
 }
 
-boost::optional<StringMap<std::string>> DocumentSource::renamedPaths(
-    const std::set<std::string>& pathsOfInterest) const {
-    auto modifiedPathsRet = this->getModifiedPaths();
-    switch (modifiedPathsRet.type) {
-        case DocumentSource::GetModPathsReturn::Type::kNotSupported:
-        case DocumentSource::GetModPathsReturn::Type::kAllPaths:
-            return boost::none;
-        case DocumentSource::GetModPathsReturn::Type::kFiniteSet: {
-            for (auto&& modified : modifiedPathsRet.paths) {
-                for (auto&& ofInterest : pathsOfInterest) {
-                    // Any overlap of the path means the path of interest is not preserved. For
-                    // example, if the path of interest is "a.b", then a modified path of "a",
-                    // "a.b", or "a.b.c" would all signal that "a.b" is not preserved.
-                    if (ofInterest == modified ||
-                        expression::isPathPrefixOf(ofInterest, modified) ||
-                        expression::isPathPrefixOf(modified, ofInterest)) {
-                        // This stage modifies at least one of the fields which the caller is
-                        // interested in, bail out.
-                        return boost::none;
-                    }
-                }
-            }
-
-            // None of the paths of interest were modified, construct the result map, mapping
-            // the names after this stage to the names before this stage.
-            return computeNewNamesAssumingAnyPathsNotRenamedAreUnmodified(modifiedPathsRet.renames,
-                                                                          pathsOfInterest);
-        }
-        case DocumentSource::GetModPathsReturn::Type::kAllExcept: {
-            auto preservedPaths = modifiedPathsRet.paths;
-            for (auto&& rename : modifiedPathsRet.renames) {
-                // For the purposes of checking which paths are modified, consider renames to
-                // preserve the path. We'll circle back later to figure out the new name if
-                // appropriate.
-                preservedPaths.insert(rename.first);
-            }
-            auto modifiedPaths = extractModifiedDependencies(pathsOfInterest, preservedPaths);
-            if (modifiedPaths.empty()) {
-                return computeNewNamesAssumingAnyPathsNotRenamedAreUnmodified(
-                    modifiedPathsRet.renames, pathsOfInterest);
-            }
-            return boost::none;
-        }
-    }
-    MONGO_UNREACHABLE;
-}
-
-void DocumentSource::serializeToArray(vector<Value>& array,
-                                      boost::optional<ExplainOptions::Verbosity> explain) const {
-    Value entry = serialize(explain);
+void DocumentSource::serializeToArray(std::vector<Value>& array,
+                                      const SerializationOptions& opts) const {
+    Value entry = serialize(opts);
     if (!entry.missing()) {
-        array.push_back(entry);
+        array.push_back(std::move(entry));
     }
 }
 
-BSONObjSet DocumentSource::allPrefixes(BSONObj obj) {
-    BSONObjSet out = SimpleBSONObjComparator::kInstance.makeBSONObjSet();
-
-    BSONObj last = {};
-    for (auto&& field : obj) {
-        BSONObjBuilder builder(last.objsize() + field.size());
-        builder.appendElements(last);
-        builder.append(field);
-        last = builder.obj();
-        out.insert(last);
-    }
-
-    return out;
-}
-
-BSONObjSet DocumentSource::truncateSortSet(const BSONObjSet& sorts,
-                                           const std::set<std::string>& fields) {
-    BSONObjSet out = SimpleBSONObjComparator::kInstance.makeBSONObjSet();
-
-    for (auto&& sort : sorts) {
-        BSONObjBuilder outputSort;
-
-        for (auto&& key : sort) {
-            auto keyName = key.fieldNameStringData();
-
-            bool shouldAppend = true;
-            for (auto&& field : fields) {
-                if (keyName == field || keyName.startsWith(field + '.')) {
-                    shouldAppend = false;
-                    break;
-                }
-            }
-
-            if (!shouldAppend) {
-                break;
-            }
-
-            outputSort.append(key);
-        }
-
-        BSONObj outSortObj = outputSort.obj();
-        if (!outSortObj.isEmpty()) {
-            out.insert(outSortObj);
-        }
-    }
-
-    return out;
-}
+MONGO_INITIALIZER_GROUP(BeginDocumentSourceRegistration,
+                        ("default"),
+                        ("EndDocumentSourceRegistration"))
+MONGO_INITIALIZER_GROUP(EndDocumentSourceRegistration, ("BeginDocumentSourceRegistration"), ())
+MONGO_INITIALIZER_GROUP(BeginDocumentSourceIdAllocation,
+                        ("default"),
+                        ("EndDocumentSourceIdAllocation"))
+MONGO_INITIALIZER_GROUP(EndDocumentSourceIdAllocation, ("BeginDocumentSourceIdAllocation"), ())
 }  // namespace mongo

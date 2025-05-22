@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,8 +27,15 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <memory>
 
+#ifndef _WIN32
+#include <pthread.h>
+#endif
+
+#include "mongo/base/string_data.h"
 #include "mongo/platform/stack_locator.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/unittest/unittest.h"
@@ -50,12 +56,12 @@ TEST(StackLocator, StacLocatorFindsStackOfTestExecutorThread) {
 
     const auto available = locator.available();
     ASSERT_TRUE(available);
-    ASSERT_TRUE(available.get() > 0);
+    ASSERT_TRUE(available.value() > 0);
 
     const auto size = locator.size();
     ASSERT_TRUE(size);
-    ASSERT_TRUE(size.get() > 0);
-    ASSERT_TRUE(size.get() > available.get());
+    ASSERT_TRUE(size.value() > 0);
+    ASSERT_TRUE(size.value() > available.value());
 }
 
 TEST(StackLocator, StacksGrowsDown) {
@@ -102,7 +108,7 @@ struct LocatorThreadHelper {
         const StackLocator locator;
         located = static_cast<bool>(locator.available());
         if (located)
-            size = locator.size().get();
+            size = locator.size().value();
     }
 
     bool located = false;

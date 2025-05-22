@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,12 +29,20 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
 #include <boost/optional.hpp>
-#include <regex>
+#include <boost/optional/optional.hpp>
+#include <memory>
+#include <string>
+#include <utility>
 
 #include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
 #include "mongo/db/matcher/expression.h"
 #include "mongo/db/pipeline/expression_context.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 
@@ -46,8 +53,6 @@ namespace mongo {
 class ExpressionWithPlaceholder {
 
 public:
-    static const std::regex placeholderRegex;
-
     /**
      * Constructs an ExpressionWithPlaceholder from an existing match expression. Returns a non-OK
      * status if the paths inside the match expression do not name a consistent placeholder string.
@@ -70,15 +75,6 @@ public:
     bool equivalent(const ExpressionWithPlaceholder* other) const;
 
     /**
-     * Uses this filter to match against 'elem' as if it is wrapped in a BSONObj with a single
-     * field whose name is given by getPlaceholder(). If the placeholder name does not exist, then
-     * the filter expression does not refer to any specific paths.
-     */
-    bool matchesBSONElement(BSONElement elem, MatchDetails* details = nullptr) const {
-        return _filter->matchesBSONElement(elem, details);
-    }
-
-    /**
      * If this object has a placeholder, returns a view of the placeholder as a StringData.
      */
     boost::optional<StringData> getPlaceholder() const {
@@ -92,8 +88,12 @@ public:
         return _filter.get();
     }
 
-    std::unique_ptr<ExpressionWithPlaceholder> shallowClone() const {
-        return stdx::make_unique<ExpressionWithPlaceholder>(_placeholder, _filter->shallowClone());
+    void resetFilter(MatchExpression* other) {
+        _filter.reset(other);
+    }
+
+    std::unique_ptr<ExpressionWithPlaceholder> clone() const {
+        return std::make_unique<ExpressionWithPlaceholder>(_placeholder, _filter->clone());
     }
 
     /*

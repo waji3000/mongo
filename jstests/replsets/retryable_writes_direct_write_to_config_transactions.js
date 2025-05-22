@@ -1,106 +1,84 @@
 // Validates the expected behaviour of direct writes against the `config.transactions` collection
-(function() {
-    'use strict';
+// Direct writes to config.transactions cannot be part of a session.
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
-    // Direct writes to config.transactions cannot be part of a session.
-    TestData.disableImplicitSessions = true;
+TestData.disableImplicitSessions = true;
 
-    load("jstests/libs/retryable_writes_util.js");
+var replTest = new ReplSetTest({nodes: 2});
+replTest.startSet();
+replTest.initiate();
 
-    if (!RetryableWritesUtil.storageEngineSupportsRetryableWrites(jsTest.options().storageEngine)) {
-        jsTestLog("Retryable writes are not supported, skipping test");
-        return;
-    }
+var priConn = replTest.getPrimary();
+var db = priConn.getDB('TestDB');
+var config = priConn.getDB('config');
 
-    var replTest = new ReplSetTest({nodes: 2});
-    replTest.startSet();
-    replTest.initiate();
+assert.commandWorked(db.user.insert({_id: 0}));
+assert.commandWorked(db.user.insert({_id: 1}));
 
-    var priConn = replTest.getPrimary();
-    var db = priConn.getDB('TestDB');
-    var config = priConn.getDB('config');
+const lsid1 = UUID();
+const lsid2 = UUID();
 
-    assert.writeOK(db.user.insert({_id: 0}));
-    assert.writeOK(db.user.insert({_id: 1}));
+const cmdObj1 = {
+    update: 'user',
+    updates: [{q: {_id: 0}, u: {$inc: {x: 1}}}],
+    lsid: {id: lsid1},
+    txnNumber: NumberLong(1)
+};
+assert.commandWorked(db.runCommand(cmdObj1));
+assert.eq(1, db.user.find({_id: 0}).toArray()[0].x);
 
-    const lsid1 = UUID();
-    const lsid2 = UUID();
+const cmdObj2 = {
+    update: 'user',
+    updates: [{q: {_id: 1}, u: {$inc: {x: 1}}}],
+    lsid: {id: lsid2},
+    txnNumber: NumberLong(1)
+};
+assert.commandWorked(db.runCommand(cmdObj2));
+assert.eq(1, db.user.find({_id: 1}).toArray()[0].x);
 
-    const cmdObj1 = {
-        update: 'user',
-        updates: [{q: {_id: 0}, u: {$inc: {x: 1}}}],
-        lsid: {id: lsid1},
-        txnNumber: NumberLong(1)
-    };
-    assert.commandWorked(db.runCommand(cmdObj1));
-    assert.eq(1, db.user.find({_id: 0}).toArray()[0].x);
+assert.eq(1, config.transactions.find({'_id.id': lsid1}).itcount());
+assert.eq(1, config.transactions.find({'_id.id': lsid2}).itcount());
 
-    const cmdObj2 = {
-        update: 'user',
-        updates: [{q: {_id: 1}, u: {$inc: {x: 1}}}],
-        lsid: {id: lsid2},
-        txnNumber: NumberLong(1)
-    };
-    assert.commandWorked(db.runCommand(cmdObj2));
-    assert.eq(1, db.user.find({_id: 1}).toArray()[0].x);
+// Invalidating lsid1 doesn't impact lsid2, but allows same statement to be executed again
+assert.commandWorked(config.transactions.remove({'_id.id': lsid1}));
+assert.commandWorked(db.runCommand(cmdObj1));
+assert.eq(2, db.user.find({_id: 0}).toArray()[0].x);
+assert.commandWorked(db.runCommand(cmdObj2));
+assert.eq(1, db.user.find({_id: 1}).toArray()[0].x);
 
-    assert.eq(1, config.transactions.find({'_id.id': lsid1}).itcount());
-    assert.eq(1, config.transactions.find({'_id.id': lsid2}).itcount());
+// Ensure lsid1 is properly tracked after the recreate
+assert.commandWorked(db.runCommand(cmdObj1));
+assert.eq(2, db.user.find({_id: 0}).toArray()[0].x);
 
-    // Invalidating lsid1 doesn't impact lsid2, but allows same statement to be executed again
-    assert.writeOK(config.transactions.remove({'_id.id': lsid1}));
-    assert.commandWorked(db.runCommand(cmdObj1));
-    assert.eq(2, db.user.find({_id: 0}).toArray()[0].x);
-    assert.commandWorked(db.runCommand(cmdObj2));
-    assert.eq(1, db.user.find({_id: 1}).toArray()[0].x);
+// Ensure garbage data cannot be written to the `config.transactions` collection
+assert.writeError(config.transactions.insert({_id: 'String'}));
+assert.writeError(config.transactions.insert({_id: {UnknownField: 'Garbage'}}));
 
-    // Ensure lsid1 is properly tracked after the recreate
-    assert.commandWorked(db.runCommand(cmdObj1));
-    assert.eq(2, db.user.find({_id: 0}).toArray()[0].x);
+// Ensure inserting an invalid session record manually without all the required fields causes
+// the session to not work anymore for retryable writes for that session, but not for any other
+const lsidManual = config.transactions.find({'_id.id': lsid1}).toArray()[0]._id;
+assert.commandWorked(config.transactions.remove({'_id.id': lsid1}));
+assert.commandWorked(config.transactions.insert({_id: lsidManual}));
 
-    // Ensure garbage data cannot be written to the `config.transactions` collection
-    assert.writeError(config.transactions.insert({_id: 'String'}));
-    assert.writeError(config.transactions.insert({_id: {UnknownField: 'Garbage'}}));
+const lsid3 = UUID();
+assert.commandWorked(db.runCommand({
+    update: 'user',
+    updates: [{q: {_id: 2}, u: {$inc: {x: 1}}, upsert: true}],
+    lsid: {id: lsid3},
+    txnNumber: NumberLong(1)
+}));
+assert.eq(1, db.user.find({_id: 2}).toArray()[0].x);
 
-    // Ensure inserting an invalid session record manually without all the required fields causes
-    // the session to not work anymore for retryable writes for that session, but not for any other
-    const lsidManual = config.transactions.find({'_id.id': lsid1}).toArray()[0]._id;
-    assert.writeOK(config.transactions.remove({'_id.id': lsid1}));
+// Ensure dropping the `config.transactions` collection breaks the retryable writes feature, but
+// doesn't crash the server
+assert(config.transactions.drop());
+var res = assert.commandWorkedIgnoringWriteErrors(db.runCommand(cmdObj2));
+assert.eq(0, res.nModified);
+assert.eq(1, db.user.find({_id: 1}).toArray()[0].x);
 
-    // Direct writes to the transactions table mark the session as killed and then asynchronously
-    // complete the cleanup process. Because of this, by the time the insert below starts, it is
-    // possible that the cleanup thread from the remove above has not yet completed and so the write
-    // could fail with ConflictingOperationInProgress.
-    assert.soon(function() {
-        try {
-            assert.writeOK(config.transactions.insert({_id: lsidManual}));
-            return true;
-        } catch (e) {
-            // assert.writeOK does not properly propagate the error code of the write error and
-            // because of this we cannot validate that the code is ConflictingOperationInProgress
-        }
-    });
+assert(config.dropDatabase());
+res = assert.commandWorkedIgnoringWriteErrors(db.runCommand(cmdObj2));
+assert.eq(0, res.nModified);
+assert.eq(1, db.user.find({_id: 1}).toArray()[0].x);
 
-    const lsid3 = UUID();
-    assert.commandWorked(db.runCommand({
-        update: 'user',
-        updates: [{q: {_id: 2}, u: {$inc: {x: 1}}, upsert: true}],
-        lsid: {id: lsid3},
-        txnNumber: NumberLong(1)
-    }));
-    assert.eq(1, db.user.find({_id: 2}).toArray()[0].x);
-
-    // Ensure dropping the `config.transactions` collection breaks the retryable writes feature, but
-    // doesn't crash the server
-    assert(config.transactions.drop());
-    var res = assert.commandWorkedIgnoringWriteErrors(db.runCommand(cmdObj2));
-    assert.eq(0, res.nModified);
-    assert.eq(1, db.user.find({_id: 1}).toArray()[0].x);
-
-    assert(config.dropDatabase());
-    res = assert.commandWorkedIgnoringWriteErrors(db.runCommand(cmdObj2));
-    assert.eq(0, res.nModified);
-    assert.eq(1, db.user.find({_id: 1}).toArray()[0].x);
-
-    replTest.stopSet();
-})();
+replTest.stopSet();

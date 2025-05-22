@@ -1,5 +1,5 @@
 // SERVER-6591: Localhost authentication exception doesn't work right on sharded cluster
-//
+// @tags: [requires_os_access]
 // This test is to ensure that localhost authentication works correctly against a replica set
 // whether they are hosted with "localhost" or a hostname.
 
@@ -8,7 +8,8 @@ var keyfile = "jstests/libs/key1";
 var username = "foo";
 var password = "bar";
 
-load("jstests/libs/host_ipaddr.js");
+import {get_ipaddr} from "jstests/libs/host_ipaddr.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 var createUser = function(mongo) {
     print("============ adding a user.");
@@ -85,9 +86,9 @@ var assertCanRunCommands = function(mongo) {
     // will throw on failure
     test.system.users.findOne();
 
-    assert.writeOK(test.foo.save({_id: 0}));
-    assert.writeOK(test.foo.update({_id: 0}, {$set: {x: 20}}));
-    assert.writeOK(test.foo.remove({_id: 0}));
+    assert.commandWorked(test.foo.save({_id: 0}));
+    assert.commandWorked(test.foo.update({_id: 0}, {$set: {x: 20}}));
+    assert.commandWorked(test.foo.remove({_id: 0}));
 
     test.foo.mapReduce(
         function() {
@@ -107,7 +108,7 @@ var authenticate = function(mongo) {
 };
 
 var start = function(useHostName) {
-    var rs = new ReplSetTest(
+    const rs = new ReplSetTest(
         {name: replSetName, nodes: 3, keyFile: keyfile, auth: "", useHostName: useHostName});
 
     rs.startSet();
@@ -126,7 +127,7 @@ var runTest = function(useHostName) {
     print("=====================");
     print("starting replica set: useHostName=" + useHostName);
     print("=====================");
-    var rs = start(useHostName);
+    const rs = start(useHostName);
     var port = rs.getPort(rs.getPrimary());
     var host = "localhost:" + port;
     var secHosts = [];
@@ -190,7 +191,7 @@ var runNonlocalTest = function(ipAddr) {
     print("starting mongod: non-local host access " + ipAddr);
     print("==========================");
 
-    var rs = start(false);
+    const rs = start(false);
     var port = rs.getPort(rs.getPrimary());
     var host = ipAddr + ":" + port;
     var secHosts = [];

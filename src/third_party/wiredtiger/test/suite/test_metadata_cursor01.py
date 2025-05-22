@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Public Domain 2014-2018 MongoDB, Inc.
+# Public Domain 2014-present MongoDB, Inc.
 # Public Domain 2008-2014 WiredTiger, Inc.
 #
 # This is free and unencumbered software released into the public domain.
@@ -48,7 +48,7 @@ class test_metadata_cursor01(wttest.WiredTigerTestCase):
         if self.tablekind == 'row':
             return 'key' + str(i)
         else:
-            return long(i+1)
+            return self.recno(i+1)
 
     def genvalue(self, i):
         if self.tablekind == 'fix':
@@ -124,13 +124,10 @@ class test_metadata_cursor01(wttest.WiredTigerTestCase):
         cursor = self.session.open_cursor(self.metauri, None, None)
         self.assertCursorHasNoKeyValue(cursor)
 
-        # Ensure the 'special' metadata metadata is found.
+        # Ensure the 'special' metadata is found.
         value = cursor['metadata:']
         self.assertTrue(value.find('key_format') != -1)
 
         # Ensure the metadata for the table we created is found
         value = cursor['table:' + self.table_name1]
         self.assertTrue(value.find('key_format') != -1)
-
-if __name__ == '__main__':
-    wttest.run()

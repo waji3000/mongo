@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -31,17 +30,22 @@
 #pragma once
 
 #include <boost/intrusive_ptr.hpp>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
 #include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
 #include <list>
 #include <memory>
 
 #include "mongo/base/string_data.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/db/catalog/collection.h"
-#include "mongo/db/pipeline/document.h"
+#include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/pipeline/document_source_cursor.h"
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/field_path.h"
+#include "mongo/db/query/multiple_collection_accessor.h"
 #include "mongo/db/query/plan_executor.h"
 
 namespace mongo {
@@ -54,45 +58,42 @@ public:
     /**
      * The name of this stage.
      */
-    static constexpr auto kStageName = "$geoNearCursor";
+    static constexpr StringData kStageName = "$geoNearCursor"_sd;
 
     /**
      * Create a new DocumentSourceGeoNearCursor. If specified, 'distanceMultiplier' must be
      * nonnegative.
      */
     static boost::intrusive_ptr<DocumentSourceGeoNearCursor> create(
-        Collection*,
+        const MultipleCollectionAccessor&,
         std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>,
+        const boost::intrusive_ptr<DocumentSourceCursor::CatalogResourceHandle>&,
         const boost::intrusive_ptr<ExpressionContext>&,
-        FieldPath distanceField,
+        boost::optional<FieldPath> distanceField,
         boost::optional<FieldPath> locationField = boost::none,
         double distanceMultiplier = 1.0);
 
     const char* getSourceName() const final;
 
-    /**
-     * $geoNear returns documents ordered from nearest to furthest, which is an ascending sort on
-     * '_distanceField'.
-     */
-    BSONObjSet getOutputSorts() final;
-
 private:
-    DocumentSourceGeoNearCursor(Collection*,
-                                std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>,
-                                const boost::intrusive_ptr<ExpressionContext>&,
-                                FieldPath distanceField,
-                                boost::optional<FieldPath> locationField,
-                                double distanceMultiplier);
+    DocumentSourceGeoNearCursor(
+        const MultipleCollectionAccessor&,
+        std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>,
+        const boost::intrusive_ptr<DocumentSourceCursor::CatalogResourceHandle>&,
+        const boost::intrusive_ptr<ExpressionContext>&,
+        boost::optional<FieldPath> distanceField,
+        boost::optional<FieldPath> locationField,
+        double distanceMultiplier);
 
-    ~DocumentSourceGeoNearCursor() = default;
+    ~DocumentSourceGeoNearCursor() override = default;
 
     /**
      * Transforms 'obj' into a Document, calculating the distance.
      */
-    Document transformBSONObjToDocument(const BSONObj& obj) const final;
+    Document transformDoc(Document&& obj) const final;
 
-    // The output field in which to store the computed distance.
-    FieldPath _distanceField;
+    // The output field in which to store the computed distance, if specified.
+    boost::optional<FieldPath> _distanceField;
 
     // The output field to store the point that matched, if specified.
     boost::optional<FieldPath> _locationField;

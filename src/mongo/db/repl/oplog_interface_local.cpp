@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,16 +27,27 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <utility>
 
-#include "mongo/db/repl/oplog_interface_local.h"
+#include <boost/move/utility_core.hpp>
 
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog_raii.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/query/plan_executor.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/db/query/plan_yield_policy.h"
+#include "mongo/db/record_id.h"
+#include "mongo/db/repl/oplog_interface_local.h"
+#include "mongo/db/server_options.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/net/socket_utils.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 namespace repl {
@@ -46,33 +56,32 @@ namespace {
 
 class OplogIteratorLocal : public OplogInterface::Iterator {
 public:
-    OplogIteratorLocal(OperationContext* opCtx, const std::string& collectionName);
+    OplogIteratorLocal(OperationContext* opCtx);
 
     StatusWith<Value> next() override;
 
 private:
-    Lock::DBLock _dbLock;
-    Lock::CollectionLock _collectionLock;
+    AutoGetOplogFastPath _oplogRead;
     OldClientContext _ctx;
     std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> _exec;
 };
 
-OplogIteratorLocal::OplogIteratorLocal(OperationContext* opCtx, const std::string& collectionName)
-    : _dbLock(opCtx, nsToDatabase(collectionName), MODE_IS),
-      _collectionLock(opCtx->lockState(), collectionName, MODE_S),
-      _ctx(opCtx, collectionName),
-      _exec(InternalPlanner::collectionScan(opCtx,
-                                            collectionName,
-                                            _ctx.db()->getCollection(opCtx, collectionName),
-                                            PlanExecutor::NO_YIELD,
-                                            InternalPlanner::BACKWARD)) {}
+OplogIteratorLocal::OplogIteratorLocal(OperationContext* opCtx)
+    : _oplogRead(opCtx, OplogAccessMode::kRead),
+      _ctx(opCtx, NamespaceString::kRsOplogNamespace),
+      _exec(_oplogRead.getCollection()
+                ? InternalPlanner::collectionScan(opCtx,
+                                                  &_oplogRead.getCollection(),
+                                                  PlanYieldPolicy::YieldPolicy::INTERRUPT_ONLY,
+                                                  InternalPlanner::BACKWARD)
+                : nullptr) {}
 
 StatusWith<OplogInterface::Iterator::Value> OplogIteratorLocal::next() {
     BSONObj obj;
     RecordId recordId;
 
     PlanExecutor::ExecState state;
-    if (PlanExecutor::ADVANCED != (state = _exec->getNext(&obj, &recordId))) {
+    if (!_exec || PlanExecutor::ADVANCED != (state = _exec->getNext(&obj, &recordId))) {
         return StatusWith<Value>(ErrorCodes::CollectionIsEmpty,
                                  "no more operations in local oplog");
     }
@@ -80,26 +89,29 @@ StatusWith<OplogInterface::Iterator::Value> OplogIteratorLocal::next() {
     // Non-yielding collection scans from InternalPlanner will never error.
     invariant(PlanExecutor::ADVANCED == state || PlanExecutor::IS_EOF == state);
 
-    return StatusWith<Value>(std::make_pair(obj, recordId));
+    return StatusWith<Value>(std::make_pair(obj.getOwned(), recordId));
 }
 
 }  // namespace
 
-OplogInterfaceLocal::OplogInterfaceLocal(OperationContext* opCtx, const std::string& collectionName)
-    : _opCtx(opCtx), _collectionName(collectionName) {
+OplogInterfaceLocal::OplogInterfaceLocal(OperationContext* opCtx) : _opCtx(opCtx) {
     invariant(opCtx);
-    invariant(!collectionName.empty());
 }
 
 std::string OplogInterfaceLocal::toString() const {
     return str::stream() << "LocalOplogInterface: "
                             "operation context: "
-                         << _opCtx->getOpID() << "; collection: " << _collectionName;
+                         << _opCtx->getOpID() << "; collection: "
+                         << NamespaceString::kRsOplogNamespace.toStringForErrorMsg();
 }
 
 std::unique_ptr<OplogInterface::Iterator> OplogInterfaceLocal::makeIterator() const {
-    return std::unique_ptr<OplogInterface::Iterator>(
-        new OplogIteratorLocal(_opCtx, _collectionName));
+    return std::unique_ptr<OplogInterface::Iterator>(new OplogIteratorLocal(_opCtx));
+}
+
+std::unique_ptr<TransactionHistoryIteratorBase> OplogInterfaceLocal::makeTransactionHistoryIterator(
+    const OpTime& startingOpTime, bool permitYield) const {
+    return std::make_unique<TransactionHistoryIterator>(startingOpTime, permitYield);
 }
 
 HostAndPort OplogInterfaceLocal::hostAndPort() const {

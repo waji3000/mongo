@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,13 +29,24 @@
 
 #pragma once
 
+#include <boost/optional/optional.hpp>
+#include <map>
+#include <memory>
+#include <string>
+
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/query/canonical_query.h"
+#include "mongo/db/query/collation/collator_interface.h"
+#include "mongo/db/query/index_entry.h"
+#include "mongo/db/query/index_hint.h"
 #include "mongo/db/query/query_planner_params.h"
 #include "mongo/db/query/query_solution.h"
 
 namespace mongo {
 
 class Collection;
+class CollectionPtr;
 
 class QueryPlannerAnalysis {
 public:
@@ -79,12 +89,26 @@ public:
         std::unique_ptr<QuerySolutionNode> solnRoot);
 
     /**
-     * Sort the results, if there is a sort required.
+     * If the query requires a sort, checks if the scan in 'solnRoot' can provide it. May modify
+     * 'solnRoot' by reversing the scan direction if 'reverseScanIfNeeded' is true.
      */
-    static QuerySolutionNode* analyzeSort(const CanonicalQuery& query,
-                                          const QueryPlannerParams& params,
-                                          QuerySolutionNode* solnRoot,
-                                          bool* blockingSortOut);
+    static bool analyzeNonBlockingSort(const QueryPlannerParams& params,
+                                       const BSONObj& sortObj,
+                                       const BSONObj& hintObj,
+                                       bool reverseScanIfNeeded,
+                                       QuerySolutionNode* solnRoot);
+
+    /**
+     * Sort the results, if there is a sort required.
+     *
+     * The mandatory output parameter 'blockingSortOut' indicates if the generated sub-plan contains
+     * a blocking QSN, such as 'SortNode'.
+     */
+    static std::unique_ptr<QuerySolutionNode> analyzeSort(
+        const CanonicalQuery& query,
+        const QueryPlannerParams& params,
+        std::unique_ptr<QuerySolutionNode> solnRoot,
+        bool* blockingSortOut);
 
     /**
      * Internal helper function used by analyzeSort.
@@ -110,8 +134,70 @@ public:
      * the sort order that each scan provides.
      */
     static bool explodeForSort(const CanonicalQuery& query,
-                               const QueryPlannerParams& params,
-                               QuerySolutionNode** solnRoot);
+                               std::unique_ptr<QuerySolutionNode>* solnRoot);
+
+    /**
+     * Walks the QuerySolutionNode tree rooted in 'soln', and looks for a ProjectionNodeSimple that
+     * is a child of GroupNode, and has a dependency set that's a super set of the the dependency
+     * set of the GroupNode. If that condition is met the ProjectionNodeSimple is redundant and can
+     * thus be elimiated to improve performance of the plan. Otherwise, this is a noop.
+     */
+    static std::unique_ptr<QuerySolution> removeInclusionProjectionBelowGroup(
+        std::unique_ptr<QuerySolution> soln);
+
+    /**
+     * Walk the solution tree, and trim out useless imprecise filters that are guaranteed to be
+     * applied again by a later filter.
+     */
+    static void removeImpreciseInternalExprFilters(const QueryPlannerParams& params,
+                                                   QuerySolutionNode& root);
+
+    struct Strategy {
+        EqLookupNode::LookupStrategy strategy;
+        boost::optional<IndexEntry> indexEntry;
+        NaturalOrderHint::Direction scanDirection = NaturalOrderHint::Direction::kForward;
+    };
+    /**
+     * For the provided 'foreignCollName' and 'foreignFieldName' corresponding to an EqLookupNode,
+     * returns what join algorithm should be used to execute it. In particular:
+     * - An empty array is produced for each document if the foreign collection does not exist.
+     * - An indexed nested loop join is chosen if an index on the foreign collection can be used to
+     * answer the join predicate. Also returns which index on the foreign collection should be
+     * used to answer the predicate.
+     * - A hash join is chosen if disk use is allowed and if the foreign collection is sufficiently
+     * small.
+     * - A nested loop join is chosen in all other cases.
+     */
+    static Strategy determineLookupStrategy(
+        const NamespaceString& foreignCollName,
+        const std::string& foreignField,
+        const std::map<NamespaceString, CollectionInfo>& collectionsInfo,
+        bool allowDiskUse,
+        const CollatorInterface* collator);
+
+    /**
+     * Returns false if there are only indexes that classic might be able to use for the right side
+     * of the lookup but SBE will not because the collation is not compatible to the query
+     * collation. If there are no indexes at all or there is an index that SBE will be able to use
+     * if the lookup is pushed down, it returns true.
+     */
+    static bool canUseIndexForRightSideOfLookupInSBE(const std::string& foreignField,
+                                                     const std::vector<IndexEntry>& fullIndexList,
+                                                     const CollatorInterface* collator);
+
+    /**
+     * Checks if the foreign collection is eligible for the hash join algorithm. We conservatively
+     * choose the hash join algorithm for cases when the hash table is unlikely to spill to disk.
+     */
+    static bool isEligibleForHashJoin(const CollectionInfo& foreignCollInfo);
+
+    /**
+     * Returns 'true' if the provided solution 'soln' can be rewritten to use a fast counting stage.
+     * Mutates the tree in 'soln->root'.
+     *
+     * Otherwise, returns 'false'.
+     */
+    static bool turnIxscanIntoCount(QuerySolution* soln);
 };
 
 }  // namespace mongo

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,13 +29,23 @@
 
 #pragma once
 
+#include <boost/optional/optional.hpp>
+#include <cstddef>
 #include <queue>
 #include <tuple>
 
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/timestamp.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/repl/oplog_buffer.h"
+#include "mongo/stdx/condition_variable.h"
 #include "mongo/stdx/mutex.h"
-#include "mongo/util/queue.h"
+#include "mongo/util/concurrency/with_lock.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/interruptible.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo {
 namespace repl {
@@ -44,10 +53,11 @@ namespace repl {
 class StorageInterface;
 
 /**
- * Oplog buffer backed by a temporary collection. This collection is created in startup() and
- * removed in shutdown(). The documents will be popped and peeked in timestamp order.
+ * Oplog buffer backed by an optionally temporary collection. This collection is optionally created
+ * in startup() and removed in shutdown(). The documents will be popped and peeked in timestamp
+ * order.
  */
-class OplogBufferCollection : public OplogBuffer {
+class OplogBufferCollection : public RandomAccessOplogBuffer {
 public:
     /**
      * Structure used to configure an instance of OplogBufferCollection.
@@ -57,11 +67,12 @@ public:
         std::size_t peekCacheSize = 0;
         bool dropCollectionAtStartup = true;
         bool dropCollectionAtShutdown = true;
+        bool useTemporaryCollection = true;
         Options() {}
     };
 
     /**
-     * Returns default namespace for temporary collection used to hold data in oplog buffer.
+     * Returns default namespace for collection used to hold data in oplog buffer.
      */
     static NamespaceString getDefaultNamespace();
 
@@ -73,30 +84,16 @@ public:
 
     /**
      * Creates and returns a document suitable for storing in the collection together with the
-     * associated timestamp and sentinel count that determines the position of this document in the
-     * _id index.
+     * associated timestamp that determines the position of this document in the _id index.
      *
-     * If 'orig' is a valid oplog entry, the '_id' field of the returned BSONObj will be:
+     * The '_id' field of the returned BSONObj will be:
      * {
      *     ts: 'ts' field of the provided document,
-     *     s: 0
      * }
-     * The timestamp returned will be equal to as the 'ts' field in the BSONObj.
-     * Assumes there is a 'ts' field in the original document.
      *
-     * If 'orig' is an empty document (ie. we're inserting a sentinel value), the '_id' field will
-     * be generated based on the timestamp of the last document processed and the total number of
-     * sentinels with the same timestamp (including the document about to be inserted. For example,
-     * the first sentinel to be inserted after a valid oplog entry will have the following '_id'
-     * field:
-     * {
-     *     ts: 'ts' field of the last inserted valid oplog entry,
-     *     s: 1
-     * }
-     * The sentinel counter will be reset to 0 on inserting the next valid oplog entry.
+     * The oplog entry itself will be stored in the 'entry' field of the returned BSONObj.
      */
-    static std::tuple<BSONObj, Timestamp, std::size_t> addIdToDocument(
-        const BSONObj& orig, const Timestamp& lastTimestamp, std::size_t sentinelCount);
+    static std::tuple<BSONObj, Timestamp> addIdToDocument(const BSONObj& orig);
 
     explicit OplogBufferCollection(StorageInterface* storageInterface, Options options = Options());
     OplogBufferCollection(StorageInterface* storageInterface,
@@ -115,35 +112,45 @@ public:
 
     void startup(OperationContext* opCtx) override;
     void shutdown(OperationContext* opCtx) override;
-    void pushEvenIfFull(OperationContext* opCtx, const Value& value) override;
-    void push(OperationContext* opCtx, const Value& value) override;
+
+    // --- CAUTION: Push() and preload() are legal to be called only after startup() ---
+
+    void push(OperationContext* opCtx,
+              Batch::const_iterator begin,
+              Batch::const_iterator end,
+              boost::optional<const Cost&> cost = boost::none) override;
     /**
-     * Pushing documents with 'pushAllNonBlocking' will not handle sentinel documents properly. If
-     * pushing sentinel documents is required, use 'push' or 'pushEvenIfFull'.
+     * Like push(), but allows the operations in the batch to be out of order with
+     * respect to themselves and to the buffer. Legal to be called only before reading anything,
+     * or immediately after a clear().
      */
-    void pushAllNonBlocking(OperationContext* opCtx,
-                            Batch::const_iterator begin,
-                            Batch::const_iterator end) override;
-    void waitForSpace(OperationContext* opCtx, std::size_t size) override;
+    void preload(OperationContext* opCtx, Batch::const_iterator begin, Batch::const_iterator end);
+
+    void waitForSpace(OperationContext* opCtx, const Cost& cost) override;
     bool isEmpty() const override;
-    std::size_t getMaxSize() const override;
     std::size_t getSize() const override;
     std::size_t getCount() const override;
     void clear(OperationContext* opCtx) override;
     bool tryPop(OperationContext* opCtx, Value* value) override;
-    bool waitForData(Seconds waitDuration) override;
+    bool waitForDataFor(Milliseconds waitDuration, Interruptible* interruptible) override;
+    bool waitForDataUntil(Date_t deadline, Interruptible* interruptible) override;
     bool peek(OperationContext* opCtx, Value* value) override;
     boost::optional<Value> lastObjectPushed(OperationContext* opCtx) const override;
 
+    // ---- Random access API ----
+    StatusWith<Value> findByTimestamp(OperationContext* opCtx, const Timestamp& ts) final;
+    // Note: once you use seekToTimestamp, calling getSize() is no longer legal.
+    Status seekToTimestamp(OperationContext* opCtx,
+                           const Timestamp& ts,
+                           SeekStrategy exact = SeekStrategy::kExact) final;
+
     // ---- Testing API ----
-    std::size_t getSentinelCount_forTest() const;
-    Timestamp getLastPushedTimestamp_forTest() const;
     Timestamp getLastPoppedTimestamp_forTest() const;
     std::queue<BSONObj> getPeekCache_forTest() const;
 
 private:
     /*
-     * Creates a temporary collection with the _nss namespace.
+     * Creates an (optionally temporary) collection with the _nss namespace.
      */
     void _createCollection(OperationContext* opCtx);
 
@@ -157,7 +164,7 @@ private:
      * Returns the oldest oplog entry in the buffer.
      * Assumes the buffer is not empty.
      */
-    BSONObj _peek_inlock(OperationContext* opCtx, PeekMode peekMode);
+    BSONObj _peek(WithLock lk, OperationContext* opCtx, PeekMode peekMode);
 
     // Storage interface used to perform storage engine level functions on the collection.
     StorageInterface* _storageInterface;
@@ -165,13 +172,36 @@ private:
     /**
      * Pops an entry off the buffer in a lock.
      */
-    bool _pop_inlock(OperationContext* opCtx, Value* value);
+    bool _pop(WithLock lk, OperationContext* opCtx, Value* value);
 
+    /**
+     * Puts documents in collection without checking for order and without updating
+     * _lastPushedTimestamp.
+     */
+    void _push(WithLock,
+               OperationContext* opCtx,
+               Batch::const_iterator begin,
+               Batch::const_iterator end);
     /**
      * Returns the last document pushed onto the collection. This does not remove the `_id` field
      * of the document. If the collection is empty, this returns boost::none.
      */
-    boost::optional<Value> _lastDocumentPushed_inlock(OperationContext* opCtx) const;
+    boost::optional<Value> _lastDocumentPushed(WithLock lk, OperationContext* opCtx) const;
+
+    /**
+     * Updates '_lastPushedTimestamp' based on the last document in the collection.
+     */
+    void _updateLastPushedTimestampFromCollection(WithLock, OperationContext* opCtx);
+
+    /**
+     * Returns the document with the given timestamp, or ErrorCodes::NoSuchKey if not found.
+     */
+    StatusWith<BSONObj> _getDocumentWithTimestamp(OperationContext* opCtx, const Timestamp& ts);
+
+    /**
+     * Returns the key for the document with the given timestamp.
+     */
+    static BSONObj _keyForTimestamp(const Timestamp& ts);
 
     // The namespace for the oplog buffer collection.
     const NamespaceString _nss;
@@ -192,16 +222,17 @@ private:
     // Size of documents in buffer.
     std::size_t _size = 0;
 
-    // Number of sentinel values inserted so far with the same timestamp as '_lastPoppedKey'.
-    std::size_t _sentinelCount = 0;
-
     Timestamp _lastPushedTimestamp;
 
     BSONObj _lastPoppedKey;
 
-    // Used by _peek_inlock() to hold results of the read ahead query that will be used for pop/peek
+    // Used by _peek() to hold results of the read ahead query that will be used for pop/peek
     // results.
     std::queue<BSONObj> _peekCache;
+
+    // Whether or not the size() method can be called.  This is set to false on seek, because
+    // we do not know how much we skipped when seeking.
+    bool _sizeIsValid = true;
 };
 
 }  // namespace repl

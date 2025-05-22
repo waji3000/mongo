@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,14 +29,26 @@
 
 #pragma once
 
-#include "vm/PosixNSPR.h"
+#include <functional>
+#include <string>
+#include <vm/PosixNSPR.h>
 
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsontypes_util.h"
+#include "mongo/bson/oid.h"
+#include "mongo/bson/timestamp.h"
 #include "mongo/client/dbclient_cursor.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/platform/decimal128.h"
+#include "mongo/scripting/engine.h"
 #include "mongo/scripting/mozjs/engine.h"
 #include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/functional.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/stdx/thread.h"
+#include "mongo/util/functional.h"
 
 namespace mongo {
 namespace mozjs {
@@ -51,7 +62,7 @@ class MozJSImplScope;
  * implementation scope from multiple threads.
  *
  * In terms of implementation, it does most of it's heavy lifting through a
- * stdx::function. The proxy scope owns an implementation scope transitively
+ * unique_function. The proxy scope owns an implementation scope transitively
  * through the thread it owns. They communicate by setting a variable, then
  * signaling each other. That communication has to work, there's no fallback
  * for timing out.
@@ -64,7 +75,8 @@ class MozJSImplScope;
  *
  */
 class MozJSProxyScope final : public Scope {
-    MONGO_DISALLOW_COPYING(MozJSProxyScope);
+    MozJSProxyScope(const MozJSProxyScope&) = delete;
+    MozJSProxyScope& operator=(const MozJSProxyScope&) = delete;
 
     /**
      * The FSM is fairly tight:
@@ -107,7 +119,7 @@ class MozJSProxyScope final : public Scope {
 
 public:
     MozJSProxyScope(MozJSScriptEngine* engine);
-    ~MozJSProxyScope();
+    ~MozJSProxyScope() override;
 
     void init(const BSONObj* data) override;
 
@@ -128,6 +140,8 @@ public:
 
     std::string getError() override;
 
+    std::string getBaseURL() const override;
+
     bool hasOutOfMemoryException() override;
 
     void gc() override;
@@ -143,6 +157,12 @@ public:
     std::string getString(const char* field) override;
     bool getBoolean(const char* field) override;
     BSONObj getObject(const char* field) override;
+    OID getOID(const char* field) override;
+    // Note: The resulting BSONBinData is only valid within the scope of the 'withBinData' callback.
+    void getBinData(const char* field,
+                    std::function<void(const BSONBinData&)> withBinData) override;
+    Timestamp getTimestamp(const char* field) override;
+    JSRegEx getRegEx(const char* field) override;
 
     void setNumber(const char* field, double val) override;
     void setString(const char* field, StringData val) override;
@@ -170,11 +190,9 @@ public:
               bool assertOnError,
               int timeoutMs) override;
 
-    void injectNative(const char* field, NativeFunction func, void* data = 0) override;
+    void injectNative(const char* field, NativeFunction func, void* data = nullptr) override;
 
     ScriptingFunction _createFunction(const char* code) override;
-
-    OperationContext* getOpContext() const;
 
     void interrupt();
 
@@ -182,10 +200,13 @@ private:
     template <typename Closure>
     void run(Closure&& closure);
 
-    void runOnImplThread(stdx::function<void()> f);
+    template <typename Closure>
+    void runWithoutInterruptionExceptAtGlobalShutdown(Closure&& closure);
+
+    void runOnImplThread(unique_function<void()> f);
 
     void shutdownThread();
-    static void implThread(void* proxy);
+    static void implThread(MozJSProxyScope* proxy);
 
     MozJSScriptEngine* const _engine;
     MozJSImplScope* _implScope;
@@ -195,12 +216,14 @@ private:
      * function invocation and exception handling
      */
     stdx::mutex _mutex;
-    stdx::function<void()> _function;
+    unique_function<void()> _function;
     State _state;
     Status _status;
+    OperationContext* _opCtx = nullptr;
 
-    stdx::condition_variable _condvar;
-    PRThread* _thread;
+    stdx::condition_variable _proxyCondvar;
+    stdx::condition_variable _implCondvar;
+    stdx::thread _thread;
 };
 
 }  // namespace mozjs

@@ -1,6 +1,3 @@
-// path_internal.h
-
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -32,11 +29,13 @@
 
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 
 #include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/db/field_ref.h"
-#include "mongo/db/jsobj.h"
 
 namespace mongo {
 

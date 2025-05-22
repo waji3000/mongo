@@ -1,29 +1,51 @@
 // Tests that aggregation is supported in transactions.
-// @tags: [uses_transactions]
-(function() {
-    "use strict";
+// @tags: [uses_transactions, uses_snapshot_read_concern, references_foreign_collection]
+// TODO (SERVER-39704): Remove the following load after SERVER-39704 is completed
+import {
+    withTxnAndAutoRetryOnMongos
+} from "jstests/libs/auto_retry_transaction_in_sharding.js";  // For isSharded.
 
-    const session = db.getMongo().startSession({causalConsistency: false});
-    const testDB = session.getDatabase("test");
-    const coll = testDB.getCollection("aggregation_in_transaction");
-    const foreignColl = testDB.getCollection("aggregation_in_transaction_lookup");
+const session = db.getMongo().startSession({causalConsistency: false});
+const testDB = session.getDatabase("test");
+const coll = testDB.getCollection("aggregation_in_transaction");
+const foreignColl = testDB.getCollection("aggregation_in_transaction_lookup");
 
-    [coll, foreignColl].forEach(col => {
-        const reply = col.runCommand("drop", {writeConcern: {w: "majority"}});
-        if (reply.ok !== 1) {
-            assert.commandFailedWithCode(reply, ErrorCodes.NamespaceNotFound);
-        }
+[coll, foreignColl].forEach(col => {
+    const reply = col.runCommand("drop", {writeConcern: {w: "majority"}});
+    if (reply.ok !== 1) {
+        assert.commandFailedWithCode(reply, ErrorCodes.NamespaceNotFound);
+    }
+});
+
+// Populate the collections.
+const testDoc = {
+    _id: 0,
+    foreignKey: "orange"
+};
+assert.commandWorked(coll.insert(testDoc, {writeConcern: {w: "majority"}}));
+const foreignDoc = {
+    _id: "orange",
+    val: 9
+};
+assert.commandWorked(foreignColl.insert(foreignDoc, {writeConcern: {w: "majority"}}));
+
+const txnOptions = {
+    readConcern: {level: "snapshot"}
+};
+
+// TODO (SERVER-39704): We use the withTxnAndAutoRetryOnMongos
+// function to handle how MongoS will propagate a StaleShardVersion error as a
+// TransientTransactionError. After SERVER-39704 is completed the
+// withTxnAndAutoRetryOnMongos function can be removed
+withTxnAndAutoRetryOnMongos(session, () => {
+    // Cleaning collection in case the transaction is retried
+    db.getSiblingDB(testDB.getName()).getCollection(coll.getName()).remove({
+        _id: "not_visible_in_transaction"
     });
 
-    // Populate the collections.
-    const testDoc = {_id: 0, foreignKey: "orange"};
-    assert.commandWorked(coll.insert(testDoc, {writeConcern: {w: "majority"}}));
-    const foreignDoc = {_id: "orange", val: 9};
-    assert.commandWorked(foreignColl.insert(foreignDoc, {writeConcern: {w: "majority"}}));
-
     // Run a dummy find to start the transaction.
-    jsTestLog("Starting transaction.");
-    session.startTransaction({readConcern: {level: "snapshot"}});
+    jsTestLog("Transaction started.");
+
     let cursor = coll.find();
     cursor.next();
 
@@ -43,28 +65,32 @@
     assert(!cursor.hasNext());
 
     // Perform aggregations that look at other collections.
-    const lookupDoc = Object.extend(testDoc, {lookup: [foreignDoc]});
+    jsTestLog("Testing $lookup within a transaction.");
+
+    const lookupDoc = Object.merge(testDoc, {lookup: [foreignDoc]});
     cursor = coll.aggregate({
-        $lookup: {
-            from: foreignColl.getName(),
-            localField: "foreignKey",
-            foreignField: "_id",
-            as: "lookup",
-        }
-    });
-    assert.docEq(cursor.next(), lookupDoc);
+                $lookup: {
+                    from: foreignColl.getName(),
+                    localField: "foreignKey",
+                    foreignField: "_id",
+                    as: "lookup",
+                }
+            });
+    assert.docEq(lookupDoc, cursor.next());
     assert(!cursor.hasNext());
 
+    jsTestLog("Testing $graphLookup within a transaction.");
+
     cursor = coll.aggregate({
-        $graphLookup: {
-            from: foreignColl.getName(),
-            startWith: "$foreignKey",
-            connectFromField: "foreignKey",
-            connectToField: "_id",
-            as: "lookup"
-        }
-    });
-    assert.docEq(cursor.next(), lookupDoc);
+                $graphLookup: {
+                    from: foreignColl.getName(),
+                    startWith: "$foreignKey",
+                    connectFromField: "foreignKey",
+                    connectToField: "_id",
+                    as: "lookup"
+                }
+            });
+    assert.docEq(lookupDoc, cursor.next());
     assert(!cursor.hasNext());
 
     jsTestLog("Testing $count within a transaction.");
@@ -83,27 +109,23 @@
     countRes = coll.aggregate([{$count: "count"}]).toArray();
     assert.eq(countRes.length, 1, tojson(countRes));
     assert.eq(countRes[0].count, 2, tojson(countRes));
+}, txnOptions);
 
-    session.commitTransaction();
-    jsTestLog("Transaction committed.");
+jsTestLog("Transaction committed.");
 
-    // Perform aggregations with non-cursor initial sources and assert that they are not supported
-    // in transactions.
-    jsTestLog("Running aggregations in transactions that are expected to throw and fail.");
-    session.startTransaction({readConcern: {level: "snapshot"}});
-    assert.throws(() => coll.aggregate({$currentOp: {allUsers: true, localOps: true}}).next());
-    assert.commandFailedWithCode(session.abortTransaction_forTesting(),
-                                 ErrorCodes.NoSuchTransaction);
+// Perform aggregations with non-cursor initial sources and assert that they are not supported
+// in transactions.
+jsTestLog("Running aggregations in transactions that are expected to throw and fail.");
+session.startTransaction({readConcern: {level: "snapshot"}});
+assert.throws(() => coll.aggregate({$currentOp: {allUsers: true, localOps: true}}).next());
+assert.commandFailedWithCode(session.abortTransaction_forTesting(), ErrorCodes.NoSuchTransaction);
 
-    session.startTransaction({readConcern: {level: "snapshot"}});
-    assert.throws(
-        () => coll.aggregate({$collStats: {latencyStats: {histograms: true}, storageStats: {}}})
-                  .next());
-    assert.commandFailedWithCode(session.abortTransaction_forTesting(),
-                                 ErrorCodes.NoSuchTransaction);
+session.startTransaction({readConcern: {level: "snapshot"}});
+assert.throws(
+    () =>
+        coll.aggregate({$collStats: {latencyStats: {histograms: true}, storageStats: {}}}).next());
+assert.commandFailedWithCode(session.abortTransaction_forTesting(), ErrorCodes.NoSuchTransaction);
 
-    session.startTransaction({readConcern: {level: "snapshot"}});
-    assert.throws(() => coll.aggregate({$indexStats: {}}).next());
-    assert.commandFailedWithCode(session.abortTransaction_forTesting(),
-                                 ErrorCodes.NoSuchTransaction);
-}());
+session.startTransaction({readConcern: {level: "snapshot"}});
+assert.throws(() => coll.aggregate({$indexStats: {}}).next());
+assert.commandFailedWithCode(session.abortTransaction_forTesting(), ErrorCodes.NoSuchTransaction);

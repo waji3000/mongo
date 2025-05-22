@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -31,12 +30,18 @@
 #pragma once
 
 #include <cstdint>
+#include <cstring>
+#include <string>
+#include <utility>
 
 #include "mongo/base/data_type_endian.h"
 #include "mongo/base/data_view.h"
 #include "mongo/base/encoded_value_storage.h"
 #include "mongo/base/static_assert.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/bson/util/builder.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/shared_buffer.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -84,6 +89,7 @@ inline bool isSupportedRequestNetworkOp(NetworkOp op) {
 
 enum class LogicalOp {
     opInvalid,
+    opBulkWrite,
     opUpdate,
     opInsert,
     opQuery,
@@ -151,6 +157,8 @@ inline const char* logicalOpToString(LogicalOp logicalOp) {
     switch (logicalOp) {
         case LogicalOp::opInvalid:
             return "none";
+        case LogicalOp::opBulkWrite:
+            return "bulkWrite";
         case LogicalOp::opUpdate:
             return "update";
         case LogicalOp::opInsert:
@@ -273,7 +281,6 @@ namespace MsgData {
 #pragma pack(1)
 struct Layout {
     MSGHEADER::Layout header;
-    char data[4];
 };
 #pragma pack()
 
@@ -302,7 +309,7 @@ public:
     }
 
     const char* data() const {
-        return storage().view(offsetof(Layout, data));
+        return storage().view(sizeof(Layout));
     }
 
     bool valid() const {
@@ -311,12 +318,6 @@ public:
         if (getNetworkOp() < 0 || getNetworkOp() > 30000)
             return false;
         return true;
-    }
-
-    int64_t getCursor() const {
-        verify(getResponseToMsgId() > 0);
-        verify(getNetworkOp() == opReply);
-        return ConstDataView(data() + sizeof(int32_t)).read<LittleEndian<int64_t>>();
     }
 
     int dataLen() const;  // len without header
@@ -361,7 +362,7 @@ public:
 
     using ConstView::data;
     char* data() {
-        return storage().view(offsetof(Layout, data));
+        return storage().view(sizeof(Layout));
     }
 
 private:
@@ -383,7 +384,7 @@ public:
     Value(ZeroInitTag_t zit) : EncodedValueStorage<Layout, ConstView, View>(zit) {}
 };
 
-const int MsgDataHeaderSize = sizeof(Value) - 4;
+const int MsgDataHeaderSize = sizeof(Value);
 
 inline int ConstView::dataLen() const {
     return getLen() - MsgDataHeaderSize;
@@ -397,7 +398,7 @@ public:
     explicit Message(SharedBuffer data) : _buf(std::move(data)) {}
 
     MsgData::View header() const {
-        verify(!empty());
+        MONGO_verify(!empty());
         return _buf.get();
     }
 
@@ -425,28 +426,29 @@ public:
         return size() - sizeof(MSGHEADER::Value);
     }
 
+    size_t capacity() const {
+        return _buf.capacity();
+    }
+
+    void realloc(size_t size) {
+        _buf.reallocOrCopy(size);
+    }
+
     void reset() {
         _buf = {};
     }
 
     // use to set first buffer if empty
     void setData(SharedBuffer buf) {
-        verify(empty());
+        MONGO_verify(empty());
         _buf = std::move(buf);
     }
+
     void setData(int operation, const char* msgtxt) {
         setData(operation, msgtxt, strlen(msgtxt) + 1);
     }
-    void setData(int operation, const char* msgdata, size_t len) {
-        verify(empty());
-        size_t dataLen = len + sizeof(MsgData::Value) - 4;
-        _buf = SharedBuffer::allocate(dataLen);
-        MsgData::View d = _buf.get();
-        if (len)
-            memcpy(d.data(), msgdata, len);
-        d.setLen(dataLen);
-        d.setOperation(operation);
-    }
+
+    void setData(int operation, const char* msgdata, size_t len);
 
     char* buf() {
         return _buf.get();
@@ -463,6 +465,8 @@ public:
     ConstSharedBuffer sharedBuffer() const {
         return _buf;
     }
+
+    std::string opMsgDebugString() const;
 
 private:
     SharedBuffer _buf;

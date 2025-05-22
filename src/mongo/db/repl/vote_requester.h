@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,18 +29,20 @@
 
 #pragma once
 
+#include <boost/optional/optional.hpp>
 #include <memory>
 #include <vector>
 
-#include "mongo/base/disallow_copying.h"
-#include "mongo/bson/timestamp.h"
+#include "mongo/base/status_with.h"
 #include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/repl_set_config.h"
 #include "mongo/db/repl/scatter_gather_algorithm.h"
 #include "mongo/db/repl/scatter_gather_runner.h"
-#include "mongo/stdx/functional.h"
-#include "mongo/stdx/memory.h"
+#include "mongo/executor/remote_command_request.h"
+#include "mongo/executor/remote_command_response.h"
+#include "mongo/executor/task_executor.h"
 #include "mongo/stdx/unordered_set.h"
+#include "mongo/util/net/hostandport.h"
 
 namespace mongo {
 
@@ -50,10 +51,17 @@ class Status;
 namespace repl {
 
 class VoteRequester {
-    MONGO_DISALLOW_COPYING(VoteRequester);
+    VoteRequester(const VoteRequester&) = delete;
+    VoteRequester& operator=(const VoteRequester&) = delete;
 
 public:
-    enum class Result { kSuccessfullyElected, kStaleTerm, kInsufficientVotes, kPrimaryRespondedNo };
+    enum class Result {
+        kSuccessfullyElected,
+        kStaleTerm,
+        kInsufficientVotes,
+        kPrimaryRespondedNo,
+        kCancelled
+    };
 
     class Algorithm : public ScatterGatherAlgorithm {
     public:
@@ -61,13 +69,14 @@ public:
                   long long candidateIndex,
                   long long term,
                   bool dryRun,
-                  OpTime lastDurableOpTime,
+                  OpTime lastWrittenOpTime,
+                  OpTime lastAppliedOpTime,
                   int primaryIndex);
-        virtual ~Algorithm();
-        virtual std::vector<executor::RemoteCommandRequest> getRequests() const;
-        virtual void processResponse(const executor::RemoteCommandRequest& request,
-                                     const executor::RemoteCommandResponse& response);
-        virtual bool hasReceivedSufficientResponses() const;
+        ~Algorithm() override;
+        std::vector<executor::RemoteCommandRequest> getRequests() const override;
+        void processResponse(const executor::RemoteCommandRequest& request,
+                             const executor::RemoteCommandResponse& response) override;
+        bool hasReceivedSufficientResponses() const override;
 
         /**
          * Returns a VoteRequest::Result indicating the result of the election.
@@ -88,7 +97,8 @@ public:
         const long long _candidateIndex;
         const long long _term;
         bool _dryRun = false;  // this bool indicates this is a mock election when true
-        const OpTime _lastDurableOpTime;
+        const OpTime _lastWrittenOpTime;
+        const OpTime _lastAppliedOpTime;
         std::vector<HostAndPort> _targets;
         stdx::unordered_set<HostAndPort> _responders;
         bool _staleTerm = false;
@@ -115,7 +125,8 @@ public:
                                                           long long candidateIndex,
                                                           long long term,
                                                           bool dryRun,
-                                                          OpTime lastDurableOpTime,
+                                                          OpTime lastWrittenOpTime,
+                                                          OpTime lastAppliedOpTime,
                                                           int primaryIndex);
 
     /**
@@ -129,7 +140,6 @@ public:
 private:
     std::shared_ptr<Algorithm> _algorithm;
     std::unique_ptr<ScatterGatherRunner> _runner;
-    bool _isCanceled = false;
 };
 
 }  // namespace repl

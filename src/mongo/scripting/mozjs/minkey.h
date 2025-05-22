@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,6 +29,11 @@
 
 #pragma once
 
+#include <js/CallArgs.h>
+#include <js/PropertySpec.h>
+#include <js/TypeDecls.h>
+
+#include "mongo/scripting/mozjs/base.h"
 #include "mongo/scripting/mozjs/wraptype.h"
 
 namespace mongo {
@@ -45,17 +49,13 @@ namespace mozjs {
 struct MinKeyInfo : public BaseInfo {
     static void call(JSContext* cx, JS::CallArgs args);
     static void construct(JSContext* cx, JS::CallArgs args);
-    static void hasInstance(JSContext* cx,
-                            JS::HandleObject obj,
-                            JS::MutableHandleValue vp,
-                            bool* bp);
-
     struct Functions {
         MONGO_DECLARE_JS_FUNCTION(tojson);
         MONGO_DECLARE_JS_FUNCTION(toJSON);
+        MONGO_DECLARE_JS_FUNCTION(hasInstance);
     };
 
-    static const JSFunctionSpec methods[3];
+    static const JSFunctionSpec methods[4];
 
     static void postInstall(JSContext* cx, JS::HandleObject global, JS::HandleObject proto);
 

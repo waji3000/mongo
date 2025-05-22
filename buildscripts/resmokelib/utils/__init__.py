@@ -1,16 +1,16 @@
 """Helper functions."""
 
-from __future__ import absolute_import
-from __future__ import print_function
-
 import contextlib
-import os.path
-import shutil
+import random
+import re
 import sys
 
 import yaml
 
-from . import archival
+from buildscripts.resmokelib import config as _config
+from buildscripts.resmokelib.utils import archival
+
+__all__ = ["archival"]
 
 
 @contextlib.contextmanager
@@ -34,26 +34,13 @@ def open_or_use_stdout(filename):
         fp.close()
 
 
-def default_if_none(value, default):
-    """Set default if value is 'None'."""
-    return value if value is not None else default
+def default_if_none(*values):
+    """Return the first argument that is not 'None'."""
+    for value in values:
+        if value is not None:
+            return value
 
-
-def rmtree(path, **kwargs):
-    """Wrap shutil.rmtreee.
-
-    Use a UTF-8 unicode path if Windows.
-    See https://bugs.python.org/issue24672, where shutil.rmtree can fail with UTF-8.
-    Use a bytes path to rmtree, otherwise.
-    See https://github.com/pypa/setuptools/issues/706.
-    """
-    if is_windows():
-        if not isinstance(path, unicode):
-            path = unicode(path, "utf-8")
-    else:
-        if isinstance(path, unicode):
-            path = path.encode("utf-8")
-    shutil.rmtree(path, **kwargs)
+    return None
 
 
 def is_windows():
@@ -61,33 +48,9 @@ def is_windows():
     return sys.platform.startswith("win32") or sys.platform.startswith("cygwin")
 
 
-def remove_if_exists(path):
-    """Remove path if it exists."""
-    if path is not None and os.path.exists(path):
-        try:
-            os.remove(path)
-        except OSError:
-            pass
-
-
 def is_string_list(lst):
     """Return true if 'lst' is a list of strings, and false otherwise."""
-    return isinstance(lst, list) and all(isinstance(x, basestring) for x in lst)
-
-
-def is_string_set(value):
-    """Return true if 'value' is a set of strings, and false otherwise."""
-    return isinstance(value, set) and all(isinstance(x, basestring) for x in value)
-
-
-def is_js_file(filename):
-    """Return true if 'filename' ends in .js, and false otherwise."""
-    return os.path.splitext(filename)[1] == ".js"
-
-
-def is_yaml_file(filename):
-    """Return true if 'filename' ends in .yml or .yaml, and false otherwise."""
-    return os.path.splitext(filename)[1] in (".yaml", ".yml")
+    return isinstance(lst, list) and all(isinstance(x, str) for x in lst)
 
 
 def load_yaml_file(filename):
@@ -120,3 +83,32 @@ def load_yaml(value):
         return yaml.safe_load(value)
     except yaml.YAMLError as err:
         raise ValueError("Attempted to parse invalid YAML value '%s': %s" % (value, err))
+
+
+def get_task_name_without_suffix(task_name, variant_name):
+    """Return evergreen task name without suffix added to the generated task.
+
+    Remove evergreen variant name, numerical suffix and underscores between them from evergreen task name.
+    Example: "noPassthrough_0_enterprise-rhel-8-64-bit-dynamic-required" -> "noPassthrough"
+    """
+    task_name = task_name if task_name else ""
+    return re.sub(rf"(_[0-9]+)?(_{variant_name})?$", "", task_name)
+
+
+def pick_catalog_shard_node(config_shard, num_shards):
+    """Get config_shard node index or None if no config_shard."""
+    if config_shard is None:
+        return None
+
+    if config_shard == "any":
+        # We check _config.NOOP_MONGO_D_S_PROCESSES because when running in antithesis
+        # the resmoke setup needs to be deterministic so the config shard cannot be random.
+        if num_shards is None or num_shards == 0 or _config.NOOP_MONGO_D_S_PROCESSES:
+            return 0
+        return random.randint(0, num_shards - 1)
+
+    config_shard_index = int(config_shard)
+    if config_shard_index < 0 or config_shard_index >= num_shards:
+        raise ValueError('Config shard value must be in range 0..num_shards-1 or "any"')
+
+    return config_shard_index

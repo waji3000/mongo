@@ -1,6 +1,3 @@
-// processinfo_none.cpp
-
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,13 +27,10 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
 
 #include <iostream>
 
 #include "mongo/util/processinfo.h"
-
-using namespace std;
 
 namespace mongo {
 
@@ -56,31 +50,11 @@ int ProcessInfo::getResidentSize() {
     return -1;
 }
 
-double ProcessInfo::getSystemMemoryPressurePercentage() {
-    return 0.0;
-}
-
-bool ProcessInfo::checkNumaEnabled() {
-    return false;
-}
-
-bool ProcessInfo::blockCheckSupported() {
-    return false;
-}
-
 void ProcessInfo::SystemInfo::collectSystemInfo() {}
 
 void ProcessInfo::getExtraInfo(BSONObjBuilder& info) {}
 
-bool ProcessInfo::blockInMemory(const void* start) {
-    verify(0);
-}
-
-bool ProcessInfo::pagesInMemory(const void* start, size_t numPages, vector<char>* out) {
-    verify(0);
-}
-
 boost::optional<unsigned long> ProcessInfo::getNumCoresForProcess() {
     return boost::none;
 }
-}
+}  // namespace mongo

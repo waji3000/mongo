@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,33 +27,25 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <utility>
 
-#include "mongo/db/matcher/extensions_callback_noop.h"
+#include <boost/smart_ptr/intrusive_ptr.hpp>
 
 #include "mongo/db/matcher/expression_text_noop.h"
 #include "mongo/db/matcher/expression_where_noop.h"
+#include "mongo/db/matcher/extensions_callback_noop.h"
 
 namespace mongo {
 
-StatusWithMatchExpression ExtensionsCallbackNoop::parseText(BSONElement text) const {
-    auto textParams = extractTextMatchExpressionParams(text);
-    if (!textParams.isOK()) {
-        return textParams.getStatus();
-    }
-
-    auto expr = stdx::make_unique<TextNoOpMatchExpression>(std::move(textParams.getValue()));
-
-    return {std::move(expr)};
+std::unique_ptr<MatchExpression> ExtensionsCallbackNoop::createText(
+    TextMatchExpressionBase::TextParams text) const {
+    return std::make_unique<TextNoOpMatchExpression>(std::move(text));
 }
 
-StatusWithMatchExpression ExtensionsCallbackNoop::parseWhere(BSONElement where) const {
-    auto whereParams = extractWhereMatchExpressionParams(where);
-    if (!whereParams.isOK()) {
-        return whereParams.getStatus();
-    }
-
-    return {stdx::make_unique<WhereNoOpMatchExpression>(std::move(whereParams.getValue()))};
+std::unique_ptr<MatchExpression> ExtensionsCallbackNoop::createWhere(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    WhereMatchExpressionBase::WhereParams where) const {
+    return std::make_unique<WhereNoOpMatchExpression>(std::move(where));
 }
 
 }  // namespace mongo

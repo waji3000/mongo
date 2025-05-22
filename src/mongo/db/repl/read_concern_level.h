@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,16 +29,19 @@
 
 #pragma once
 
+#include "mongo/base/string_data.h"
+#include "mongo/db/repl/read_concern_gen.h"
+
 namespace mongo {
 namespace repl {
 
-enum class ReadConcernLevel {
-    kLocalReadConcern,
-    kMajorityReadConcern,
-    kLinearizableReadConcern,
-    kAvailableReadConcern,
-    kSnapshotReadConcern
-};
+using ReadConcernLevel = ReadConcernLevelEnum;
+
+namespace readConcernLevels {
+
+StringData toString(ReadConcernLevel level);
+
+}  // namespace readConcernLevels
 
 }  // namespace repl
 }  // namespace mongo

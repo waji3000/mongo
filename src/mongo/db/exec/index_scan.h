@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,64 +29,64 @@
 
 #pragma once
 
+#include <boost/optional/optional.hpp>
+#include <memory>
+#include <string>
+#include <utility>
+
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/catalog/collection.h"
 #include "mongo/db/exec/plan_stage.h"
+#include "mongo/db/exec/plan_stats.h"
+#include "mongo/db/exec/recordid_deduplicator.h"
+#include "mongo/db/exec/requires_index_stage.h"
+#include "mongo/db/exec/working_set.h"
 #include "mongo/db/index/index_descriptor.h"
-#include "mongo/db/jsobj.h"
+#include "mongo/db/index/multikey_paths.h"
 #include "mongo/db/matcher/expression.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/query/index_bounds.h"
-#include "mongo/db/record_id.h"
+#include "mongo/db/query/plan_executor.h"
 #include "mongo/db/storage/index_entry_comparison.h"
 #include "mongo/db/storage/sorted_data_interface.h"
-#include "mongo/stdx/unordered_set.h"
 
 namespace mongo {
 
 class WorkingSet;
 
 struct IndexScanParams {
-    IndexScanParams(const IndexDescriptor& descriptor,
+    IndexScanParams(const IndexDescriptor* descriptor,
                     std::string indexName,
                     BSONObj keyPattern,
                     MultikeyPaths multikeyPaths,
                     bool multikey)
-        : accessMethod(descriptor.getIndexCatalog()->getIndex(&descriptor)),
+        : indexDescriptor(descriptor),
           name(std::move(indexName)),
           keyPattern(std::move(keyPattern)),
           multikeyPaths(std::move(multikeyPaths)),
-          isMultiKey(multikey),
-          isSparse(descriptor.isSparse()),
-          isUnique(descriptor.unique()),
-          isPartial(descriptor.isPartial()),
-          version(descriptor.version()),
-          collation(descriptor.infoObj()
-                        .getObjectField(IndexDescriptor::kCollationFieldName)
-                        .getOwned()) {
-        invariant(accessMethod);
-    }
+          isMultiKey(multikey) {}
 
-    IndexScanParams(OperationContext* opCtx, const IndexDescriptor& descriptor)
+    IndexScanParams(OperationContext* opCtx,
+                    const CollectionPtr& collection,
+                    const IndexDescriptor* descriptor)
         : IndexScanParams(descriptor,
-                          descriptor.indexName(),
-                          descriptor.keyPattern(),
-                          descriptor.getMultikeyPaths(opCtx),
-                          descriptor.isMultikey(opCtx)) {}
+                          descriptor->indexName(),
+                          descriptor->keyPattern(),
+                          descriptor->getEntry()->getMultikeyPaths(opCtx, collection),
+                          descriptor->getEntry()->isMultikey(opCtx, collection)) {}
 
-    const IndexAccessMethod* accessMethod;
+    const IndexDescriptor* indexDescriptor;
+
     std::string name;
 
     BSONObj keyPattern;
-    IndexBounds bounds;
 
     MultikeyPaths multikeyPaths;
+
     bool isMultiKey;
 
-    bool isSparse;
-    bool isUnique;
-    bool isPartial;
-
-    IndexDescriptor::IndexVersion version;
-
-    BSONObj collation;
+    IndexBounds bounds;
 
     int direction{1};
 
@@ -103,7 +102,7 @@ struct IndexScanParams {
  *
  * Sub-stage preconditions: None.  Is a leaf and consumes no stage data.
  */
-class IndexScan final : public PlanStage {
+class IndexScan final : public RequiresIndexStage {
 public:
     /**
      * Keeps track of what this index scan is currently doing so that it
@@ -123,15 +122,14 @@ public:
         HIT_END
     };
 
-    IndexScan(OperationContext* opCtx,
+    IndexScan(ExpressionContext* expCtx,
+              VariantCollectionPtrOrAcquisition collection,
               IndexScanParams params,
               WorkingSet* workingSet,
               const MatchExpression* filter);
 
     StageState doWork(WorkingSetID* out) final;
-    bool isEOF() final;
-    void doSaveState() final;
-    void doRestoreState() final;
+    bool isEOF() const final;
     void doDetachFromOperationContext() final;
     void doReattachToOperationContext() final;
 
@@ -141,9 +139,28 @@ public:
 
     std::unique_ptr<PlanStageStats> getStats() final;
 
-    const SpecificStats* getSpecificStats() const final;
+    const IndexScanStats* getSpecificStats() const final {
+        return &_specificStats;
+    }
 
     static const char* kStageType;
+
+    const BSONObj& getKeyPattern() const {
+        return _keyPattern;
+    }
+
+    bool isForward() const {
+        return _forward;
+    }
+
+    const IndexBounds& getBounds() const {
+        return _bounds;
+    }
+
+protected:
+    void doSaveStateRequiresIndex() final;
+
+    void doRestoreStateRequiresIndex() final;
 
 private:
     /**
@@ -154,27 +171,33 @@ private:
     // The WorkingSet we fill with results.  Not owned by us.
     WorkingSet* const _workingSet;
 
-    // Index access.
-    const IndexAccessMethod* const _iam;  // owned by Collection -> IndexCatalog
     std::unique_ptr<SortedDataInterface::Cursor> _indexCursor;
     const BSONObj _keyPattern;
 
-    // Keeps track of what work we need to do next.
-    ScanState _scanState;
+    const IndexBounds _bounds;
 
     // Contains expressions only over fields in the index key.  We assume this is built
     // correctly by whomever creates this class.
     // The filter is not owned by us.
     const MatchExpression* const _filter;
 
-    // Could our index have duplicates?  If so, we use _returned to dedup.
-    stdx::unordered_set<RecordId, RecordId::Hasher> _returned;
-
+    const int _direction;
     const bool _forward;
-    const IndexScanParams _params;
+
+    // Do we want to add the key as metadata?
+    const bool _addKeyMetadata;
 
     // Stats
     IndexScanStats _specificStats;
+
+    // Keeps track of what work we need to do next.
+    ScanState _scanState = ScanState::INITIALIZING;
+
+    // True if we dedup on RecordId, false otherwise.
+    const bool _dedup;
+
+    // Which RecordIds have we returned?
+    RecordIdDeduplicator _recordIdDeduplicator;
 
     //
     // This class employs one of two different algorithms for determining when the index scan

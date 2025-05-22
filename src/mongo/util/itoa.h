@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,10 +29,11 @@
 
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <string>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/string_data.h"
 
 namespace mongo {
@@ -43,22 +43,28 @@ namespace mongo {
  * and only really should be used in hot code paths.
  */
 class ItoA {
-    MONGO_DISALLOW_COPYING(ItoA);
-
 public:
-    static constexpr size_t kBufSize = std::numeric_limits<uint64_t>::digits10  //
-        + 1   // digits10 is 1 less than the maximum number of digits.
-        + 1;  // NUL byte.
+    // digits10 is 1 less than the maximum number of digits.
+    static constexpr size_t kBufSize = std::numeric_limits<std::uint64_t>::digits10 + 1;
 
     explicit ItoA(std::uint64_t i);
+    ItoA(const ItoA&) = delete;
+    ItoA& operator=(const ItoA&) = delete;
 
-    operator StringData() {
-        return {_str, _len};
+    std::string toString() const {
+        return std::string{_str};
+    }
+
+    StringData toStringData() const {
+        return _str;
+    }
+
+    operator StringData() const {
+        return _str;
     }
 
 private:
-    const char* _str{nullptr};
-    std::size_t _len{0};
+    StringData _str;
     char _buf[kBufSize];
 };
 

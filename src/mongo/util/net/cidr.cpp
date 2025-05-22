@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -31,7 +30,6 @@
 #include "mongo/util/net/cidr.h"
 
 #include "mongo/bson/bsonobjbuilder.h"
-#include "mongo/platform/basic.h"
 
 #ifdef _WIN32
 #include <Ws2tcpip.h>
@@ -41,8 +39,8 @@
 #endif
 
 using std::begin;
-using std::find;
 using std::end;
+using std::find;
 
 namespace mongo {
 
@@ -89,63 +87,67 @@ T& append(T& s, int family, const std::array<uint8_t, 16> ip, int len) {
 
 }  // namespace
 
-StatusWith<CIDR> CIDR::parse(BSONElement from) noexcept {
+StatusWith<CIDR> CIDR::parse(BSONElement from) {
     if (from.type() != String) {
         return {ErrorCodes::UnsupportedFormat, "CIDR range must be a string"};
     }
     return parse(from.valueStringData());
 }
 
-StatusWith<CIDR> CIDR::parse(StringData s) noexcept try {
-    return CIDR(s);
-} catch (const DBException& e) {
-    return e.toStatus();
-}
-
-CIDR::CIDR(StringData s) try {
-    _ip.fill(0);
+StatusWith<CIDR> CIDR::parse(StringData s) {
+    CIDR value;
     auto slash = find(begin(s), end(s), '/');
     auto ip = (slash == end(s)) ? s.toString() : s.substr(0, slash - begin(s)).toString();
 
-    if (inet_pton(AF_INET, ip.c_str(), _ip.data())) {
-        _family = AF_INET;
-        _len = kIPv4Bits;
-    } else if (inet_pton(AF_INET6, ip.c_str(), _ip.data())) {
-        _family = AF_INET6;
-        _len = kIPv6Bits;
+    if (inet_pton(AF_INET, ip.c_str(), value._ip.data())) {
+        value._family = AF_INET;
+        value._len = kIPv4Bits;
+    } else if (inet_pton(AF_INET6, ip.c_str(), value._ip.data())) {
+        value._family = AF_INET6;
+        value._len = kIPv6Bits;
     } else {
-        uasserted(ErrorCodes::UnsupportedFormat, "Invalid IP address in CIDR string");
+        return Status(ErrorCodes::UnsupportedFormat, "Invalid IP address in CIDR string");
     }
 
     if (slash == end(s)) {
-        return;
+        return value;
     }
 
-    auto len = strict_stoi(std::string(slash + 1, end(s)), 10);
-    uassert(ErrorCodes::UnsupportedFormat,
-            "Invalid length in CIDR string",
-            (len >= 0) && (len <= _len));
-    _len = len;
+    try {
+        auto len = strict_stoi(std::string(slash + 1, end(s)), 10);
 
-} catch (const std::invalid_argument&) {
-    uasserted(ErrorCodes::UnsupportedFormat, "Non-numeric length in CIDR string");
-} catch (const std::out_of_range&) {
-    uasserted(ErrorCodes::UnsupportedFormat, "Invalid length in CIDR string");
+        if (len < 0 || len > value._len) {
+            return Status(ErrorCodes::UnsupportedFormat, "Invalid length in CIDR string");
+        }
+        value._len = len;
+    } catch (const std::invalid_argument&) {
+        return Status(ErrorCodes::UnsupportedFormat, "Non-numeric length in CIDR string");
+    } catch (const std::out_of_range&) {
+        return Status(ErrorCodes::UnsupportedFormat, "Invalid length in CIDR string");
+    }
+    return value;
 }
 
-template <>
-BSONObjBuilder& BSONObjBuilderValueStream::operator<<<CIDR>(CIDR value) {
-    _builder->append(_fieldName, value.toString());
-    _fieldName = StringData();
-    return *_builder;
+CIDR::CIDR(StringData s) {
+    auto status = parse(s);
+    uassertStatusOK(status);
+    *this = status.getValue();
 }
 
-}  // namespace
+CIDR::CIDR() : _family(AF_UNSPEC), _len(0) {
+    _ip.fill(0);
+}
 
-std::ostream& mongo::operator<<(std::ostream& s, const CIDR& cidr) {
+BSONObjBuilder& operator<<(BSONObjBuilder::ValueStream& stream, const CIDR& value) {
+    return stream << value.toString();
+}
+
+std::ostream& operator<<(std::ostream& s, const CIDR& cidr) {
     return append(s, cidr._family, cidr._ip, cidr._len);
 }
 
-mongo::StringBuilder& mongo::operator<<(StringBuilder& s, const CIDR& cidr) {
+StringBuilder& operator<<(StringBuilder& s, const CIDR& cidr) {
     return append(s, cidr._family, cidr._ip, cidr._len);
 }
+
+}  // namespace mongo

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,22 +27,25 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
+// IWYU pragma: no_include "cxxabi.h"
+#include <mutex>
+#include <utility>
 #include <vector>
 
-#include "mongo/db/operation_context_noop.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/base/string_data.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/repl/task_runner.h"
 #include "mongo/db/repl/task_runner_test_fixture.h"
 #include "mongo/stdx/condition_variable.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/unittest/barrier.h"
+#include "mongo/unittest/unittest.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/concurrency/thread_pool.h"
 
+namespace mongo::repl {
 namespace {
-
-using namespace mongo;
-using namespace mongo::repl;
 
 using Task = TaskRunner::Task;
 
@@ -81,9 +83,8 @@ TEST_F(TaskRunnerTest, CallbackValues) {
 
 using OpIdVector = std::vector<unsigned int>;
 
-OpIdVector _testRunTaskTwice(TaskRunnerTest& test,
-                             TaskRunner::NextAction nextAction,
-                             unique_function<void(Task task)> schedule) {
+OpIdVector _testRunTaskTwice(TaskRunnerTest& test, unique_function<void(Task task)> schedule) {
+    auto nextAction = TaskRunner::NextAction::kDisposeOperationContext;
     unittest::Barrier barrier(2U);
     stdx::mutex mutex;
     std::vector<OperationContext*> txns;
@@ -119,14 +120,11 @@ OpIdVector _testRunTaskTwice(TaskRunnerTest& test,
     return txnIds;
 }
 
-std::vector<unsigned int> _testRunTaskTwice(TaskRunnerTest& test,
-                                            TaskRunner::NextAction nextAction) {
-    auto schedule = [&](Task task) { test.getTaskRunner().schedule(std::move(task)); };
-    return _testRunTaskTwice(test, nextAction, schedule);
-}
-
 TEST_F(TaskRunnerTest, RunTaskTwiceDisposeOperationContext) {
-    auto txnId = _testRunTaskTwice(*this, TaskRunner::NextAction::kDisposeOperationContext);
+    auto schedule = [&](Task task) {
+        getTaskRunner().schedule(std::move(task));
+    };
+    auto txnId = _testRunTaskTwice(*this, schedule);
     ASSERT_NOT_EQUALS(txnId[0], txnId[1]);
 }
 
@@ -138,14 +136,8 @@ TEST_F(TaskRunnerTest, RunTaskTwiceDisposeOperationContextJoinThreadPoolBeforeSc
         getThreadPool().waitForIdle();
         getTaskRunner().schedule(std::move(task));
     };
-    auto txnId =
-        _testRunTaskTwice(*this, TaskRunner::NextAction::kDisposeOperationContext, schedule);
+    auto txnId = _testRunTaskTwice(*this, schedule);
     ASSERT_NOT_EQUALS(txnId[0], txnId[1]);
-}
-
-TEST_F(TaskRunnerTest, RunTaskTwiceKeepOperationContext) {
-    auto txnId = _testRunTaskTwice(*this, TaskRunner::NextAction::kKeepOperationContext);
-    ASSERT_EQUALS(txnId[0], txnId[1]);
 }
 
 TEST_F(TaskRunnerTest, SkipSecondTask) {
@@ -218,7 +210,7 @@ TEST_F(TaskRunnerTest, FirstTaskThrowsException) {
 
         // not reached.
         MONGO_UNREACHABLE;
-        return TaskRunner::NextAction::kKeepOperationContext;
+        return TaskRunner::NextAction::kDisposeOperationContext;
     };
     getTaskRunner().schedule(task);
     ASSERT_TRUE(getTaskRunner().isActive());
@@ -252,7 +244,7 @@ TEST_F(TaskRunnerTest, Cancel) {
         status = theStatus;
         taskRunning = true;
         condition.notify_all();
-        return TaskRunner::NextAction::kKeepOperationContext;
+        return TaskRunner::NextAction::kDisposeOperationContext;
     };
 
     // Calling cancel() before schedule() has no effect.
@@ -288,18 +280,14 @@ TEST_F(TaskRunnerTest, JoinShouldWaitForTasksToComplete) {
     Status status2 = getDetectableErrorStatus();
 
     // "task1" should start running before we invoke join() the task runner.
-    // Upon completion, "task1" requests the task runner to retain the operation context. This has
-    // effect of keeping the task runner active.
     auto task1 = [&](OperationContext* theTxn, const Status& theStatus) {
         stdx::lock_guard<stdx::mutex> lk(mutex);
         barrier.countDownAndWait();
         status1 = theStatus;
-        return TaskRunner::NextAction::kKeepOperationContext;
+        return TaskRunner::NextAction::kDisposeOperationContext;
     };
 
     // "task2" should start running after we invoke join() the task runner.
-    // Upon completion, "task2" requests the task runner to dispose the operation context. After the
-    // operation context is destroyed, the task runner will go into an inactive state.
     auto task2 = [&](OperationContext* theTxn, const Status& theStatus) {
         stdx::lock_guard<stdx::mutex> lk(mutex);
         status2 = theStatus;
@@ -333,7 +321,7 @@ TEST_F(TaskRunnerTest, DestroyShouldWaitForTasksToComplete) {
         status = theStatus;
         taskRunning = true;
         condition.notify_all();
-        return TaskRunner::NextAction::kKeepOperationContext;
+        return TaskRunner::NextAction::kDisposeOperationContext;
     };
 
     getTaskRunner().schedule(task);
@@ -356,3 +344,4 @@ TEST_F(TaskRunnerTest, DestroyShouldWaitForTasksToComplete) {
 }
 
 }  // namespace
+}  // namespace mongo::repl

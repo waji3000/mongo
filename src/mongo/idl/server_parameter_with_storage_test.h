@@ -29,18 +29,31 @@
 
 #pragma once
 
-#include "mongo/platform/basic.h"
+#include <boost/optional/optional.hpp>
+#include <cstddef>
+#include <cstdint>
 
-#include "mongo/idl/server_parameter.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/db/server_parameter.h"
+#include "mongo/db/tenant_id.h"
+#include "mongo/idl/server_parameter_with_storage_test_structs_gen.h"
+#include "mongo/platform/atomic_word.h"
 
 namespace mongo {
 namespace test {
 
+constexpr std::int32_t kStartupIntWithExpressionsMinimum = 10;
+constexpr std::int32_t kStartupIntWithExpressionsMaximum = 1000;
+
 // Storage for set parameter defined in server_parameter_with_storage.idl
-extern AtomicInt32 gStdIntPreallocated;
+extern AtomicWord<int> gStdIntPreallocated;
 
 // Counter for how many times gStdIntPreallocated has been modified.
-extern AtomicInt32 gStdIntPreallocatedUpdateCount;
+extern AtomicWord<int> gStdIntPreallocatedUpdateCount;
+
+// Counter for how many times changeStreamOptions has been modified.
+extern size_t count;
 
 /**
  * Validates that the proposed new value is odd.
@@ -49,12 +62,35 @@ inline Status validateOdd(const std::int32_t& value) {
     return (value & 1) ? Status::OK() : Status(ErrorCodes::BadValue, "Must be odd");
 }
 
+inline Status validateOddSP(const std::int32_t& value, const boost::optional<TenantId>&) {
+    return validateOdd(value);
+}
+
+/**
+ * Validates that the new expireAfterSeconds is non-negative.
+ */
+inline Status validateNonNegativeExpireAfterSeconds(const ChangeStreamOptionsClusterParam& newVal,
+                                                    const boost::optional<TenantId>& tenantId) {
+    if (newVal.getPreAndPostImages().getExpireAfterSeconds() < 0) {
+        return Status(ErrorCodes::BadValue, "Should be non-negative value only");
+    }
+    return Status::OK();
+}
+
 /**
  * Bumps the count of gStdIntPreallocatedUpdateCount in response
  * to the successful update of gStdIntPreallocated.
  */
 inline Status onUpdateStdIntPreallocated(const std::int32_t&) {
     gStdIntPreallocatedUpdateCount.fetchAndAdd(1);
+    return Status::OK();
+}
+
+/**
+ * Bumps count in response to the successful update of changeStreamOptions.
+ */
+inline Status onUpdateChangeStreamOptions(const ChangeStreamOptionsClusterParam&) {
+    ++count;
     return Status::OK();
 }
 

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,11 +27,19 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <boost/move/utility_core.hpp>
+#include <string>
+#include <utility>
 
-#include "mongo/db/matcher/extensions_callback.h"
+#include <boost/smart_ptr/intrusive_ptr.hpp>
 
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsontypes.h"
 #include "mongo/bson/util/bson_extract.h"
+#include "mongo/db/matcher/extensions_callback.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 
@@ -98,6 +105,14 @@ ExtensionsCallback::extractTextMatchExpressionParams(BSONElement text) {
     return {std::move(params)};
 }
 
+StatusWithMatchExpression ExtensionsCallback::parseText(BSONElement text) const {
+    auto textParams = extractTextMatchExpressionParams(text);
+    if (!textParams.isOK()) {
+        return textParams.getStatus();
+    }
+    return createText(std::move(textParams.getValue()));
+}
+
 StatusWith<WhereMatchExpressionBase::WhereParams>
 ExtensionsCallback::extractWhereMatchExpressionParams(BSONElement where) {
     WhereMatchExpressionBase::WhereParams params;
@@ -106,11 +121,9 @@ ExtensionsCallback::extractWhereMatchExpressionParams(BSONElement where) {
         case mongo::String:
         case mongo::Code:
             params.code = where._asCode();
-            params.scope = BSONObj();
             break;
         case mongo::CodeWScope:
-            params.code = where._asCode();
-            params.scope = where.codeWScopeObject().getOwned();
+            uasserted(4649201, "$where no longer supports deprecated BSON type CodeWScope");
             break;
         default:
             return {ErrorCodes::BadValue, "$where got bad type"};
@@ -121,6 +134,15 @@ ExtensionsCallback::extractWhereMatchExpressionParams(BSONElement where) {
     }
 
     return params;
+}
+
+StatusWithMatchExpression ExtensionsCallback::parseWhere(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx, BSONElement where) const {
+    auto whereParams = extractWhereMatchExpressionParams(where);
+    if (!whereParams.isOK()) {
+        return whereParams.getStatus();
+    }
+    return {createWhere(expCtx, std::move(whereParams.getValue()))};
 }
 
 }  // namespace mongo

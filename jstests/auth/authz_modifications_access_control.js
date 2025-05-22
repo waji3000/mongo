@@ -3,6 +3,8 @@
  * @tags: [requires_sharding]
  */
 
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+
 function runTest(conn) {
     var authzErrorCode = 13;
 
@@ -70,7 +72,6 @@ function runTest(conn) {
         var roleObj = adminUserAdmin.system.roles.findOne({role: "readWrite", db: "admin"});
         // double check that no role object named "readWrite" has been created
         assert(!roleObj, "user-defined \"readWrite\" role was created: " + tojson(roleObj));
-
     })();
 
     (function testViewUser() {
@@ -300,8 +301,6 @@ runTest(conn);
 MongoRunner.stopMongod(conn);
 
 jsTest.log('Test sharding');
-// TODO: Remove 'shardAsReplicaSet: false' when SERVER-32672 is fixed.
-var st = new ShardingTest(
-    {shards: 2, config: 3, keyFile: 'jstests/libs/key1', other: {shardAsReplicaSet: false}});
+var st = new ShardingTest({shards: 2, config: 3, keyFile: 'jstests/libs/key1'});
 runTest(st.s);
 st.stop();

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -32,6 +31,8 @@
 
 #include <string>
 
+#include "mongo/db/auth/cluster_auth_mode.h"
+
 namespace mongo {
 template <class T>
 class StatusWith;
@@ -43,6 +44,6 @@ class StatusWith;
  * @param filename the file containing the key
  * @return if the key was successfully stored
  */
-bool setUpSecurityKey(const std::string& filename);
+bool setUpSecurityKey(const std::string& filename, ClusterAuthMode mode);
 
 }  // namespace mongo

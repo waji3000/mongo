@@ -1,5 +1,5 @@
 /*-
- * Public Domain 2014-2018 MongoDB, Inc.
+ * Public Domain 2014-present MongoDB, Inc.
  * Public Domain 2008-2014 WiredTiger, Inc.
  *
  * This is free and unencumbered software released into the public domain.
@@ -26,389 +26,502 @@
  * OTHER DEALINGS IN THE SOFTWARE.
  */
 
+#pragma once
+
+#include "math.h"
 #include "test_util.h"
 
-#ifdef BDB
+#ifdef HAVE_SETRLIMIT
+#include <sys/resource.h>
+#endif
+#include <signal.h>
+
+#define BUILDDIR "../../"
+#define EXTPATH BUILDDIR "ext/" /* Extensions path */
+#ifndef EXT_LIBPATH
+#define EXT_LIBPATH ".libs/"
+#endif
+
+/* Collators. */
+#define REVERSE_PATH EXTPATH "collators/reverse/" EXT_LIBPATH "libwiredtiger_reverse_collator.so"
+
+/* Compressors. */
+#define LZ4_PATH EXTPATH "compressors/lz4/" EXT_LIBPATH "libwiredtiger_lz4.so"
+
+#define SNAPPY_PATH EXTPATH "compressors/snappy/" EXT_LIBPATH "libwiredtiger_snappy.so"
+
+#define ZLIB_PATH EXTPATH "compressors/zlib/" EXT_LIBPATH "libwiredtiger_zlib.so"
+
+#define ZSTD_PATH EXTPATH "compressors/zstd/" EXT_LIBPATH "libwiredtiger_zstd.so"
+
+/* Encryptors. */
+#define ROTN_PATH EXTPATH "encryptors/rotn/" EXT_LIBPATH "libwiredtiger_rotn.so"
+
+#define SODIUM_PATH EXTPATH "encryptors/sodium/" EXT_LIBPATH "libwiredtiger_sodium.so"
+
 /*
- * Berkeley DB has an #ifdef we need to provide a value for, we'll see an
- * undefined error if it's unset during a strict compile.
+ * To test the sodium encryptor, we use secretkey= rather than setting a keyid, because for a "real"
+ * (vs. test-only) encryptor, keyids require some kind of key server, and (a) setting one up for
+ * testing would be a nuisance and (b) currently the sodium encryptor doesn't support any anyway.
+ *
+ * It expects secretkey= to provide a hex-encoded 256-bit chacha20 key. This key will serve for
+ * testing purposes.
  */
-#ifndef	DB_DBM_HSEARCH
-#define	DB_DBM_HSEARCH	0
-#endif
-#include <assert.h>
-#include <db.h>
-#endif
+#define SODIUM_TESTKEY "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 
-#define	EXTPATH	"../../ext/"			/* Extensions path */
+#undef M
+#define M(v) ((v)*WT_MILLION) /* Million */
+#undef KILOBYTE
+#define KILOBYTE(v) ((v)*WT_KILOBYTE)
+#undef MEGABYTE
+#define MEGABYTE(v) ((v)*WT_MEGABYTE)
 
-#define	LZ4_PATH							\
-	EXTPATH "compressors/lz4/.libs/libwiredtiger_lz4.so"
-#define	SNAPPY_PATH							\
-	EXTPATH "compressors/snappy/.libs/libwiredtiger_snappy.so"
-#define	ZLIB_PATH							\
-	EXTPATH "compressors/zlib/.libs/libwiredtiger_zlib.so"
-#define	ZSTD_PATH							\
-	EXTPATH "compressors/zstd/.libs/libwiredtiger_zstd.so"
+/* Format isn't careful about path buffers, an easy to fix hard-coded length. */
+#define MAX_FORMAT_PATH 1024
 
-#define	REVERSE_PATH							\
-	EXTPATH "collators/reverse/.libs/libwiredtiger_reverse_collator.so"
+#define BACKUP_INFO_FILE "BACKUP_INFO"         /* Format's backup information for restart */
+#define BACKUP_INFO_FILE_TMP "BACKUP_INFO.TMP" /* Format's backup information for restart */
+#define BACKUP_MAX_COPY MEGABYTE(64)           /* Maximum size we'll read/write at a time */
 
-#define	ROTN_PATH							\
-	EXTPATH "encryptors/rotn/.libs/libwiredtiger_rotn.so"
+#define FORMAT_OPERATION_REPS 3 /* 3 thread operations sets */
 
-#define	KVS_BDB_PATH							\
-	EXTPATH "test/kvs_bdb/.libs/libwiredtiger_kvs_bdb.so"
-#define	HELIUM_PATH							\
-	EXTPATH "datasources/helium/.libs/libwiredtiger_helium.so"
+#define FORMAT_PAD_BYTE '-'  /* modify pad byte */
+#define MAX_MODIFY_ENTRIES 5 /* maximum change vectors */
+#define REALLOC_MAX_TABLES 5 /* maximum number of tables with realloc_exact and realloc_malloc */
+#define STR(s) #s
+#define XSTR(s) STR(s)
 
-#define	LZO_PATH	".libs/lzo_compress.so"
+/* Session configuration to enable prefetch. */
+#define SESSION_PREFETCH_CFG_ON "prefetch=(enabled=true)"
 
-#undef	M
-#define	M(v)		((v) * WT_MILLION)	/* Million */
-#undef	KILOBYTE
-#define	KILOBYTE(v)	((v) * WT_KILOBYTE)
-#undef	MEGABYTE
-#define	MEGABYTE(v)	((v) * WT_MEGABYTE)
-
-#define	WT_NAME	"wt"				/* Object name */
-
-#define	DATASOURCE(v)	(strcmp(v, g.c_data_source) == 0 ? 1 : 0)
-#define	SINGLETHREADED	(g.c_threads == 1)
-
-#define	FORMAT_OPERATION_REPS	3		/* 3 thread operations sets */
-
-#define	MAX_MODIFY_ENTRIES	5		/* maximum change vectors */
+#include "config.h"
+extern CONFIG configuration_list[];
 
 typedef struct {
-	char *home;				/* Home directory */
-	char *home_backup;			/* Hot-backup directory */
-	char *home_backup_init;			/* Initialize backup command */
-	char *home_bdb;				/* BDB directory */
-	char *home_config;			/* Run CONFIG file path */
-	char *home_init;			/* Initialize home command */
-	char *home_log;				/* Operation log file path */
-	char *home_rand;			/* RNG log file path */
-	char *home_salvage_copy;		/* Salvage copy command */
-	char *home_stats;			/* Statistics file path */
+    uint32_t v; /* integral value */
+    char *vstr; /* string value */
+    bool set;   /* value explicitly set */
+} CONFIGV;
 
-	char *helium_mount;			/* Helium volume */
+/*
+ * The LANE data structure is used with predictable replay. With predictable replay, we want to make
+ * sure that two threads can never act on the same key. The last bits of the timestamp to be used to
+ * determine a lane, so it takes a while (LANE_COUNT operations) to cycle through the lanes. A lane
+ * only acts on key numbers whose last bits match the lane. We also keep track of lanes via the
+ * g.lanes array. This guarantees that a lane is only being used one at a time, which in turn
+ * guarantees that a key can only be used once at a time.
+ *
+ * A more complete description of how this fits into predictable replay is in replay.c .
+ */
+typedef struct {
+    uint64_t last_commit_ts;
+    bool in_use;
+} LANE;
+#define LANE_NONE UINT32_MAX /* A lane number guaranteed to be illegal */
+#define LANE_COUNT 1024u
 
-	char wiredtiger_open_config[8 * 1024];	/* Database open config */
+/* Arguments to the read scanner. */
+typedef struct {
+    WT_CONNECTION *conn;
+    WT_RAND_STATE *rnd;
+} READ_SCAN_ARGS;
 
-#ifdef HAVE_BERKELEY_DB
-	void *bdb;				/* BDB comparison handle */
-	void *dbc;				/* BDB cursor handle */
-#endif
+/*
+ * Abstract lock that lets us use either pthread reader-writer locks or WiredTiger's own (likely
+ * faster) implementation.
+ */
+typedef struct {
+    union {
+        WT_RWLOCK wt;
+        pthread_rwlock_t pthread;
+    } l;
+    enum { LOCK_NONE = 0, LOCK_WT, LOCK_PTHREAD } lock_type;
+} RWLOCK;
 
-	WT_CONNECTION	 *wts_conn;
-	WT_EXTENSION_API *wt_api;
+/* Session application private information referenced in the event handlers. */
+typedef struct {
+    WT_SESSION *trace; /* Tracing session for logging operations */
+    const char *track; /* Tag for tracking operation progress */
+} SAP;
 
-	bool  rand_log_stop;			/* Logging turned off */
-	FILE *randfp;				/* Random number log */
+/*
+ * Default fixed-length column-store value when there's no available base mirror value, something
+ * with half the bits set.
+ */
+#define FIX_MIRROR_DNE 0x55
 
-	uint32_t run_cnt;			/* Run counter */
+/* There's no out-of-band value for FLCS, use 0xff as the least likely to match any existing value.
+ */
+#define FIX_VALUE_WRONG 0xff
 
-	enum {
-	    LOG_FILE=1,				/* Use a log file */
-	    LOG_OPS=2				/* Log all operations */
-	} logging;
-	FILE *logfp;				/* Log file */
+typedef enum { FIX, ROW, VAR } table_type;
+typedef struct {
+    u_int id;              /* table ID */
+    char uri[32];          /* table URI */
+    table_type type;       /* table type */
+    char track_prefix[32]; /* table track message prefix */
 
-	bool replay;				/* Replaying a run. */
-	bool workers_finished;			/* Operations completed */
+    bool mirror; /* Table is in a mirrored group */
 
-	pthread_rwlock_t backup_lock;		/* Backup running */
+    uint32_t max_intl_page; /* page size configurations converted to bytes */
+    uint32_t max_leaf_page;
+    uint32_t max_mem_page;
 
-	WT_RAND_STATE rnd;			/* Global RNG state */
+    uint32_t rows_current; /* current row count */
 
-	/*
-	 * Prepare will return an error if the prepare timestamp is less than
-	 * any active read timestamp. Lock across allocating prepare and read
-	 * timestamps.
-	 *
-	 * We get the last committed timestamp periodically in order to update
-	 * the oldest timestamp, that requires locking out transactional ops
-	 * that set a timestamp.
-	 */
-	pthread_rwlock_t ts_lock;
+    uint32_t key_rand_len[1031]; /* key: lengths */
+    char *val_base;              /* value: base/original */
+    uint32_t val_dup_data_len;   /* value: length of duplicate data items */
 
-	uint64_t timestamp;			/* Counter for timestamps */
+    CONFIGV v[V_ELEMENT_COUNT]; /* table configuration */
+} TABLE;
 
-	uint64_t truncate_cnt;			/* Counter for truncation */
+/*
+ * We read the configuration in a single pass, which means we don't know the table count until the
+ * end, and it can be extended at any time. Start out with a single table, which contains all of the
+ * global/default values, stored in the first slot of the tables array. If tables are added during
+ * configuration, they are separately allocated, but we continue to use the first (base) table slot
+ * for non-specific table or global configurations. In other words, the base information and the
+ * only table's information are both in tables' slot 0 to start. If additional tables are
+ * configured, the per-table information for each table is stored in tables slots 1-N. The number of
+ * tables starts at 0, and if any tables are configured, it's incremented: in other words, if the
+ * number of tables is 0, all of the information is in tables' slot 0. If the number of tables is
+ * greater than 1, all of the base information is in tables slot 0, and tables slot 1 holds table
+ * #1's specific information, slot #2 holds table #2's specific information and so on. This allows
+ * general and table-specific information to be configured in any order, and as part of the final
+ * table configuration, if there's more than a single table, the information in tables' slot 0 is
+ * propagated out to the additional table slots.
+ */
+extern TABLE *tables[V_MAX_TABLES_CONFIG + 1]; /* Table array */
+extern u_int ntables;
 
-	/*
-	 * We have a list of records that are appended, but not yet "resolved",
-	 * that is, we haven't yet incremented the g.rows value to reflect the
-	 * new records.
-	 */
-	uint64_t *append;			/* Appended records */
-	size_t    append_max;			/* Maximum unresolved records */
-	size_t	  append_cnt;			/* Current unresolved records */
-	pthread_rwlock_t append_lock;		/* Single-thread resolution */
+/*
+ * Global and table-specific macros to retrieve configuration information. All of the tables contain
+ * all of the possible configuration entries, but the first table slot contains all of the global
+ * configuration information. The offset names a prefixed with "V_GLOBAL" and "V_TABLE" to reduce
+ * the chance of a coding error retrieving the wrong configuration item. If returning string values,
+ * convert NULL, where a configuration has never been set, to "off" for consistency.
+ */
+#define GV(off) (tables[0]->v[V_GLOBAL_##off].v)
+#define GVS(off) \
+    (tables[0]->v[V_GLOBAL_##off].vstr == NULL ? "off" : tables[0]->v[V_GLOBAL_##off].vstr)
+#define NTV(table, off) ((table)->v[V_TABLE_##off].v)
+#define NTVS(table, off) \
+    ((table)->v[V_TABLE_##off].vstr == NULL ? "off" : (table)->v[V_TABLE_##off].vstr)
+#define TV(off) NTV(table, off)
+#define TVS(off) NTVS(table, off)
+#define NT_EXPLICIT_SET(table, off) ((table)->v[V_TABLE_##off].set)
+#define NT_EXPLICIT_OFF(table, off) (NT_EXPLICIT_SET(table, off) && !NTV(table, off))
 
-	pthread_rwlock_t death_lock;		/* Single-thread failure */
+#define DATASOURCE(table, ds) (strcmp((table)->v[V_TABLE_RUNS_SOURCE].vstr, ds) == 0)
 
-	char *uri;				/* Object name */
+typedef struct {
+    WT_CONNECTION *wts_conn;
+    WT_CONNECTION *wts_conn_inmemory;
 
-	char *config_open;			/* Command-line configuration */
+    bool backward_compatible; /* Backward compatibility testing */
+    bool configured;          /* Configuration completed */
+    bool reopen;              /* Reopen an existing database */
+    bool workers_finished;    /* Operations completed */
 
-	uint32_t c_abort;			/* Config values */
-	uint32_t c_alter;
-	uint32_t c_auto_throttle;
-	uint32_t c_backups;
-	uint32_t c_bitcnt;
-	uint32_t c_bloom;
-	uint32_t c_bloom_bit_count;
-	uint32_t c_bloom_hash_count;
-	uint32_t c_bloom_oldest;
-	uint32_t c_cache;
-	uint32_t c_cache_minimum;
-	char	*c_checkpoint;
-	uint32_t c_checkpoint_log_size;
-	uint32_t c_checkpoint_wait;
-	char	*c_checksum;
-	uint32_t c_chunk_size;
-	uint32_t c_compact;
-	char	*c_compression;
-	char	*c_config_open;
-	uint32_t c_data_extend;
-	char	*c_data_source;
-	uint32_t c_delete_pct;
-	uint32_t c_dictionary;
-	uint32_t c_direct_io;
-	char	*c_encryption;
-	uint32_t c_evict_max;
-	char	*c_file_type;
-	uint32_t c_firstfit;
-	uint32_t c_huffman_key;
-	uint32_t c_huffman_value;
-	uint32_t c_in_memory;
-	uint32_t c_independent_thread_rng;
-	uint32_t c_insert_pct;
-	uint32_t c_internal_key_truncation;
-	uint32_t c_intl_page_max;
-	char	*c_isolation;
-	uint32_t c_key_gap;
-	uint32_t c_key_max;
-	uint32_t c_key_min;
-	uint32_t c_leaf_page_max;
-	uint32_t c_leak_memory;
-	uint32_t c_logging;
-	uint32_t c_logging_archive;
-	char	*c_logging_compression;
-	uint32_t c_logging_file_max;
-	uint32_t c_logging_prealloc;
-	uint32_t c_long_running_txn;
-	uint32_t c_lsm_worker_threads;
-	uint32_t c_memory_page_max;
-	uint32_t c_merge_max;
-	uint32_t c_mmap;
-	uint32_t c_modify_pct;
-	uint32_t c_ops;
-	uint32_t c_prefix_compression;
-	uint32_t c_prefix_compression_min;
-	uint32_t c_prepare;
-	uint32_t c_quiet;
-	uint32_t c_read_pct;
-	uint32_t c_rebalance;
-	uint32_t c_repeat_data_pct;
-	uint32_t c_reverse;
-	uint32_t c_rows;
-	uint32_t c_runs;
-	uint32_t c_salvage;
-	uint32_t c_split_pct;
-	uint32_t c_statistics;
-	uint32_t c_statistics_server;
-	uint32_t c_threads;
-	uint32_t c_timer;
-	uint32_t c_timing_stress_checkpoint;
-	uint32_t c_timing_stress_lookaside_sweep;
-	uint32_t c_timing_stress_split_1;
-	uint32_t c_timing_stress_split_2;
-	uint32_t c_timing_stress_split_3;
-	uint32_t c_timing_stress_split_4;
-	uint32_t c_timing_stress_split_5;
-	uint32_t c_timing_stress_split_6;
-	uint32_t c_timing_stress_split_7;
-	uint32_t c_timing_stress_split_8;
-	uint32_t c_truncate;
-	uint32_t c_txn_freq;
-	uint32_t c_txn_timestamps;
-	uint32_t c_value_max;
-	uint32_t c_value_min;
-	uint32_t c_verify;
-	uint32_t c_write_pct;
+    WT_CONNECTION *trace_conn; /* Tracing operations */
+    WT_SESSION *trace_session;
+    WT_SPINLOCK trace_lock;
 
-#define	FIX				1
-#define	ROW				2
-#define	VAR				3
-	u_int type;				/* File type's flag value */
+#define TRACE 0x01u
+#define TRACE_BULK 0x02u
+#define TRACE_CURSOR 0x04u
+#define TRACE_MIRROR_FAIL 0x08u
+#define TRACE_READ 0x10u
+#define TRACE_TIMESTAMP 0x20u
+#define TRACE_TXN 0x40u
+#define TRACE_ALL (TRACE_BULK | TRACE_CURSOR | TRACE_READ | TRACE_TIMESTAMP | TRACE_TXN)
+    uint8_t trace_flags;
 
-#define	CHECKPOINT_OFF			1
-#define	CHECKPOINT_ON			2
-#define	CHECKPOINT_WIREDTIGER		3
-	u_int c_checkpoint_flag;		/* Checkpoint flag value */
+    int trace_retain;
 
-#define	CHECKSUM_OFF			1
-#define	CHECKSUM_ON			2
-#define	CHECKSUM_UNCOMPRESSED		3
-	u_int c_checksum_flag;			/* Checksum flag value */
+    char *home;        /* Home directory */
+    char *home_backup; /* Backup file name */
+    char *home_config; /* Run CONFIG file path */
+    char *home_key;    /* Key file filename */
+    char *home_stats;  /* Statistics file path */
 
-#define	COMPRESS_NONE			1
-#define	COMPRESS_LZ4			2
-#define	COMPRESS_LZ4_NO_RAW		3
-#define	COMPRESS_LZO			4
-#define	COMPRESS_SNAPPY			5
-#define	COMPRESS_ZLIB			6
-#define	COMPRESS_ZLIB_NO_RAW		7
-#define	COMPRESS_ZSTD			8
-	u_int c_compression_flag;		/* Compression flag value */
-	u_int c_logging_compression_flag;	/* Log compression flag value */
+    char *config_open; /* Command-line configuration */
 
-#define	ENCRYPT_NONE			1
-#define	ENCRYPT_ROTN_7			2
-	u_int c_encryption_flag;		/* Encryption flag value */
+    TABLE *base_mirror;    /* First mirrored table */
+    bool mirror_col_store; /* Special case if mirroring column store table */
 
-#define	ISOLATION_RANDOM		1
-#define	ISOLATION_READ_UNCOMMITTED	2
-#define	ISOLATION_READ_COMMITTED	3
-#define	ISOLATION_SNAPSHOT		4
-	u_int c_isolation_flag;			/* Isolation flag value */
+    bool background_compaction_running; /* Background compaction running */
 
-	uint32_t intl_page_max;			/* Maximum page sizes */
-	uint32_t leaf_page_max;
+    RWLOCK backup_lock; /* Backup running */
+    uint64_t backup_id; /* Block incremental id */
+    bool backup_incr;   /* Incremental backup */
+    bool backup_verify; /* Verifying backup */
 
-	uint64_t key_cnt;			/* Keys loaded so far */
-	uint64_t rows;				/* Total rows */
+    WT_RAND_STATE data_rnd;  /* Global RNG state for data operations */
+    WT_RAND_STATE extra_rnd; /* Global RNG state for extra operations */
 
-	uint32_t key_rand_len[1031];		/* Key lengths */
+    uint64_t timestamp;        /* Counter for timestamps */
+    uint64_t oldest_timestamp; /* Last timestamp used for oldest */
+    uint64_t stable_timestamp; /* Last timestamp used for stable */
+
+    uint64_t truncate_cnt; /* truncation operation counter */
+
+    uint64_t replay_cached_committed;    /* Our committed timestamp, cached */
+    uint32_t replay_calculate_committed; /* Times before recalculating cached committed */
+    uint64_t replay_start_timestamp;     /* Timestamp at the beginning of a run */
+    uint64_t stop_timestamp;             /* If non-zero, stop when stable reaches this */
+    uint64_t timestamp_copy;             /* A copy of the timestamp, for safety checks */
+
+    uint32_t operation_timeout_ms; /* Requested limit to complete operations in transaction */
+
+    /*
+     * Lock to prevent the stable timestamp from moving during the commit of prepared transactions.
+     * Otherwise, it may panic if the stable timestamp is moved to greater than or equal to the
+     * prepared transaction's durable timestamp when it is committing.
+     */
+    RWLOCK prepare_commit_lock;
+
+    /*
+     * Single-thread failure. Not a WiredTiger library lock because it's set up before configuring
+     * anything.
+     */
+    pthread_rwlock_t death_lock;
+
+    /* Any runs.type configuration. */
+    char runs_type[64];
+
+    /*
+     * The minimum key size: A minimum key size of 13 is necessary, row-store keys have a leading
+     * 10-digit number, and in the case of a row-store insert, a '.' and a two-character suffix.r
+     * The 13 guarantees we never see a key we can't immediately convert to a numeric value without
+     * modification (there's a trailing non-digit character after every key) and ensures inserts
+     * never have a key that matches an original, bulk-loaded key.
+     *
+     * Range of common key prefix selection and the maximum table prefix length.
+     */
+#define KEY_LEN_CONFIG_MIN 13
+#define PREFIX_LEN_CONFIG_MIN 15
+#define PREFIX_LEN_CONFIG_MAX 80
+    uint32_t prefix_len_max;
+
+    bool column_store_config;           /* At least one column-store table configured */
+    bool multi_table_config;            /* If configuring multiple tables */
+    bool tiered_storage_config;         /* If tiered storage is configured */
+    bool transaction_timestamps_config; /* If transaction timestamps configured on any table */
+
+#define CHECKPOINT_OFF 1
+#define CHECKPOINT_ON 2
+#define CHECKPOINT_WIREDTIGER 3
+    u_int checkpoint_config; /* Checkpoint configuration */
+
+    LANE lanes[LANE_COUNT];     /* The lanes for multithreaded coordination  */
+    pthread_rwlock_t lane_lock; /* Lock used when modifying lanes */
 } GLOBAL;
 extern GLOBAL g;
 
+/* Timestamp to lane number */
+#define LANE_NUMBER(ts) (ts & (LANE_COUNT - 1))
+
+/* Worker thread operations. */
+typedef enum { INSERT = 1, MODIFY, READ, REMOVE, TRUNCATE, UPDATE } thread_op;
+
+/* Worker read operations. */
+typedef enum { NEXT, PREV, SEARCH, SEARCH_NEAR } read_operation;
+
+/* Operation snapshot. */
 typedef struct {
-	int	    id;				/* simple thread ID */
-	wt_thread_t tid;			/* thread ID */
+    thread_op op;  /* Operation */
+    uint64_t opid; /* Operation ID */
 
-	WT_RAND_STATE rnd;			/* thread RNG state */
+    u_int id;       /* Table ID */
+    uint64_t keyno; /* Row number */
 
-	volatile bool quit;			/* thread should quit */
+    uint64_t ts;     /* Read/commit timestamp */
+    bool repeatable; /* Operation can be repeated */
 
-	uint64_t ops;				/* total operations */
-	uint64_t commit;			/* operation counts */
-	uint64_t insert;
-	uint64_t prepare;
-	uint64_t remove;
-	uint64_t rollback;
-	uint64_t search;
-	uint64_t truncate;
-	uint64_t update;
+    uint64_t last; /* Inclusive end of a truncate range */
 
-	uint64_t keyno;				/* key */
-	WT_ITEM	 *key, _key;			/* key, value */
-	WT_ITEM	 *value, _value;
+    WT_ITEM key;   /* Generated key for row-store inserts */
+    WT_ITEM value; /* If not a delete or truncate, the value. */
+    uint8_t bitv;  /* FLCS */
+} SNAP_OPS;
 
-	uint64_t last;				/* truncate range */
-	WT_ITEM	 *lastkey, _lastkey;
+typedef struct {
+    SNAP_OPS *snap_state_current;
+    SNAP_OPS *snap_state_end;
+    SNAP_OPS *snap_state_first;
+    SNAP_OPS *snap_state_list;
+} SNAP_STATE;
 
-	WT_ITEM  *tbuf, _tbuf;			/* temporary buffer */
+typedef struct {
+    int id;          /* thread ID */
+    wt_thread_t tid; /* thread ID */
 
-#define	TINFO_RUNNING	1			/* Running */
-#define	TINFO_COMPLETE	2			/* Finished */
-#define	TINFO_JOINED	3			/* Resolved */
-	volatile int state;			/* state */
+    SAP sap; /* Thread's session event handler information */
+
+    WT_RAND_STATE data_rnd;  /* thread RNG state for data operations */
+    WT_RAND_STATE extra_rnd; /* thread RNG state for extra operations */
+
+    uint32_t lane;     /* Current lane for replay */
+    thread_op op;      /* Operation */
+    bool replay_again; /* Need to redo an operation at a timestamp. */
+
+    volatile bool quit; /* thread should quit */
+
+    uint64_t ops;    /* total operations */
+    uint64_t commit; /* operation counts */
+    uint64_t insert;
+    uint64_t modify;
+    uint64_t prepare;
+    uint64_t remove;
+    uint64_t rollback;
+    uint64_t search;
+    uint64_t truncate;
+    uint64_t update;
+
+    WT_SESSION *session; /* WiredTiger session */
+    WT_CURSOR **cursors; /* WiredTiger cursors, maps one-to-one to tables */
+    WT_CURSOR *cursor;   /* Current cursor */
+    TABLE *table;        /* Current table */
+
+    struct col_insert {
+        uint32_t insert_list[256]; /* Inserted column-store records, maps one-to-one to tables */
+        u_int insert_list_cnt;
+    } * col_insert;
+
+    uint64_t keyno;                 /* key */
+    WT_ITEM *key, _key;             /* read key */
+    WT_ITEM *value, _value;         /* read value */
+    WT_ITEM *new_value, _new_value; /* insert, modify or update value */
+    uint8_t bitv;                   /* FLCS insert, modify or update value */
+
+    uint64_t last; /* truncate range */
+    WT_ITEM *lastkey, _lastkey;
+
+    bool ignore_prepare;   /* read with ignore_prepare */
+    bool repeatable_reads; /* if read ops repeatable */
+    bool repeatable_wrap;  /* if circular buffer wrapped */
+    uint64_t opid;         /* Operation ID */
+    uint64_t commit_ts;    /* commit timestamp */
+    uint64_t read_ts;      /* read timestamp */
+    uint64_t replay_ts;    /* allocated timestamp for predictable replay */
+    uint64_t stable_ts;    /* stable timestamp */
+    SNAP_STATE snap_states[2];
+    SNAP_STATE *s; /* points to one of the snap_states */
+
+#define snap_current s->snap_state_current
+#define snap_end s->snap_state_end
+#define snap_first s->snap_state_first
+#define snap_list s->snap_state_list
+
+    int nentries; /* Modify operations */
+    WT_MODIFY entries[MAX_MODIFY_ENTRIES];
+    WT_ITEM moda, modb; /* Temporary buffers for modify checks */
+
+    int op_ret; /* Operation return. */
+
+#define TINFO_RUNNING 1  /* Running */
+#define TINFO_COMPLETE 2 /* Finished */
+#define TINFO_JOINED 3   /* Resolved */
+    volatile int state;  /* state */
 } TINFO;
-
-#ifdef HAVE_BERKELEY_DB
-void	 bdb_close(void);
-void	 bdb_insert(const void *, size_t, const void *, size_t);
-void	 bdb_np(bool, void *, size_t *, void *, size_t *, int *);
-void	 bdb_open(void);
-void	 bdb_read(uint64_t, void *, size_t *, int *);
-void	 bdb_remove(uint64_t, int *);
-void	 bdb_truncate(uint64_t, uint64_t);
-void	 bdb_update(const void *, size_t, const void *, size_t);
-#endif
+extern TINFO **tinfo_list;
 
 WT_THREAD_RET alter(void *);
+WT_THREAD_RET background_compact(void *);
 WT_THREAD_RET backup(void *);
 WT_THREAD_RET checkpoint(void *);
 WT_THREAD_RET compact(void *);
-void	 config_clear(void);
-void	 config_error(void);
-void	 config_file(const char *);
-void	 config_print(int);
-void	 config_setup(void);
-void	 config_single(const char *, int);
-void	 fclose_and_clear(FILE **);
-void	 key_gen(WT_ITEM *, uint64_t);
-void	 key_gen_init(WT_ITEM *);
-void	 key_gen_insert(WT_RAND_STATE *, WT_ITEM *, uint64_t);
-void	 key_gen_teardown(WT_ITEM *);
-void	 key_init(void);
-WT_THREAD_RET lrt(void *);
-void	 path_setup(const char *);
-void	 print_item(const char *, WT_ITEM *);
-void	 print_item_data(const char *, const uint8_t *, size_t);
-int	 read_row_worker(WT_CURSOR *, uint64_t, WT_ITEM *, WT_ITEM *, bool);
-uint32_t rng(WT_RAND_STATE *);
+WT_THREAD_RET hs_cursor(void *);
+WT_THREAD_RET import(void *);
+WT_THREAD_RET random_kv(void *);
 WT_THREAD_RET timestamp(void *);
-void	 track(const char *, uint64_t, TINFO *);
-void	 val_gen(WT_RAND_STATE *, WT_ITEM *, uint64_t);
-void	 val_gen_init(WT_ITEM *);
-void	 val_gen_teardown(WT_ITEM *);
-void	 val_init(void);
-void	 val_teardown(void);
-void	 wts_close(void);
-void	 wts_dump(const char *, int);
-void	 wts_init(void);
-void	 wts_load(void);
-void	 wts_open(const char *, bool, WT_CONNECTION **);
-void	 wts_ops(int);
-void	 wts_read_scan(void);
-void	 wts_rebalance(void);
-void	 wts_reopen(void);
-void	 wts_salvage(void);
-void	 wts_stats(void);
-void	 wts_verify(const char *);
 
-/*
- * mmrand --
- *	Return a random value between a min/max pair, inclusive.
- */
-static inline uint32_t
-mmrand(WT_RAND_STATE *rnd, u_int min, u_int max)
-{
-	uint32_t v;
-	u_int range;
+uint32_t atou32(const char *, const char *, int);
+void config_clear(void);
+void config_compat(const char **);
+void config_error(void);
+void config_file(const char *);
+void config_print(bool);
+void config_run(void);
+void config_single(TABLE *, const char *, bool);
+void create_database(const char *home, WT_CONNECTION **connp);
+void cursor_dump_page(WT_CURSOR *, const char *);
+bool enable_session_prefetch(void);
+void fclose_and_clear(FILE **);
+void key_gen_common(TABLE *, WT_ITEM *, uint64_t, const char *);
+void key_gen_init(WT_ITEM *);
+void key_gen_teardown(WT_ITEM *);
+void key_init(TABLE *, void *);
+void lock_destroy(WT_SESSION *, RWLOCK *);
+void lock_init(WT_SESSION *, RWLOCK *);
+void operations(u_int, u_int, u_int);
+void path_setup(const char *);
+void set_alarm(u_int);
+void set_core(bool);
+void snap_init(TINFO *);
+void snap_op_init(TINFO *, uint64_t, bool);
+void snap_repeat_rollback(WT_SESSION *, TINFO **, size_t);
+void snap_repeat_single(TINFO *);
+int snap_repeat_txn(TINFO *);
+void snap_repeat_update(TINFO *, bool);
+void snap_teardown(TINFO *);
+void snap_track(TINFO *, thread_op);
+void table_dump_page(WT_SESSION *, const char *, TABLE *, uint64_t, const char *);
+void table_verify(TABLE *, void *);
+void timestamp_init(void);
+uint64_t timestamp_minimum_committed(void);
+void timestamp_once(WT_SESSION *, bool, bool);
+void replay_adjust_key(TINFO *, uint64_t);
+uint64_t replay_commit_ts(TINFO *);
+void replay_committed(TINFO *);
+void replay_end_timed_run(void);
+void replay_loop_begin(TINFO *, bool);
+uint64_t replay_maximum_committed(void);
+bool replay_operation_enabled(thread_op);
+void replay_pause_after_rollback(TINFO *, uint32_t);
+uint64_t replay_prepare_ts(TINFO *);
+uint64_t replay_read_ts(TINFO *);
+void replay_rollback(TINFO *);
+void replay_run_begin(WT_SESSION *);
+void replay_run_end(WT_SESSION *);
+int timestamp_query(const char *, uint64_t *);
+void timestamp_teardown(WT_SESSION *);
+void trace_config(const char *);
+void trace_init(void);
+void trace_ops_init(TINFO *);
+void trace_teardown(void);
+void track(const char *, uint64_t);
+void track_ops(TINFO *);
+void val_gen(TABLE *, WT_RAND_STATE *, WT_ITEM *, uint8_t *, uint64_t);
+void val_gen_init(WT_ITEM *);
+void val_gen_teardown(WT_ITEM *);
+void val_init(TABLE *, void *);
+void val_to_flcs(TABLE *, WT_ITEM *, uint8_t *);
+void wt_wrap_open_session(
+  WT_CONNECTION *conn, SAP *sap, const char *track, const char *cfg, WT_SESSION **sessionp);
+void wt_wrap_close_session(WT_SESSION *session);
+void wts_checkpoints(void);
+void wts_close(WT_CONNECTION **);
+void wts_create_database(void);
+void wts_create_home(void);
+void wts_dump(const char *, bool);
+void wts_load(void);
+void wts_open(const char *, WT_CONNECTION **, bool);
+void wts_read_scan(TABLE *, void *);
+void wts_reopen(void);
+void wts_salvage(TABLE *, void *);
+void wts_stats(void);
+void wts_verify(WT_CONNECTION *, bool);
+void wts_verify_mirrored_truncate(TINFO *tinfo);
+void wts_verify_mirrors(WT_CONNECTION *, const char *, TINFO *);
 
-	v = rng(rnd);
-	range = (max - min) + 1;
-	v %= range;
-	v += min;
-	return (v);
-}
+/* Backward compatibility to older versions of the WiredTiger library. */
+#if !defined(CUR2S)
+#define CUR2S(c) ((WT_SESSION_IMPL *)((WT_CURSOR *)c)->session)
+#endif
 
-static inline void
-random_sleep(WT_RAND_STATE *rnd, u_int max_seconds)
-{
-	uint64_t i, micro_seconds;
+#define WARN(fmt, ...) fprintf(stderr, "%s: WARNING: " fmt "\n", progname, __VA_ARGS__)
 
-	/*
-	 * We need a fast way to choose a sleep time. We want to sleep a short
-	 * period most of the time, but occasionally wait longer. Divide the
-	 * maximum period of time into 10 buckets (where bucket 0 doesn't sleep
-	 * at all), and roll dice, advancing to the next bucket 50% of the time.
-	 * That means we'll hit the maximum roughly every 1K calls.
-	 */
-	for (i = 0;;)
-		if (rng(rnd) & 0x1 || ++i > 9)
-			break;
-
-	if (i == 0)
-		__wt_yield();
-	else {
-		micro_seconds = (uint64_t)max_seconds * WT_MILLION;
-		__wt_sleep(0, i * (micro_seconds / 10));
-	}
-}
+#include "format_inline.h"

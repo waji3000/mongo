@@ -1,6 +1,3 @@
-// update_index_data.cpp
-
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -31,22 +28,31 @@
  */
 
 #include "mongo/db/update_index_data.h"
-#include "mongo/bson/util/builder.h"
+
+#include <absl/container/btree_set.h>
+#include <boost/container/small_vector.hpp>
+#include <cstddef>
+
+// IWYU pragma: no_include "boost/intrusive/detail/iterator.hpp"
 
 namespace mongo {
 
 UpdateIndexData::UpdateIndexData() : _allPathsIndexed(false) {}
 
 void UpdateIndexData::addPath(const FieldRef& path) {
-    _canonicalPaths.insert(getCanonicalIndexField(path));
+    _canonicalPaths.insert(FieldRef::getCanonicalIndexField(path));
 }
 
 void UpdateIndexData::addPathComponent(StringData pathComponent) {
     _pathComponents.insert(pathComponent.toString());
 }
 
-void UpdateIndexData::allPathsIndexed() {
+void UpdateIndexData::setAllPathsIndexed() {
     _allPathsIndexed = true;
+}
+
+bool UpdateIndexData::allPathsIndexed() const {
+    return _allPathsIndexed;
 }
 
 void UpdateIndexData::clear() {
@@ -55,16 +61,19 @@ void UpdateIndexData::clear() {
     _allPathsIndexed = false;
 }
 
+bool UpdateIndexData::isEmpty() const {
+    return !_allPathsIndexed && _canonicalPaths.empty() && _pathComponents.empty();
+}
+
 bool UpdateIndexData::mightBeIndexed(const FieldRef& path) const {
     if (_allPathsIndexed) {
         return true;
     }
 
-    FieldRef canonicalPath = getCanonicalIndexField(path);
-
-    for (const auto& idx : _canonicalPaths) {
-        if (_startsWith(canonicalPath, idx) || _startsWith(idx, canonicalPath))
+    for (const auto& indexedPath : _canonicalPaths) {
+        if (FieldRef::pathOverlaps(path, indexedPath)) {
             return true;
+        }
     }
 
     for (const auto& pathComponent : _pathComponents) {
@@ -78,41 +87,12 @@ bool UpdateIndexData::mightBeIndexed(const FieldRef& path) const {
     return false;
 }
 
-bool UpdateIndexData::_startsWith(const FieldRef& a, const FieldRef& b) const {
-    return (a == b) || (b.isPrefixOf(a));
+const absl::btree_set<FieldRef>& UpdateIndexData::getCanonicalPaths() const {
+    return _canonicalPaths;
 }
 
-FieldRef UpdateIndexData::getCanonicalIndexField(const FieldRef& path) {
-    if (path.numParts() <= 1)
-        return path;
-
-    // The first part of the path must always be a valid field name, since it's not possible to
-    // store a top-level array or '$' field name in a document.
-    FieldRef buf(path.getPart(0));
-    for (size_t i = 1; i < path.numParts(); ++i) {
-        auto pathComponent = path.getPart(i);
-
-        if (pathComponent == "$"_sd) {
-            continue;
-        }
-
-        if (FieldRef::isNumericPathComponentLenient(pathComponent)) {
-            // Peek ahead to see if the next component is also all digits. This implies that the
-            // update is attempting to create a numeric field name which would violate the
-            // "ambiguous field name in array" constraint for multi-key indexes. Break early in this
-            // case and conservatively return that this path affects the prefix of the consecutive
-            // numerical path components. For instance, an input such as 'a.0.1.b.c' would return
-            // the canonical index path of 'a'.
-            if ((i + 1) < path.numParts() &&
-                FieldRef::isNumericPathComponentLenient(path.getPart(i + 1))) {
-                break;
-            }
-            continue;
-        }
-
-        buf.appendPart(pathComponent);
-    }
-
-    return buf;
+const absl::btree_set<std::string>& UpdateIndexData::getPathComponents() const {
+    return _pathComponents;
 }
-}
+
+}  // namespace mongo

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -35,6 +34,7 @@
 
 #include "mongo/base/clonable_ptr.h"
 #include "mongo/db/field_ref.h"
+#include "mongo/db/update/path_support.h"
 #include "mongo/db/update/update_node.h"
 
 namespace mongo {
@@ -45,24 +45,6 @@ namespace mongo {
  */
 class UpdateInternalNode : public UpdateNode {
 public:
-    /**
-     * Helper class for appending to a FieldRef for the duration of the current scope and then
-     * restoring the FieldRef at the end of the scope.
-     */
-    class FieldRefTempAppend {
-    public:
-        FieldRefTempAppend(FieldRef& fieldRef, StringData part) : _fieldRef(fieldRef) {
-            _fieldRef.appendPart(part);
-        }
-
-        ~FieldRefTempAppend() {
-            _fieldRef.removeLastPart();
-        }
-
-    private:
-        FieldRef& _fieldRef;
-    };
-
     UpdateInternalNode(UpdateNode::Type type) : UpdateNode(type) {}
 
     /**
@@ -78,15 +60,25 @@ public:
 
 protected:
     /**
+     * Helper for subclass implementations needing to produce the syntax for applied array filters.
+     */
+    static std::string toArrayFilterIdentifier(const std::string& fieldName) {
+        return "$[" + fieldName + "]";
+    }
+
+    /**
      * Helper for subclass implementations of createUpdateNodeByMerging. Any UpdateNode value whose
      * key is only in 'leftMap' or only in 'rightMap' is cloned and added to the output map. If the
      * key is in both maps, the two UpdateNodes are merged and added to the output map. If
      * wrapFieldNameAsArrayFilterIdentifier is true, field names are wrapped as $[<field name>] for
      * error reporting.
      */
-    static std::map<std::string, clonable_ptr<UpdateNode>> createUpdateNodeMapByMerging(
-        const std::map<std::string, clonable_ptr<UpdateNode>>& leftMap,
-        const std::map<std::string, clonable_ptr<UpdateNode>>& rightMap,
+    static std::map<std::string, clonable_ptr<UpdateNode>, pathsupport::cmpPathsAndArrayIndexes>
+    createUpdateNodeMapByMerging(
+        const std::map<std::string, clonable_ptr<UpdateNode>, pathsupport::cmpPathsAndArrayIndexes>&
+            leftMap,
+        const std::map<std::string, clonable_ptr<UpdateNode>, pathsupport::cmpPathsAndArrayIndexes>&
+            rightMap,
         FieldRef* pathTaken,
         bool wrapFieldNameAsArrayFilterIdentifier = false);
 

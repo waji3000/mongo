@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,7 +27,7 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <memory>
 
 #include "mongo/db/auth/address_restriction.h"
 #include "mongo/unittest/unittest.h"
@@ -212,8 +211,8 @@ TEST(AddressRestrictionTest, contains) {
         {{}, "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff", false},
     };
     for (const auto& p : contains) {
-        const SockAddr dummy;
-        const SockAddr addr(p.address, 1024, AF_UNSPEC);
+        const auto dummy = SockAddr();
+        const auto addr = SockAddr::create(p.address, 1024, AF_UNSPEC);
         const RestrictionEnvironment rec(addr, dummy);
         const RestrictionEnvironment res(dummy, addr);
 
@@ -228,22 +227,16 @@ TEST(AddressRestrictionTest, contains) {
 }
 
 TEST(AddressRestrictionTest, parseFail) {
-    const BSONObj
-        tests[] =
-            {
-                BSON("unknownField"
-                     << ""),
-                BSON("clientSource"
-                     << "1.2.3.4.5"),
-                BSON("clientSource"
-                     << "1.2.3.4"
-                     << "unknownField"
-                     << ""),
-                BSON("clientSource"
-                     << "1.2.3.4"
-                     << "clientSource"
-                     << "2.3.4.5"),
-            };
+    const BSONObj tests[] = {
+        BSON("unknownField" << ""),
+        BSON("clientSource" << "1.2.3.4.5"),
+        BSON("clientSource" << "1.2.3.4"
+                            << "unknownField"
+                            << ""),
+        BSON("clientSource" << "1.2.3.4"
+                            << "clientSource"
+                            << "2.3.4.5"),
+    };
     for (const auto& t : tests) {
         ASSERT_FALSE(parseAddressRestrictionSet(t).isOK());
     }
@@ -320,8 +313,8 @@ TEST(AddressRestrictionTest, parseAndMatch) {
         const auto setwith = parseAddressRestrictionSet(doc);
         ASSERT_OK(setwith);
 
-        const RestrictionEnvironment env(SockAddr(t.client, 1024, AF_UNSPEC),
-                                         SockAddr(t.server, 1025, AF_UNSPEC));
+        const RestrictionEnvironment env(SockAddr::create(t.client, 1024, AF_UNSPEC),
+                                         SockAddr::create(t.server, 1025, AF_UNSPEC));
         ASSERT_EQ(setwith.getValue().validate(env).isOK(), t.valid);
     }
 }

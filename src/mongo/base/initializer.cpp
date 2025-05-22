@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,122 +27,262 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/base/initializer.h"
-
+#include <fmt/format.h>
 #include <iostream>
+#include <random>
+#include <string>
+#include <utility>
+#include <vector>
 
-#include "mongo/base/deinitializer_context.h"
-#include "mongo/base/global_initializer.h"
-#include "mongo/base/initializer_context.h"
+#include "mongo/base/dependency_graph.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/base/initializer.h"
+#include "mongo/base/status.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/exit_code.h"
 #include "mongo/util/quick_exit.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
+
 
 namespace mongo {
 
-Initializer::Initializer() {}
-Initializer::~Initializer() {}
+namespace {
+/**
+ * If certain args are present, we cannot print anything.
+ */
+bool mustRunSilently(const auto& args) {
+    static constexpr std::array q{
+        "--quiet"_sd,
+        "--list"_sd,  // Avoid crosstalk with unit test names
+        "--version"_sd,
+        "--sysInfo"_sd,
+        "--help"_sd,
+        "-h"_sd,
+    };
+    return std::any_of(args.begin(), args.end(), [&](StringData a) {
+        return std::any_of(q.begin(), q.end(), [&](StringData s) { return a.starts_with(s); });
+    });
+}
+}  // namespace
 
-Status Initializer::executeInitializers(const InitializerContext::ArgumentVector& args,
-                                        const InitializerContext::EnvironmentMap& env) {
-    std::vector<std::string> sortedNodes;
-    Status status = _graph.topSort(&sortedNodes);
-    if (Status::OK() != status)
-        return status;
+class Initializer::Graph {
+public:
+    class Payload : public DependencyGraph::Payload {
+    public:
+        InitializerFunction initFn;
+        DeinitializerFunction deinitFn;
+        bool initialized = false;
+    };
 
-    InitializerContext context(args, env);
-
-    for (size_t i = 0; i < sortedNodes.size(); ++i) {
-        InitializerDependencyNode* node = _graph.getInitializerNode(sortedNodes[i]);
-
-        // If already initialized then this node is a legacy initializer without re-initialization
-        // support.
-        if (node->isInitialized())
-            continue;
-
-        auto const& fn = node->getInitializerFunction();
-        if (!fn) {
-            return Status(ErrorCodes::InternalError,
-                          "topSort returned a node that has no associated function: \"" +
-                              sortedNodes[i] + '"');
-        }
-        try {
-            status = fn(&context);
-        } catch (const DBException& xcp) {
-            return xcp.toStatus();
-        }
-
-        if (Status::OK() != status)
-            return status;
-
-        node->setInitialized(true);
+    /**
+     * Note that cycles in the dependency graph are not discovered by this
+     * function. Rather, they're discovered by `topSort`, below.
+     */
+    void add(std::string name,
+             InitializerFunction initFn,
+             DeinitializerFunction deinitFn,
+             std::vector<std::string> prerequisites,
+             std::vector<std::string> dependents) {
+        auto data = std::make_unique<Payload>();
+        data->initFn = std::move(initFn);
+        data->deinitFn = std::move(deinitFn);
+        _graph.addNode(
+            std::move(name), std::move(prerequisites), std::move(dependents), std::move(data));
     }
-    return Status::OK();
+
+    /**
+     * Returns the payload of the node that was added by `name`, or nullptr if no such node exists.
+     */
+    Payload* find(const std::string& name) {
+        return static_cast<Payload*>(_graph.find(name));
+    }
+
+    /**
+     * Returns a topological sort of the dependency graph, represented
+     * as an ordered vector of node names.
+     *
+     * - Throws with `ErrorCodes::GraphContainsCycle` if the graph contains a cycle.
+     *
+     * - Throws with `ErrorCodes::BadValue` if the graph is incomplete.
+     *   That is, a node named in a dependency edge was never added.
+     */
+    std::vector<std::string> topSort(unsigned randomSeed) const {
+        return _graph.topSort(randomSeed);
+    }
+
+private:
+    /**
+     * Map of all named nodes. Nodes named as dependency edges but not
+     * explicitly added will either be absent from this map or be present with
+     * a null-valude initFn.
+     */
+    DependencyGraph _graph;
+};
+
+Initializer::Initializer() : _graph(std::make_unique<Graph>()) {}
+Initializer::~Initializer() = default;
+
+void Initializer::_transition(State expected, State next) {
+    if (_lifecycleState != expected)
+        uasserted(
+            ErrorCodes::IllegalOperation,
+            fmt::format(
+                "Invalid initializer state transition. Expected {} -> {}, but currently at {}",
+                fmt::underlying(expected),
+                fmt::underlying(next),
+                fmt::underlying(_lifecycleState)));
+    _lifecycleState = next;
 }
 
-Status Initializer::executeDeinitializers() {
-    std::vector<std::string> sortedNodes;
-    Status status = _graph.topSort(&sortedNodes);
-    if (Status::OK() != status)
-        return status;
+void Initializer::addInitializer(std::string name,
+                                 InitializerFunction initFn,
+                                 DeinitializerFunction deinitFn,
+                                 std::vector<std::string> prerequisites,
+                                 std::vector<std::string> dependents) {
+    uassert(ErrorCodes::BadValue, "Null-valued init function", initFn);
+    uassert(ErrorCodes::CannotMutateObject,
+            "Initializer dependency graph is frozen",
+            _lifecycleState == State::kNeverInitialized);
+    _graph->add(std::move(name),
+                std::move(initFn),
+                std::move(deinitFn),
+                std::move(prerequisites),
+                std::move(dependents));
+}
+
+
+void Initializer::executeInitializers(const std::vector<std::string>& args) {
+    if (_lifecycleState == State::kNeverInitialized)
+        _transition(State::kNeverInitialized, State::kUninitialized);  // freeze
+    _transition(State::kUninitialized, State::kInitializing);
+
+    if (_sortedNodes.empty()) {
+        auto seed = extractRandomSeedFromOptions(args);
+        if (!mustRunSilently(args))
+            LOGV2(8991200, "Shuffling initializers", "seed"_attr = seed);
+        _sortedNodes = _graph->topSort(seed);
+    }
+
+    InitializerContext context(args);
+
+    for (const auto& nodeName : _sortedNodes) {
+        auto* node = _graph->find(nodeName);
+
+        if (node->initialized)
+            continue;  // Legacy initializer without re-initialization support.
+
+        uassert(ErrorCodes::InternalError,
+                fmt::format("node has no init function: \"{}\"", nodeName),
+                node->initFn);
+        node->initFn(&context);
+
+        node->initialized = true;
+    }
+
+    _transition(State::kInitializing, State::kInitialized);
+
+    // The order of the initializers is non-deterministic, so make it available.
+    // Must be after verbose has been parsed, or the Debug(2) severity won't be visible.
+    LOGV2_DEBUG_OPTIONS(4777800,
+                        2,
+                        {logv2::LogTruncation::Disabled},
+                        "Ran initializers",
+                        "nodes"_attr = _sortedNodes);
+}
+
+void Initializer::executeDeinitializers() {
+    _transition(State::kInitialized, State::kDeinitializing);
 
     DeinitializerContext context{};
 
     // Execute deinitialization in reverse order from initialization.
-    for (auto it = sortedNodes.rbegin(), end = sortedNodes.rend(); it != end; ++it) {
-        InitializerDependencyNode* node = _graph.getInitializerNode(*it);
-        auto const& fn = node->getDeinitializerFunction();
-        if (fn) {
-            try {
-                status = fn(&context);
-            } catch (const DBException& xcp) {
-                return xcp.toStatus();
-            }
-
-            if (Status::OK() != status)
-                return status;
-
-            node->setInitialized(false);
-        }
-    }
-    return Status::OK();
-}
-
-Status runGlobalInitializers(const InitializerContext::ArgumentVector& args,
-                             const InitializerContext::EnvironmentMap& env) {
-    return getGlobalInitializer().executeInitializers(args, env);
-}
-
-Status runGlobalInitializers(int argc, const char* const* argv, const char* const* envp) {
-    InitializerContext::ArgumentVector args(argc);
-    std::copy(argv, argv + argc, args.begin());
-
-    InitializerContext::EnvironmentMap env;
-
-    if (envp) {
-        for (; *envp; ++envp) {
-            const char* firstEqualSign = strchr(*envp, '=');
-            if (!firstEqualSign) {
-                return Status(ErrorCodes::BadValue, "malformed environment block");
-            }
-            env[std::string(*envp, firstEqualSign)] = std::string(firstEqualSign + 1);
+    for (auto it = _sortedNodes.rbegin(), end = _sortedNodes.rend(); it != end; ++it) {
+        auto* node = _graph->find(*it);
+        if (node->deinitFn) {
+            node->deinitFn(&context);
+            node->initialized = false;
         }
     }
 
-    return runGlobalInitializers(args, env);
+    _transition(State::kDeinitializing, State::kUninitialized);
+}
+
+InitializerFunction Initializer::getInitializerFunctionForTesting(const std::string& name) {
+    auto node = _graph->find(name);
+    return node ? node->initFn : nullptr;
+}
+
+unsigned extractRandomSeedFromOptions(const std::vector<std::string>& args) {
+    const std::string targetArg{"--initializerShuffleSeed"};
+    const auto errMsg = fmt::format("Value must be specified for {}", targetArg);
+
+    for (size_t i = 0; i < args.size(); i++) {
+        StringData arg = args[i];
+        std::string val;
+        if (!arg.starts_with(targetArg))
+            continue;
+        arg.remove_prefix(targetArg.size());
+        if (arg.empty()) {
+            // --initializerShuffleSeed 123456
+            uassert(ErrorCodes::InvalidOptions, errMsg, i + 1 < args.size());
+            val = args[i + 1];
+        } else {
+            // --initializerShuffleSeed=123456
+            uassert(ErrorCodes::InvalidOptions, errMsg, arg.starts_with("="));
+            arg.remove_prefix(1);
+            val = std::string{arg};
+        }
+
+        unsigned seed;
+        uassertStatusOK(NumberParser{}(val, &seed));
+        return seed;
+    }
+
+    return std::random_device{}();
+}
+
+Initializer& getGlobalInitializer() {
+    static auto g = new Initializer;
+    return *g;
+}
+
+Status runGlobalInitializers(const std::vector<std::string>& argv) {
+    try {
+        getGlobalInitializer().executeInitializers(argv);
+        return Status::OK();
+    } catch (const DBException& ex) {
+        return ex.toStatus();
+    }
 }
 
 Status runGlobalDeinitializers() {
-    return getGlobalInitializer().executeDeinitializers();
-}
-
-void runGlobalInitializersOrDie(int argc, const char* const* argv, const char* const* envp) {
-    Status status = runGlobalInitializers(argc, argv, envp);
-    if (!status.isOK()) {
-        std::cerr << "Failed global initialization: " << status << std::endl;
-        quickExit(1);
+    try {
+        getGlobalInitializer().executeDeinitializers();
+        return Status::OK();
+    } catch (const DBException& ex) {
+        return ex.toStatus();
     }
 }
+
+void runGlobalInitializersOrDie(const std::vector<std::string>& argv) {
+    if (Status status = runGlobalInitializers(argv); !status.isOK()) {
+        std::cerr << "Failed global initialization: " << status << std::endl;
+        quickExit(ExitCode::fail);
+    }
+}
+
+namespace {
+
+// Make sure that getGlobalInitializer() is called at least once before main(), and so at least
+// once in a single-threaded context.  Otherwise, static initialization inside
+// getGlobalInitializer() won't be thread-safe.
+[[maybe_unused]] const auto earlyCaller = [] {
+    getGlobalInitializer();
+    return 0;
+}();
+
+}  // namespace
 
 }  // namespace mongo

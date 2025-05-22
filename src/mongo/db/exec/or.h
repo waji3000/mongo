@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,11 +29,16 @@
 
 #pragma once
 
+#include <cstddef>
+#include <memory>
+
 #include "mongo/db/exec/plan_stage.h"
-#include "mongo/db/jsobj.h"
+#include "mongo/db/exec/plan_stats.h"
+#include "mongo/db/exec/recordid_deduplicator.h"
+#include "mongo/db/exec/working_set.h"
 #include "mongo/db/matcher/expression.h"
-#include "mongo/db/record_id.h"
-#include "mongo/stdx/unordered_set.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/query/stage_types.h"
 
 namespace mongo {
 
@@ -45,13 +49,13 @@ namespace mongo {
  */
 class OrStage final : public PlanStage {
 public:
-    OrStage(OperationContext* opCtx, WorkingSet* ws, bool dedup, const MatchExpression* filter);
+    OrStage(ExpressionContext* expCtx, WorkingSet* ws, bool dedup, const MatchExpression* filter);
 
-    void addChild(PlanStage* child);
+    void addChild(std::unique_ptr<PlanStage> child);
 
     void addChildren(Children childrenToAdd);
 
-    bool isEOF() final;
+    bool isEOF() const final;
 
     StageState doWork(WorkingSetID* out) final;
 
@@ -79,7 +83,7 @@ private:
     const bool _dedup;
 
     // Which RecordIds have we returned?
-    stdx::unordered_set<RecordId, RecordId::Hasher> _seen;
+    RecordIdDeduplicator _recordIdDeduplicator;
 
     // Stats
     OrStats _specificStats;

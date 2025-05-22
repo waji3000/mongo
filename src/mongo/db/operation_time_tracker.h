@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -29,6 +28,8 @@
  */
 
 #pragma once
+
+#include <memory>
 
 #include "mongo/db/logical_time.h"
 #include "mongo/db/operation_context.h"

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,8 +29,25 @@
 
 #pragma once
 
+#include <cstdint>
+#include <memory>
+
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/exec/mutable_bson/const_element.h"
+#include "mongo/db/exec/mutable_bson/element.h"
+#include "mongo/db/field_ref.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/query/collation/collator_interface.h"
 #include "mongo/db/update/modifier_node.h"
-#include "mongo/stdx/memory.h"
+#include "mongo/db/update/update_node.h"
+#include "mongo/db/update/update_node_visitor.h"
 
 namespace mongo {
 
@@ -40,16 +56,18 @@ public:
     Status init(BSONElement modExpr, const boost::intrusive_ptr<ExpressionContext>& expCtx) final;
 
     ModifyResult updateExistingElement(mutablebson::Element* element,
-                                       std::shared_ptr<FieldRef> elementPath) const final;
+                                       const FieldRef& elementPath) const final;
 
     void validateUpdate(mutablebson::ConstElement updatedElement,
                         mutablebson::ConstElement leftSibling,
                         mutablebson::ConstElement rightSibling,
                         std::uint32_t recursionLevel,
-                        ModifyResult modifyResult) const final;
+                        ModifyResult modifyResult,
+                        bool validateForStorage,
+                        bool* containsDotsAndDollarsField) const final;
 
     std::unique_ptr<UpdateNode> clone() const final {
-        return stdx::make_unique<PopNode>(*this);
+        return std::make_unique<PopNode>(*this);
     }
 
     void setCollator(const CollatorInterface* collator) final {}
@@ -62,7 +80,19 @@ public:
         return _popFromFront;
     }
 
+    void acceptVisitor(UpdateNodeVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
 private:
+    StringData operatorName() const final {
+        return "$pop";
+    }
+
+    BSONObj operatorValue() const final {
+        return _popFromFront ? BSON("" << -1) : BSON("" << 1);
+    }
+
     bool _popFromFront = true;
 };
 

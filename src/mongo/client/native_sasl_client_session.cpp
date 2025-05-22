@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,18 +27,34 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <absl/container/node_hash_map.h>
+#include <tuple>
 
+#include "mongo/base/error_codes.h"
+#include "mongo/base/init.h"  // IWYU pragma: keep
+#include "mongo/base/initializer.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/client/authenticate.h"
 #include "mongo/client/native_sasl_client_session.h"
-
-#include "mongo/base/init.h"
 #include "mongo/client/sasl_client_conversation.h"
+#include "mongo/client/sasl_oidc_client_conversation.h"
 #include "mongo/client/sasl_plain_client_conversation.h"
 #include "mongo/client/sasl_scram_client_conversation.h"
+#include "mongo/client/sasl_x509_client_conversation.h"
 #include "mongo/client/scram_client_cache.h"
+#include "mongo/config.h"  // IWYU pragma: keep
 #include "mongo/crypto/sha1_block.h"
 #include "mongo/crypto/sha256_block.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/db/commands/server_status.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/util/str.h"
+
+#ifdef MONGO_CONFIG_SSL
+#include "mongo/client/sasl_aws_client_conversation.h"
+#endif
 
 namespace mongo {
 namespace {
@@ -50,17 +65,49 @@ SaslClientSession* createNativeSaslClientSession(const std::string mech) {
 
 MONGO_INITIALIZER(NativeSaslClientContext)(InitializerContext* context) {
     SaslClientSession::create = createNativeSaslClientSession;
-    return Status::OK();
 }
 
 // Global cache for SCRAM-SHA-1/256 credentials
 auto* scramsha1ClientCache = new SCRAMClientCache<SHA1Block>;
 auto* scramsha256ClientCache = new SCRAMClientCache<SHA256Block>;
 
+template <typename HashBlock>
+void cacheToBSON(SCRAMClientCache<HashBlock>* cache, StringData name, BSONObjBuilder* builder) {
+    auto stats = cache->getStats();
+
+    BSONObjBuilder sub(builder->subobjStart(name));
+    sub.append("count", stats.count);
+    sub.append("hits", stats.hits);
+    sub.append("misses", stats.misses);
+}
+
+/**
+ * Output stats about the SCRAM client cache to server status.
+ */
+class ScramCacheStatsStatusSection : public ServerStatusSection {
+public:
+    using ServerStatusSection::ServerStatusSection;
+
+    bool includeByDefault() const override {
+        return true;
+    }
+
+    BSONObj generateSection(OperationContext* opCtx,
+                            const BSONElement& configElement) const override {
+        BSONObjBuilder builder;
+        cacheToBSON(scramsha1ClientCache, "SCRAM-SHA-1", &builder);
+        cacheToBSON(scramsha256ClientCache, "SCRAM-SHA-256", &builder);
+        return builder.obj();
+    }
+};
+
+auto& scramCacheSection =
+    *ServerStatusSectionBuilder<ScramCacheStatsStatusSection>("scramCache").forShard().forRouter();
+
 }  // namespace
 
 NativeSaslClientSession::NativeSaslClientSession()
-    : SaslClientSession(), _step(0), _done(false), _saslConversation(nullptr) {}
+    : SaslClientSession(), _step(0), _success(false), _saslConversation(nullptr) {}
 
 NativeSaslClientSession::~NativeSaslClientSession() {}
 
@@ -70,18 +117,34 @@ Status NativeSaslClientSession::initialize() {
                       "Cannot reinitialize NativeSaslClientSession.");
 
     std::string mechanism = getParameter(parameterMechanism).toString();
-    if (mechanism == "PLAIN") {
-        _saslConversation.reset(new SaslPLAINClientConversation(this));
-    } else if (mechanism == "SCRAM-SHA-1") {
-        _saslConversation.reset(
-            new SaslSCRAMClientConversationImpl<SHA1Block>(this, scramsha1ClientCache));
-    } else if (mechanism == "SCRAM-SHA-256") {
-        _saslConversation.reset(
-            new SaslSCRAMClientConversationImpl<SHA256Block>(this, scramsha256ClientCache));
+    if (mechanism == auth::kMechanismSaslPlain) {
+        _saslConversation = std::make_unique<SaslPLAINClientConversation>(this);
+    } else if (mechanism == auth::kMechanismScramSha1) {
+        _saslConversation = std::make_unique<SaslSCRAMClientConversationImpl<SHA1Block>>(
+            this, scramsha1ClientCache);
+    } else if (mechanism == auth::kMechanismScramSha256) {
+        _saslConversation = std::make_unique<SaslSCRAMClientConversationImpl<SHA256Block>>(
+            this, scramsha256ClientCache);
+#ifdef MONGO_CONFIG_SSL
+        // AWS depends on kms-message which depends on ssl libraries
+    } else if (mechanism == auth::kMechanismMongoAWS) {
+        _saslConversation = std::make_unique<SaslAWSClientConversation>(this);
+    } else if (mechanism == auth::kMechanismMongoX509) {
+        _saslConversation = std::make_unique<SaslX509ClientConversation>(this);
+#endif
+    } else if (mechanism == auth::kMechanismMongoOIDC) {
+        auto userName = hasParameter(SaslClientSession::parameterUser)
+            ? getParameter(SaslClientSession::parameterUser)
+            : ""_sd;
+        auto accessToken = hasParameter(SaslClientSession::parameterOIDCAccessToken)
+            ? getParameter(SaslClientSession::parameterOIDCAccessToken)
+            : ""_sd;
+
+        _saslConversation =
+            std::make_unique<SaslOIDCClientConversation>(this, userName, accessToken);
     } else {
         return Status(ErrorCodes::BadValue,
-                      mongoutils::str::stream() << "SASL mechanism " << mechanism
-                                                << " is not supported");
+                      str::stream() << "SASL mechanism " << mechanism << " is not supported");
     }
 
     return Status::OK();
@@ -90,14 +153,14 @@ Status NativeSaslClientSession::initialize() {
 Status NativeSaslClientSession::step(StringData inputData, std::string* outputData) {
     if (!_saslConversation) {
         return Status(ErrorCodes::BadValue,
-                      mongoutils::str::stream()
+                      str::stream()
                           << "The client authentication session has not been properly initialized");
     }
 
     StatusWith<bool> status = _saslConversation->step(inputData, outputData);
     if (status.isOK()) {
-        _done = status.getValue();
+        _success = status.getValue();
     }
     return status.getStatus();
 }
-}  // namespace
+}  // namespace mongo

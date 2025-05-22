@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -27,18 +26,31 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
+
+#include <algorithm>
+#include <cstddef>
+#include <iterator>
+#include <memory>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/string_data.h"
+#include "mongo/logv2/log.h"
+#include "mongo/unittest/unittest.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/dns_query.h"
 
-#include "mongo/unittest/unittest.h"
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
+
 
 using namespace std::literals::string_literals;
 
 namespace {
 std::string getFirstARecord(const std::string& service) {
-    auto res = mongo::dns::lookupARecords(service);
+    auto resPair = mongo::dns::lookupARecords(service);
+    auto res = resPair.front().first;
     if (res.empty())
         return "";
-    return res.front();
+    return res;
 }
 
 TEST(MongoDnsQuery, basic) {
@@ -83,11 +95,15 @@ TEST(MongoDnsQuery, basic) {
     for (const auto& test : tests) {
         try {
             const auto witness = getFirstARecord(test.dns);
-            std::cout << "Resolved " << test.dns << " to: " << witness << std::endl;
+            using namespace mongo::literals;
+            LOGV2(23512,
+                  "Resolved {dns} to: {witness}",
+                  "dns"_attr = test.dns,
+                  "witness"_attr = witness);
 
             const bool resolution = (witness == test.ip);
             if (!resolution)
-                std::cerr << "Warning: Did not correctly resolve " << test.dns << std::endl;
+                LOGV2(23513, "Warning: Did not correctly resolve {dns}", "dns"_attr = test.dns);
             resolution_count += resolution;
         }
         // Failure to resolve is okay, but not great -- print a warning
@@ -99,7 +115,8 @@ TEST(MongoDnsQuery, basic) {
 
     // As long as enough tests pass, we're okay -- this means that a single DNS name server drift
     // won't cause a BF -- when enough fail, then we can rebuild the list in one pass.
-    const std::size_t kPassingRate = sizeof(tests) / sizeof(tests[0]) * kPassingPercentage;
+    const std::size_t kPassingRate =
+        static_cast<std::size_t>(sizeof(tests) / sizeof(tests[0])) * kPassingPercentage;
     ASSERT_GTE(resolution_count, kPassingRate);
 }
 
@@ -111,11 +128,13 @@ TEST(MongoDnsQuery, srvRecords) {
     } tests[] = {
         {"test1.test.build.10gen.cc.",
          {
-             {"localhost.test.build.10gen.cc.", 27017}, {"localhost.test.build.10gen.cc.", 27018},
+             {"localhost.test.build.10gen.cc.", 27017},
+             {"localhost.test.build.10gen.cc.", 27018},
          }},
         {"test2.test.build.10gen.cc.",
          {
-             {"localhost.test.build.10gen.cc.", 27018}, {"localhost.test.build.10gen.cc.", 27019},
+             {"localhost.test.build.10gen.cc.", 27018},
+             {"localhost.test.build.10gen.cc.", 27019},
          }},
         {"test3.test.build.10gen.cc.",
          {
@@ -143,16 +162,28 @@ TEST(MongoDnsQuery, srvRecords) {
             continue;
         }
 
-        auto witness = mongo::dns::lookupSRVRecords(kMongodbSRVPrefix + test.query);
+        auto witnessPairs = mongo::dns::lookupSRVRecords(kMongodbSRVPrefix + test.query);
+        std::vector<mongo::dns::SRVHostEntry> witness;
+        witness.reserve(witnessPairs.size());
+        std::transform(witnessPairs.begin(),
+                       witnessPairs.end(),
+                       std::back_inserter(witness),
+                       [](const auto& p) { return p.first; });
+        // std::transform(witnessPairs.begin(), witnessPairs.end(), std::back_inserter(witness),
+        // [](std::pair<mongo::dns::SRVHostEntry, mongo::Seconds> &p) { return p.first;});
         std::sort(begin(witness), end(witness));
 
         for (const auto& entry : witness) {
-            std::cout << "Entry: " << entry << std::endl;
+            using namespace mongo::literals;
+            LOGV2(23514, "Entry: {entry}", "entry"_attr = entry);
         }
 
         for (std::size_t i = 0; i < witness.size() && i < expected.size(); ++i) {
-            std::cout << "Expected: " << expected.at(i) << std::endl;
-            std::cout << "Witness:  " << witness.at(i) << std::endl;
+            using namespace mongo::literals;
+            LOGV2(23510,
+                  "Expected: {expected} Witness: {witness}",
+                  "expected"_attr = expected.at(i),
+                  "witness"_attr = witness.at(i));
             ASSERT_EQ(witness.at(i), expected.at(i));
         }
 
@@ -175,7 +206,8 @@ TEST(MongoDnsQuery, txtRecords) {
          }},
         {"test6.test.build.10gen.cc",
          {
-             "authSource=otherDB", "replicaSet=repl0",
+             "authSource=otherDB",
+             "replicaSet=repl0",
          }},
     };
 

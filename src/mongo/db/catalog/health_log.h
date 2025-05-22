@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,23 +29,17 @@
 
 #pragma once
 
-#include "mongo/base/disallow_copying.h"
+#include "mongo/db/catalog/health_log_gen.h"
+#include "mongo/db/catalog/health_log_interface.h"
 #include "mongo/db/concurrency/deferred_writer.h"
-#include "mongo/db/service_context.h"
 
 namespace mongo {
 
 class HealthLogEntry;
 
-/**
- * The interface to the local healthlog.
- *
- * This class contains facilities for creating and asynchronously writing to the local healthlog
- * collection.  There should only be one instance of this class, initialized on startup and cleaned
- * up on shutdown.
- */
-class HealthLog {
-    MONGO_DISALLOW_COPYING(HealthLog);
+class HealthLog : public HealthLogInterface {
+    HealthLog(const HealthLog&) = delete;
+    HealthLog& operator=(const HealthLog&) = delete;
 
 public:
     /**
@@ -56,40 +49,13 @@ public:
      */
     HealthLog();
 
-    /**
-     * The maximum size of the in-memory buffer of health-log entries, in bytes.
-     */
-    static const int64_t kMaxBufferSize = 25'000'000;
+    void startup() override;
 
-    /**
-     * Start the worker thread writing the buffer to the collection.
-     */
-    void startup(void);
+    void shutdown() override;
 
-    /**
-     * Stop the worker thread.
-     */
-    void shutdown(void);
-
-    /**
-     * The name of the collection.
-     */
-    static const NamespaceString nss;
-
-    /**
-     * Get the current context's HealthLog.
-     */
-    static HealthLog& get(ServiceContext* ctx);
-    static HealthLog& get(OperationContext* ctx);
-
-    /**
-     * Asynchronously insert the given entry.
-     *
-     * Return `false` iff there is no more space in the buffer.
-     */
-    bool log(const HealthLogEntry& entry);
+    bool log(const HealthLogEntry& entry) override;
 
 private:
     DeferredWriter _writer;
 };
-}
+}  // namespace mongo

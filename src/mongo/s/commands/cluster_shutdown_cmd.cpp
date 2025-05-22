@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,31 +27,29 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <memory>
+#include <string>
 
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/shutdown.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/util/duration.h"
 
 namespace mongo {
 namespace {
 
-class ClusterShutdownCmd : public CmdShutdown {
+class ClusterShutdownCmd : public CmdShutdown<ClusterShutdownCmd> {
 public:
     std::string help() const override {
-        return "shutdown the database.  must be ran against admin db and "
-               "either (1) ran from localhost or (2) authenticated.";
+        return "Shuts down the mongos. Must be run against the admin database and either (1) run "
+               "from localhost or (2) run while authenticated with the shutdown privilege. Spends "
+               "'timeoutSecs' in quiesce mode, where the mongos continues to allow operations to "
+               "run, but directs clients to route new operations to other mongos nodes.";
     }
 
-    virtual bool run(OperationContext* opCtx,
-                     const std::string& dbname,
-                     const BSONObj& cmdObj,
-                     BSONObjBuilder& result) {
-        // Never returns
-        shutdownHelper(cmdObj);
-        return true;
-    }
-
-} clusterShutdownCmd;
+    static void beginShutdown(OperationContext* opCtx, bool force, Milliseconds timeout) {}
+};
+MONGO_REGISTER_COMMAND(ClusterShutdownCmd).forRouter();
 
 }  // namespace
 }  // namespace mongo

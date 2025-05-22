@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,9 +29,7 @@
 
 #include "mongo/db/repl/repl_set_request_votes_args.h"
 
-#include "mongo/bson/util/bson_check.h"
 #include "mongo/bson/util/bson_extract.h"
-#include "mongo/db/jsobj.h"
 #include "mongo/db/repl/bson_extract_optime.h"
 
 namespace mongo {
@@ -42,38 +39,21 @@ namespace {
 const std::string kCandidateIndexFieldName = "candidateIndex";
 const std::string kCommandName = "replSetRequestVotes";
 const std::string kConfigVersionFieldName = "configVersion";
+const std::string kConfigTermFieldName = "configTerm";
 const std::string kDryRunFieldName = "dryRun";
-// The underlying field name is inaccurate, but changing it requires a fair amount of cross
-// compatibility work for no real benefit.
-const std::string kLastDurableOpTimeFieldName = "lastCommittedOp";
+const std::string kLastWrittenOpTimeFieldName = "lastWrittenOpTime";
+const std::string kLastAppliedOpTimeFieldName = "lastAppliedOpTime";
 const std::string kOkFieldName = "ok";
 const std::string kReasonFieldName = "reason";
 const std::string kSetNameFieldName = "setName";
 const std::string kTermFieldName = "term";
 const std::string kVoteGrantedFieldName = "voteGranted";
 const std::string kOperationTime = "operationTime";
-
-const std::string kLegalArgsFieldNames[] = {
-    kCandidateIndexFieldName,
-    kCommandName,
-    kConfigVersionFieldName,
-    kDryRunFieldName,
-    kLastDurableOpTimeFieldName,
-    kSetNameFieldName,
-    kTermFieldName,
-    kOperationTime,
-};
-
 }  // namespace
 
 
 Status ReplSetRequestVotesArgs::initialize(const BSONObj& argsObj) {
-    Status status =
-        bsonCheckOnlyHasFieldsForCommand("ReplSetRequestVotes", argsObj, kLegalArgsFieldNames);
-    if (!status.isOK())
-        return status;
-
-    status = bsonExtractIntegerField(argsObj, kTermFieldName, &_term);
+    Status status = bsonExtractIntegerField(argsObj, kTermFieldName, &_term);
     if (!status.isOK())
         return status;
 
@@ -81,7 +61,12 @@ Status ReplSetRequestVotesArgs::initialize(const BSONObj& argsObj) {
     if (!status.isOK())
         return status;
 
-    status = bsonExtractIntegerField(argsObj, kConfigVersionFieldName, &_cfgver);
+    status = bsonExtractIntegerField(argsObj, kConfigVersionFieldName, &_cfgVer);
+    if (!status.isOK())
+        return status;
+
+    status = bsonExtractIntegerFieldWithDefault(
+        argsObj, kConfigTermFieldName, OpTime::kUninitializedTerm, &_cfgTerm);
     if (!status.isOK())
         return status;
 
@@ -93,9 +78,18 @@ Status ReplSetRequestVotesArgs::initialize(const BSONObj& argsObj) {
     if (!status.isOK())
         return status;
 
-    status = bsonExtractOpTimeField(argsObj, kLastDurableOpTimeFieldName, &_lastDurableOpTime);
-    if (!status.isOK())
+    status = bsonExtractOpTimeField(argsObj, kLastAppliedOpTimeFieldName, &_lastAppliedOpTime);
+    if (!status.isOK()) {
         return status;
+    }
+
+    status = bsonExtractOpTimeField(argsObj, kLastWrittenOpTimeFieldName, &_lastWrittenOpTime);
+    if (status.code() == ErrorCodes::NoSuchKey) {
+        _lastWrittenOpTime = _lastAppliedOpTime;
+        status = Status::OK();
+    } else if (!status.isOK()) {
+        return status;
+    }
 
     return Status::OK();
 }
@@ -113,11 +107,23 @@ long long ReplSetRequestVotesArgs::getCandidateIndex() const {
 }
 
 long long ReplSetRequestVotesArgs::getConfigVersion() const {
-    return _cfgver;
+    return _cfgVer;
 }
 
-OpTime ReplSetRequestVotesArgs::getLastDurableOpTime() const {
-    return _lastDurableOpTime;
+long long ReplSetRequestVotesArgs::getConfigTerm() const {
+    return _cfgTerm;
+}
+
+ConfigVersionAndTerm ReplSetRequestVotesArgs::getConfigVersionAndTerm() const {
+    return ConfigVersionAndTerm(_cfgVer, _cfgTerm);
+}
+
+OpTime ReplSetRequestVotesArgs::getLastWrittenOpTime() const {
+    return _lastWrittenOpTime;
+}
+
+OpTime ReplSetRequestVotesArgs::getLastAppliedOpTime() const {
+    return _lastAppliedOpTime;
 }
 
 bool ReplSetRequestVotesArgs::isADryRun() const {
@@ -129,9 +135,11 @@ void ReplSetRequestVotesArgs::addToBSON(BSONObjBuilder* builder) const {
     builder->append(kSetNameFieldName, _setName);
     builder->append(kDryRunFieldName, _dryRun);
     builder->append(kTermFieldName, _term);
-    builder->appendIntOrLL(kCandidateIndexFieldName, _candidateIndex);
-    builder->appendIntOrLL(kConfigVersionFieldName, _cfgver);
-    _lastDurableOpTime.append(builder, kLastDurableOpTimeFieldName);
+    builder->appendNumber(kCandidateIndexFieldName, _candidateIndex);
+    builder->appendNumber(kConfigVersionFieldName, _cfgVer);
+    builder->appendNumber(kConfigTermFieldName, _cfgTerm);
+    _lastWrittenOpTime.append(kLastWrittenOpTimeFieldName, builder);
+    _lastAppliedOpTime.append(kLastAppliedOpTimeFieldName, builder);
 }
 
 std::string ReplSetRequestVotesArgs::toString() const {

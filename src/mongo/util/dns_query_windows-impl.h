@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,13 +27,13 @@
  *    it in the license file.
  */
 
-#ifndef MONGO_UTIL_DNS_QUERY_PLATFORM_INCLUDE_WHITELIST
+#ifndef MONGO_ALLOW_INCLUDE_UTIL_DNS_QUERY_PLATFORM
 #error Do not include the DNS Query platform implementation headers.  Please use "mongo/util/dns_query.h" instead.
 #endif
 
 #include <windns.h>
 
-#include <stdio.h>
+#include <cstdio>
 
 #include <array>
 #include <cassert>
@@ -49,6 +48,7 @@
 
 #include <boost/noncopyable.hpp>
 
+#include "mongo/util/duration.h"
 #include "mongo/util/errno_util.h"
 
 using std::begin;
@@ -62,7 +62,12 @@ namespace dns {
 namespace {
 enum class DNSQueryClass { kInternet };
 
-enum class DNSQueryType { kSRV = DNS_TYPE_SRV, kTXT = DNS_TYPE_TEXT, kAddress = DNS_TYPE_A };
+enum class DNSQueryType {
+    kSRV = DNS_TYPE_SRV,
+    kTXT = DNS_TYPE_TEXT,
+    kAddress = DNS_TYPE_A,
+    kCNAME = DNS_TYPE_CNAME
+};
 
 /**
  * A `ResourceRecord` represents a single DNS entry as parsed by the resolver API.
@@ -136,6 +141,30 @@ public:
         return {data.pNameTarget + "."s, data.wPort};
     }
 
+    /**
+     * View this record as a DNS CName record
+     */
+    std::string cnameEntry() const {
+        if (getType() != DNSQueryType::kCNAME) {
+            StringBuilder oss;
+            oss << "Incorrect record format for \"" << this->_service
+                << "\": expected CNAME record, found a record of type " << this->_record->wType
+                << " instead";
+            uasserted(ErrorCodes::DNSRecordTypeMismatch, oss.str());
+        }
+
+        return std::string(this->_record->Data.CNAME.pNameHost);
+    }
+
+    DNSQueryType getType() const {
+        return static_cast<DNSQueryType>(this->_record->wType);
+    }
+
+    Seconds getTtl() const {
+        return Seconds(this->_record->dwTtl);
+    }
+
+
 private:
     std::string _service;
     std::shared_ptr<DNS_RECORDA> _record;
@@ -154,8 +183,14 @@ public:
     explicit DNSResponse(std::string service, PDNS_RECORDA initialResults)
         : _service(std::move(service)), _results(initialResults, freeDnsRecord) {}
 
-    class iterator : public std::iterator<std::forward_iterator_tag, ResourceRecord> {
+    class iterator {
     public:
+        using iterator_category = std::forward_iterator_tag;
+        using value_type = ResourceRecord;
+        using difference_type = std::ptrdiff_t;
+        using pointer = value_type*;
+        using reference = value_type&;
+
         const ResourceRecord& operator*() {
             this->_populate();
             return this->_storage;
@@ -244,16 +279,16 @@ public:
                        const DNSQueryClass class_,
                        const DNSQueryType type) {
         PDNS_RECORDA queryResults;
-        auto ec = DnsQuery_UTF8(service.c_str(),
-                                WORD(type),
-                                DNS_QUERY_BYPASS_CACHE,
-                                nullptr,
-                                reinterpret_cast<PDNS_RECORD*>(&queryResults),
-                                nullptr);
-
-        if (ec) {
+        auto e = DnsQuery_UTF8(service.c_str(),
+                               WORD(type),
+                               DNS_QUERY_BYPASS_CACHE,
+                               nullptr,
+                               reinterpret_cast<PDNS_RECORD*>(&queryResults),
+                               nullptr);
+        if (e) {
+            auto ec = systemError(e);
             uasserted(ErrorCodes::DNSHostNotFound,
-                      "Failed to look up service \""s + "\":"s + errnoWithDescription(ec));
+                      "Failed to look up service \""s + "\":"s + errorMessage(ec));
         }
         return DNSResponse{service, queryResults};
     }

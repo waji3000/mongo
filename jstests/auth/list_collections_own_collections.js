@@ -1,138 +1,262 @@
-// Test nameOnly option of listCollections
-(function() {
-    "use strict";
+/**
+ * Test nameOnly option of listCollections
+ *
+ * @tags: [
+ *   requires_sharding,
+ * ]
+ */
 
-    const dbName = "list_collections_own_collections";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
-    function runTestOnConnection(conn) {
-        const admin = conn.getDB("admin");
-        const db = conn.getDB(dbName);
+const dbName = "list_collections_own_collections";
 
-        assert.commandWorked(admin.runCommand({createUser: "root", pwd: "root", roles: ["root"]}));
-        assert(admin.auth("root", "root"));
+const nameSort = (a, b) => a.name > b.name;
+const resFoo = {
+    "name": "foo",
+    "type": "collection"
+};
+const resBar = {
+    "name": "bar",
+    "type": "view"
+};
+const resOther =
+    [{"name": "otherCollection", "type": "collection"}, {"name": "otherView", "type": "view"}];
+const resSystemViews = {
+    "name": "system.views",
+    "type": "collection"
+};
+const resFooTS = {
+    "name": "foo",
+    "type": "timeseries"
+};
+const resBarTS = {
+    "name": "bar",
+    "type": "timeseries"
+};
+const resSBFoo = {
+    "name": "system.buckets.foo",
+    "type": "collection"
+};
+const resSBBar = {
+    "name": "system.buckets.bar",
+    "type": "collection"
+};
 
-        assert.commandWorked(admin.runCommand({
-            createRole: "roleWithExactNamespacePrivileges",
-            roles: [],
-            privileges: [
-                {resource: {db: dbName, collection: "foo"}, actions: ["createCollection"]},
-                {resource: {db: dbName, collection: "bar"}, actions: ["createCollection"]}
-            ]
-        }));
+function createTestRoleAndUser(db, roleName, privs) {
+    const admin = db.getSiblingDB("admin");
+    assert.commandWorked(admin.runCommand({createRole: roleName, roles: [], privileges: privs}));
 
-        assert.commandWorked(admin.runCommand({
-            createRole: "roleWithExactNamespaceAndSystemPrivileges",
-            roles: [],
-            privileges: [
-                {resource: {db: dbName, collection: "foo"}, actions: ["createCollection"]},
-                {resource: {db: dbName, collection: "bar"}, actions: ["createCollection"]},
-                {
-                  resource: {db: dbName, collection: "system.views"},
-                  actions: ["createCollection"]
-                }
-            ]
-        }));
+    const userName = "user|" + roleName;
+    assert.commandWorked(
+        db.runCommand({createUser: userName, pwd: "pwd", roles: [{role: roleName, db: "admin"}]}));
+}
 
-        assert.commandWorked(admin.runCommand({
-            createRole: "roleWithCollectionPrivileges",
-            roles: [],
-            privileges: [
-                {resource: {db: "", collection: "foo"}, actions: ["createCollection"]},
-                {resource: {db: "", collection: "bar"}, actions: ["createCollection"]}
-            ]
-        }));
+function runTestOnRole(db, roleName, expectedColls) {
+    jsTestLog(roleName);
+    const userName = "user|" + roleName;
+    assert(db.auth(userName, "pwd"));
 
-        assert.commandWorked(admin.runCommand({
-            createRole: "roleWithDatabasePrivileges",
-            roles: [],
-            privileges: [
-                {resource: {db: dbName, collection: ""}, actions: ["createCollection"]},
-            ]
-        }));
+    let res;
 
-        assert.commandWorked(admin.runCommand({
-            createRole: "roleWithAnyNormalResourcePrivileges",
-            roles: [],
-            privileges: [
-                {resource: {db: "", collection: ""}, actions: ["createCollection"]},
-            ]
-        }));
-        admin.logout();
+    res = db.runCommand({listCollections: 1});
+    assert.commandFailed(res);
+    res = db.runCommand({listCollections: 1, nameOnly: true});
+    assert.commandFailed(res);
+    res = db.runCommand({listCollections: 1, authorizedCollections: true});
+    assert.commandFailed(res);
 
-        function runTestOnRole(roleName) {
-            assert(admin.auth("root", "root"));
-            assert.commandWorked(db.dropDatabase());
+    res = db.runCommand({listCollections: 1, nameOnly: true, authorizedCollections: true});
+    assert.commandWorked(res);
+    assert.eq(expectedColls.sort(nameSort), res.cursor.firstBatch.sort(nameSort));
 
-            const userName = "user|" + roleName;
-            assert.commandWorked(db.runCommand(
-                {createUser: userName, pwd: "pwd", roles: [{role: roleName, db: "admin"}]}));
-            admin.logout();
-
-            assert(db.auth(userName, "pwd"));
-
-            let res;
-
-            res = db.runCommand({listCollections: 1});
-            assert.commandFailed(res);
-            res = db.runCommand({listCollections: 1, nameOnly: true});
-            assert.commandFailed(res);
-            res = db.runCommand({listCollections: 1, authorizedCollections: true});
-            assert.commandFailed(res);
-            res = db.runCommand({listCollections: 1, nameOnly: true, authorizedCollections: true});
-            assert.commandWorked(res);
-            assert.eq(0, res.cursor.firstBatch.length);
-
-            assert.commandWorked(db.createCollection("foo"));
-
-            res = db.runCommand({listCollections: 1, nameOnly: true, authorizedCollections: true});
-            assert.commandWorked(res);
-            assert.eq(1, res.cursor.firstBatch.length);
-            assert.eq([{"name": "foo", "type": "collection"}], res.cursor.firstBatch);
-
-            assert.commandWorked(db.createView("bar", "foo", []));
-
-            res = db.runCommand({listCollections: 1, nameOnly: true, authorizedCollections: true});
-            assert.commandWorked(res);
-            assert.eq(2, res.cursor.firstBatch.length, tojson(res.cursor.firstBatch));
-            const sortFun = function(a, b) {
-                return a.name > b.name;
-            };
-            assert.eq([{"name": "bar", "type": "view"}, {"name": "foo", "type": "collection"}].sort(
-                          sortFun),
-                      res.cursor.firstBatch.sort(sortFun));
-
-            res = db.runCommand({
-                listCollections: 1,
-                nameOnly: true,
-                authorizedCollections: true,
-                filter: {"name": "foo"}
-            });
-            assert.commandWorked(res);
-            assert.eq(1, res.cursor.firstBatch.length);
-            assert.eq([{"name": "foo", "type": "collection"}], res.cursor.firstBatch);
-
-            db.logout();
-        }
-
-        runTestOnRole("roleWithExactNamespacePrivileges");
-        runTestOnRole("roleWithExactNamespaceAndSystemPrivileges");
-        runTestOnRole("roleWithCollectionPrivileges");
-        runTestOnRole("roleWithDatabasePrivileges");
-        runTestOnRole("roleWithAnyNormalResourcePrivileges");
+    res = db.runCommand(
+        {listCollections: 1, nameOnly: true, authorizedCollections: true, filter: {"name": "foo"}});
+    assert.commandWorked(res);
+    if (roleName.indexOf("Buckets") != -1) {
+        assert.eq([resFooTS], res.cursor.firstBatch);
+    } else {
+        assert.eq([resFoo], res.cursor.firstBatch);
     }
 
-    const mongod = MongoRunner.runMongod({auth: ''});
-    runTestOnConnection(mongod);
-    MongoRunner.stopMongod(mongod);
+    db.logout();
+}
 
-    // TODO: Remove 'shardAsReplicaSet: false' when SERVER-32672 is fixed.
-    const st = new ShardingTest({
-        shards: 1,
-        mongos: 1,
-        config: 1,
-        other: {keyFile: 'jstests/libs/key1', shardAsReplicaSet: false}
-    });
-    runTestOnConnection(st.s0);
-    st.stop();
+function runTestOnConnection(conn) {
+    const admin = conn.getDB("admin");
+    const db = conn.getDB(dbName);
 
-}());
+    assert.commandWorked(admin.runCommand({createUser: "root", pwd: "root", roles: ["root"]}));
+    assert(admin.auth("root", "root"));
+
+    createTestRoleAndUser(db, "roleWithExactNamespacePrivileges", [
+        {resource: {db: dbName, collection: "foo"}, actions: ["find"]},
+        {resource: {db: dbName, collection: "bar"}, actions: ["find"]}
+    ]);
+
+    createTestRoleAndUser(db, "roleWithExactNamespaceAndSystemPrivileges", [
+        {resource: {db: dbName, collection: "foo"}, actions: ["find"]},
+        {resource: {db: dbName, collection: "bar"}, actions: ["find"]},
+        {resource: {db: dbName, collection: "system.views"}, actions: ["find"]}
+    ]);
+
+    createTestRoleAndUser(db, "roleWithCollectionPrivileges", [
+        {resource: {db: "", collection: "foo"}, actions: ["find"]},
+        {resource: {db: "", collection: "bar"}, actions: ["find"]}
+    ]);
+
+    createTestRoleAndUser(db, "roleWithCollectionAndSystemPrivileges", [
+        {resource: {db: "", collection: "foo"}, actions: ["find"]},
+        {resource: {db: "", collection: "bar"}, actions: ["find"]},
+        {resource: {db: "", collection: "system.views"}, actions: ["find"]}
+    ]);
+
+    createTestRoleAndUser(db, "roleWithDatabasePrivileges", [
+        {resource: {db: dbName, collection: ""}, actions: ["find"]},
+    ]);
+
+    createTestRoleAndUser(db, "roleWithDatabaseAndSystemPrivileges", [
+        {resource: {db: dbName, collection: ""}, actions: ["find"]},
+        {resource: {db: dbName, collection: "system.views"}, actions: ["find"]}
+    ]);
+
+    createTestRoleAndUser(db, "roleWithAnyNormalResourcePrivileges", [
+        {resource: {db: "", collection: ""}, actions: ["find"]},
+    ]);
+
+    createTestRoleAndUser(db, "roleWithAnyNormalResourceAndSystemPrivileges", [
+        {resource: {db: "", collection: ""}, actions: ["find"]},
+        {resource: {db: "", collection: "system.views"}, actions: ["find"]}
+    ]);
+
+    // Create the collection and view used by the tests.
+    assert.commandWorked(db.dropDatabase());
+    assert.commandWorked(db.createCollection("foo"));
+    assert.commandWorked(db.createView("bar", "foo", []));
+
+    // Create a collection and view that are never granted specific permissions, to ensure
+    // they're only returned by listCollections when the role has access to the whole db/server.
+    assert.commandWorked(db.createCollection("otherCollection"));
+    assert.commandWorked(db.createView("otherView", "otherCollection", []));
+
+    admin.logout();
+
+    runTestOnRole(db, "roleWithExactNamespacePrivileges", [resFoo, resBar]);
+    runTestOnRole(
+        db, "roleWithExactNamespaceAndSystemPrivileges", [resFoo, resBar, resSystemViews]);
+
+    runTestOnRole(db, "roleWithCollectionPrivileges", [resFoo, resBar]);
+    runTestOnRole(db, "roleWithCollectionAndSystemPrivileges", [resFoo, resBar, resSystemViews]);
+
+    runTestOnRole(db, "roleWithDatabasePrivileges", [resFoo, resBar, ...resOther]);
+    runTestOnRole(
+        db, "roleWithDatabaseAndSystemPrivileges", [resFoo, resBar, ...resOther, resSystemViews]);
+
+    runTestOnRole(db, "roleWithAnyNormalResourcePrivileges", [resFoo, resBar, ...resOther]);
+    runTestOnRole(db,
+                  "roleWithAnyNormalResourceAndSystemPrivileges",
+                  [resFoo, resBar, ...resOther, resSystemViews]);
+}
+
+function runSystemsBucketsTestOnConnection(conn, isMongod) {
+    const admin = conn.getDB("admin");
+    const db = conn.getDB(dbName);
+
+    assert(admin.auth("root", "root"));
+
+    createTestRoleAndUser(db, "roleWithExactNamespacePrivilegesBuckets", [
+        {resource: {db: dbName, collection: "foo"}, actions: ["find"]},
+    ]);
+
+    createTestRoleAndUser(db, "roleWithExactNamespaceAndSystemPrivilegesBuckets", [
+        {resource: {db: dbName, collection: "foo"}, actions: ["find"]},
+        {resource: {db: dbName, collection: "bar"}, actions: ["find"]},
+        {resource: {db: dbName, collection: "system.buckets.foo"}, actions: ["find"]}
+    ]);
+
+    createTestRoleAndUser(db, "roleWithSystemBucketsInAnyDB", [
+        {resource: {db: "", collection: "foo"}, actions: ["find"]},
+        {resource: {db: "", system_buckets: "foo"}, actions: ["find"]},
+        {resource: {db: "", collection: "bar"}, actions: ["find"]}
+    ]);
+
+    createTestRoleAndUser(db, "roleWithAnySystemBucketsInDB", [
+        {resource: {db: dbName, collection: "foo"}, actions: ["find"]},
+        {resource: {db: dbName, system_buckets: ""}, actions: ["find"]},
+        {resource: {db: dbName, collection: "bar"}, actions: ["find"]},
+    ]);
+
+    createTestRoleAndUser(db, "roleWithAnySystemBuckets", [
+        {resource: {db: dbName, collection: "foo"}, actions: ["find"]},
+        {resource: {db: "", system_buckets: ""}, actions: ["find"]},
+        {resource: {db: dbName, collection: "bar"}, actions: ["find"]},
+    ]);
+
+    // Create the collection and view used by the tests.
+    assert.commandWorked(db.dropDatabase());
+    assert.commandWorked(db.createCollection("foo", {timeseries: {timeField: "date"}}));
+    assert.commandWorked(db.createCollection("bar", {timeseries: {timeField: "date"}}));
+
+    // Create a collection and view that are never granted specific permissions, to ensure
+    // they're only returned by listCollections when the role has access to the whole db/server.
+    assert.commandWorked(db.createCollection("otherCollection"));
+    assert.commandWorked(db.createView("otherView", "otherCollection", []));
+
+    admin.logout();
+
+    runTestOnRole(db, "roleWithExactNamespacePrivilegesBuckets", [resFooTS]);
+    runTestOnRole(
+        db, "roleWithExactNamespaceAndSystemPrivilegesBuckets", [resFooTS, resBarTS, resSBFoo]);
+
+    runTestOnRole(db, "roleWithSystemBucketsInAnyDB", [resFooTS, resBarTS, resSBFoo]);
+
+    runTestOnRole(db, "roleWithAnySystemBucketsInDB", [resFooTS, resBarTS, resSBFoo, resSBBar]);
+    runTestOnRole(db, "roleWithAnySystemBuckets", [resFooTS, resBarTS, resSBFoo, resSBBar]);
+}
+
+function runNoAuthTestOnConnection(conn) {
+    const db = conn.getDB(dbName);
+
+    assert.commandWorked(db.dropDatabase());
+    assert.commandWorked(db.createCollection("foo"));
+    assert.commandWorked(db.createView("bar", "foo", []));
+    assert.commandWorked(db.createCollection("ts_foo", {timeseries: {timeField: "date"}}));
+
+    var resFull = db.runCommand({listCollections: 1});
+    assert.commandWorked(resFull);
+    var resAuthColls = db.runCommand({listCollections: 1, authorizedCollections: true});
+    assert.commandWorked(resAuthColls);
+    assert.eq(resFull.cursor.firstBatch.sort(nameSort),
+              resAuthColls.cursor.firstBatch.sort(nameSort));
+
+    var resNameOnly = db.runCommand({listCollections: 1, nameOnly: true});
+    assert.commandWorked(resNameOnly);
+    var resNameOnlyAuthColls =
+        db.runCommand({listCollections: 1, nameOnly: true, authorizedCollections: true});
+    assert.commandWorked(resNameOnlyAuthColls);
+    assert.eq(resNameOnly.cursor.firstBatch.sort(nameSort),
+              resNameOnlyAuthColls.cursor.firstBatch.sort(nameSort));
+
+    var resWithFilter = db.runCommand(
+        {listCollections: 1, nameOnly: true, authorizedCollections: true, filter: {"name": "foo"}});
+    assert.commandWorked(resWithFilter);
+    assert.eq([{"name": "foo", "type": "collection"}], resWithFilter.cursor.firstBatch);
+}
+
+const mongod = MongoRunner.runMongod({auth: ''});
+runTestOnConnection(mongod);
+runSystemsBucketsTestOnConnection(mongod, true);
+MongoRunner.stopMongod(mongod);
+
+const st =
+    new ShardingTest({shards: 1, mongos: 1, config: 1, other: {keyFile: 'jstests/libs/key1'}});
+runTestOnConnection(st.s0);
+runSystemsBucketsTestOnConnection(st.s0, false);
+st.stop();
+
+const mongodNoAuth = MongoRunner.runMongod();
+runNoAuthTestOnConnection(mongodNoAuth);
+MongoRunner.stopMongod(mongodNoAuth);
+
+const stNoAuth = new ShardingTest({shards: 1, mongos: 1, config: 1});
+runNoAuthTestOnConnection(stNoAuth.s0);
+stNoAuth.stop();

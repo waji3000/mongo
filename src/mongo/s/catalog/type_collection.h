@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,20 +29,29 @@
 
 #pragma once
 
-#include <boost/optional.hpp>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <cstdint>
 #include <string>
 
-#include "mongo/db/jsobj.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/oid.h"
+#include "mongo/bson/timestamp.h"
 #include "mongo/db/keypattern.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/s/catalog/type_collection_gen.h"
+#include "mongo/s/chunk_version.h"
+#include "mongo/s/index_version.h"
+#include "mongo/s/resharding/type_collection_fields_gen.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
+#include "mongo/util/time_support.h"
 #include "mongo/util/uuid.h"
 
 namespace mongo {
 
-class Status;
-template <typename T>
-class StatusWith;
-
+using ReshardingFields = TypeCollectionReshardingFields;
 
 /**
  * This class represents the layout and contents of documents contained in the config server's
@@ -55,7 +63,6 @@ class StatusWith;
  *      "_id" : "foo.bar",
  *      "lastmodEpoch" : ObjectId("58b6fd76132358839e409e47"),
  *      "lastmod" : ISODate("1970-02-19T17:02:47.296Z"),
- *      "dropped" : false,
  *      "key" : {
  *          "_id" : 1
  *      },
@@ -65,142 +72,142 @@ class StatusWith;
  *      "unique" : false,
  *      "uuid" : UUID,
  *      "noBalance" : false,
- *      "allowSplit" : false
+ *      // Only populated if the collection is currently undergoing a resharding operation.
+ *      "reshardingFields" : {
+ *          "uuid" : UUID,
+ *          "state" : CoordinatorState<kInitialized>,
+ *          // Only populated if the collection is currently undergoing a resharding operation,
+ *          // and this collection is the original sharded collection.
+ *          "donorFields" : {
+ *              "reshardingKey" : {
+ *                  "_notTheID" : 1
+ *              }
+ *          },
+ *          // Only populated if this collection is the temporary resharding collection in a
+ *          // resharding operation.
+ *          "recipientFields" : {
+ *              "fetchTimestamp" : Timestamp(3, 4),
+ *              "originalNamespace" : "foo.bar",
+ *          }
+ *      }
  *   }
  *
  */
-class CollectionType {
+class CollectionType : private CollectionTypeBase {
 public:
+    // Make field names accessible.
+    static constexpr auto kEpochFieldName = kPre22CompatibleEpochFieldName;
+
+    using CollectionTypeBase::kAllowMigrationsFieldName;
+    using CollectionTypeBase::kDefaultCollationFieldName;
+    using CollectionTypeBase::kDefragmentationPhaseFieldName;
+    using CollectionTypeBase::kDefragmentCollectionFieldName;
+    using CollectionTypeBase::kEnableAutoMergeFieldName;
+    using CollectionTypeBase::kIndexVersionFieldName;
+    using CollectionTypeBase::kKeyPatternFieldName;
+    using CollectionTypeBase::kMaxChunkSizeBytesFieldName;
+    using CollectionTypeBase::kNoBalanceFieldName;
+    using CollectionTypeBase::kNssFieldName;
+    using CollectionTypeBase::kPermitMigrationsFieldName;
+    using CollectionTypeBase::kReshardingFieldsFieldName;
+    using CollectionTypeBase::kTimeseriesFieldsFieldName;
+    using CollectionTypeBase::kTimestampFieldName;
+    using CollectionTypeBase::kUniqueFieldName;
+    using CollectionTypeBase::kUnsplittableFieldName;
+    using CollectionTypeBase::kUpdatedAtFieldName;
+    using CollectionTypeBase::kUuidFieldName;
+
+    // Make getters and setters accessible.
+    using CollectionTypeBase::getDefragmentationPhase;
+    using CollectionTypeBase::getKeyPattern;
+    using CollectionTypeBase::getMaxChunkSizeBytes;
+    using CollectionTypeBase::getNss;
+    using CollectionTypeBase::getReshardingFields;
+    using CollectionTypeBase::getTimeseriesFields;
+    using CollectionTypeBase::getTimestamp;
+    using CollectionTypeBase::getUnique;
+    using CollectionTypeBase::getUnsplittable;
+    using CollectionTypeBase::getUpdatedAt;
+    using CollectionTypeBase::getUuid;
+    using CollectionTypeBase::setDefragmentationPhase;
+    using CollectionTypeBase::setDefragmentCollection;
+    using CollectionTypeBase::setKeyPattern;
+    using CollectionTypeBase::setNss;
+    using CollectionTypeBase::setReshardingFields;
+    using CollectionTypeBase::setTimeseriesFields;
+    using CollectionTypeBase::setTimestamp;
+    using CollectionTypeBase::setUnique;
+    using CollectionTypeBase::setUnsplittable;
+    using CollectionTypeBase::setUpdatedAt;
+    using CollectionTypeBase::setUuid;
+    using CollectionTypeBase::toBSON;
+
     // Name of the collections collection in the config server.
     static const NamespaceString ConfigNS;
 
-    static const BSONField<std::string> fullNs;
-    static const BSONField<OID> epoch;
-    static const BSONField<Date_t> updatedAt;
-    static const BSONField<BSONObj> keyPattern;
-    static const BSONField<BSONObj> defaultCollation;
-    static const BSONField<bool> unique;
-    static const BSONField<UUID> uuid;
+    CollectionType(NamespaceString nss,
+                   OID epoch,
+                   Timestamp creationTime,
+                   Date_t updatedAt,
+                   UUID uuid,
+                   KeyPattern keyPattern);
 
-    /**
-     * Constructs a new DatabaseType object from BSON. Also does validation of the contents.
-     *
-     * Dropped collections accumulate in the collections list, through 3.6, so that
-     * mongos <= 3.4.x, when it retrieves the list from the config server, can delete its
-     * cache entries for dropped collections.  See SERVER-27475, SERVER-27474
-     */
-    static StatusWith<CollectionType> fromBSON(const BSONObj& source);
+    explicit CollectionType(const BSONObj& obj);
 
-    /**
-     * Returns OK if all fields have been set. Otherwise returns NoSuchKey and information
-     * about what is the first field which is missing.
-     */
-    Status validate() const;
+    CollectionType() = default;
 
-    /**
-     * Returns the BSON representation of the entry.
-     */
-    BSONObj toBSON() const;
-
-    /**
-     * Returns a std::string representation of the current internal state.
-     */
     std::string toString() const;
 
-    const NamespaceString& getNs() const {
-        return _fullNs.get();
-    }
-    void setNs(const NamespaceString& fullNs);
-
-    OID getEpoch() const {
-        return _epoch.get();
+    const OID& getEpoch() const {
+        return *getPre22CompatibleEpoch();
     }
     void setEpoch(OID epoch);
 
-    Date_t getUpdatedAt() const {
-        return _updatedAt.get();
-    }
-    void setUpdatedAt(Date_t updatedAt);
-
-    bool getDropped() const {
-        return _dropped.get_value_or(false);
-    }
-    void setDropped(bool dropped) {
-        _dropped = dropped;
+    BSONObj getDefaultCollation() const {
+        return CollectionTypeBase::getDefaultCollation().get_value_or(BSONObj());
     }
 
-    const KeyPattern& getKeyPattern() const {
-        return _keyPattern.get();
-    }
-    void setKeyPattern(const KeyPattern& keyPattern);
+    void setMaxChunkSizeBytes(int64_t value);
 
-    const BSONObj& getDefaultCollation() const {
-        return _defaultCollation;
-    }
-    void setDefaultCollation(const BSONObj& collation) {
-        _defaultCollation = collation.getOwned();
-    }
+    void setDefaultCollation(const BSONObj& defaultCollation);
 
-    bool getUnique() const {
-        return _unique.get_value_or(false);
-    }
-    void setUnique(bool unique) {
-        _unique = unique;
-    }
-
-    boost::optional<UUID> getUUID() const {
-        return _uuid;
-    }
-
-    void setUUID(UUID uuid) {
-        _uuid = uuid;
+    bool getDefragmentCollection() const {
+        return CollectionTypeBase::getDefragmentCollection().get_value_or(false);
     }
 
     bool getAllowBalance() const {
-        return _allowBalance.get_value_or(true);
+        return !getNoBalance() && !getDefragmentCollection();
     }
 
-    void setIsAssignedShardKey(bool isAssignedShardKey) {
-        _isAssignedShardKey = isAssignedShardKey;
+    bool getAllowMigrations() const {
+        return CollectionTypeBase::getAllowMigrations().get_value_or(true);
     }
 
-    bool isAssignedShardKey() const {
-        return _isAssignedShardKey.get_value_or(true);
+    void setAllowMigrations(bool allowMigrations) {
+        if (allowMigrations)
+            CollectionTypeBase::setAllowMigrations(boost::none);
+        else
+            CollectionTypeBase::setAllowMigrations(false);
     }
 
-    bool hasSameOptions(CollectionType& other);
+    boost::optional<CollectionIndexes> getIndexVersion() const {
+        return CollectionTypeBase::getIndexVersion()
+            ? CollectionIndexes(getUuid(), *CollectionTypeBase::getIndexVersion())
+            : boost::optional<CollectionIndexes>(boost::none);
+    }
 
-private:
-    // Required full namespace (with the database prefix).
-    boost::optional<NamespaceString> _fullNs;
+    void setIndexVersion(CollectionIndexes indexVersion) {
+        tassert(7000500,
+                str::stream() << "Cannot set collection indexes to " << indexVersion
+                              << " since collection uuid is " << getUuid(),
+                indexVersion.uuid() == getUuid());
+        CollectionTypeBase::setIndexVersion(indexVersion.indexVersion());
+    }
 
-    // Required to disambiguate collection namespace incarnations.
-    boost::optional<OID> _epoch;
-
-    // Required last updated time.
-    boost::optional<Date_t> _updatedAt;
-
-    // Optional, whether the collection has been dropped. If missing, implies false.
-    boost::optional<bool> _dropped;
-
-    // Sharding key. Required, if collection is not dropped.
-    boost::optional<KeyPattern> _keyPattern;
-
-    // Optional collection default collation. If empty, implies simple collation.
-    BSONObj _defaultCollation;
-
-    // Optional uniqueness of the sharding key. If missing, implies false.
-    boost::optional<bool> _unique;
-
-    // Optional in 3.6 binaries, because UUID does not exist in featureCompatibilityVersion=3.4.
-    boost::optional<UUID> _uuid;
-
-    // Optional whether balancing is allowed for this collection. If missing, implies true.
-    boost::optional<bool> _allowBalance;
-
-    // Optional whether user has assigned a shard key to this collection before.
-    // Implicitly true if missing.
-    boost::optional<bool> _isAssignedShardKey;
+    // TODO SERVER-61033: remove after permitMigrations have been merge with allowMigrations.
+    bool getPermitMigrations() const {
+        return CollectionTypeBase::getPermitMigrations().get_value_or(true);
+    }
 };
 
 }  // namespace mongo

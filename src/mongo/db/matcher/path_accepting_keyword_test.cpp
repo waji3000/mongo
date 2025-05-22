@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,9 +27,19 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <boost/optional.hpp>
+#include <memory>
 
-#include "mongo/db/jsobj.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/none_t.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/matcher/expression_parser.h"
 #include "mongo/unittest/unittest.h"
 
@@ -50,33 +59,42 @@ TEST(PathAcceptingKeyword, CanParseKnownMatchTypes) {
                 MatchExpressionParser::parsePathAcceptingKeyword(BSON("$in" << 1).firstElement()));
     ASSERT_TRUE(PathAcceptingKeyword::NOT_EQUAL ==
                 MatchExpressionParser::parsePathAcceptingKeyword(BSON("$ne" << 1).firstElement()));
-    ASSERT_TRUE(PathAcceptingKeyword::SIZE == MatchExpressionParser::parsePathAcceptingKeyword(
-                                                  BSON("$size" << 1).firstElement()));
+    ASSERT_TRUE(
+        PathAcceptingKeyword::SIZE ==
+        MatchExpressionParser::parsePathAcceptingKeyword(BSON("$size" << 1).firstElement()));
     ASSERT_TRUE(PathAcceptingKeyword::ALL ==
                 MatchExpressionParser::parsePathAcceptingKeyword(BSON("$all" << 1).firstElement()));
     ASSERT_TRUE(PathAcceptingKeyword::NOT_IN ==
                 MatchExpressionParser::parsePathAcceptingKeyword(BSON("$nin" << 1).firstElement()));
-    ASSERT_TRUE(PathAcceptingKeyword::EXISTS == MatchExpressionParser::parsePathAcceptingKeyword(
-                                                    BSON("$exists" << 1).firstElement()));
+    ASSERT_TRUE(
+        PathAcceptingKeyword::EXISTS ==
+        MatchExpressionParser::parsePathAcceptingKeyword(BSON("$exists" << 1).firstElement()));
     ASSERT_TRUE(PathAcceptingKeyword::MOD ==
                 MatchExpressionParser::parsePathAcceptingKeyword(BSON("$mod" << 1).firstElement()));
-    ASSERT_TRUE(PathAcceptingKeyword::TYPE == MatchExpressionParser::parsePathAcceptingKeyword(
-                                                  BSON("$type" << 1).firstElement()));
-    ASSERT_TRUE(PathAcceptingKeyword::REGEX == MatchExpressionParser::parsePathAcceptingKeyword(
-                                                   BSON("$regex" << 1).firstElement()));
-    ASSERT_TRUE(PathAcceptingKeyword::OPTIONS == MatchExpressionParser::parsePathAcceptingKeyword(
-                                                     BSON("$options" << 1).firstElement()));
+    ASSERT_TRUE(
+        PathAcceptingKeyword::TYPE ==
+        MatchExpressionParser::parsePathAcceptingKeyword(BSON("$type" << 1).firstElement()));
+    ASSERT_TRUE(
+        PathAcceptingKeyword::REGEX ==
+        MatchExpressionParser::parsePathAcceptingKeyword(BSON("$regex" << 1).firstElement()));
+    ASSERT_TRUE(
+        PathAcceptingKeyword::OPTIONS ==
+        MatchExpressionParser::parsePathAcceptingKeyword(BSON("$options" << 1).firstElement()));
     ASSERT_TRUE(
         PathAcceptingKeyword::ELEM_MATCH ==
         MatchExpressionParser::parsePathAcceptingKeyword(BSON("$elemMatch" << 1).firstElement()));
-    ASSERT_TRUE(PathAcceptingKeyword::GEO_NEAR == MatchExpressionParser::parsePathAcceptingKeyword(
-                                                      BSON("$near" << 1).firstElement()));
-    ASSERT_TRUE(PathAcceptingKeyword::GEO_NEAR == MatchExpressionParser::parsePathAcceptingKeyword(
-                                                      BSON("$geoNear" << 1).firstElement()));
-    ASSERT_TRUE(PathAcceptingKeyword::WITHIN == MatchExpressionParser::parsePathAcceptingKeyword(
-                                                    BSON("$within" << 1).firstElement()));
-    ASSERT_TRUE(PathAcceptingKeyword::WITHIN == MatchExpressionParser::parsePathAcceptingKeyword(
-                                                    BSON("$geoWithin" << 1).firstElement()));
+    ASSERT_TRUE(
+        PathAcceptingKeyword::GEO_NEAR ==
+        MatchExpressionParser::parsePathAcceptingKeyword(BSON("$near" << 1).firstElement()));
+    ASSERT_TRUE(
+        PathAcceptingKeyword::GEO_NEAR ==
+        MatchExpressionParser::parsePathAcceptingKeyword(BSON("$geoNear" << 1).firstElement()));
+    ASSERT_TRUE(
+        PathAcceptingKeyword::WITHIN ==
+        MatchExpressionParser::parsePathAcceptingKeyword(BSON("$within" << 1).firstElement()));
+    ASSERT_TRUE(
+        PathAcceptingKeyword::WITHIN ==
+        MatchExpressionParser::parsePathAcceptingKeyword(BSON("$geoWithin" << 1).firstElement()));
     ASSERT_TRUE(PathAcceptingKeyword::GEO_INTERSECTS ==
                 MatchExpressionParser::parsePathAcceptingKeyword(
                     BSON("$geoIntersects" << 1).firstElement()));
@@ -113,16 +131,8 @@ TEST(PathAcceptingKeyword, CanParseKnownMatchTypes) {
     ASSERT_TRUE(PathAcceptingKeyword::INTERNAL_EXPR_EQ ==
                 MatchExpressionParser::parsePathAcceptingKeyword(
                     BSON("$_internalExprEq" << 1).firstElement()));
-}
-
-TEST(PathAcceptingKeyword, EqualityMatchReturnsDefault) {
-    // 'boost::none' is the default when none specified.
-    ASSERT_TRUE(boost::none ==
+    ASSERT_TRUE(PathAcceptingKeyword::EQUALITY ==
                 MatchExpressionParser::parsePathAcceptingKeyword(BSON("$eq" << 1).firstElement()));
-    // Should return default specified by caller.
-    ASSERT_TRUE(PathAcceptingKeyword::GEO_NEAR ==
-                MatchExpressionParser::parsePathAcceptingKeyword(BSON("$eq" << 1).firstElement(),
-                                                                 PathAcceptingKeyword::GEO_NEAR));
 }
 
 TEST(PathAcceptingKeyword, UnknownExpressionReturnsDefault) {
@@ -134,6 +144,10 @@ TEST(PathAcceptingKeyword, UnknownExpressionReturnsDefault) {
     ASSERT_TRUE(PathAcceptingKeyword::NOT_IN ==
                 MatchExpressionParser::parsePathAcceptingKeyword(BSON("size" << 1).firstElement(),
                                                                  PathAcceptingKeyword::NOT_IN));
+    // 'boost::none' is the default when none specified.
+    ASSERT_TRUE(boost::none ==
+                MatchExpressionParser::parsePathAcceptingKeyword(
+                    BSON("NonExistentKeyWord" << 1).firstElement()));
 }
 
 TEST(PathAcceptingKeyword, EmptyBSONElemReturnsDefault) {

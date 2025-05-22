@@ -1,6 +1,3 @@
-// framework.h
-
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -40,5 +37,5 @@
 namespace mongo {
 namespace dbtests {
 int runDbTests(int argc, char** argv);
-}  // dbtests
+}  // namespace dbtests
 }  // namespace mongo

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,18 +27,17 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/storage/backup_cursor_hooks.h"
-
-#include "mongo/base/init.h"
+#include "mongo/base/init.h"  // IWYU pragma: keep
 #include "mongo/db/service_context.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/decorable.h"
 
 namespace mongo {
 
 namespace {
-BackupCursorHooks::InitializerFunction initializer = [](StorageEngine* storageEngine) {
-    return stdx::make_unique<BackupCursorHooks>();
+BackupCursorHooks::InitializerFunction initializer = []() {
+    return std::make_unique<BackupCursorHooks>();
 };
 
 struct BackupCursorHooksHolder {
@@ -53,8 +51,8 @@ void BackupCursorHooks::registerInitializer(InitializerFunction func) {
     initializer = func;
 }
 
-void BackupCursorHooks::initialize(ServiceContext* service, StorageEngine* storageEngine) {
-    getBackupCursorHooks(service).ptr = initializer(storageEngine);
+void BackupCursorHooks::initialize(ServiceContext* service) {
+    getBackupCursorHooks(service).ptr = initializer();
 }
 
 BackupCursorHooks* BackupCursorHooks::get(ServiceContext* service) {
@@ -78,7 +76,8 @@ void BackupCursorHooks::fsyncUnlock(OperationContext* opCtx) {
     MONGO_UNREACHABLE;
 }
 
-BackupCursorState BackupCursorHooks::openBackupCursor(OperationContext* opCtx) {
+BackupCursorState BackupCursorHooks::openBackupCursor(OperationContext* opCtx,
+                                                      const StorageEngine::BackupOptions& options) {
     MONGO_UNREACHABLE;
 }
 
@@ -95,4 +94,14 @@ BackupCursorExtendState BackupCursorHooks::extendBackupCursor(OperationContext* 
 bool BackupCursorHooks::isBackupCursorOpen() const {
     return false;
 }
+
+bool BackupCursorHooks::isFileReturnedByCursor(const UUID& backupId,
+                                               boost::filesystem::path filePath) {
+    MONGO_UNREACHABLE;
+}
+
+void BackupCursorHooks::addFile(const UUID& backupId, boost::filesystem::path filePath) {
+    MONGO_UNREACHABLE;
+}
+
 }  // namespace mongo

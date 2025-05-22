@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,16 +27,21 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
 
-#include "mongo/s/catalog/type_changelog.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
 
+#include "mongo/base/error_codes.h"
 #include "mongo/base/status_with.h"
+#include "mongo/bson/bsonelement.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
 #include "mongo/bson/util/bson_extract.h"
+#include "mongo/s/catalog/type_changelog.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/namespace_string_util.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -47,8 +51,11 @@ const BSONField<std::string> ChangeLogType::shard("shard");
 const BSONField<std::string> ChangeLogType::clientAddr("clientAddr");
 const BSONField<Date_t> ChangeLogType::time("time");
 const BSONField<std::string> ChangeLogType::what("what");
+const BSONField<BSONObj> ChangeLogType::versionContext("versionContext");
 const BSONField<std::string> ChangeLogType::ns("ns");
 const BSONField<BSONObj> ChangeLogType::details("details");
+
+const NamespaceString ChangeLogType::ConfigNS(NamespaceString::kConfigChangelogNamespace);
 
 StatusWith<ChangeLogType> ChangeLogType::fromBSON(const BSONObj& source) {
     ChangeLogType changeLog;
@@ -103,11 +110,23 @@ StatusWith<ChangeLogType> ChangeLogType::fromBSON(const BSONObj& source) {
     }
 
     {
+        BSONElement changeLogVersionCtxElem;
+        Status status = bsonExtractField(source, versionContext.name(), &changeLogVersionCtxElem);
+        if (status.isOK())
+            changeLog._versionContext = VersionContext{changeLogVersionCtxElem.Obj()};
+        else if (status == ErrorCodes::NoSuchKey)
+            changeLog._versionContext = boost::none;
+        else
+            return status;
+    }
+
+    {
         std::string changeLogNs;
         Status status = bsonExtractStringFieldWithDefault(source, ns.name(), "", &changeLogNs);
         if (!status.isOK())
             return status;
-        changeLog._ns = changeLogNs;
+        changeLog._ns = NamespaceStringUtil::deserialize(
+            boost::none, changeLogNs, SerializationContext::stateDefault());
     }
 
     {
@@ -120,29 +139,6 @@ StatusWith<ChangeLogType> ChangeLogType::fromBSON(const BSONObj& source) {
     }
 
     return changeLog;
-}
-
-Status ChangeLogType::validate() const {
-    if (!_changeId.is_initialized() || _changeId->empty())
-        return {ErrorCodes::NoSuchKey, str::stream() << "missing " << changeId.name() << " field"};
-
-    if (!_server.is_initialized() || _server->empty())
-        return {ErrorCodes::NoSuchKey, str::stream() << "missing " << server.name() << " field"};
-
-    if (!_clientAddr.is_initialized() || _clientAddr->empty())
-        return {ErrorCodes::NoSuchKey,
-                str::stream() << "missing " << clientAddr.name() << " field"};
-
-    if (!_time.is_initialized())
-        return {ErrorCodes::NoSuchKey, str::stream() << "missing " << time.name() << " field"};
-
-    if (!_what.is_initialized() || _what->empty())
-        return {ErrorCodes::NoSuchKey, str::stream() << "missing " << what.name() << " field"};
-
-    if (!_details.is_initialized() || _details->isEmpty())
-        return {ErrorCodes::NoSuchKey, str::stream() << "missing " << details.name() << " field"};
-
-    return Status::OK();
 }
 
 BSONObj ChangeLogType::toBSON() const {
@@ -160,8 +156,12 @@ BSONObj ChangeLogType::toBSON() const {
         builder.append(time.name(), getTime());
     if (_what)
         builder.append(what.name(), getWhat());
+    if (_versionContext)
+        builder.append(versionContext.name(), getVersionContext()->toBSON());
     if (_ns)
-        builder.append(ns.name(), getNS());
+        builder.append(
+            ns.name(),
+            NamespaceStringUtil::serialize(getNS(), SerializationContext::stateDefault()));
     if (_details)
         builder.append(details.name(), getDetails());
 
@@ -193,7 +193,11 @@ void ChangeLogType::setWhat(const std::string& what) {
     _what = what;
 }
 
-void ChangeLogType::setNS(const std::string& ns) {
+void ChangeLogType::setVersionContext(const VersionContext& vCtx) {
+    _versionContext = vCtx;
+}
+
+void ChangeLogType::setNS(const NamespaceString& ns) {
     _ns = ns;
 }
 

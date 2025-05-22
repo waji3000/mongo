@@ -1,6 +1,3 @@
-// processinfo.h
-
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -32,19 +29,27 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
 #include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
 #include <cstdint>
+#include <new>
 #include <string>
+#include <vector>
 
-#include "mongo/db/jsobj.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/platform/process_id.h"
-#include "mongo/stdx/mutex.h"
-#include "mongo/util/concurrency/mutex.h"
+#include "mongo/util/static_immortal.h"
 
 namespace mongo {
 
 class ProcessInfo {
 public:
+    static auto constexpr kTranparentHugepageDirectory = "/sys/kernel/mm/transparent_hugepage";
+    static auto constexpr kGlibcTunableEnvVar = "GLIBC_TUNABLES";
+    static auto constexpr kRseqKey = "glibc.pthread.rseq";
+
     ProcessInfo(ProcessId pid = ProcessId::getCurrent());
     ~ProcessInfo();
 
@@ -87,17 +92,38 @@ public:
     }
 
     /**
-     * Get the total amount of system memory in MB
+     * Get the size of total memory available to the process in MB
      */
     static unsigned long long getMemSizeMB() {
+        return sysInfo().memLimit / (1024 * 1024);
+    }
+
+    /**
+     * Get the total memory available on the machine in MB
+     */
+    static unsigned long long getSystemMemSizeMB() {
         return sysInfo().memSize / (1024 * 1024);
     }
 
     /**
-     * Get the number of CPUs
+     * Get the number of (logical) CPUs
      */
-    static unsigned getNumCores() {
+    static unsigned getNumLogicalCores() {
         return sysInfo().numCores;
+    }
+
+    /**
+     * Get the number of physical CPUs
+     */
+    static unsigned getNumPhysicalCores() {
+        return sysInfo().numPhysicalCores;
+    }
+
+    /**
+     * Get the number of CPU sockets
+     */
+    static unsigned getNumCpuSockets() {
+        return sysInfo().numCpuSockets;
     }
 
     /**
@@ -105,7 +131,14 @@ public:
      * If that information is not available, get the total number of CPUs.
      */
     static unsigned long getNumAvailableCores() {
-        return ProcessInfo::getNumCoresForProcess().value_or(ProcessInfo::getNumCores());
+        return ProcessInfo::getNumCoresForProcess().value_or(ProcessInfo::getNumLogicalCores());
+    }
+
+    /**
+     * Get the number of cores available for process or return the errorValue.
+     */
+    static long getNumCoresAvailableToProcess(long errorValue = -1) {
+        return ProcessInfo::getNumCoresForProcess().value_or(errorValue);
     }
 
     /**
@@ -130,10 +163,13 @@ public:
     }
 
     /**
-     * Determine if file zeroing is necessary for newly allocated data files.
+     * Get the number of NUMA nodes if NUMA is enabled, or 1 otherwise.
      */
-    static bool isDataFileZeroingNeeded() {
-        return sysInfo().fileZeroNeeded;
+    static unsigned long getNumNumaNodes() {
+        if (sysInfo().hasNuma) {
+            return sysInfo().numNumaNodes;
+        }
+        return 1;
     }
 
     /**
@@ -144,10 +180,24 @@ public:
     }
 
     /**
+     * Transparent hugepage files display settings like so, with the selected setting in brackets:
+     *      always defer [defer+madvise] madvise never
+     *
+     * This function parses out the selected setting from this file format.
+     */
+    static StatusWith<std::string> readTransparentHugePagesParameter(
+        StringData parameter, StringData directory = kTranparentHugepageDirectory);
+
+    /**
+     * Check whether the environment variable GLIBC_TUNABLES=glibc.pthread.rseq=0 is correctly set.
+     */
+    static bool checkGlibcRseqTunable();
+
+    /**
      * Get extra system stats
      */
     void appendSystemDetails(BSONObjBuilder& details) const {
-        details.append(StringData("extra"), sysInfo()._extraStats.copy());
+        details.appendElements(sysInfo()._extraStats);
     }
 
     /**
@@ -157,36 +207,13 @@ public:
 
     bool supported();
 
-    static bool blockCheckSupported();
-
-    static bool blockInMemory(const void* start);
-
-    /**
-     * Returns a positive floating point number between 0.0 and 1.0 to inform MMapV1 how much it
-     * must remap pages to bring the system page file implementation back below a certain
-     * threshold. A number of 1.0 means remap everything.
-     */
-    static double getSystemMemoryPressurePercentage();
-
-    /**
-     * @return a pointer aligned to the start of the page the provided pointer belongs to.
-     *
-     * NOTE requires blockCheckSupported() == true
-     */
-    inline static const void* alignToStartOfPage(const void* ptr) {
-        return reinterpret_cast<const void*>(reinterpret_cast<unsigned long long>(ptr) &
-                                             ~(getPageSize() - 1));
+    static const std::string& getProcessName() {
+        return appInfo().getProcessName();
     }
 
-    /**
-     * Sets i-th element of 'out' to non-zero if the i-th page starting from the one containing
-     * 'start' is in memory.
-     * The 'out' vector will be resized to fit the requested number of pages.
-     * @return true on success, false otherwise
-     *
-     * NOTE: requires blockCheckSupported() == true
-     */
-    static bool pagesInMemory(const void* start, size_t numPages, std::vector<char>* out);
+    static int getDefaultListenBacklog() {
+        return sysInfo().defaultListenBacklog;
+    }
 
 private:
     /**
@@ -199,16 +226,15 @@ private:
         std::string osVersion;
         unsigned addrSize;
         unsigned long long memSize;
+        unsigned long long memLimit;
         unsigned numCores;
+        unsigned numPhysicalCores;
+        unsigned numCpuSockets;
         unsigned long long pageSize;
         std::string cpuArch;
         bool hasNuma;
+        unsigned numNumaNodes;
         BSONObj _extraStats;
-
-        // This is an OS specific value, which determines whether files should be zero-filled
-        // at allocation time in order to avoid Microsoft KB 2731284.
-        //
-        bool fileZeroNeeded;
 
         // On non-Solaris (ie, Linux, Darwin, *BSD) kernels, prefer msync.
         // Illumos kernels do O(N) scans in memory of the page table during msync which
@@ -217,14 +243,20 @@ private:
         //  18658199 Speed up msync() on ZFS by 90000x with this one weird trick
         bool preferMsyncOverFSync;
 
+        int defaultListenBacklog;
+
         SystemInfo()
             : addrSize(0),
               memSize(0),
+              memLimit(0),
               numCores(0),
+              numPhysicalCores(0),
+              numCpuSockets(0),
               pageSize(0),
               hasNuma(false),
-              fileZeroNeeded(false),
-              preferMsyncOverFSync(true) {
+              numNumaNodes(0),
+              preferMsyncOverFSync(true),
+              defaultListenBacklog(0) {
             // populate SystemInfo during construction
             collectSystemInfo();
         }
@@ -234,13 +266,35 @@ private:
         void collectSystemInfo();
     };
 
+    class ApplicationInfo {
+    public:
+        void init(const std::vector<std::string>& argv) {
+            invariant(!_isInitialized);
+            _isInitialized = true;
+            if (!argv.empty()) {
+                _processName = argv[0];
+            }
+        }
+        const std::string& getProcessName() const {
+            return _processName;
+        }
+
+    private:
+        bool _isInitialized = false;
+        std::string _processName;
+    };
+
     ProcessId _pid;
 
-    static bool checkNumaEnabled();
-
-    inline static const SystemInfo& sysInfo() {
+    static const SystemInfo& sysInfo() {
         static ProcessInfo::SystemInfo systemInfo;
         return systemInfo;
+    }
+
+public:
+    static ApplicationInfo& appInfo() {
+        static StaticImmortal<ApplicationInfo> applicationInfo{};
+        return applicationInfo.value();
     }
 
 private:
@@ -252,4 +306,4 @@ private:
 };
 
 bool writePidFile(const std::string& path);
-}
+}  // namespace mongo

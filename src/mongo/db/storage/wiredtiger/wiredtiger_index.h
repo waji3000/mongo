@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,21 +29,62 @@
 
 #pragma once
 
+#include <boost/optional/optional.hpp>
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <string>
 #include <wiredtiger.h>
 
+#include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
-#include "mongo/db/storage/index_entry_comparison.h"
-#include "mongo/db/storage/key_string.h"
-#include "mongo/db/storage/kv/kv_prefix.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/record_id.h"
+#include "mongo/db/storage/duplicate_key_error_info.h"
+#include "mongo/db/storage/key_format.h"
+#include "mongo/db/storage/key_string/key_string.h"
 #include "mongo/db/storage/sorted_data_interface.h"
-#include "mongo/db/storage/wiredtiger/wiredtiger_prepare_conflict.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_connection.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_recovery_unit.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_util.h"
+#include "mongo/db/validate/validate_results.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/uuid.h"
 
 namespace mongo {
 
-class IndexCatalogEntry;
-class IndexDescriptor;
-struct WiredTigerItem;
+/**
+ * Table of WiredTiger index types<->KeyString format<->Data format version:
+ *
+ * | Index Type                   | Key                             | Data Format Version        |
+ * | ---------------------------- | ------------------------------- | -------------------------- |
+ * | _id index                    | KeyString without RecordId      | index V1: 6, index V2: 8   |
+ * | non-unique index             | KeyString with RecordId         | index V1: 6, index V2: 8   |
+ * | unique secondary index (new) | KeyString with RecordId         | index V1: 13, index V2: 14 |
+ * | unique secondary index (old) | KeyString with/without RecordId | index V1: 11, index V2: 12 |
+ *
+ * Starting in 4.2, unique indexes can be in format version 11 or 12. On upgrade to 4.2, an existing
+ * format 6 unique index will upgrade to format 11 and an existing format 8 unique index will
+ * upgrade to format 12.
+ *
+ * Starting in 6.0, any new unique index will be in format 13 or 14, which guarantees that all keys
+ * are in the new format.
+ */
+const int kDataFormatV1KeyStringV0IndexVersionV1 = 6;
+const int kDataFormatV2KeyStringV1IndexVersionV2 = 8;
+const int kDataFormatV3KeyStringV0UniqueIndexVersionV1 = 11;
+const int kDataFormatV4KeyStringV1UniqueIndexVersionV2 = 12;
+const int kDataFormatV5KeyStringV0UniqueIndexVersionV1 = 13;
+const int kDataFormatV6KeyStringV1UniqueIndexVersionV2 = 14;
+const int kMinimumIndexVersion = kDataFormatV1KeyStringV0IndexVersionV1;
+const int kMaximumIndexVersion = kDataFormatV6KeyStringV1UniqueIndexVersionV2;
+
+namespace CollectionValidation {
+class ValidationOptions;
+}
 
 class WiredTigerIndex : public SortedDataInterface {
 public:
@@ -60,7 +100,7 @@ public:
      * in WiredTiger's metadata. The output string is of the form:
      * ",app_metadata=(...)," and can be appended to the config strings for WiredTiger's API calls.
      */
-    static std::string generateAppMetadataString(const IndexDescriptor& desc);
+    static std::string generateAppMetadataString(const IndexConfig& config);
 
     /**
      * Creates a configuration string suitable for 'config' parameter in WT_SESSION::create().
@@ -77,48 +117,71 @@ public:
     static StatusWith<std::string> generateCreateString(const std::string& engineName,
                                                         const std::string& sysIndexConfig,
                                                         const std::string& collIndexConfig,
-                                                        const IndexDescriptor& desc,
-                                                        bool isPrefixed);
+                                                        StringData tableName,
+                                                        const IndexConfig& config,
+                                                        bool isLogged);
 
     /**
      * Creates a WiredTiger table suitable for implementing a MongoDB index.
      * 'config' should be created with generateCreateString().
      */
-    static int Create(OperationContext* opCtx, const std::string& uri, const std::string& config);
+    static Status create(WiredTigerRecoveryUnit&,
+                         const std::string& uri,
+                         const std::string& config);
 
+    /**
+     * Drops the specified WiredTiger table. This should only be used for resuming index builds.
+     */
+    static Status Drop(WiredTigerRecoveryUnit&, const std::string& uri);
+
+    /**
+     * Constructs an index. The rsKeyFormat is the RecordId key format of the related RecordStore.
+     */
     WiredTigerIndex(OperationContext* ctx,
                     const std::string& uri,
-                    const IndexDescriptor* desc,
-                    KVPrefix prefix,
-                    bool readOnly);
+                    const UUID& collectionUUID,
+                    StringData ident,
+                    KeyFormat rsKeyFormat,
+                    const IndexConfig& config,
+                    bool isLogged);
 
-    virtual StatusWith<SpecialFormatInserted> insert(OperationContext* opCtx,
-                                                     const BSONObj& key,
-                                                     const RecordId& id,
-                                                     bool dupsAllowed);
+    std::variant<Status, DuplicateKey> insert(OperationContext* opCtx,
+                                              const key_string::View& keyString,
+                                              bool dupsAllowed,
+                                              IncludeDuplicateRecordId includeDuplicateRecordId =
+                                                  IncludeDuplicateRecordId::kOff) override;
 
-    virtual void unindex(OperationContext* opCtx,
-                         const BSONObj& key,
-                         const RecordId& id,
-                         bool dupsAllowed);
+    void unindex(OperationContext* opCtx,
+                 const key_string::View& keyString,
+                 bool dupsAllowed) override;
 
-    virtual void fullValidate(OperationContext* opCtx,
-                              long long* numKeysOut,
-                              ValidateResults* fullResults) const;
-    virtual bool appendCustomStats(OperationContext* opCtx,
-                                   BSONObjBuilder* output,
-                                   double scale) const;
-    virtual Status dupKeyCheck(OperationContext* opCtx, const BSONObj& key, const RecordId& id);
+    boost::optional<RecordId> findLoc(OperationContext* opCtx,
+                                      std::span<const char> keyString) const override;
 
-    virtual bool isEmpty(OperationContext* opCtx);
+    IndexValidateResults validate(
+        OperationContext* opCtx,
+        const CollectionValidation::ValidationOptions& options) const override;
 
-    virtual Status touch(OperationContext* opCtx) const;
+    bool appendCustomStats(OperationContext* opCtx,
+                           BSONObjBuilder* output,
+                           double scale) const override;
+    boost::optional<DuplicateKey> dupKeyCheck(OperationContext* opCtx,
+                                              const key_string::View& keyString) override;
 
-    virtual long long getSpaceUsedBytes(OperationContext* opCtx) const;
+    bool isEmpty(OperationContext* opCtx) override;
 
-    virtual Status initAsEmpty(OperationContext* opCtx);
+    int64_t numEntries(OperationContext* opCtx) const override;
 
-    virtual Status compact(OperationContext* opCtx);
+    long long getSpaceUsedBytes(OperationContext* opCtx) const override;
+
+    long long getFreeStorageBytes(OperationContext* opCtx) const override;
+
+    Status initAsEmpty() override;
+
+    void printIndexEntryMetadata(OperationContext* opCtx,
+                                 const key_string::View& keyString) const override;
+
+    StatusWith<int64_t> compact(OperationContext* opCtx, const CompactOptions& options) override;
 
     const std::string& uri() const {
         return _uri;
@@ -126,87 +189,128 @@ public:
 
     // WiredTigerIndex additions
 
-    virtual bool isDup(OperationContext* opCtx,
-                       WT_CURSOR* c,
-                       const BSONObj& key,
-                       const RecordId& id);
-
     uint64_t tableId() const {
         return _tableId;
-    }
-    Ordering ordering() const {
-        return _ordering;
-    }
-
-    KeyString::Version keyStringVersion() const {
-        return _keyStringVersion;
-    }
-
-    std::string collectionNamespace() const {
-        return _collectionNamespace;
     }
 
     std::string indexName() const {
         return _indexName;
     }
 
-    const BSONObj& keyPattern() const {
-        return _keyPattern;
+    virtual bool isIdIndex() const {
+        return false;
     }
 
-    bool isIdIndex() const {
-        return _isIdIndex;
+    UUID getCollectionUUID() const {
+        return _collectionUUID;
     }
 
+    virtual bool isDup(OperationContext* opCtx,
+                       WT_CURSOR* c,
+                       WiredTigerSession* session,
+                       const key_string::View& keyString) = 0;
     virtual bool unique() const = 0;
     virtual bool isTimestampSafeUniqueIdx() const = 0;
 
+    bool hasOldFormatVersion() const {
+        return _dataFormatVersion == kDataFormatV3KeyStringV0UniqueIndexVersionV1 ||
+            _dataFormatVersion == kDataFormatV4KeyStringV1UniqueIndexVersionV2;
+    }
+
 protected:
-    virtual StatusWith<SpecialFormatInserted> _insert(OperationContext* opCtx,
-                                                      WT_CURSOR* c,
-                                                      const BSONObj& key,
-                                                      const RecordId& id,
-                                                      bool dupsAllowed) = 0;
+    virtual std::variant<Status, SortedDataInterface::DuplicateKey> _insert(
+        OperationContext* opCtx,
+        WT_CURSOR* c,
+        WiredTigerSession* session,
+        const key_string::View& keyString,
+        bool dupsAllowed,
+        IncludeDuplicateRecordId includeDuplicateRecordId = IncludeDuplicateRecordId::kOff) = 0;
 
     virtual void _unindex(OperationContext* opCtx,
                           WT_CURSOR* c,
-                          const BSONObj& key,
-                          const RecordId& id,
+                          const key_string::View& keyString,
                           bool dupsAllowed) = 0;
 
-    void setKey(WT_CURSOR* cursor, const WT_ITEM* item);
+    /**
+     * Loads the key positioned by this cursor into 'key'.
+     */
     void getKey(WT_CURSOR* cursor, WT_ITEM* key);
 
-    class BulkBuilder;
-    class StandardBulkBuilder;
-    class UniqueBulkBuilder;
+    /**
+     * Checks whether the prefix key defined by 'keyString' and 'sizeWithoutRecordId' is in the
+     * index. If it is, returns the RecordId of the first matching key and positions the cursor 'c'
+     * on that key.
+     */
+    boost::optional<RecordId> _keyExists(OperationContext* opCtx,
+                                         WT_CURSOR* c,
+                                         WiredTigerSession* session,
+                                         const key_string::View& keyString);
 
-    const Ordering _ordering;
-    // The keystring and data format version are effectively const after the WiredTigerIndex
-    // instance is constructed.
-    KeyString::Version _keyStringVersion;
+    /**
+     * Sets the upper bound on the passed in cursor to be the maximum value of the KeyString prefix.
+     * Used when checking if a specific key prefix exists.
+     */
+    void _setUpperBoundForKeyExists(WT_CURSOR* c,
+                                    WiredTigerSession* session,
+                                    const key_string::View& keyString);
+
+    /**
+     * Returns a DuplicateKey error if the prefix key exists in the index with a different RecordId.
+     * Returns true if the prefix key exists in the index with the same RecordId. Returns false if
+     * the prefix key does not exist in the index. Should only be used for non-_id indexes.
+     */
+    std::variant<bool, DuplicateKey> _checkDups(
+        OperationContext* opCtx,
+        WT_CURSOR* c,
+        WiredTigerSession* session,
+        const key_string::View& keyString,
+        IncludeDuplicateRecordId includeDuplicateRecordId = IncludeDuplicateRecordId::kOff);
+
+    /*
+     * Determines the data format version from application metadata and verifies compatibility.
+     * Returns the corresponding KeyString version.
+     */
+    key_string::Version _handleVersionInfo(OperationContext* ctx,
+                                           const std::string& uri,
+                                           StringData ident,
+                                           const IndexConfig& config,
+                                           bool isLogged);
+
+    /*
+     * Attempts to repair the data format version in the index table metadata if there is a mismatch
+     * to the index type during startup.
+     */
+    void _repairDataFormatVersion(OperationContext* opCtx,
+                                  const std::string& uri,
+                                  StringData ident,
+                                  const IndexConfig& config);
+
+    /*
+     * The data format version is effectively const after the WiredTigerIndex instance is
+     * constructed.
+     */
     int _dataFormatVersion;
-    std::string _uri;
+    const std::string _uri;
     uint64_t _tableId;
-    const std::string _collectionNamespace;
+    const UUID _collectionUUID;
     const std::string _indexName;
-    const BSONObj _keyPattern;
-    KVPrefix _prefix;
-    bool _isIdIndex;
+    const bool _isLogged;
 };
 
 class WiredTigerIndexUnique : public WiredTigerIndex {
 public:
     WiredTigerIndexUnique(OperationContext* ctx,
                           const std::string& uri,
-                          const IndexDescriptor* desc,
-                          KVPrefix prefix,
-                          bool readOnly = false);
+                          const UUID& collectionUUID,
+                          StringData ident,
+                          KeyFormat rsKeyFormat,
+                          const IndexConfig& config,
+                          bool isLogged);
 
     std::unique_ptr<SortedDataInterface::Cursor> newCursor(OperationContext* opCtx,
                                                            bool forward) const override;
 
-    SortedDataBuilderInterface* getBulkBuilder(OperationContext* opCtx, bool dupsAllowed) override;
+    std::unique_ptr<SortedDataBuilderInterface> makeBulkBuilder(OperationContext* opCtx) override;
 
     bool unique() const override {
         return true;
@@ -216,61 +320,108 @@ public:
 
     bool isDup(OperationContext* opCtx,
                WT_CURSOR* c,
-               const BSONObj& key,
-               const RecordId& id) override;
+               WiredTigerSession* session,
+               const key_string::View& keyString) override;
 
-    StatusWith<SpecialFormatInserted> _insert(OperationContext* opCtx,
-                                              WT_CURSOR* c,
-                                              const BSONObj& key,
-                                              const RecordId& id,
-                                              bool dupsAllowed) override;
 
-    StatusWith<SpecialFormatInserted> _insertTimestampUnsafe(OperationContext* opCtx,
-                                                             WT_CURSOR* c,
-                                                             const BSONObj& key,
-                                                             const RecordId& id,
-                                                             bool dupsAllowed);
-
-    StatusWith<SpecialFormatInserted> _insertTimestampSafe(OperationContext* opCtx,
-                                                           WT_CURSOR* c,
-                                                           const BSONObj& key,
-                                                           const RecordId& id,
-                                                           bool dupsAllowed);
+protected:
+    std::variant<Status, SortedDataInterface::DuplicateKey> _insert(
+        OperationContext* opCtx,
+        WT_CURSOR* c,
+        WiredTigerSession* session,
+        const key_string::View& keyString,
+        bool dupsAllowed,
+        IncludeDuplicateRecordId includeDuplicateRecordId =
+            IncludeDuplicateRecordId::kOff) override;
 
     void _unindex(OperationContext* opCtx,
                   WT_CURSOR* c,
-                  const BSONObj& key,
-                  const RecordId& id,
+                  const key_string::View& keyString,
                   bool dupsAllowed) override;
 
+    /**
+     * This function continues to exist in order to support v4.0 unique index format: the format
+     * changed in v4.2 and onward. _unindex will call this if an index entry in the new format
+     * cannot be found, and this function will check for the old format.
+     */
     void _unindexTimestampUnsafe(OperationContext* opCtx,
                                  WT_CURSOR* c,
-                                 const BSONObj& key,
-                                 const RecordId& id,
+                                 const key_string::View& keyString,
                                  bool dupsAllowed);
+};
 
-    void _unindexTimestampSafe(OperationContext* opCtx,
-                               WT_CURSOR* c,
-                               const BSONObj& key,
-                               const RecordId& id,
-                               bool dupsAllowed);
+class WiredTigerIdIndex : public WiredTigerIndex {
+public:
+    WiredTigerIdIndex(OperationContext* ctx,
+                      const std::string& uri,
+                      const UUID& collectionUUID,
+                      StringData ident,
+                      const IndexConfig& config,
+                      bool isLogged);
 
-private:
-    bool _partial;
+    std::unique_ptr<Cursor> newCursor(OperationContext* opCtx,
+                                      bool isForward = true) const override;
+
+    std::unique_ptr<SortedDataBuilderInterface> makeBulkBuilder(OperationContext* opCtx) override;
+
+    bool unique() const override {
+        return true;
+    }
+
+    bool isIdIndex() const override {
+        return true;
+    }
+
+    bool isTimestampSafeUniqueIdx() const override {
+        return false;
+    }
+
+    bool isDup(OperationContext* opCtx,
+               WT_CURSOR* c,
+               WiredTigerSession* session,
+               const key_string::View& keyString) override {
+        // Unimplemented by _id indexes for lack of need
+        MONGO_UNREACHABLE;
+    }
+
+protected:
+    std::variant<Status, SortedDataInterface::DuplicateKey> _insert(
+        OperationContext* opCtx,
+        WT_CURSOR* c,
+        WiredTigerSession* session,
+        const key_string::View& keyString,
+        bool dupsAllowed,
+        IncludeDuplicateRecordId includeDuplicateRecordId =
+            IncludeDuplicateRecordId::kOff) override;
+
+    void _unindex(OperationContext* opCtx,
+                  WT_CURSOR* c,
+                  const key_string::View& keyString,
+                  bool dupsAllowed) override;
+
+    /**
+     * This is not applicable to id indexes. See base class comments.
+     */
+    Status _checkDups(OperationContext* opCtx,
+                      WT_CURSOR* c,
+                      const key_string::View& keyString,
+                      IncludeDuplicateRecordId includeDuplicateRecordId) = delete;
 };
 
 class WiredTigerIndexStandard : public WiredTigerIndex {
 public:
     WiredTigerIndexStandard(OperationContext* ctx,
                             const std::string& uri,
-                            const IndexDescriptor* desc,
-                            KVPrefix prefix,
-                            bool readOnly = false);
+                            const UUID& collectionUUID,
+                            StringData ident,
+                            KeyFormat rsKeyFormat,
+                            const IndexConfig& config,
+                            bool isLogged);
 
     std::unique_ptr<SortedDataInterface::Cursor> newCursor(OperationContext* opCtx,
                                                            bool forward) const override;
 
-    SortedDataBuilderInterface* getBulkBuilder(OperationContext* opCtx, bool dupsAllowed) override;
+    std::unique_ptr<SortedDataBuilderInterface> makeBulkBuilder(OperationContext* opCtx) override;
 
     bool unique() const override {
         return false;
@@ -280,17 +431,28 @@ public:
         return false;
     }
 
-    StatusWith<SpecialFormatInserted> _insert(OperationContext* opCtx,
-                                              WT_CURSOR* c,
-                                              const BSONObj& key,
-                                              const RecordId& id,
-                                              bool dupsAllowed) override;
+    bool isDup(OperationContext* opCtx,
+               WT_CURSOR* c,
+               WiredTigerSession* session,
+               const key_string::View& keyString) override {
+        // Unimplemented by non-unique indexes
+        MONGO_UNREACHABLE;
+    }
+
+protected:
+    std::variant<Status, SortedDataInterface::DuplicateKey> _insert(
+        OperationContext* opCtx,
+        WT_CURSOR* c,
+        WiredTigerSession* session,
+        const key_string::View& keyString,
+        bool dupsAllowed,
+        IncludeDuplicateRecordId includeDuplicateRecordId =
+            IncludeDuplicateRecordId::kOff) override;
 
     void _unindex(OperationContext* opCtx,
                   WT_CURSOR* c,
-                  const BSONObj& key,
-                  const RecordId& id,
+                  const key_string::View& keyString,
                   bool dupsAllowed) override;
 };
 
-}  // namespace
+}  // namespace mongo

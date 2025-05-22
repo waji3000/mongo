@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,13 +27,15 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/pipeline/tee_buffer.h"
-
 #include <algorithm>
+#include <utility>
 
-#include "mongo/db/pipeline/document.h"
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/pipeline/tee_buffer.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -95,7 +96,7 @@ void TeeBuffer::loadNextBatch() {
     //   - TeeBuffer is the only place where a paused GetNextReturn will be returned.
     //   - The $facet stage is the only stage that uses TeeBuffer.
     //   - We currently disallow nested $facet stages.
-    invariant(!input.isPaused());
+    invariant(!input.isPaused());  // NOLINT(bugprone-use-after-move)
 
     // Populate the pending returns.
     for (size_t consumerId = 0; consumerId < _consumers.size(); ++consumerId) {

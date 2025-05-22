@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Public Domain 2014-2018 MongoDB, Inc.
+# Public Domain 2014-present MongoDB, Inc.
 # Public Domain 2008-2014 WiredTiger, Inc.
 #
 # This is free and unencumbered software released into the public domain.
@@ -26,13 +26,13 @@
 # ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
 # OTHER DEALINGS IN THE SOFTWARE.
 
-import os
-import wiredtiger, wttest, run
+import wttest
+from helper_tiered import TieredConfigMixin, gen_tiered_storage_sources
 from wtscenario import make_scenarios
 
 # test_schema04.py
 #    Test indices with duplicates
-class test_schema04(wttest.WiredTigerTestCase):
+class test_schema04(TieredConfigMixin, wttest.WiredTigerTestCase):
     """
     Test indices with duplicates.
     Our set of rows looks like a multiplication table:
@@ -47,11 +47,14 @@ class test_schema04(wttest.WiredTigerTestCase):
     """
     nentries = 100
 
-    scenarios = make_scenarios([
+    index = [
         ('index-before', { 'create_index' : 0 }),
         ('index-during', { 'create_index' : 1 }),
         ('index-after', { 'create_index' : 2 }),
-    ])
+    ]
+
+    tiered_storage_sources = gen_tiered_storage_sources()
+    scenarios = make_scenarios(tiered_storage_sources, index)
 
     def create_indices(self):
         # Create 6 index files, each with a column from the main table
@@ -66,9 +69,9 @@ class test_schema04(wttest.WiredTigerTestCase):
         cursor = self.session.open_cursor('table:schema04', None, None)
         if phase == 0:
             range_from = 0
-            range_to = self.nentries / 2
+            range_to = self.nentries // 2
         else:
-            range_from = self.nentries / 2
+            range_from = self.nentries // 2
             range_to = self.nentries
 
         for i in range(range_from, range_to):
@@ -121,6 +124,3 @@ class test_schema04(wttest.WiredTigerTestCase):
         if self.create_index == 2:
             self.create_indices()
         self.check_entries()
-
-if __name__ == '__main__':
-    wttest.run()

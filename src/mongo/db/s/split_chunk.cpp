@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,57 +27,91 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
-
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/s/split_chunk.h"
 
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional.hpp>
+#include <iterator>
+#include <memory>
+#include <utility>
+
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
-#include "mongo/bson/util/bson_extract.h"
-#include "mongo/db/catalog/index_catalog.h"
-#include "mongo/db/catalog_raii.h"
-#include "mongo/db/commands.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/client/read_preference.h"
+#include "mongo/db/catalog/collection.h"
 #include "mongo/db/dbhelpers.h"
-#include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/generic_argument_util.h"
 #include "mongo/db/keypattern.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/query/index_bounds.h"
 #include "mongo/db/query/internal_plans.h"
+#include "mongo/db/query/plan_executor.h"
+#include "mongo/db/query/plan_yield_policy.h"
+#include "mongo/db/s/active_migrations_registry.h"
 #include "mongo/db/s/collection_metadata.h"
-#include "mongo/db/s/collection_sharding_state.h"
+#include "mongo/db/s/collection_sharding_runtime.h"
 #include "mongo/db/s/shard_filtering_metadata_refresh.h"
-#include "mongo/db/s/sharding_state.h"
+#include "mongo/db/s/shard_key_index_util.h"
+#include "mongo/db/s/split_chunk_request_type.h"
+#include "mongo/db/shard_id.h"
+#include "mongo/db/write_concern_options.h"
+#include "mongo/logv2/log.h"
+#include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/catalog/type_chunk.h"
+#include "mongo/s/chunk_version.h"
+#include "mongo/s/client/shard.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
-#include "mongo/s/request_types/split_chunk_request_type.h"
-#include "mongo/util/log.h"
+#include "mongo/s/index_version.h"
+#include "mongo/s/shard_key_pattern.h"
+#include "mongo/s/shard_version.h"
+#include "mongo/s/shard_version_factory.h"
+#include "mongo/s/sharding_state.h"
+#include "mongo/s/stale_exception.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 namespace mongo {
 namespace {
 
 const ReadPreferenceSetting kPrimaryOnlyReadPreference{ReadPreference::PrimaryOnly};
 
+// This shard version is used as the received version in StaleConfigInfo since we do not have
+// information about the received version of the operation.
+ShardVersion ShardVersionPlacementIgnoredNoIndexes() {
+    return ShardVersionFactory::make(ChunkVersion::IGNORED(),
+                                     boost::optional<CollectionIndexes>(boost::none));
+}
+
 bool checkIfSingleDoc(OperationContext* opCtx,
-                      Collection* collection,
-                      const IndexDescriptor* idx,
+                      const CollectionPtr& collection,
+                      const ShardKeyIndex& idx,
                       const ChunkType* chunk) {
-    KeyPattern kp(idx->keyPattern());
+    KeyPattern kp(idx.keyPattern());
     BSONObj newmin = Helpers::toKeyFormat(kp.extendRangeBound(chunk->getMin(), false));
     BSONObj newmax = Helpers::toKeyFormat(kp.extendRangeBound(chunk->getMax(), true));
 
-    auto exec = InternalPlanner::indexScan(opCtx,
-                                           collection,
-                                           idx,
-                                           newmin,
-                                           newmax,
-                                           BoundInclusion::kIncludeStartKeyOnly,
-                                           PlanExecutor::NO_YIELD);
+    auto exec = InternalPlanner::shardKeyIndexScan(opCtx,
+                                                   &collection,
+                                                   idx,
+                                                   newmin,
+                                                   newmax,
+                                                   BoundInclusion::kIncludeStartKeyOnly,
+                                                   PlanYieldPolicy::YieldPolicy::INTERRUPT_ONLY);
     // check if exactly one document found
     PlanExecutor::ExecState state;
     BSONObj obj;
-    if (PlanExecutor::ADVANCED == (state = exec->getNext(&obj, NULL))) {
-        if (PlanExecutor::IS_EOF == (state = exec->getNext(&obj, NULL))) {
+    if (PlanExecutor::ADVANCED == (state = exec->getNext(&obj, nullptr))) {
+        if (PlanExecutor::IS_EOF == (state = exec->getNext(&obj, nullptr))) {
             return true;
         }
     }
@@ -91,36 +124,60 @@ bool checkIfSingleDoc(OperationContext* opCtx,
 
 /**
  * Checks the collection's metadata for a successful split on the specified chunkRange using the
- * specified splitKeys. Returns false if the metadata's chunks don't match the new chunk
+ * specified split points. Returns false if the metadata's chunks don't match the new chunk
  * boundaries exactly.
  */
 bool checkMetadataForSuccessfulSplitChunk(OperationContext* opCtx,
                                           const NamespaceString& nss,
-                                          const OID& epoch,
+                                          const OID& expectedEpoch,
+                                          const boost::optional<Timestamp>& expectedTimestamp,
                                           const ChunkRange& chunkRange,
-                                          const std::vector<BSONObj>& splitKeys) {
-    const auto metadataAfterSplit = [&] {
-        AutoGetCollection autoColl(opCtx, nss, MODE_IS);
-        return CollectionShardingState::get(opCtx, nss)->getCurrentMetadata();
-    }();
+                                          const std::vector<BSONObj>& splitPoints) {
+    const auto scopedCSR = CollectionShardingRuntime::acquireShared(opCtx, nss);
+    const auto metadataAfterSplit = scopedCSR->getCurrentMetadataIfKnown();
 
-    uassert(ErrorCodes::StaleEpoch,
-            str::stream() << "Collection " << nss.ns() << " changed since split start",
-            metadataAfterSplit->getCollVersion().epoch() == epoch);
+    ShardId shardId = ShardingState::get(opCtx)->shardId();
 
-    auto newChunkBounds(splitKeys);
-    auto startKey = chunkRange.getMin();
-    newChunkBounds.push_back(chunkRange.getMax());
+    uassert(StaleConfigInfo(nss,
+                            ShardVersionPlacementIgnoredNoIndexes() /* receivedVersion */,
+                            boost::none /* wantedVersion */,
+                            shardId),
+            str::stream() << "Collection " << nss.toStringForErrorMsg() << " needs to be recovered",
+            metadataAfterSplit);
+    uassert(StaleConfigInfo(nss,
+                            ShardVersionPlacementIgnoredNoIndexes() /* receivedVersion */,
+                            ShardVersion::UNSHARDED() /* wantedVersion */,
+                            shardId),
+            str::stream() << "Collection " << nss.toStringForErrorMsg() << " is not sharded",
+            metadataAfterSplit->isSharded());
+    const auto placementVersion = metadataAfterSplit->getShardPlacementVersion();
+    const auto epoch = placementVersion.epoch();
+    uassert(
+        StaleConfigInfo(
+            nss,
+            ShardVersionPlacementIgnoredNoIndexes() /* receivedVersion */,
+            ShardVersionFactory::make(*metadataAfterSplit,
+                                      scopedCSR->getCollectionIndexes(opCtx)) /* wantedVersion */,
+            shardId),
+        str::stream() << "Collection " << nss.toStringForErrorMsg() << " changed since split start",
+        epoch == expectedEpoch &&
+            (!expectedTimestamp || placementVersion.getTimestamp() == expectedTimestamp));
 
     ChunkType nextChunk;
-    for (const auto& endKey : newChunkBounds) {
+    for (auto it = splitPoints.begin(); it != splitPoints.end(); ++it) {
         // Check that all new chunks fit the new chunk boundaries
-        if (!metadataAfterSplit->getNextChunk(startKey, &nextChunk) ||
-            nextChunk.getMax().woCompare(endKey)) {
+        const auto& currentChunkMinKey =
+            it == splitPoints.begin() ? chunkRange.getMin() : *std::prev(it);
+        const auto& currentChunkMaxKey = *it;
+        if (!metadataAfterSplit->getNextChunk(currentChunkMinKey, &nextChunk) ||
+            nextChunk.getMax().woCompare(currentChunkMaxKey)) {
             return false;
         }
-
-        startKey = endKey;
+    }
+    // Special check for the last chunk produced.
+    if (!metadataAfterSplit->getNextChunk(splitPoints.back(), &nextChunk) ||
+        nextChunk.getMax().woCompare(chunkRange.getMax())) {
+        return false;
     }
 
     return true;
@@ -128,60 +185,48 @@ bool checkMetadataForSuccessfulSplitChunk(OperationContext* opCtx,
 
 }  // namespace
 
-StatusWith<boost::optional<ChunkRange>> splitChunk(OperationContext* opCtx,
-                                                   const NamespaceString& nss,
-                                                   const BSONObj& keyPatternObj,
-                                                   const ChunkRange& chunkRange,
-                                                   const std::vector<BSONObj>& splitKeys,
-                                                   const std::string& shardName,
-                                                   const OID& expectedCollectionEpoch) {
-    //
-    // Lock the collection's metadata and get highest version for the current shard
-    // TODO(SERVER-25086): Remove distLock acquisition from split chunk
-    //
-    const std::string whyMessage(
-        str::stream() << "splitting chunk " << chunkRange.toString() << " in " << nss.toString());
-    auto scopedDistLock = Grid::get(opCtx)->catalogClient()->getDistLockManager()->lock(
-        opCtx, nss.ns(), whyMessage, DistLockManager::kSingleLockAttemptTimeout);
-    if (!scopedDistLock.isOK()) {
-        return scopedDistLock.getStatus().withContext(
-            str::stream() << "could not acquire collection lock for " << nss.toString()
-                          << " to split chunk "
-                          << chunkRange.toString());
-    }
+Status splitChunk(OperationContext* opCtx,
+                  const NamespaceString& nss,
+                  const BSONObj& keyPatternObj,
+                  const ChunkRange& chunkRange,
+                  std::vector<BSONObj>&& splitPoints,
+                  const std::string& shardName,
+                  const OID& expectedCollectionEpoch,
+                  const boost::optional<Timestamp>& expectedCollectionTimestamp) {
+    auto scopedSplitOrMergeChunk(uassertStatusOK(
+        ActiveMigrationsRegistry::get(opCtx).registerSplitOrMergeChunk(opCtx, nss, chunkRange)));
 
-    // If the shard key is hashed, then we must make sure that the split points are of type
-    // NumberLong.
-    if (KeyPattern::isHashedKeyPattern(keyPatternObj)) {
-        for (BSONObj splitKey : splitKeys) {
-            BSONObjIterator it(splitKey);
-            while (it.more()) {
-                BSONElement splitKeyElement = it.next();
-                if (splitKeyElement.type() != NumberLong) {
-                    return {ErrorCodes::CannotSplit,
-                            str::stream() << "splitChunk cannot split chunk "
-                                          << chunkRange.toString()
-                                          << ", split point "
-                                          << splitKeyElement.toString()
-                                          << " must be of type "
-                                             "NumberLong for hashed shard key patterns"};
-                }
+    // If the shard key is hashed, then we must make sure that the split points are of supported
+    // data types.
+    const auto hashedField = ShardKeyPattern::extractHashedField(keyPatternObj);
+    if (hashedField) {
+        for (const auto& splitPoint : splitPoints) {
+            auto hashedSplitElement = splitPoint[hashedField.fieldName()];
+            if (!ShardKeyPattern::isValidHashedValue(hashedSplitElement)) {
+                return {ErrorCodes::CannotSplit,
+                        str::stream() << "splitChunk cannot split chunk " << chunkRange.toString()
+                                      << ", split point " << hashedSplitElement.toString()
+                                      << "Value of type '" << hashedSplitElement.type()
+                                      << "' is not allowed for hashed fields"};
             }
         }
     }
 
     // Commit the split to the config server.
-    auto request =
-        SplitChunkRequest(nss, shardName, expectedCollectionEpoch, chunkRange, splitKeys);
+    auto request = SplitChunkRequest(nss,
+                                     shardName,
+                                     expectedCollectionEpoch,
+                                     expectedCollectionTimestamp,
+                                     chunkRange,
+                                     std::move(splitPoints));
 
-    auto configCmdObj =
-        request.toConfigCommandBSON(ShardingCatalogClient::kMajorityWriteConcern.toBSON());
+    auto configCmdObj = request.toConfigCommandBSON(defaultMajorityWriteConcernDoNotUse().toBSON());
 
     auto cmdResponseStatus =
         Grid::get(opCtx)->shardRegistry()->getConfigShard()->runCommandWithFixedRetryAttempts(
             opCtx,
             kPrimaryOnlyReadPreference,
-            "admin",
+            DatabaseName::kAdmin,
             configCmdObj,
             Shard::RetryPolicy::kIdempotent);
 
@@ -191,26 +236,38 @@ StatusWith<boost::optional<ChunkRange>> splitChunk(OperationContext* opCtx,
         return cmdResponseStatus.getStatus();
     }
 
+    const Shard::CommandResponse& cmdResponse = cmdResponseStatus.getValue();
+
+    boost::optional<ChunkVersion> chunkVersionReceived = [&]() -> boost::optional<ChunkVersion> {
+        // old versions might not have the shardVersion field
+        if (cmdResponse.response[ChunkVersion::kChunkVersionField]) {
+            return ChunkVersion::parse(cmdResponse.response[ChunkVersion::kChunkVersionField]);
+        }
+        return boost::none;
+    }();
+    uassertStatusOK(FilteringMetadataCache::get(opCtx)->onCollectionPlacementVersionMismatch(
+        opCtx, nss, chunkVersionReceived));
+
     // Check commandStatus and writeConcernStatus
-    auto commandStatus = cmdResponseStatus.getValue().commandStatus;
-    auto writeConcernStatus = cmdResponseStatus.getValue().writeConcernStatus;
+    auto commandStatus = cmdResponse.commandStatus;
+    auto writeConcernStatus = cmdResponse.writeConcernStatus;
 
     // Send stale epoch if epoch of request did not match epoch of collection
     if (commandStatus == ErrorCodes::StaleEpoch) {
         return commandStatus;
     }
 
-    //
-    // If _configsvrCommitChunkSplit returned an error, refresh and look at the metadata to
+    // If _configsvrCommitChunkSplit returned an error, look at the metadata to
     // determine if the split actually did happen. This can happen if there's a network error
     // getting the response from the first call to _configsvrCommitChunkSplit, but it actually
     // succeeds, thus the automatic retry fails with a precondition violation, for example.
-    //
     if (!commandStatus.isOK() || !writeConcernStatus.isOK()) {
-        forceShardFilteringMetadataRefresh(opCtx, nss);
-
-        if (checkMetadataForSuccessfulSplitChunk(
-                opCtx, nss, expectedCollectionEpoch, chunkRange, splitKeys)) {
+        if (checkMetadataForSuccessfulSplitChunk(opCtx,
+                                                 nss,
+                                                 expectedCollectionEpoch,
+                                                 expectedCollectionTimestamp,
+                                                 chunkRange,
+                                                 request.getSplitPoints())) {
             // Split was committed.
         } else if (!commandStatus.isOK()) {
             return commandStatus;
@@ -219,41 +276,7 @@ StatusWith<boost::optional<ChunkRange>> splitChunk(OperationContext* opCtx,
         }
     }
 
-    AutoGetCollection autoColl(opCtx, nss, MODE_IS);
-
-    Collection* const collection = autoColl.getCollection();
-    if (!collection) {
-        warning() << "will not perform top-chunk checking since " << nss.toString()
-                  << " does not exist after splitting";
-        return boost::optional<ChunkRange>(boost::none);
-    }
-
-    // Allow multiKey based on the invariant that shard keys must be single-valued. Therefore,
-    // any multi-key index prefixed by shard key cannot be multikey over the shard key fields.
-    IndexDescriptor* idx =
-        collection->getIndexCatalog()->findShardKeyPrefixedIndex(opCtx, keyPatternObj, false);
-    if (!idx) {
-        return boost::optional<ChunkRange>(boost::none);
-    }
-
-    auto backChunk = ChunkType();
-    backChunk.setMin(splitKeys.back());
-    backChunk.setMax(chunkRange.getMax());
-
-    auto frontChunk = ChunkType();
-    frontChunk.setMin(chunkRange.getMin());
-    frontChunk.setMax(splitKeys.front());
-
-    KeyPattern shardKeyPattern(keyPatternObj);
-    if (shardKeyPattern.globalMax().woCompare(backChunk.getMax()) == 0 &&
-        checkIfSingleDoc(opCtx, collection, idx, &backChunk)) {
-        return boost::optional<ChunkRange>(ChunkRange(backChunk.getMin(), backChunk.getMax()));
-    } else if (shardKeyPattern.globalMin().woCompare(frontChunk.getMin()) == 0 &&
-               checkIfSingleDoc(opCtx, collection, idx, &frontChunk)) {
-        return boost::optional<ChunkRange>(ChunkRange(frontChunk.getMin(), frontChunk.getMax()));
-    }
-
-    return boost::optional<ChunkRange>(boost::none);
+    return Status::OK();
 }
 
 }  // namespace mongo

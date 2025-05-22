@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,10 +27,12 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <string>
+#include <vector>
 
 #include "mongo/db/fts/fts_language.h"
 #include "mongo/db/fts/fts_unicode_tokenizer.h"
+#include "mongo/db/fts/fts_util.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
@@ -40,10 +41,7 @@ namespace fts {
 std::vector<std::string> tokenizeString(const char* str,
                                         const char* language,
                                         FTSTokenizer::Options options) {
-    StatusWithFTSLanguage swl = FTSLanguage::make(language, TEXT_INDEX_VERSION_3);
-    ASSERT_OK(swl);
-
-    UnicodeFTSTokenizer tokenizer(swl.getValue());
+    UnicodeFTSTokenizer tokenizer(&FTSLanguage::make(language, TEXT_INDEX_VERSION_3));
 
     tokenizer.reset(str, options);
 

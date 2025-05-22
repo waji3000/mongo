@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,21 +29,47 @@
 
 #pragma once
 
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/document_source_single_document_transformation.h"
+#include "mongo/db/pipeline/expression.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/field_path.h"
 
 namespace mongo {
 
 /**
  * $addFields adds or replaces the specified fields to/in the document while preserving the original
  * document. It is modeled on and throws the same errors as $project.
+ *
+ * This stage is also aliased as $set and functions the same way.
  */
 class DocumentSourceAddFields final {
 public:
+    static constexpr StringData kStageName = "$addFields"_sd;
+    static constexpr StringData kAliasNameSet = "$set"_sd;  // An alternate name for this stage.
+
     /**
      * Convenience method for creating a $addFields stage from 'addFieldsSpec'.
      */
     static boost::intrusive_ptr<DocumentSource> create(
-        BSONObj addFieldsSpec, const boost::intrusive_ptr<ExpressionContext>& expCtx);
+        BSONObj addFieldsSpec,
+        const boost::intrusive_ptr<ExpressionContext>& expCtx,
+        StringData stageName = kStageName);
+
+    /**
+     * Create a stage that binds an expression to a top-level field.
+     *
+     * 'fieldPath' must be a top-level field name (exactly one element; no dots).
+     */
+    static boost::intrusive_ptr<DocumentSource> create(
+        const FieldPath& fieldPath,
+        const boost::intrusive_ptr<Expression>& expr,
+        const boost::intrusive_ptr<ExpressionContext>& expCtx);
 
     /**
      * Parses a $addFields stage from the user-supplied BSON.

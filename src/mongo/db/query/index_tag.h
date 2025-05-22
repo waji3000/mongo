@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,11 +29,17 @@
 
 #pragma once
 
+#include <cstddef>
 #include <deque>
+#include <memory>
+#include <string>
+#include <utility>
 #include <vector>
 
 #include "mongo/bson/util/builder.h"
 #include "mongo/db/matcher/expression.h"
+#include "mongo/db/matcher/expression_hasher.h"
+#include "mongo/db/query/index_entry.h"
 
 namespace mongo {
 
@@ -56,19 +61,24 @@ public:
     IndexTag(size_t i, size_t p, bool canCombineBounds_)
         : index(i), pos(p), canCombineBounds(canCombineBounds_) {}
 
-    virtual ~IndexTag() {}
+    ~IndexTag() override {}
 
-    virtual void debugString(StringBuilder* builder) const {
+    void debugString(StringBuilder* builder) const override {
         *builder << " || Selected Index #" << index << " pos " << pos << " combine "
-                 << canCombineBounds;
+                 << canCombineBounds << "\n";
     }
 
-    virtual MatchExpression::TagData* clone() const {
+    MatchExpression::TagData* clone() const override {
         return new IndexTag(index, pos, canCombineBounds);
     }
 
-    virtual Type getType() const {
+    Type getType() const override {
         return Type::IndexTag;
+    }
+
+    void hash(absl::HashState& state, const MatchExpression::HashParam& param) const override {
+        state = absl::HashState::combine(
+            std::move(state), param.indexes->at(index).identifier, pos, canCombineBounds);
     }
 
     // What index should we try to use for this leaf?
@@ -89,7 +99,7 @@ public:
 // used internally
 class RelevantTag : public MatchExpression::TagData {
 public:
-    RelevantTag() : elemMatchExpr(NULL), pathPrefix("") {}
+    RelevantTag() : elemMatchExpr(nullptr), pathPrefix("") {}
 
     std::vector<size_t> first;
     std::vector<size_t> notFirst;
@@ -119,7 +129,7 @@ public:
     // compound two predicates sharing a path prefix.
     std::string pathPrefix;
 
-    virtual void debugString(StringBuilder* builder) const {
+    void debugString(StringBuilder* builder) const override {
         *builder << " || First: ";
         for (size_t i = 0; i < first.size(); ++i) {
             *builder << first[i] << " ";
@@ -128,17 +138,21 @@ public:
         for (size_t i = 0; i < notFirst.size(); ++i) {
             *builder << notFirst[i] << " ";
         }
-        *builder << "full path: " << path;
+        *builder << "full path: " << path << "\n";
     }
 
-    virtual MatchExpression::TagData* clone() const {
+    MatchExpression::TagData* clone() const override {
         RelevantTag* ret = new RelevantTag();
         ret->first = first;
         ret->notFirst = notFirst;
         return ret;
     }
 
-    virtual Type getType() const {
+    void hash(absl::HashState& state, const MatchExpression::HashParam& param) const override {
+        MONGO_UNREACHABLE_TASSERT(9766200);
+    }
+
+    Type getType() const override {
         return Type::RelevantTag;
     }
 };
@@ -208,7 +222,7 @@ public:
     }
 
     MatchExpression::TagData* clone() const override {
-        std::unique_ptr<OrPushdownTag> clone = stdx::make_unique<OrPushdownTag>();
+        std::unique_ptr<OrPushdownTag> clone = std::make_unique<OrPushdownTag>();
         for (const auto& dest : _destinations) {
             clone->addDestination(dest.clone());
         }
@@ -220,6 +234,12 @@ public:
 
     Type getType() const override {
         return Type::OrPushdownTag;
+    }
+
+    void hash(absl::HashState& state, const MatchExpression::HashParam& param) const override {
+        if (_indexTag) {
+            _indexTag->hash(state, param);
+        }
     }
 
     void addDestination(Destination dest) {

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -32,26 +31,34 @@
 #pragma once
 
 #include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
 #include <cstddef>
+#include <cstdint>
 #include <iosfwd>
+#include <memory>
 #include <string>
+#include <vector>
 
-#include "mongo/base/disallow_copying.h"
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
 #include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/bson/timestamp.h"
 #include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/collection_options.h"
+#include "mongo/db/index/multikey_paths.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/query/index_bounds.h"
 #include "mongo/db/repl/collection_bulk_loader.h"
+#include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/optime.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/storage/key_string/key_string.h"
+#include "mongo/util/uuid.h"
 
 namespace mongo {
-
-class Collection;
-struct CollectionOptions;
-class OperationContext;
-
 namespace repl {
 
 struct TimestampedBSONObj {
@@ -72,7 +79,8 @@ struct TimestampedBSONObj {
  *      * Insert documents into a collection
  */
 class StorageInterface {
-    MONGO_DISALLOW_COPYING(StorageInterface);
+    StorageInterface(const StorageInterface&) = delete;
+    StorageInterface& operator=(const StorageInterface&) = delete;
 
 public:
     // Operation Context binding.
@@ -117,7 +125,7 @@ public:
     virtual StatusWith<std::unique_ptr<CollectionBulkLoader>> createCollectionForBulkLoading(
         const NamespaceString& nss,
         const CollectionOptions& options,
-        const BSONObj idIndexSpec,
+        BSONObj idIndexSpec,
         const std::vector<BSONObj>& secondaryIndexSpecs) = 0;
 
     /**
@@ -135,6 +143,17 @@ public:
      * Inserts the given documents, with associated timestamps and statement id's, into the
      * collection.
      * It is an error to call this function with an empty set of documents.
+     *
+     * NOTE: We have some limitations with this function if the caller plans to use it for
+     * replicated collection writes and 'docs' size greater than 1.
+     * 1) It will violate multi-timestamp constraints (See SERVER-48771).
+     * 2) It doesn't have batch size throttling logic so there are possibilities that we might cause
+     * stress on storage engine by trying to insert a big chunk of data in a single WUOW.
+     *    - Another side effect of writing a big chunk is that writers will hold RSTL lock for a
+     * long time, causing state transition (like step down) to get blocked.
+     *
+     * So, it's recommended to use write_ops_exec::performInserts() for replicated collection
+     * writes.
      */
     virtual Status insertDocuments(OperationContext* opCtx,
                                    const NamespaceStringOrUUID& nsOrUUID,
@@ -151,20 +170,39 @@ public:
      * Implementations are allowed to be "fuzzy" and delete documents when the actual size is
      * slightly above or below this, so callers should not rely on its exact value.
      */
-    virtual StatusWith<size_t> getOplogMaxSize(OperationContext* opCtx,
-                                               const NamespaceString& nss) = 0;
+    virtual StatusWith<size_t> getOplogMaxSize(OperationContext* opCtx) = 0;
 
     /**
      * Creates a collection.
      */
     virtual Status createCollection(OperationContext* opCtx,
                                     const NamespaceString& nss,
-                                    const CollectionOptions& options) = 0;
+                                    const CollectionOptions& options,
+                                    bool createIdIndex = true,
+                                    const BSONObj& idIndexSpec = BSONObj()) = 0;
+
+    /**
+     * Creates all the specified non-_id indexes on a given collection, which must be empty.
+     * Note: This function assumes the give collection is a committed collection, so it takes
+     * an exclusive collection lock on that collection.
+     */
+    virtual Status createIndexesOnEmptyCollection(
+        OperationContext* opCtx,
+        const NamespaceString& nss,
+        const std::vector<BSONObj>& secondaryIndexSpecs) = 0;
 
     /**
      * Drops a collection.
      */
     virtual Status dropCollection(OperationContext* opCtx, const NamespaceString& nss) = 0;
+
+    /**
+     * Drops all collections with a name starting with the prefix in the database.
+     * To drop all collections regardless of prefix, use an empty string.
+     */
+    virtual Status dropCollectionsWithPrefix(OperationContext* opCtx,
+                                             const DatabaseName& dbName,
+                                             const std::string& collectionNamePrefix) = 0;
 
     /**
      * Truncates a collection.
@@ -186,18 +224,15 @@ public:
      */
     virtual Status setIndexIsMultikey(OperationContext* opCtx,
                                       const NamespaceString& nss,
+                                      const UUID& collectionUUID,
                                       const std::string& indexName,
+                                      const KeyStringSet& multikeyMetadataKeys,
                                       const MultikeyPaths& paths,
                                       Timestamp ts) = 0;
     /**
      * Drops all databases except "local".
      */
     virtual Status dropReplicatedDatabases(OperationContext* opCtx) = 0;
-
-    /**
-     * Validates that the admin database is valid during initial sync.
-     */
-    virtual Status isAdminDbValid(OperationContext* opCtx) = 0;
 
     /**
      * Finds at most "limit" documents returned by a collection or index scan on the collection in
@@ -260,6 +295,20 @@ public:
                                 const TimestampedBSONObj& update) = 0;
 
     /**
+     * Updates a singleton document in a collection. Upserts the document if it does not exist. If
+     * the document is upserted and no '_id' is provided, one will be generated.
+     * If the collection has more than 1 document matching the query, the update will only be
+     * performed on the first one found. The upsert is performed at the given timestamp. Returns
+     * 'NamespaceNotFound' if the collection does not exist. This does not implicitly create the
+     * collection so that the caller can create the collection with any collection options they want
+     * (ex: capped, temp, collation, etc.).
+     */
+    virtual Status putSingleton(OperationContext* opCtx,
+                                const NamespaceString& nss,
+                                const BSONObj& query,
+                                const TimestampedBSONObj& update) = 0;
+
+    /**
      * Updates a singleton document in a collection. Never upsert.
      *
      * If the collection has more than 1 document, the update will only be performed on the first
@@ -272,6 +321,22 @@ public:
                                    const NamespaceString& nss,
                                    const BSONObj& query,
                                    const TimestampedBSONObj& update) = 0;
+
+    /**
+     * Updates all matching documents in a collection. Never upsert.
+     *
+     * If the collection has more than 1 document, the update will be performed on all the documents
+     * found. The update is performed at the given timestamp.
+     * Returns 'NamespaceNotFound' if the collection does not exist. This does not implicitly
+     * create the collection so that the caller can create the collection with any collection
+     * options they want (ex: capped, temp, collation, etc.).
+     */
+    virtual Status updateDocuments(
+        OperationContext* opCtx,
+        const NamespaceString& nss,
+        const BSONObj& query,
+        const TimestampedBSONObj& update,
+        const boost::optional<std::vector<BSONObj>>& arrayFilters = boost::none) = 0;
 
     /**
      * Finds a single document in the collection referenced by the specified _id.
@@ -314,6 +379,34 @@ public:
                                   const NamespaceString& nss,
                                   const BSONObj& filter) = 0;
 
+    /**
+     * Searches for an oplog optime with a timestamp <= 'timestamp'. Returns boost::none if no
+     * matches are found.
+     */
+    virtual boost::optional<OpTimeAndWallTime> findOplogOpTimeLessThanOrEqualToTimestamp(
+        OperationContext* opCtx, const CollectionPtr& oplog, const Timestamp& timestamp) = 0;
+
+    /**
+     * Calls findOplogOpTimeLessThanOrEqualToTimestamp with endless WriteConflictException retries.
+     * Other errors get thrown. Concurrent oplog reads with the validate cmd on the same collection
+     * may throw WCEs. Obeys opCtx interrupts.
+     *
+     * Call this function instead of findOplogOpTimeLessThanOrEqualToTimestamp if the caller cannot
+     * fail, say for correctness.
+     */
+    virtual boost::optional<OpTimeAndWallTime> findOplogOpTimeLessThanOrEqualToTimestampRetryOnWCE(
+        OperationContext* opCtx, const CollectionPtr& oplog, const Timestamp& timestamp) = 0;
+
+    /**
+     * Fetches the oldest oplog entry's timestamp.
+     */
+    virtual Timestamp getEarliestOplogTimestamp(OperationContext* opCtx) = 0;
+
+    /**
+     * Fetches the latest oplog entry's timestamp. Bypasses the oplog visibility rules.
+     */
+    virtual Timestamp getLatestOplogTimestamp(OperationContext* opCtx) = 0;
+
     using CollectionSize = uint64_t;
     using CollectionCount = uint64_t;
 
@@ -339,20 +432,18 @@ public:
     /**
      * Returns the UUID of the collection specified by nss, if such a UUID exists.
      */
-    virtual StatusWith<OptionalCollectionUUID> getCollectionUUID(OperationContext* opCtx,
-                                                                 const NamespaceString& nss) = 0;
+    virtual StatusWith<UUID> getCollectionUUID(OperationContext* opCtx,
+                                               const NamespaceString& nss) = 0;
 
     /**
-     * Updates unique indexes belonging to all non-replicated collections. To be called at the
-     * end of initial sync.
+     * Sets the highest timestamp at which the storage engine is allowed to take a checkpoint. This
+     * timestamp must not decrease unless force=true is set, in which case we force the stable
+     * timestamp, the oldest timestamp, and the commit timestamp backward. Additionally when
+     * force=true is set, the all durable timestamp will be set to the stable timestamp.
      */
-    virtual Status upgradeNonReplicatedUniqueIndexes(OperationContext* opCtx) = 0;
-
-    /**
-     * Sets the highest timestamp at which the storage engine is allowed to take a checkpoint.
-     * This timestamp can never decrease, and thus should be a timestamp that can never roll back.
-     */
-    virtual void setStableTimestamp(ServiceContext* serviceCtx, Timestamp snapshotName) = 0;
+    virtual void setStableTimestamp(ServiceContext* serviceCtx,
+                                    Timestamp snapshotName,
+                                    bool force = false) = 0;
 
     /**
      * Tells the storage engine the timestamp of the data at startup. This is necessary because
@@ -361,14 +452,21 @@ public:
     virtual void setInitialDataTimestamp(ServiceContext* serviceCtx, Timestamp snapshotName) = 0;
 
     /**
+     * Returns the initial timestamp of data at startup.
+     */
+    virtual Timestamp getInitialDataTimestamp(ServiceContext* serviceCtx) const = 0;
+
+    /**
      * Reverts the state of all database data to the last stable timestamp.
      *
      * The "local" database is exempt and none of its state should be reverted except for
      * "local.replset.minvalid" which should be reverted to the last stable timestamp.
      *
      * The 'stable' timestamp is set by calling StorageInterface::setStableTimestamp.
+     *
+     * Returns the stable timestamp to which it reverted the data.
      */
-    virtual StatusWith<Timestamp> recoverToStableTimestamp(OperationContext* opCtx) = 0;
+    virtual Timestamp recoverToStableTimestamp(OperationContext* opCtx) = 0;
 
     /**
      * Returns whether the storage engine supports "recover to stable timestamp".
@@ -381,6 +479,14 @@ public:
     virtual bool supportsRecoveryTimestamp(ServiceContext* serviceCtx) const = 0;
 
     /**
+     * Responsible for initializing independent processes for replication that manage
+     * and interact with the storage layer.
+     *
+     * Initializes the OplogCapMaintainerThread to control deletion of oplog truncate markers.
+     */
+    virtual void initializeStorageControlsForReplication(ServiceContext* serviceCtx) const = 0;
+
+    /**
      * Returns the stable timestamp that the storage engine recovered to on startup. If the
      * recovery point was not stable, returns "none".
      */
@@ -390,21 +496,22 @@ public:
      * Waits for oplog writes to be visible in the oplog.
      * This function is used to ensure tests do not fail due to initial sync receiving an empty
      * batch.
+     *
+     * primaryOnly: If this node is not primary, do nothing.
      */
-    virtual void waitForAllEarlierOplogWritesToBeVisible(OperationContext* opCtx) = 0;
+    virtual void waitForAllEarlierOplogWritesToBeVisible(OperationContext* opCtx,
+                                                         bool primaryOnly = false) = 0;
 
     /**
-     * Returns the all committed timestamp. All transactions with timestamps earlier than the
-     * all committed timestamp are committed. Only storage engines that support document level
-     * locking must provide an implementation. Other storage engines may provide a no-op
-     * implementation.
+     * Returns the all_durable timestamp. All transactions with timestamps earlier than the
+     * all_durable timestamp are committed.
+     *
+     * The all_durable timestamp only includes non-prepared transactions that have been given a
+     * commit_timestamp and prepared transactions that have been given a durable_timestamp.
+     * Previously, the deprecated all_committed timestamp would also include prepared transactions
+     * that were prepared but not committed which could make the stable timestamp briefly jump back.
      */
-    virtual Timestamp getAllCommittedTimestamp(ServiceContext* serviceCtx) const = 0;
-
-    /**
-     * Returns true if the storage engine supports document level locking.
-     */
-    virtual bool supportsDocLocking(ServiceContext* serviceCtx) const = 0;
+    virtual Timestamp getAllDurableTimestamp(ServiceContext* serviceCtx) const = 0;
 
     /**
      * Registers a timestamp with the storage engine so that it can enforce oplog visiblity rules.
@@ -430,21 +537,17 @@ public:
         ServiceContext* serviceCtx) const = 0;
 
     /**
-     * DEPRECATED. Use getLastStableRecoveryTimestamp instead!
-     *
-     * Returns a timestamp that is guaranteed to be persisted on disk in a checkpoint. Returns
-     * `Timestamp::min()` if no stable checkpoint has been taken. Returns boost::none if
-     * `supportsRecoverToStableTimestamp` returns false or if this is not a persisted data engine.
-     *
-     * TODO: delete this in v4.4 (SERVER-36194).
-     */
-    virtual boost::optional<Timestamp> getLastStableCheckpointTimestampDeprecated(
-        ServiceContext* serviceCtx) const = 0;
-
-    /**
      * Returns the read timestamp of the recovery unit of the given operation context.
      */
     virtual Timestamp getPointInTimeReadTimestamp(OperationContext* opCtx) const = 0;
+
+    /**
+     * Prevents oplog history at 'pinnedTimestamp' and later from being truncated. Setting
+     * Timestamp::max() effectively nullifies the pin because no oplog truncation will be stopped by
+     * it.
+     */
+    virtual void setPinnedOplogTimestamp(OperationContext* opCtx,
+                                         const Timestamp& pinnedTimestamp) const = 0;
 };
 
 }  // namespace repl

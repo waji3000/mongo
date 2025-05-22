@@ -1,6 +1,3 @@
-// fts_index_format.cpp
-
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,80 +27,65 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <absl/container/node_hash_map.h>
+#include <array>
+#include <boost/container/vector.hpp>
+#include <cstddef>
+#include <cstdint>
+#include <map>
+#include <utility>
+#include <vector>
 
-#include <third_party/murmurhash3/MurmurHash3.h>
+#include <boost/optional/optional.hpp>
 
-#include "mongo/base/init.h"
-#include "mongo/db/bson/dotted_path_support.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/base/init.h"  // IWYU pragma: keep
+#include "mongo/base/initializer.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonelement_comparator_interface.h"
 #include "mongo/db/fts/fts_index_format.h"
 #include "mongo/db/fts/fts_spec.h"
-#include "mongo/db/server_options.h"
+#include "mongo/db/index/multikey_paths.h"
+#include "mongo/db/query/bson/multikey_dotted_path_support.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/hex.h"
-#include "mongo/util/md5.hpp"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/md5.h"
+#include "mongo/util/murmur3.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
+
+MONGO_FAIL_POINT_DEFINE(enableCompoundTextIndexes);
 
 namespace fts {
 
 using std::string;
 using std::vector;
 
-namespace dps = ::mongo::dotted_path_support;
+namespace mdps = ::mongo::multikey_dotted_path_support;
 
 namespace {
 BSONObj nullObj;
 BSONElement nullElt;
 
-// New in textIndexVersion 2.
-// If the term is longer than 32 characters, it may
-// result in the generated key being too large
-// for the index. In that case, we generate a 64-character key
-// from the concatenation of the first 32 characters
-// and the hex string of the murmur3 hash value of the entire
-// term value.
+// New in textIndexVersion 2. If the term is longer than 32 characters, it may result in the
+// generated key being too large for the index. In that case, we generate a 64-character key from
+// the concatenation of the first 32 characters and the hex string of the murmur3 hash value of the
+// entire term value.
 const size_t termKeyPrefixLengthV2 = 32U;
 // 128-bit hash value expressed in hex = 32 characters
 const size_t termKeySuffixLengthV2 = 32U;
 const size_t termKeyLengthV2 = termKeyPrefixLengthV2 + termKeySuffixLengthV2;
 
-// TextIndexVersion 3.
-// If the term is longer than 256 characters, it may
-// result in the generated key being too large
-// for the index. In that case, we generate a 256-character key
-// from the concatenation of the first 224 characters
-// and the hex string of the md5 hash value of the entire
+// TextIndexVersion 3. If the term is longer than 256 characters, it may result in the generated key
+// being too large for the index. In that case, we generate a 256-character key from the
+// concatenation of the first 224 characters and the hex string of the md5 hash value of the entire
 // term value.
 const size_t termKeyPrefixLengthV3 = 224U;
 // 128-bit hash value expressed in hex = 32 characters
 const size_t termKeySuffixLengthV3 = 32U;
 const size_t termKeyLengthV3 = termKeyPrefixLengthV3 + termKeySuffixLengthV3;
-
-/**
- * Returns size of buffer required to store term in index key.
- * In version 1, terms are stored verbatim in key.
- * In version 2 and above, terms longer than 32 characters are hashed and combined
- * with a prefix.
- */
-int guessTermSize(const std::string& term, TextIndexVersion textIndexVersion) {
-    if (TEXT_INDEX_VERSION_1 == textIndexVersion) {
-        return term.size();
-    } else if (TEXT_INDEX_VERSION_2 == textIndexVersion) {
-        if (term.size() <= termKeyPrefixLengthV2) {
-            return term.size();
-        }
-
-        return termKeyLengthV2;
-    } else {
-        invariant(TEXT_INDEX_VERSION_3 == textIndexVersion);
-        if (term.size() <= termKeyPrefixLengthV3) {
-            return term.size();
-        }
-
-        return termKeyLengthV3;
-    }
-}
 
 /**
  * Given an object being indexed, 'obj', and a path through 'obj', returns the corresponding BSON
@@ -116,12 +98,16 @@ int guessTermSize(const std::string& term, TextIndexVersion textIndexVersion) {
 BSONElement extractNonFTSKeyElement(const BSONObj& obj, StringData path) {
     BSONElementSet indexedElements;
     const bool expandArrayOnTrailingField = true;
-    std::set<size_t> arrayComponents;
-    dps::extractAllElementsAlongPath(
+    MultikeyComponents arrayComponents;
+    mdps::extractAllElementsAlongPath(
         obj, path, indexedElements, expandArrayOnTrailingField, &arrayComponents);
+
+    if (MONGO_unlikely(enableCompoundTextIndexes.shouldFail())) {
+        return nullElt;
+    }
     uassert(ErrorCodes::CannotBuildIndexKeys,
-            str::stream() << "Field '" << path << "' of text index contains an array in document: "
-                          << obj,
+            str::stream() << "Field '" << path
+                          << "' of text index contains an array in document: " << obj,
             arrayComponents.empty());
 
     // Since there aren't any arrays, there cannot be more than one extracted element on 'path'.
@@ -135,11 +121,15 @@ MONGO_INITIALIZER(FTSIndexFormat)(InitializerContext* context) {
     b.appendNull("");
     nullObj = b.obj();
     nullElt = nullObj.firstElement();
-    return Status::OK();
 }
 
-void FTSIndexFormat::getKeys(const FTSSpec& spec, const BSONObj& obj, BSONObjSet* keys) {
-    int extraSize = 0;
+void FTSIndexFormat::getKeys(SharedBufferFragmentBuilder& pooledBufferBuilder,
+                             const FTSSpec& spec,
+                             const BSONObj& obj,
+                             KeyStringSet* keys,
+                             key_string::Version keyStringVersion,
+                             Ordering ordering,
+                             const boost::optional<RecordId>& id) {
     vector<BSONElement> extrasBefore;
     vector<BSONElement> extrasAfter;
 
@@ -147,74 +137,38 @@ void FTSIndexFormat::getKeys(const FTSSpec& spec, const BSONObj& obj, BSONObjSet
     for (unsigned i = 0; i < spec.numExtraBefore(); i++) {
         auto indexedElement = extractNonFTSKeyElement(obj, spec.extraBefore(i));
         extrasBefore.push_back(indexedElement);
-        extraSize += indexedElement.size();
     }
 
     // Compute the non FTS key elements for the suffix.
     for (unsigned i = 0; i < spec.numExtraAfter(); i++) {
         auto indexedElement = extractNonFTSKeyElement(obj, spec.extraAfter(i));
         extrasAfter.push_back(indexedElement);
-        extraSize += indexedElement.size();
     }
 
     TermFrequencyMap term_freqs;
     spec.scoreDocument(obj, &term_freqs);
 
-    // create index keys from raw scores
-    // only 1 per string
-
-    // TODO SERVER-36440: Completely remove this limit in 4.3.
-    if (serverGlobalParams.featureCompatibility.isVersionInitialized() &&
-        serverGlobalParams.featureCompatibility.getVersion() ==
-            ServerGlobalParams::FeatureCompatibility::Version::kFullyDowngradedTo40) {
-        uassert(16732,
-                mongoutils::str::stream() << "too many unique keys for a single document to"
-                                          << " have a text index, max is "
-                                          << term_freqs.size()
-                                          << obj["_id"],
-                term_freqs.size() <= 400000);
-    }
-
-    long long keyBSONSize = 0;
-    const int MaxKeyBSONSizeMB = 4;
-
+    auto sequence = keys->extract_sequence();
     for (TermFrequencyMap::const_iterator i = term_freqs.begin(); i != term_freqs.end(); ++i) {
         const string& term = i->first;
         double weight = i->second;
 
-        // guess the total size of the btree entry based on the size of the weight, term tuple
-        int guess = 5 /* bson overhead */ + 10 /* weight */ + 8 /* term overhead */ +
-            /* term size (could be truncated/hashed) */
-            guessTermSize(term, spec.getTextIndexVersion()) + extraSize;
-
-        BSONObjBuilder b(guess);  // builds a BSON object with guess length.
-        for (unsigned k = 0; k < extrasBefore.size(); k++) {
-            b.appendAs(extrasBefore[k], "");
+        key_string::PooledBuilder keyString(pooledBufferBuilder, keyStringVersion, ordering);
+        for (const auto& elem : extrasBefore) {
+            keyString.appendBSONElement(elem);
         }
-        _appendIndexKey(b, weight, term, spec.getTextIndexVersion());
-        for (unsigned k = 0; k < extrasAfter.size(); k++) {
-            b.appendAs(extrasAfter[k], "");
+        _appendIndexKey(keyString, weight, term, spec.getTextIndexVersion());
+        for (const auto& elem : extrasAfter) {
+            keyString.appendBSONElement(elem);
         }
-        BSONObj res = b.obj();
 
-        verify(guess >= res.objsize());
-
-        keys->insert(res);
-        keyBSONSize += res.objsize();
-
-        // TODO SERVER-36440: Completely remove this limit in 4.3.
-        if (serverGlobalParams.featureCompatibility.isVersionInitialized() &&
-            serverGlobalParams.featureCompatibility.getVersion() ==
-                ServerGlobalParams::FeatureCompatibility::Version::kFullyDowngradedTo40) {
-            uassert(16733,
-                    mongoutils::str::stream()
-                        << "trying to index text where term list is too big, max is "
-                        << MaxKeyBSONSizeMB
-                        << "mb "
-                        << obj["_id"],
-                    keyBSONSize <= (MaxKeyBSONSizeMB * 1024 * 1024));
+        if (id) {
+            keyString.appendRecordId(*id);
         }
+
+        sequence.push_back(keyString.release());
     }
+    keys->adopt_sequence(std::move(sequence));
 }
 
 BSONObj FTSIndexFormat::getIndexKey(double weight,
@@ -228,48 +182,47 @@ BSONObj FTSIndexFormat::getIndexKey(double weight,
         b.appendAs(i.next(), "");
     }
 
-    _appendIndexKey(b, weight, term, textIndexVersion);
-    return b.obj();
+    key_string::Builder keyString(key_string::Version::kLatestVersion, key_string::ALL_ASCENDING);
+    _appendIndexKey(keyString, weight, term, textIndexVersion);
+    auto key = key_string::toBson(keyString, key_string::ALL_ASCENDING);
+
+    return b.appendElements(key).obj();
 }
 
-void FTSIndexFormat::_appendIndexKey(BSONObjBuilder& b,
+template <typename KeyStringBuilder>
+void FTSIndexFormat::_appendIndexKey(KeyStringBuilder& keyString,
                                      double weight,
                                      const string& term,
                                      TextIndexVersion textIndexVersion) {
-    verify(weight >= 0 && weight <= MAX_WEIGHT);  // FTSmaxweight =  defined in fts_header
+    invariant(weight >= 0 && weight <= MAX_WEIGHT);  // FTSmaxweight =  defined in fts_header
     // Terms are added to index key verbatim.
     if (TEXT_INDEX_VERSION_1 == textIndexVersion) {
-        b.append("", term);
-        b.append("", weight);
+        keyString.appendString(term);
     }
     // See comments at the top of file for termKeyPrefixLengthV2.
     // Apply hash for text index version 2 to long terms (longer than 32 characters).
     else if (TEXT_INDEX_VERSION_2 == textIndexVersion) {
         if (term.size() <= termKeyPrefixLengthV2) {
-            b.append("", term);
+            keyString.appendString(term);
         } else {
-            union {
-                uint64_t hash[2];
-                char data[16];
-            } t;
+            std::array<char, 16> hash;
             uint32_t seed = 0;
-            MurmurHash3_x64_128(term.data(), term.size(), seed, t.hash);
-            string keySuffix = mongo::toHexLower(t.data, sizeof(t.data));
+            murmur3(StringData{term}, seed, hash);
+            string keySuffix = hexblob::encodeLower(hash.data(), hash.size());
             invariant(termKeySuffixLengthV2 == keySuffix.size());
-            b.append("", term.substr(0, termKeyPrefixLengthV2) + keySuffix);
+            keyString.appendString(term.substr(0, termKeyPrefixLengthV2) + keySuffix);
         }
-        b.append("", weight);
     } else {
         invariant(TEXT_INDEX_VERSION_3 == textIndexVersion);
         if (term.size() <= termKeyPrefixLengthV3) {
-            b.append("", term);
+            keyString.appendString(term);
         } else {
             string keySuffix = md5simpledigest(term);
             invariant(termKeySuffixLengthV3 == keySuffix.size());
-            b.append("", term.substr(0, termKeyPrefixLengthV3) + keySuffix);
+            keyString.appendString(term.substr(0, termKeyPrefixLengthV3) + keySuffix);
         }
-        b.append("", weight);
     }
+    keyString.appendNumberDouble(weight);
 }
-}
-}
+}  // namespace fts
+}  // namespace mongo

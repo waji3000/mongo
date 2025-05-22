@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,28 +27,73 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kIndex
 
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+// IWYU pragma: no_include "ext/alloc_traits.h"
+#include <algorithm>
 #include <memory>
+#include <set>
+#include <string>
+#include <utility>
+#include <vector>
 
-#include "mongo/db/catalog/multi_index_block.h"
-#include "mongo/db/catalog/multi_index_block_impl.h"
-#include "mongo/db/db_raii.h"
-#include "mongo/db/index/wildcard_access_method.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/json.h"
+#include "mongo/bson/ordering.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/collection_options.h"
+#include "mongo/db/catalog/index_catalog.h"
+#include "mongo/db/catalog/index_catalog_entry.h"
+#include "mongo/db/catalog_raii.h"
+#include "mongo/db/client.h"
+#include "mongo/db/concurrency/d_concurrency.h"
+#include "mongo/db/concurrency/lock_manager_defs.h"
+#include "mongo/db/field_ref.h"
+#include "mongo/db/index/index_access_method.h"
+#include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/index/multikey_metadata_access_stats.h"
+#include "mongo/db/index_builds/multi_index_block.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/dependencies.h"
+#include "mongo/db/query/wildcard_multikey_paths.h"
+#include "mongo/db/record_id.h"
+#include "mongo/db/record_id_helpers.h"
+#include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/storage_interface_impl.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/shard_role.h"
+#include "mongo/db/storage/index_entry_comparison.h"
+#include "mongo/db/storage/key_format.h"
+#include "mongo/db/storage/key_string/key_string.h"
+#include "mongo/db/storage/snapshot.h"
 #include "mongo/db/storage/sorted_data_interface.h"
+#include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/logv2/log.h"
 #include "mongo/unittest/unittest.h"
-#include "mongo/util/log.h"
+#include "mongo/util/scopeguard.h"
+#include "mongo/util/uuid.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
+
 
 namespace mongo {
 namespace {
 
 using namespace unittest;
 
-static const RecordId kMetadataId = RecordId::minReserved();
+static const RecordId kMetadataId = record_id_helpers::reservedIdFor(
+    record_id_helpers::ReservationId::kWildcardMultikeyMetadataId, KeyFormat::Long);
 
-static const int kIndexVersion = static_cast<int>(IndexDescriptor::kLatestIndexVersion);
-static const NamespaceString kDefaultNSS{"wildcard_multikey_persistence.test"};
+static const int kIndexVersion = static_cast<int>(IndexConfig::kLatestIndexVersion);
+static const NamespaceString kDefaultNSS =
+    NamespaceString::createNamespaceString_forTest("wildcard_multikey_persistence.test");
 static const std::string kDefaultIndexName{"wildcard_multikey"};
 static const BSONObj kDefaultIndexKey = fromjson("{'$**': 1}");
 static const BSONObj kDefaultPathProjection;
@@ -64,13 +108,23 @@ std::vector<InsertStatement> toInserts(std::vector<BSONObj> docs) {
     return inserts;
 }
 
+CollectionAcquisition acquireCollForRead(OperationContext* opCtx, const NamespaceString& nss) {
+    return acquireCollection(
+        opCtx,
+        CollectionAcquisitionRequest(nss,
+                                     PlacementConcern(boost::none, ShardVersion::UNSHARDED()),
+                                     repl::ReadConcernArgs::get(opCtx),
+                                     AcquisitionPrerequisites::kRead),
+        MODE_IS);
+}
+
 class WildcardMultikeyPersistenceTestFixture : public unittest::Test {
 public:
     WildcardMultikeyPersistenceTestFixture() {
         _opCtx = cc().makeOperationContext();
     }
 
-    virtual ~WildcardMultikeyPersistenceTestFixture() {
+    ~WildcardMultikeyPersistenceTestFixture() override {
         _opCtx.reset();
     }
 
@@ -95,15 +149,22 @@ protected:
                                    const NamespaceString& nss = kDefaultNSS,
                                    const std::string& indexName = kDefaultIndexName) {
         // Subsequent operations must take place under a collection lock.
-        AutoGetCollectionForRead autoColl(opCtx(), nss);
-        auto collection = autoColl.getCollection();
+        const auto collection = acquireCollForRead(opCtx(), nss);
+        const auto& collectionPtr = collection.getCollectionPtr();
 
         // Verify whether or not the index has been marked as multikey.
-        ASSERT_EQ(expectIndexIsMultikey, getIndexDesc(collection, indexName)->isMultikey(opCtx()));
+        ASSERT_EQ(
+            expectIndexIsMultikey,
+            getIndexDesc(collectionPtr, indexName)->getEntry()->isMultikey(opCtx(), collectionPtr));
 
         // Obtain a cursor over the index, and confirm that the keys are present in order.
-        auto indexCursor = getIndexCursor(collection, indexName);
-        auto indexKey = indexCursor->seek(kMinBSONKey, true);
+        auto indexCursor = getIndexCursor(collectionPtr, indexName);
+
+        key_string::Builder builder(key_string::Version::V1);
+        auto keyStringForSeek = IndexEntryComparison::makeKeyStringFromBSONKeyForSeek(
+            BSONObj(), Ordering::make(BSONObj()), true, true, builder);
+
+        auto indexKey = indexCursor->seek(keyStringForSeek);
         try {
             for (const auto& expectedKey : expectedKeys) {
                 ASSERT(indexKey);
@@ -114,9 +175,12 @@ protected:
             // Confirm that there are no further keys in the index.
             ASSERT(!indexKey);
         } catch (const TestAssertionFailureException& ex) {
-            log() << "Writing remaining index keys to debug log:";
+            LOGV2(22518, "Writing remaining index keys to debug log:");
             while (indexKey) {
-                log() << "{ key: " << indexKey->key << ", loc: " << indexKey->loc << " }";
+                LOGV2(22519,
+                      "{{ key: {indexKey_key}, loc: {indexKey_loc} }}",
+                      "indexKey_key"_attr = indexKey->key,
+                      "indexKey_loc"_attr = indexKey->loc);
                 indexKey = indexCursor->next();
             }
             throw ex;
@@ -124,10 +188,10 @@ protected:
     }
 
     /**
-     * Verifes that the index access method associated with 'indexName' in the collection identified
-     * by 'nss' reports 'expectedPaths' as the set of multikey paths.
+     * Verifes that the index access method associated with 'indexName' in the collection
+     * identified by 'nss' reports 'expectedPaths' as the set of multikey paths.
      */
-    void assertMultikeyPathSetEquals(const std::set<std::string>& expectedPaths,
+    void assertMultikeyPathSetEquals(const OrderedPathSet& expectedPaths,
                                      const NamespaceString& nss = kDefaultNSS,
                                      const std::string& indexName = kDefaultIndexName) {
         // Convert the set of std::string to a set of FieldRef.
@@ -137,11 +201,10 @@ protected:
         }
         ASSERT_EQ(expectedPaths.size(), expectedFieldRefs.size());
 
-        AutoGetCollectionForRead autoColl(opCtx(), nss);
-        auto collection = autoColl.getCollection();
-        auto indexAccessMethod = getIndex(collection, indexName);
+        const auto collection = acquireCollForRead(opCtx(), nss);
+        auto indexEntry = getIndexCatalogEntry(collection.getCollectionPtr(), indexName);
         MultikeyMetadataAccessStats stats;
-        auto multikeyPathSet = indexAccessMethod->getMultikeyPathSet(opCtx(), &stats);
+        auto multikeyPathSet = getWildcardMultikeyPathSet(opCtx(), indexEntry, &stats);
 
         ASSERT(expectedFieldRefs == multikeyPathSet);
     }
@@ -183,28 +246,33 @@ protected:
                                   BSONObj key,
                                   BSONObj pathProjection,
                                   bool background) {
-        BSONObjBuilder bob =
-            std::move(BSONObjBuilder() << "ns" << nss.ns() << "name" << name << "key" << key);
+        BSONObjBuilder bob = std::move(BSONObjBuilder() << "name" << name << "key" << key);
 
         if (!pathProjection.isEmpty())
-            bob << IndexDescriptor::kPathProjectionFieldName << pathProjection;
+            bob << IndexDescriptor::kWildcardProjectionFieldName << pathProjection;
 
-        auto indexSpec = (bob << "v" << kIndexVersion << "background" << background).obj();
+        auto indexSpec = (bob << "v" << kIndexVersion).obj();
 
-        Lock::DBLock dbLock(opCtx(), nss.db(), MODE_X);
+        Lock::DBLock dbLock(opCtx(), nss.dbName(), MODE_X);
         AutoGetCollection autoColl(opCtx(), nss, MODE_X);
-        auto coll = autoColl.getCollection();
+        CollectionWriter coll(opCtx(), autoColl);
 
-        MultiIndexBlockImpl indexer(opCtx(), coll);
-        indexer.allowBackgroundBuilding();
-        indexer.allowInterruption();
+        MultiIndexBlock indexer;
+        ScopeGuard abortOnExit(
+            [&] { indexer.abortIndexBuild(opCtx(), coll, MultiIndexBlock::kNoopOnCleanUpFn); });
 
         // Initialize the index builder and add all documents currently in the collection.
-        ASSERT_OK(indexer.init(indexSpec).getStatus());
-        ASSERT_OK(indexer.insertAllDocumentsInCollection());
+        ASSERT_OK(
+            indexer.init(opCtx(), coll, indexSpec, MultiIndexBlock::kNoopOnInitFn).getStatus());
+        ASSERT_OK(indexer.insertAllDocumentsInCollection(opCtx(), coll.get()));
+        ASSERT_OK(indexer.checkConstraints(opCtx(), coll.get()));
 
         WriteUnitOfWork wunit(opCtx());
-        ASSERT_OK(indexer.commit());
+        ASSERT_OK(indexer.commit(opCtx(),
+                                 coll.getWritableCollection(opCtx()),
+                                 MultiIndexBlock::kNoopOnCreateEachFn,
+                                 MultiIndexBlock::kNoopOnCommitFn));
+        abortOnExit.dismiss();
         wunit.commit();
     }
 
@@ -217,17 +285,22 @@ protected:
         return docs;
     }
 
-    const IndexDescriptor* getIndexDesc(const Collection* collection, const StringData indexName) {
+    const IndexDescriptor* getIndexDesc(const CollectionPtr& collection,
+                                        const StringData indexName) {
         return collection->getIndexCatalog()->findIndexByName(opCtx(), indexName);
     }
 
-    IndexAccessMethod* getIndex(Collection* collection, const StringData indexName) {
-        return collection->getIndexCatalog()->getIndex(getIndexDesc(collection, indexName));
+    const IndexCatalogEntry* getIndexCatalogEntry(const CollectionPtr& collection,
+                                                  const StringData indexName) {
+        return collection->getIndexCatalog()->getEntry(getIndexDesc(collection, indexName));
     }
 
-    std::unique_ptr<SortedDataInterface::Cursor> getIndexCursor(Collection* collection,
+    std::unique_ptr<SortedDataInterface::Cursor> getIndexCursor(const CollectionPtr& collection,
                                                                 const StringData indexName) {
-        return getIndex(collection, indexName)->newCursor(opCtx());
+        return getIndexCatalogEntry(collection, indexName)
+            ->accessMethod()
+            ->asSortedData()
+            ->newCursor(opCtx());
     }
 
     CollectionOptions collOptions() {
@@ -369,9 +442,9 @@ TEST_F(WildcardMultikeyPersistenceTestFixture, AddNewMultikeyPathsOnUpdate) {
 
     {
         // Verify that the updated document appears as expected;
-        AutoGetCollectionForRead autoColl(opCtx(), kDefaultNSS);
+        const auto coll = acquireCollForRead(opCtx(), kDefaultNSS);
         Snapshotted<BSONObj> result;
-        ASSERT(autoColl.getCollection()->findDoc(opCtx(), RecordId(1), &result));
+        ASSERT(coll.getCollectionPtr()->findDoc(opCtx(), RecordId(1), &result));
         ASSERT_BSONOBJ_EQ(result.value(),
                           fromjson("{_id:1, a:1, b:[{c:2}, {d:{e:[3]}}, {d:{f:[4]}}, {g:[5]}]}"));
     }
@@ -401,9 +474,9 @@ TEST_F(WildcardMultikeyPersistenceTestFixture, AddNewMultikeyPathsOnReplacement)
 
     {
         // Verify that the updated document appears as expected;
-        AutoGetCollectionForRead autoColl(opCtx(), kDefaultNSS);
+        const auto coll = acquireCollForRead(opCtx(), kDefaultNSS);
         Snapshotted<BSONObj> result;
-        ASSERT(autoColl.getCollection()->findDoc(opCtx(), RecordId(1), &result));
+        ASSERT(coll.getCollectionPtr()->findDoc(opCtx(), RecordId(1), &result));
         ASSERT_BSONOBJ_EQ(result.value(),
                           fromjson("{_id: 1, a: 2, b: [{c: 3}, {d: {e: [4], f: [5]}}]}"));
     }
@@ -442,7 +515,8 @@ TEST_F(WildcardMultikeyPersistenceTestFixture, DoNotRemoveMultikeyPathsOnDocDele
 
     assertIndexContentsEquals(expectedKeys);
 
-    // Now remove all documents in the collection, and verify that only the multikey paths remain.
+    // Now remove all documents in the collection, and verify that only the multikey paths
+    // remain.
     assertRemoveDocuments(docs);
 
     expectedKeys = {{fromjson("{'': 1, '': 'b'}"), kMetadataId},
@@ -558,15 +632,15 @@ TEST_F(WildcardMultikeyPersistenceTestFixture, OnlyIndexIncludedPathsOnUpdate) {
     assertIndexContentsEquals(expectedKeys);
     assertMultikeyPathSetEquals({"b", "b.d.e", "d.e.f"});
 
-    // Now update RecordId(3), adding one new field 'd.e.g' within the included 'd.e' subpath and
-    // one new field 'd.h' which lies outside all included subtrees.
+    // Now update RecordId(3), adding one new field 'd.e.g' within the included 'd.e' subpath
+    // and one new field 'd.h' which lies outside all included subtrees.
     assertUpdateDocuments({{fromjson("{_id: 3}"), fromjson("{$set: {'d.e.g': 6, 'd.h': 7}}")}});
 
     {
         // Verify that the updated document appears as expected;
-        AutoGetCollectionForRead autoColl(opCtx(), kDefaultNSS);
+        const auto coll = acquireCollForRead(opCtx(), kDefaultNSS);
         Snapshotted<BSONObj> result;
-        ASSERT(autoColl.getCollection()->findDoc(opCtx(), RecordId(3), &result));
+        ASSERT(coll.getCollectionPtr()->findDoc(opCtx(), RecordId(3), &result));
         ASSERT_BSONOBJ_EQ(result.value(), fromjson("{_id: 3, d: {e: {f: [5], g: 6}, h: 7}}"));
     }
 
@@ -645,19 +719,20 @@ TEST_F(WildcardMultikeyPersistenceTestFixture, DoNotIndexExcludedPathsOnUpdate) 
     assertIndexContentsEquals(expectedKeys);
     assertMultikeyPathSetEquals({"b"});
 
-    // Now update RecordId(3), adding one new field 'd.e.g' within the excluded 'd.e' subpath and
-    // one new field 'd.h' which lies outside all excluded subtrees.
+    // Now update RecordId(3), adding one new field 'd.e.g' within the excluded 'd.e' subpath
+    // and one new field 'd.h' which lies outside all excluded subtrees.
     assertUpdateDocuments({{fromjson("{_id: 3}"), fromjson("{$set: {'d.e.g': 6, 'd.h': 7}}")}});
 
     {
         // Verify that the updated document appears as expected;
-        AutoGetCollectionForRead autoColl(opCtx(), kDefaultNSS);
+        const auto coll = acquireCollForRead(opCtx(), kDefaultNSS);
         Snapshotted<BSONObj> result;
-        ASSERT(autoColl.getCollection()->findDoc(opCtx(), RecordId(3), &result));
+        ASSERT(coll.getCollectionPtr()->findDoc(opCtx(), RecordId(3), &result));
         ASSERT_BSONOBJ_EQ(result.value(), fromjson("{_id: 3, d: {e: {f: [5], g: 6}, h: 7}}"));
     }
 
-    // The key {d: {}} is no longer present, since it will be replaced by a key for subpath 'd.h'.
+    // The key {d: {}} is no longer present, since it will be replaced by a key for subpath
+    // 'd.h'.
     expectedKeys.back() = {fromjson("{'': 'd.h', '': 7}"), RecordId(3)};
     assertIndexContentsEquals(expectedKeys);
     assertMultikeyPathSetEquals({"b"});
@@ -719,7 +794,8 @@ TEST_F(WildcardMultikeyPersistenceTestFixture, DoNotMarkAsMultikeyIfNoArraysInBu
         {"{a: 1, b: {c: 2, d: {e: 3}}}", "{a: 2, b: {c: 3, d: {e: 4}}}", "{d: {e: {f: 5}}}"});
     assertSetupEnvironment(false, docs, fromjson("{'$**': 1}"));
 
-    // Verify that the data keys are present in the expected order, and the index is NOT multikey.
+    // Verify that the data keys are present in the expected order, and the index is NOT
+    // multikey.
     const bool expectIndexIsMultikey = false;
     std::vector<IndexKeyEntry> expectedKeys = {{fromjson("{'': 'a', '': 1}"), RecordId(1)},
                                                {fromjson("{'': 'a', '': 2}"), RecordId(2)},
@@ -739,7 +815,8 @@ TEST_F(WildcardMultikeyPersistenceTestFixture, DoNotMarkAsMultikeyIfNoArraysInBa
         {"{a: 1, b: {c: 2, d: {e: 3}}}", "{a: 2, b: {c: 3, d: {e: 4}}}", "{d: {e: {f: 5}}}"});
     assertSetupEnvironment(true, docs, fromjson("{'$**': 1}"));
 
-    // Verify that the data keys are present in the expected order, and the index is NOT multikey.
+    // Verify that the data keys are present in the expected order, and the index is NOT
+    // multikey.
     const bool expectIndexIsMultikey = false;
     std::vector<IndexKeyEntry> expectedKeys = {{fromjson("{'': 'a', '': 1}"), RecordId(1)},
                                                {fromjson("{'': 'a', '': 2}"), RecordId(2)},
@@ -759,7 +836,8 @@ TEST_F(WildcardMultikeyPersistenceTestFixture, IndexShouldBecomeMultikeyIfArrayI
         {"{a: 1, b: {c: 2, d: {e: 3}}}", "{a: 2, b: {c: 3, d: {e: 4}}}", "{d: {e: {f: 5}}}"});
     assertSetupEnvironment(false, docs, fromjson("{'$**': 1}"));
 
-    // Verify that the data keys are present in the expected order, and the index is NOT multikey.
+    // Verify that the data keys are present in the expected order, and the index is NOT
+    // multikey.
     bool expectIndexIsMultikey = false;
     std::vector<IndexKeyEntry> expectedKeys = {{fromjson("{'': 'a', '': 1}"), RecordId(1)},
                                                {fromjson("{'': 'a', '': 2}"), RecordId(2)},

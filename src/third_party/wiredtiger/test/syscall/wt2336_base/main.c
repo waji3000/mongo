@@ -1,5 +1,5 @@
 /*-
- * Public Domain 2014-2018 MongoDB, Inc.
+ * Public Domain 2014-present MongoDB, Inc.
  * Public Domain 2008-2014 WiredTiger, Inc.
  *
  * This is free and unencumbered software released into the public domain.
@@ -28,70 +28,71 @@
 
 #include <stdlib.h>
 
-#include <unistd.h> // TODO
-#include <fcntl.h> // TODO
+#include <unistd.h>
+#include <fcntl.h>
 #include <wt_internal.h>
 
 static void fail(int) WT_GCC_FUNC_DECL_ATTRIBUTE((noreturn));
 
+/*
+ * fail --
+ *     TODO: Add a comment describing this function.
+ */
 static void
-fail(int ret) {
-	fprintf(stderr,
-	    "%s: %d (%s)\n",
-	    "wt2336_fileop_basic", ret, wiredtiger_strerror(ret));
-	exit(ret);
+fail(int ret)
+{
+    fprintf(stderr, "%s: %d (%s)\n", "wt2336_fileop_basic", ret, wiredtiger_strerror(ret));
+    exit(ret);
 }
 
-#define	SEPARATOR "--------------"
+#define SEPARATOR "--------------"
 
+/*
+ * main --
+ *     TODO: Add a comment describing this function.
+ */
 int
 main(int argc, char *argv[])
 {
-	WT_CONNECTION *conn;
-	WT_SESSION *session;
-	int ret;
+    WT_CONNECTION *conn;
+    WT_SESSION *session;
+    int ret;
 
-	(void)argc;
-	(void)argv;
-	fprintf(stderr, SEPARATOR "wiredtiger_open\n");
-	if ((ret = wiredtiger_open(".", NULL, "create", &conn)) != 0)
-		fail(ret);
+    (void)argc;
+    (void)argv;
+    fprintf(stderr, SEPARATOR "wiredtiger_open\n");
+    if ((ret = wiredtiger_open(
+           ".", NULL, "create,statistics=(all),statistics_log=(json,on_close,wait=1)", &conn)) != 0)
+        fail(ret);
 
-	usleep(100);
-	fflush(stderr);
-	fprintf(stderr, SEPARATOR "open_session\n");
-	fflush(stderr);
+    usleep(100);
+    fflush(stderr);
+    fprintf(stderr, SEPARATOR "open_session\n");
+    fflush(stderr);
 
-	if ((ret = conn->open_session(conn, NULL, NULL, &session)) != 0)
-		fail(ret);
+    if ((ret = conn->open_session(conn, NULL, NULL, &session)) != 0)
+        fail(ret);
 
-	usleep(100);
-	fflush(stderr);
-	fprintf(stderr, SEPARATOR "create\n");
-	fflush(stderr);
+    usleep(100);
+    fflush(stderr);
+    fprintf(stderr, SEPARATOR "create\n");
+    fflush(stderr);
 
-	if ((ret = session->create(
-	    session, "table:hello", "key_format=S,value_format=S")) != 0)
-		fail(ret);
+    if ((ret = session->create(session, "table:hello", "key_format=S,value_format=S")) != 0)
+        fail(ret);
 
-	usleep(100);
-	fprintf(stderr, SEPARATOR "rename\n");
+    usleep(100);
+    fflush(stdout);
+    fprintf(stderr, SEPARATOR "drop\n");
+    fflush(stdout);
 
-	if ((ret = session->rename(
-	    session, "table:hello", "table:world", NULL)) != 0)
-		fail(ret);
+    if ((ret = session->drop(session, "table:hello", NULL)) != 0)
+        fail(ret);
 
-	fflush(stdout);
-	fprintf(stderr, SEPARATOR "drop\n");
-	fflush(stdout);
+    fprintf(stderr, SEPARATOR "WT_CONNECTION::close\n");
 
-	if ((ret = session->drop(session, "table:world", NULL)) != 0)
-		fail(ret);
+    if ((ret = conn->close(conn, NULL)) != 0)
+        fail(ret);
 
-	fprintf(stderr, SEPARATOR "WT_CONNECTION::close\n");
-
-	if ((ret = conn->close(conn, NULL)) != 0)
-		fail(ret);
-
-	return (0);
+    return (0);
 }

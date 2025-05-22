@@ -1,4 +1,4 @@
-# Copyright (C) 2018-present MongoDB, Inc.
+# Copyright (C) 2024-present MongoDB, Inc.
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the Server Side Public License, version 1,
@@ -26,25 +26,19 @@
 # it in the license file.
 #
 
-# DatabaseVersion type
-
 global:
     cpp_namespace: "mongo"
+    cpp_includes:
+        - "mongo/s/database_version.h"
 
 imports:
-    - "mongo/idl/basic_types.idl"
+    - "mongo/s/database_version_base.idl"
 
-structs:
+types:
     DatabaseVersion:
-        description: "A (UUID, int) pair that uniquely identifies an incarnation of a database in a cluster and reflects changes to the database's primary shard"
-        # The generated comparison operators will do a field-wise lexicographic comparison, which
-        # doesn't work because it's nonsensical to lexicographically compare UUIDs.
-        generate_comparison_operators: false
-        strict: true
-        fields:
-            uuid:
-                type: uuid
-                description: "a unique identifier to distinguish different incarnations of this database"
-            lastMod:
-                type: int
-                description: "an integer which is bumped whenever the database's primary shard changes"
+        description: ""
+        cpp_type: DatabaseVersion
+        bson_serialization_type: object
+        serializer: "mongo::DatabaseVersion::toBSON"
+        deserializer: "mongo::DatabaseVersion"
+        is_view: false

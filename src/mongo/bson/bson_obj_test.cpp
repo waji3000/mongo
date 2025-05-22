@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,16 +27,37 @@
  *    it in the license file.
  */
 
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <limits>
+#include <string>
+#include <vector>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+
+#include "mongo/base/data_range.h"
+#include "mongo/base/data_type_endian.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
 #include "mongo/bson/bsonelement_comparator.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobj_comparator.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/bson/json.h"
 #include "mongo/bson/simple_bsonelement_comparator.h"
 #include "mongo/bson/simple_bsonobj_comparator.h"
+#include "mongo/bson/timestamp.h"
 #include "mongo/bson/unordered_fields_bsonobj_comparator.h"
-#include "mongo/db/jsobj.h"
-#include "mongo/db/json.h"
 #include "mongo/platform/decimal128.h"
-
+#include "mongo/stdx/type_traits.h"
 #include "mongo/unittest/unittest.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/string_map.h"
 
 namespace {
 using namespace mongo;
@@ -189,8 +209,16 @@ TEST(BSONObjCompare, NumberLong_Double) {
         const double equal = -9223372036854775808.0;         // 2**63
         const double closestAbove = -9223372036854774784.0;  // -2**63 + epsilon
 
+// VS2017 Doesn't like the tests below, even though we're using static_cast
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable : 4056)  // warning C4056: overflow in floating-point constant arithmetic
+#endif
         invariant(static_cast<double>(minLL) == equal);
         invariant(static_cast<long long>(equal) == minLL);
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif
 
         ASSERT_BSONOBJ_LT(BSON("" << minLL), BSON("" << (minLL + 1)));
 
@@ -614,6 +642,26 @@ TEST(Looping, Cpp11Auto) {
     ASSERT_EQUALS(count, 1 + 2 + 3);
 }
 
+TEST(Looping, Cpp17StructuredBindings) {
+    int count = 0;
+    for (auto [name, e] : BSON("a" << 1 << "a" << 2 << "a" << 3)) {
+        ASSERT_EQUALS(name, "a");
+        count += e.Int();
+    }
+
+    ASSERT_EQUALS(count, 1 + 2 + 3);
+}
+
+TEST(BSONObj, getFieldsWithEmbeddedNull) {
+    // Test that getField() returns an eoo element when the field name contains an embedded null.
+    // This should never happen, but we want to make sure we handle it correctly.
+    BSONObj obj = BSON("" << "foo"_sd
+                          << "bar" << 9 << "baz" << 4.5);
+    ASSERT_TRUE(obj.getField("\0"_sd).eoo());
+    ASSERT_TRUE(obj.getField("ba\0r"_sd).eoo());
+    ASSERT_TRUE(obj.getField("baz\0"_sd).eoo());
+}
+
 TEST(BSONObj, getFields) {
     auto e = BSON("a" << 1 << "b" << 2 << "c" << 3 << "d" << 4 << "e" << 5 << "f" << 6);
     std::array<StringData, 3> fieldNames{"c", "d", "f"};
@@ -630,10 +678,7 @@ TEST(BSONObj, getFields) {
 TEST(BSONObj, getFieldsWithDuplicates) {
     auto e = BSON("a" << 2 << "b"
                       << "3"
-                      << "a"
-                      << 9
-                      << "b"
-                      << 10);
+                      << "a" << 9 << "b" << 10);
     std::array<StringData, 2> fieldNames{"a", "b"};
     std::array<BSONElement, 2> fields;
     e.getFields(fieldNames, &fields);
@@ -678,11 +723,51 @@ TEST(BSONObj, addField) {
     ASSERT_BSONOBJ_EQ(obj, BSON("a" << 1 << "b" << 2));
 }
 
+TEST(BSONObj, addFieldsWithoutSpecifyingFields) {
+    // New fields are appended to the end in the order in which they appear in the 'from' object.
+    auto obj = BSON("p" << 1 << "q" << 1);
+    auto output = obj.addFields(BSON("a" << 2 << "b" << 2), boost::none);
+    ASSERT_BSONOBJ_EQ(output, BSON("p" << 1 << "q" << 1 << "a" << 2 << "b" << 2));
+
+    // Duplicate fields names are merged at original poistion.
+    obj = BSON("p" << 1 << "q" << 1 << "a" << 1 << "b" << 1);
+    output = obj.addFields(BSON("b" << 2 << "a" << BSON("a" << 2)), boost::none);
+    ASSERT_BSONOBJ_EQ(output, BSON("p" << 1 << "q" << 1 << "a" << BSON("a" << 2) << "b" << 2));
+
+    // New fields are appended to the end while duplicates are merged in place.
+    obj = BSON("p" << 1 << "q" << 1 << "a" << BSON("a" << 1) << "b" << 1);
+    output = obj.addFields(BSON("c" << 2 << "a" << 2), boost::none);
+    ASSERT_BSONOBJ_EQ(output, BSON("p" << 1 << "q" << 1 << "a" << 2 << "b" << 1 << "c" << 2));
+
+    // No fields added when the set is empty
+    obj = BSON("p" << 1);
+    output = obj.addFields(BSON("q" << 2), StringDataSet{});
+    ASSERT_BSONOBJ_EQ(output, BSON("p" << 1));
+}
+
+TEST(BSONObj, addFields) {
+    // Fields that are not present in the 'from' object are ignored.
+    auto obj = BSON("p" << 1 << "q" << 1);
+    auto output = obj.addFields(BSON("a" << 2 << "b" << BSON("b" << 2)), {{"b", "c"}});
+    ASSERT_BSONOBJ_EQ(output, BSON("p" << 1 << "q" << 1 << "b" << BSON("b" << 2)));
+
+    // Duplicate fields names are merged at original poistion.
+    obj = BSON("p" << 2 << "q" << 2 << "b" << 2);
+    output = obj.addFields(BSON("q" << 1 << "p" << BSON("p" << 1)), {{"q", "p", "b", "c"}});
+    ASSERT_BSONOBJ_EQ(output, BSON("p" << BSON("p" << 1) << "q" << 1 << "b" << 2));
+
+    // New fields are appended to the end, in the order in which they appear in the 'from'
+    // object.
+    obj = BSON("p" << 1 << "q" << 1 << "b" << BSON("a" << 1));
+    output = obj.addFields(BSON("d" << 2 << "b" << 2 << "c" << 2), {{"b", "c", "d"}});
+    ASSERT_BSONOBJ_EQ(output, BSON("p" << 1 << "q" << 1 << "b" << 2 << "d" << 2 << "c" << 2));
+}
+
 TEST(BSONObj, sizeChecks) {
     auto generateBuffer = [](std::int32_t size) {
         std::vector<char> buffer(size);
         DataRange bufferRange(&buffer.front(), &buffer.back());
-        ASSERT_OK(bufferRange.write(LittleEndian<int32_t>(size)));
+        ASSERT_OK(bufferRange.writeNoThrow(LittleEndian<int32_t>(size)));
 
         return buffer;
     };
@@ -713,11 +798,50 @@ TEST(BSONObj, sizeChecks) {
     // But a size is in fact being enforced.
     ASSERT_THROWS_CODE(
         [&]() {
-            auto hugeBuffer = generateBuffer(70 * 1024 * 1024);
+            auto hugeBuffer = generateBuffer(130 * 1024 * 1024);
             BSONObj obj(hugeBuffer.data(), BSONObj::LargeSizeTrait{});
         }(),
         DBException,
         ErrorCodes::BSONObjectTooLarge);
+}
+
+TEST(BSONObj, nullByteInStringBasic) {
+    const size_t size = 3;
+    StringData str("b\0c", size);
+
+    // { "a": "b\0c" }
+    BSONObjBuilder b;
+    b.append("a"_sd, str);
+    BSONObj obj{b.obj()};
+
+    ASSERT_EQ(str.size(), obj.getStringField("a").size());
+    ASSERT_EQ(str, obj.getStringField("a"));
+}
+
+TEST(BSONObj, nullByteInStringMulti) {
+    const size_t size = 5;
+    StringData str("b\0c\0d", size);
+
+    // { "a": "b\0c\0d" }
+    BSONObjBuilder b;
+    b.append("a"_sd, str);
+    BSONObj obj{b.obj()};
+
+    ASSERT_EQ(str.size(), obj.getStringField("a").size());
+    ASSERT_EQ(str, obj.getStringField("a"));
+}
+
+TEST(BSONObj, nullByteInStringFull) {
+    const size_t size = 9;
+    StringData str("\0\0\0\0\0\0\0\0\0", size);
+
+    // { "a": "\0\0\0\0\0\0\0\0\0" }
+    BSONObjBuilder b;
+    b.append("a"_sd, str);
+    BSONObj obj{b.obj()};
+
+    ASSERT_EQ(str.size(), obj.getStringField("a").size());
+    ASSERT_EQ(str, obj.getStringField("a"));
 }
 
 }  // unnamed namespace

@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Public Domain 2014-2018 MongoDB, Inc.
+# Public Domain 2014-present MongoDB, Inc.
 # Public Domain 2008-2014 WiredTiger, Inc.
 #
 # This is free and unencumbered software released into the public domain.
@@ -31,7 +31,6 @@
 #   cause files to be closed.
 #
 
-import fnmatch, os, shutil, time
 from helper import copy_wiredtiger_home
 from suite_subprocess import suite_subprocess
 import wttest
@@ -43,7 +42,7 @@ class test_durability01(wttest.WiredTigerTestCase, suite_subprocess):
     def check_crash_restart(self, olddir, newdir):
         ''' Simulate a crash from olddir and restart in newdir. '''
         # with the connection still open, copy files to new directory
-        copy_wiredtiger_home(olddir, newdir)
+        copy_wiredtiger_home(self, olddir, newdir)
 
         # Open the new directory
         conn = self.setUpConnectionOpen(newdir)
@@ -71,8 +70,5 @@ class test_durability01(wttest.WiredTigerTestCase, suite_subprocess):
             if i % 5 == 0:
                 self.session.checkpoint()
             else:
-                self.session.verify(self.uri)
+                self.verifyUntilSuccess(self.session, self.uri)
             self.check_crash_restart(".", "RESTART")
-
-if __name__ == '__main__':
-    wttest.run()

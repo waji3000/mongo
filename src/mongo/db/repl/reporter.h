@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,14 +29,19 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
+#include <functional>
+#include <string>
+
 #include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
-#include "mongo/db/jsobj.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/executor/task_executor.h"
 #include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/functional.h"
 #include "mongo/stdx/mutex.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/net/hostandport.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
@@ -64,7 +68,8 @@ namespace repl {
  * keep alive timeout, resetting the keep alive schedule.
  */
 class Reporter {
-    MONGO_DISALLOW_COPYING(Reporter);
+    Reporter(const Reporter&) = delete;
+    Reporter& operator=(const Reporter&) = delete;
 
 public:
     /**
@@ -73,7 +78,7 @@ public:
      *
      * The returned status indicates whether or not the command was created.
      */
-    using PrepareReplSetUpdatePositionCommandFn = stdx::function<StatusWith<BSONObj>()>;
+    using PrepareReplSetUpdatePositionCommandFn = std::function<StatusWith<BSONObj>()>;
 
     Reporter(executor::TaskExecutor* executor,
              PrepareReplSetUpdatePositionCommandFn prepareReplSetUpdatePositionCommandFn,
@@ -107,6 +112,12 @@ public:
     bool isActive() const;
 
     /**
+     * Returns true if a remote command has been scheduled (but not completed)
+     * with the executor using the backupChannel.
+     */
+    bool isBackupActive() const;
+
+    /**
      * Returns true if new data is available while a remote command is in progress.
      * The reporter will schedule a subsequent remote update immediately upon successful
      * completion of the previous command instead of when the keep alive callback runs.
@@ -128,7 +139,7 @@ public:
      * Signals to the Reporter that there is new information to be sent to the "_target" server.
      * Returns the _status, indicating any error the Reporter has encountered.
      */
-    Status trigger();
+    Status trigger(bool allowOneMore = false);
 
     // ================== Test support API ===================
 
@@ -138,11 +149,18 @@ public:
     Date_t getKeepAliveTimeoutWhen_forTest() const;
     Status getStatus_forTest() const;
 
+    enum class RequestWaitingStatus { kNoWaiting, kNormalWaiting, kPrioritizedWaiting };
+
 private:
     /**
      * Returns true if reporter is active.
      */
-    bool _isActive_inlock() const;
+    bool _isActive(WithLock lk) const;
+
+    /**
+     * Returns true if reporter's backup channel is also active.
+     */
+    bool _isBackupActive(WithLock lk) const;
 
     /**
      * Prepares remote command to be run by the executor.
@@ -152,23 +170,28 @@ private:
     /**
      * Schedules remote command to be run by the executor with the given network timeout.
      */
-    void _sendCommand_inlock(BSONObj commandRequest, Milliseconds netTimeout);
+    void _sendCommand(WithLock lk,
+                      BSONObj commandRequest,
+                      Milliseconds netTimeout,
+                      bool useBackupChannel);
 
     /**
      * Callback for processing response from remote command.
      */
-    void _processResponseCallback(const executor::TaskExecutor::RemoteCommandCallbackArgs& rcbd);
+    void _processResponseCallback(const executor::TaskExecutor::RemoteCommandCallbackArgs& rcbd,
+                                  bool useBackupChannel);
 
     /**
      * Callback for preparing and sending remote command.
      */
     void _prepareAndSendCommandCallback(const executor::TaskExecutor::CallbackArgs& args,
-                                        bool fromTrigger);
+                                        bool fromTrigger,
+                                        bool useBackupChannel);
 
     /**
      * Signals end of Reporter work and notifies waiters.
      */
-    void _onShutdown_inlock();
+    void _onShutdown(WithLock lk, bool useBackupChannel);
 
     // Not owned by us.
     executor::TaskExecutor* const _executor;
@@ -196,13 +219,19 @@ private:
 
     // _isWaitingToSendReporter is true when Reporter is scheduled to be run by the executor and
     // subsequent updates have come in.
-    bool _isWaitingToSendReporter = false;
+    RequestWaitingStatus _requestWaitingStatus = RequestWaitingStatus::kNoWaiting;
 
     // Callback handle to the scheduled remote command.
     executor::TaskExecutor::CallbackHandle _remoteCommandCallbackHandle;
 
     // Callback handle to the scheduled task for preparing and sending the remote command.
     executor::TaskExecutor::CallbackHandle _prepareAndSendCommandCallbackHandle;
+
+    // Callback handle to the scheduled backup remote command.
+    executor::TaskExecutor::CallbackHandle _backupRemoteCommandCallbackHandle;
+
+    // Callback handle to the scheduled backup task for preparing and sending the remote command.
+    executor::TaskExecutor::CallbackHandle _backupPrepareAndSendCommandCallbackHandle;
 
     // Keep alive timeout callback will not run before this time.
     // If this date is Date_t(), the callback is either unscheduled or canceled.

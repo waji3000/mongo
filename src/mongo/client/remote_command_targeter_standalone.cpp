@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,12 +27,14 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <utility>
 
-#include "mongo/client/connection_string.h"
-#include "mongo/client/remote_command_targeter_standalone.h"
+#include <boost/move/utility_core.hpp>
 
 #include "mongo/base/status_with.h"
+#include "mongo/client/connection_string.h"
+#include "mongo/client/remote_command_targeter_standalone.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 
@@ -44,9 +45,14 @@ ConnectionString RemoteCommandTargeterStandalone::connectionString() {
     return ConnectionString(_hostAndPort);
 }
 
-Future<HostAndPort> RemoteCommandTargeterStandalone::findHostWithMaxWait(
-    const ReadPreferenceSetting& readPref, Milliseconds maxWait) {
-    return _hostAndPort;
+SemiFuture<HostAndPort> RemoteCommandTargeterStandalone::findHost(
+    const ReadPreferenceSetting& readPref, const CancellationToken& cancelToken) {
+    return {_hostAndPort};
+}
+
+SemiFuture<std::vector<HostAndPort>> RemoteCommandTargeterStandalone::findHosts(
+    const ReadPreferenceSetting& readPref, const CancellationToken& cancelToken) {
+    return {{_hostAndPort}};
 }
 
 StatusWith<HostAndPort> RemoteCommandTargeterStandalone::findHost(
@@ -54,13 +60,18 @@ StatusWith<HostAndPort> RemoteCommandTargeterStandalone::findHost(
     return _hostAndPort;
 }
 
-void RemoteCommandTargeterStandalone::markHostNotMaster(const HostAndPort& host,
-                                                        const Status& status) {
+void RemoteCommandTargeterStandalone::markHostNotPrimary(const HostAndPort& host,
+                                                         const Status& status) {
     dassert(host == _hostAndPort);
 }
 
 void RemoteCommandTargeterStandalone::markHostUnreachable(const HostAndPort& host,
                                                           const Status& status) {
+    dassert(host == _hostAndPort);
+}
+
+void RemoteCommandTargeterStandalone::markHostShuttingDown(const HostAndPort& host,
+                                                           const Status& status) {
     dassert(host == _hostAndPort);
 }
 

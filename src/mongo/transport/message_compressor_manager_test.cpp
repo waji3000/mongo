@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,23 +27,43 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
 
-#include "mongo/platform/basic.h"
+#include <array>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <cstdint>
+#include <cstring>
+#include <limits>
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
 
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/data_range.h"
+#include "mongo/base/data_range_cursor.h"
+#include "mongo/base/data_type_endian.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
 #include "mongo/rpc/message.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/transport/message_compressor_manager.h"
 #include "mongo/transport/message_compressor_noop.h"
 #include "mongo/transport/message_compressor_registry.h"
 #include "mongo/transport/message_compressor_snappy.h"
 #include "mongo/transport/message_compressor_zlib.h"
+#include "mongo/transport/message_compressor_zstd.h"
 #include "mongo/unittest/unittest.h"
-#include "mongo/util/log.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/shared_buffer.h"
+#include "mongo/util/str.h"
 
-#include <string>
-#include <vector>
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
+
 
 namespace mongo {
 namespace {
@@ -56,7 +75,7 @@ const auto assertOk = [](auto&& sw) {
 
 MessageCompressorRegistry buildRegistry() {
     MessageCompressorRegistry ret;
-    auto compressor = stdx::make_unique<NoopMessageCompressor>();
+    auto compressor = std::make_unique<NoopMessageCompressor>();
 
     std::vector<std::string> compressorList = {compressor->getName()};
     ret.setSupportedCompressors(std::move(compressorList));
@@ -86,7 +105,8 @@ void checkNegotiationResult(const BSONObj& result, const std::vector<std::string
     }
 }
 
-void checkServerNegotiation(const BSONObj& input, const std::vector<std::string>& expected) {
+void checkServerNegotiation(const boost::optional<std::vector<StringData>>& input,
+                            const std::vector<std::string>& expected) {
     auto registry = buildRegistry();
     MessageCompressorManager manager(&registry);
 
@@ -106,8 +126,8 @@ void checkFidelity(const Message& msg, std::unique_ptr<MessageCompressorBase> co
     registry.finalizeSupportedCompressors().transitional_ignore();
 
     MessageCompressorManager mgr(&registry);
-    auto negotiator = BSON("isMaster" << 1 << "compression" << BSON_ARRAY(compressorName));
     BSONObjBuilder negotiatorOut;
+    std::vector<StringData> negotiator({compressorName});
     mgr.serverNegotiate(negotiator, &negotiatorOut);
     checkNegotiationResult(negotiatorOut.done(), {compressorName});
 
@@ -183,23 +203,44 @@ Message buildMessage() {
 
 TEST(MessageCompressorManager, NoCompressionRequested) {
     auto input = BSON("isMaster" << 1);
-    checkServerNegotiation(input, {});
+    checkServerNegotiation(boost::none, {});
 }
 
 TEST(MessageCompressorManager, NormalCompressionRequested) {
-    auto input = BSON("isMaster" << 1 << "compression" << BSON_ARRAY("noop"));
+    std::vector<StringData> input{"noop"_sd};
     checkServerNegotiation(input, {"noop"});
 }
 
 TEST(MessageCompressorManager, BadCompressionRequested) {
-    auto input = BSON("isMaster" << 1 << "compression" << BSON_ARRAY("fakecompressor"));
+    std::vector<StringData> input{"fakecompressor"_sd};
     checkServerNegotiation(input, {});
 }
 
 TEST(MessageCompressorManager, BadAndGoodCompressionRequested) {
-    auto input = BSON("isMaster" << 1 << "compression" << BSON_ARRAY("fakecompressor"
-                                                                     << "noop"));
+    std::vector<StringData> input{"fakecompressor"_sd, "noop"_sd};
     checkServerNegotiation(input, {"noop"});
+}
+
+// Transitional: Parse BSON "isMaster"-like docs for compressor lists.
+boost::optional<std::vector<StringData>> parseBSON(BSONObj input) {
+    auto elem = input["compression"];
+    if (!elem) {
+        return boost::none;
+    }
+
+    uassert(ErrorCodes::BadValue,
+            str::stream() << "'compression' is not an array: " << elem,
+            elem.type() == Array);
+
+    std::vector<StringData> ret;
+    for (const auto& e : elem.Obj()) {
+        uassert(ErrorCodes::BadValue,
+                str::stream() << "'compression' element is not a string: " << e,
+                e.type() == String);
+        ret.push_back(e.valueStringData());
+    }
+
+    return ret;
 }
 
 TEST(MessageCompressorManager, FullNormalCompression) {
@@ -213,7 +254,7 @@ TEST(MessageCompressorManager, FullNormalCompression) {
     checkNegotiationResult(clientObj, {"noop"});
 
     BSONObjBuilder serverOutput;
-    serverManager.serverNegotiate(clientObj, &serverOutput);
+    serverManager.serverNegotiate(parseBSON(clientObj), &serverOutput);
     auto serverObj = serverOutput.done();
     checkNegotiationResult(serverObj, {"noop"});
 
@@ -222,25 +263,34 @@ TEST(MessageCompressorManager, FullNormalCompression) {
 
 TEST(NoopMessageCompressor, Fidelity) {
     auto testMessage = buildMessage();
-    checkFidelity(testMessage, stdx::make_unique<NoopMessageCompressor>());
+    checkFidelity(testMessage, std::make_unique<NoopMessageCompressor>());
 }
 
 TEST(SnappyMessageCompressor, Fidelity) {
     auto testMessage = buildMessage();
-    checkFidelity(testMessage, stdx::make_unique<SnappyMessageCompressor>());
+    checkFidelity(testMessage, std::make_unique<SnappyMessageCompressor>());
 }
 
 TEST(ZlibMessageCompressor, Fidelity) {
     auto testMessage = buildMessage();
-    checkFidelity(testMessage, stdx::make_unique<ZlibMessageCompressor>());
+    checkFidelity(testMessage, std::make_unique<ZlibMessageCompressor>());
+}
+
+TEST(ZstdMessageCompressor, Fidelity) {
+    auto testMessage = buildMessage();
+    checkFidelity(testMessage, std::make_unique<ZstdMessageCompressor>());
 }
 
 TEST(SnappyMessageCompressor, Overflow) {
-    checkOverflow(stdx::make_unique<SnappyMessageCompressor>());
+    checkOverflow(std::make_unique<SnappyMessageCompressor>());
 }
 
 TEST(ZlibMessageCompressor, Overflow) {
-    checkOverflow(stdx::make_unique<ZlibMessageCompressor>());
+    checkOverflow(std::make_unique<ZlibMessageCompressor>());
+}
+
+TEST(ZstdMessageCompressor, Overflow) {
+    checkOverflow(std::make_unique<ZstdMessageCompressor>());
 }
 
 TEST(MessageCompressorManager, SERVER_28008) {
@@ -248,17 +298,23 @@ TEST(MessageCompressorManager, SERVER_28008) {
     // Create a client and server that will negotiate the same compressors,
     // but with a different ordering for the preferred compressor.
 
+    std::unique_ptr<MessageCompressorBase> zstdCompressor =
+        std::make_unique<ZstdMessageCompressor>();
+    const auto zstdId = zstdCompressor->getId();
+
     std::unique_ptr<MessageCompressorBase> zlibCompressor =
-        stdx::make_unique<ZlibMessageCompressor>();
+        std::make_unique<ZlibMessageCompressor>();
     const auto zlibId = zlibCompressor->getId();
 
     std::unique_ptr<MessageCompressorBase> snappyCompressor =
-        stdx::make_unique<SnappyMessageCompressor>();
+        std::make_unique<SnappyMessageCompressor>();
     const auto snappyId = snappyCompressor->getId();
 
     MessageCompressorRegistry registry;
-    registry.setSupportedCompressors({snappyCompressor->getName(), zlibCompressor->getName()});
+    registry.setSupportedCompressors(
+        {snappyCompressor->getName(), zlibCompressor->getName(), zstdCompressor->getName()});
     registry.registerImplementation(std::move(zlibCompressor));
+    registry.registerImplementation(std::move(zstdCompressor));
     registry.registerImplementation(std::move(snappyCompressor));
     ASSERT_OK(registry.finalizeSupportedCompressors());
 
@@ -270,7 +326,7 @@ TEST(MessageCompressorManager, SERVER_28008) {
     clientManager.clientBegin(&clientOutput);
     auto clientObj = clientOutput.done();
     BSONObjBuilder serverOutput;
-    serverManager.serverNegotiate(clientObj, &serverOutput);
+    serverManager.serverNegotiate(parseBSON(clientObj), &serverOutput);
     auto serverObj = serverOutput.done();
     clientManager.clientFinish(serverObj);
 
@@ -294,6 +350,17 @@ TEST(MessageCompressorManager, SERVER_28008) {
     toSend = assertOk(serverManager.compressMessage(recvd, &compressorId));
     recvd = assertOk(clientManager.decompressMessage(toSend, &compressorId));
     ASSERT_EQ(compressorId, zlibId);
+
+    // Then, force the client to send as zstd. We should round trip as
+    // zstd if we feed the out compresor id parameter from
+    // decompressMessage back in to compressMessage.
+    toSend = buildMessage();
+    toSend = assertOk(clientManager.compressMessage(toSend, &zstdId));
+    recvd = assertOk(serverManager.decompressMessage(toSend, &compressorId));
+    ASSERT_EQ(compressorId, zstdId);
+    toSend = assertOk(serverManager.compressMessage(recvd, &compressorId));
+    recvd = assertOk(clientManager.decompressMessage(toSend, &compressorId));
+    ASSERT_EQ(compressorId, zstdId);
 }
 
 TEST(MessageCompressorManager, MessageSizeTooLarge) {
@@ -308,10 +375,49 @@ TEST(MessageCompressorManager, MessageSizeTooLarge) {
     badMessage.setLen(128);
 
     DataRangeCursor cursor(badMessage.data(), badMessage.data() + badMessage.dataLen());
-    uassertStatusOK(cursor.writeAndAdvance<LittleEndian<int32_t>>(dbQuery));
-    uassertStatusOK(cursor.writeAndAdvance<LittleEndian<int32_t>>(MaxMessageSizeBytes + 1));
-    uassertStatusOK(
-        cursor.writeAndAdvance<LittleEndian<uint8_t>>(registry.getCompressor("noop")->getId()));
+    cursor.writeAndAdvance<LittleEndian<int32_t>>(dbQuery);
+    cursor.writeAndAdvance<LittleEndian<int32_t>>(MaxMessageSizeBytes + 1);
+    cursor.writeAndAdvance<LittleEndian<uint8_t>>(registry.getCompressor("noop")->getId());
+
+    auto status = compManager.decompressMessage(Message(badMessageBuffer), nullptr).getStatus();
+    ASSERT_NOT_OK(status);
+}
+
+TEST(MessageCompressorManager, MessageSizeMax32Bit) {
+    auto registry = buildRegistry();
+    MessageCompressorManager compManager(&registry);
+
+    auto badMessageBuffer = SharedBuffer::allocate(128);
+    MsgData::View badMessage(badMessageBuffer.get());
+    badMessage.setId(1);
+    badMessage.setResponseToMsgId(0);
+    badMessage.setOperation(dbCompressed);
+    badMessage.setLen(128);
+
+    DataRangeCursor cursor(badMessage.data(), badMessage.data() + badMessage.dataLen());
+    cursor.writeAndAdvance<LittleEndian<int32_t>>(dbQuery);
+    cursor.writeAndAdvance<LittleEndian<int32_t>>(std::numeric_limits<int32_t>::max());
+    cursor.writeAndAdvance<LittleEndian<uint8_t>>(registry.getCompressor("noop")->getId());
+
+    auto status = compManager.decompressMessage(Message(badMessageBuffer), nullptr).getStatus();
+    ASSERT_NOT_OK(status);
+}
+
+TEST(MessageCompressorManager, MessageSizeTooSmall) {
+    auto registry = buildRegistry();
+    MessageCompressorManager compManager(&registry);
+
+    auto badMessageBuffer = SharedBuffer::allocate(128);
+    MsgData::View badMessage(badMessageBuffer.get());
+    badMessage.setId(1);
+    badMessage.setResponseToMsgId(0);
+    badMessage.setOperation(dbCompressed);
+    badMessage.setLen(128);
+
+    DataRangeCursor cursor(badMessage.data(), badMessage.data() + badMessage.dataLen());
+    cursor.writeAndAdvance<LittleEndian<int32_t>>(dbQuery);
+    cursor.writeAndAdvance<LittleEndian<int32_t>>(-1);
+    cursor.writeAndAdvance<LittleEndian<uint8_t>>(registry.getCompressor("noop")->getId());
 
     auto status = compManager.decompressMessage(Message(badMessageBuffer), nullptr).getStatus();
     ASSERT_NOT_OK(status);
@@ -331,8 +437,8 @@ TEST(MessageCompressorManager, RuntMessage) {
     // This is a totally bogus compression header of just the orginal opcode + 0 byte uncompressed
     // size
     DataRangeCursor cursor(badMessage.data(), badMessage.data() + badMessage.dataLen());
-    uassertStatusOK(cursor.writeAndAdvance<LittleEndian<int32_t>>(dbQuery));
-    uassertStatusOK(cursor.writeAndAdvance<LittleEndian<int32_t>>(0));
+    cursor.writeAndAdvance<LittleEndian<int32_t>>(dbQuery);
+    cursor.writeAndAdvance<LittleEndian<int32_t>>(0);
 
     auto status = compManager.decompressMessage(Message(badMessageBuffer), nullptr).getStatus();
     ASSERT_NOT_OK(status);

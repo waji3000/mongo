@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Public Domain 2014-2018 MongoDB, Inc.
+# Public Domain 2014-present MongoDB, Inc.
 # Public Domain 2008-2014 WiredTiger, Inc.
 #
 # This is free and unencumbered software released into the public domain.
@@ -26,21 +26,14 @@
 # ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
 # OTHER DEALINGS IN THE SOFTWARE.
 
-import wiredtiger, wtscenario, wttest
+import wttest
 
 # test_unicode01.py
-#   Make sure UTF8 config can be passed to WT_SESSION::create
-#
-#   There are a couple of tricks here:
-#   1) we don't want to treat the whole file as UTF-8, because this would
-#      be the only one in our tree and that causes problems for some
-#      scripts; and
-#   2) we can't pass in a Unicode object directly because the
-#      SWIG-generated code expects a simple Python string.
+#   Make sure UTF8 config can be passed to WT_SESSION::create.
+# Python turns Unicode strings into UTF-8.
 class test_unicode01(wttest.WiredTigerTestCase):
     def test_unicode(self):
-        self.session.create('table:t',
-            u'app_metadata={"name" : "Employ\xe9s"}'.encode('utf-8'))
-
-if __name__ == '__main__':
-    wttest.run()
+        # We use valid Unicode characters that are examples in
+        # the Unicode standard.
+        metadata_string = u'app_metadata={"name" : "Employ\u222b\u67d2\ud4db"}'
+        self.session.create('table:t', metadata_string)

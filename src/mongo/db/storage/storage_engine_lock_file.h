@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -31,17 +30,21 @@
 #pragma once
 
 #include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
 #include <memory>
 #include <string>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
 #include "mongo/db/service_context.h"
 
 namespace mongo {
 
+constexpr StringData kLockFileBasename = "mongod.lock"_sd;
+
 class StorageEngineLockFile {
-    MONGO_DISALLOW_COPYING(StorageEngineLockFile);
+    StorageEngineLockFile(const StorageEngineLockFile&) = delete;
+    StorageEngineLockFile& operator=(const StorageEngineLockFile&) = delete;
 
 public:
     static boost::optional<StorageEngineLockFile>& get(ServiceContext* service);
@@ -52,7 +55,7 @@ public:
      * Uses open() to read existing lock file or create new file.
      * Uses boost::filesystem to check lock file so may throw boost::exception.
      */
-    StorageEngineLockFile(const std::string& dbpath);
+    StorageEngineLockFile(const std::string& dbpath, StringData fileName = kLockFileBasename);
 
     virtual ~StorageEngineLockFile();
 
@@ -85,11 +88,19 @@ public:
     Status writePid();
 
     /**
+     * Writes the string to file.
+     * Fails if lock file has not been opened.
+     */
+    Status writeString(StringData str);
+
+    /**
      * Truncates file contents and releases file locks.
      */
     void clearPidAndUnlock();
 
 private:
+    std::string _getNonExistentPathMessage() const;
+
     std::string _dbpath;
     std::string _filespec;
     bool _uncleanShutdown;

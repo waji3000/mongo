@@ -2,7 +2,7 @@
 // ssl/detail/impl/engine.ipp
 // ~~~~~~~~~~~~~~~~~~~~~~~~~~
 //
-// Copyright (c) 2003-2017 Christopher M. Kohlhoff (chris at kohlhoff dot com)
+// Copyright (c) 2003-2019 Christopher M. Kohlhoff (chris at kohlhoff dot com)
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
@@ -15,14 +15,16 @@
 #pragma once
 #endif  // defined(_MSC_VER) && (_MSC_VER >= 1200)
 
-#include "asio/detail/config.hpp"
+#include <asio/detail/config.hpp>
+#include <asio/ip/address.hpp>
 
-#include "asio/detail/throw_error.hpp"
-#include "asio/error.hpp"
 #include "mongo/util/net/ssl/detail/engine.hpp"
 #include "mongo/util/net/ssl/error.hpp"
+#include <asio/detail/throw_error.hpp>
+#include <asio/error.hpp>
 
-#include "asio/detail/push_options.hpp"
+// This must be after all other includes
+#include <asio/detail/push_options.hpp>
 
 namespace asio {
 namespace ssl {
@@ -34,6 +36,7 @@ engine::engine(SSL_CTX* context, const std::string& remoteHostName)
         asio::error_code ec(static_cast<int>(::ERR_get_error()), asio::error::get_ssl_category());
         asio::detail::throw_error(ec, "engine");
     }
+    SSL_set_tlsext_status_type(ssl_, TLSEXT_STATUSTYPE_ocsp);
 
 #if (OPENSSL_VERSION_NUMBER < 0x10000000L)
     accept_mutex().init();
@@ -41,18 +44,15 @@ engine::engine(SSL_CTX* context, const std::string& remoteHostName)
 
     ::SSL_set_mode(ssl_, SSL_MODE_ENABLE_PARTIAL_WRITE);
     ::SSL_set_mode(ssl_, SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
-#if defined(SSL_MODE_RELEASE_BUFFERS)
-    ::SSL_set_mode(ssl_, SSL_MODE_RELEASE_BUFFERS);
-#endif  // defined(SSL_MODE_RELEASE_BUFFERS)
 
-    ::BIO* int_bio = 0;
+    ::BIO* int_bio = nullptr;
     ::BIO_new_bio_pair(&int_bio, 0, &ext_bio_, 0);
     ::SSL_set_bio(ssl_, int_bio, int_bio);
 }
 
 engine::~engine() {
     if (SSL_get_app_data(ssl_)) {
-        SSL_set_app_data(ssl_, 0);
+        SSL_set_app_data(ssl_, nullptr);
     }
 
     ::BIO_free(ext_bio_);
@@ -63,17 +63,32 @@ SSL* engine::native_handle() {
     return ssl_;
 }
 
+boost::optional<std::string> engine::get_sni() {
+    if (_sni) {
+        return _sni;
+    }
+
+    auto name = SSL_get_servername(ssl_, TLSEXT_NAMETYPE_host_name);
+    if (!name) {
+        _sni = boost::none;
+        return _sni;
+    }
+
+    _sni = std::string(name);
+    return _sni;
+}
+
 engine::want engine::handshake(stream_base::handshake_type type, asio::error_code& ec) {
     return perform((type == asio::ssl::stream_base::client) ? &engine::do_connect
                                                             : &engine::do_accept,
-                   0,
+                   nullptr,
                    0,
                    ec,
-                   0);
+                   nullptr);
 }
 
 engine::want engine::shutdown(asio::error_code& ec) {
-    return perform(&engine::do_shutdown, 0, 0, ec, 0);
+    return perform(&engine::do_shutdown, nullptr, 0, ec, nullptr);
 }
 
 engine::want engine::write(const asio::const_buffer& data,
@@ -144,13 +159,31 @@ asio::detail::static_mutex& engine::accept_mutex() {
 }
 #endif  // (OPENSSL_VERSION_NUMBER < 0x10000000L)
 
+
+void engine::purge_error_state() {
+#if (OPENSSL_VERSION_NUMBER < 0x1010000fL)
+    // OpenSSL 1.1.0 introduced a thread local state storage mechanism.
+    // Versions prior sometimes had contention issues on global mutexes
+    // which protected thread local state.
+    // If we are compiled against a version without native thread local
+    // support, cache a pointer to this thread's error state, which we can
+    // access without contention. If that state requires no cleanup,
+    // we can avoid invoking OpenSSL's more expensive machinery.
+    const static thread_local ERR_STATE* es = ERR_get_state();
+    if (es->bottom == es->top) {
+        return;
+    }
+#endif  // (OPENSSL_VERSION_NUMBER < 0x1010000fL)
+    ::ERR_clear_error();
+}
+
 engine::want engine::perform(int (engine::*op)(void*, std::size_t),
                              void* data,
                              std::size_t length,
                              asio::error_code& ec,
                              std::size_t* bytes_transferred) {
     std::size_t pending_output_before = ::BIO_ctrl_pending(ext_bio_);
-    ::ERR_clear_error();
+    purge_error_state();
     int result = (this->*op)(data, length);
     int ssl_error = ::SSL_get_error(ssl_, result);
     int sys_error = static_cast<int>(::ERR_get_error());
@@ -158,12 +191,16 @@ engine::want engine::perform(int (engine::*op)(void*, std::size_t),
 
     if (ssl_error == SSL_ERROR_SSL) {
         ec = asio::error_code(sys_error, asio::error::get_ssl_category());
-        return want_nothing;
+        return pending_output_after > pending_output_before ? want_output : want_nothing;
     }
 
     if (ssl_error == SSL_ERROR_SYSCALL) {
-        ec = asio::error_code(sys_error, asio::error::get_system_category());
-        return want_nothing;
+        if (sys_error == 0) {
+            ec = asio::ssl::error::unspecified_system_error;
+        } else {
+            ec = asio::error_code(sys_error, asio::error::get_ssl_category());
+        }
+        return pending_output_after > pending_output_before ? want_output : want_nothing;
     }
 
     if (result > 0 && bytes_transferred)
@@ -178,11 +215,14 @@ engine::want engine::perform(int (engine::*op)(void*, std::size_t),
     } else if (ssl_error == SSL_ERROR_WANT_READ) {
         ec = asio::error_code();
         return want_input_and_retry;
-    } else if (::SSL_get_shutdown(ssl_) & SSL_RECEIVED_SHUTDOWN) {
+    } else if (ssl_error == SSL_ERROR_ZERO_RETURN) {
         ec = asio::error::eof;
         return want_nothing;
-    } else {
+    } else if (ssl_error == SSL_ERROR_NONE) {
         ec = asio::error_code();
+        return want_nothing;
+    } else {
+        ec = asio::ssl::error::unexpected_result;
         return want_nothing;
     }
 }
@@ -196,9 +236,15 @@ int engine::do_accept(void*, std::size_t) {
 
 int engine::do_connect(void*, std::size_t) {
     if (!_remoteHostName.empty()) {
-        int ret = ::SSL_set_tlsext_host_name(ssl_, _remoteHostName.c_str());
-        if (ret != 1)
-            return ret;
+        error_code ec;
+        ip::make_address(_remoteHostName, ec);
+        // only have TLS advertise _remoteHostName as an SNI if it is not an IP address
+        if (ec) {
+            int ret = ::SSL_set_tlsext_host_name(ssl_, _remoteHostName.c_str());
+            if (ret != 1) {
+                return ret;
+            }
+        }
 
         _remoteHostName.clear();
     }
@@ -225,6 +271,6 @@ int engine::do_write(void* data, std::size_t length) {
 }  // namespace ssl
 }  // namespace asio
 
-#include "asio/detail/pop_options.hpp"
+#include <asio/detail/pop_options.hpp>
 
 #endif  // ASIO_SSL_DETAIL_IMPL_ENGINE_OPENSSL_IPP

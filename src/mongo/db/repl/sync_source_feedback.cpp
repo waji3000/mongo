@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,23 +27,32 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
 
-#include "mongo/platform/basic.h"
+#include <boost/move/utility_core.hpp>
+// IWYU pragma: no_include "cxxabi.h"
+#include <algorithm>
+#include <mutex>
 
-#include "mongo/db/repl/sync_source_feedback.h"
-
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/db/client.h"
 #include "mongo/db/repl/bgsync.h"
+#include "mongo/db/repl/member_state.h"
 #include "mongo/db/repl/repl_set_config.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/reporter.h"
+#include "mongo/db/repl/sync_source_feedback.h"
 #include "mongo/executor/task_executor.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/concurrency/idle_thread_block.h"
-#include "mongo/util/log.h"
+#include "mongo/util/duration.h"
 #include "mongo/util/net/hostandport.h"
 #include "mongo/util/scopeguard.h"
-#include "mongo/util/time_support.h"
+#include "mongo/util/str.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
+
 
 namespace mongo {
 namespace repl {
@@ -97,16 +105,18 @@ Reporter::PrepareReplSetUpdatePositionCommandFn makePrepareReplSetUpdatePosition
 
 }  // namespace
 
-void SyncSourceFeedback::forwardSlaveProgress() {
+void SyncSourceFeedback::forwardSecondaryProgress(bool prioritized) {
     {
         stdx::unique_lock<stdx::mutex> lock(_mtx);
         _positionChanged = true;
         _cond.notify_all();
         if (_reporter) {
-            auto triggerStatus = _reporter->trigger();
+            auto triggerStatus = _reporter->trigger(prioritized);
             if (!triggerStatus.isOK()) {
-                warning() << "unable to forward slave progress to " << _reporter->getTarget()
-                          << ": " << triggerStatus;
+                LOGV2_WARNING(21764,
+                              "Unable to forward progress",
+                              "target"_attr = _reporter->getTarget(),
+                              "error"_attr = triggerStatus);
             }
         }
     }
@@ -117,18 +127,23 @@ Status SyncSourceFeedback::_updateUpstream(Reporter* reporter) {
 
     auto triggerStatus = reporter->trigger();
     if (!triggerStatus.isOK()) {
-        warning() << "unable to schedule reporter to update replication progress on " << syncTarget
-                  << ": " << triggerStatus;
+        LOGV2_WARNING(21765,
+                      "Unable to schedule reporter to update replication progress",
+                      "syncTarget"_attr = syncTarget,
+                      "error"_attr = triggerStatus);
         return triggerStatus;
     }
 
     auto status = reporter->join();
 
     if (!status.isOK()) {
-        log() << "SyncSourceFeedback error sending update to " << syncTarget << ": " << status;
+        LOGV2(21760,
+              "SyncSourceFeedback error sending update",
+              "syncTarget"_attr = syncTarget,
+              "error"_attr = status);
     }
 
-    // Sync source blacklisting will be done in BackgroundSync and SyncSourceResolver.
+    // Sync source denylisting will be done in BackgroundSync and SyncSourceResolver.
 
     return status;
 }
@@ -145,7 +160,8 @@ void SyncSourceFeedback::shutdown() {
 void SyncSourceFeedback::run(executor::TaskExecutor* executor,
                              BackgroundSync* bgsync,
                              ReplicationCoordinator* replCoord) {
-    Client::initThread("SyncSourceFeedback");
+    Client::initThread("SyncSourceFeedback",
+                       getGlobalServiceContext()->getService(ClusterRole::ShardServer));
 
     HostAndPort syncTarget;
 
@@ -203,18 +219,20 @@ void SyncSourceFeedback::run(executor::TaskExecutor* executor,
         }
 
         if (syncTarget != target) {
-            LOG(1) << "setting syncSourceFeedback to " << target;
+            LOGV2_DEBUG(21761, 1, "Setting syncSourceFeedback", "target"_attr = target);
             syncTarget = target;
 
             // Update keepalive value from config.
             auto oldKeepAliveInterval = keepAliveInterval;
             keepAliveInterval = calculateKeepAliveInterval(replCoord->getConfig());
             if (oldKeepAliveInterval != keepAliveInterval) {
-                LOG(1) << "new syncSourceFeedback keep alive duration = " << keepAliveInterval
-                       << " (previously " << oldKeepAliveInterval << ")";
+                LOGV2_DEBUG(21762,
+                            1,
+                            "New syncSourceFeedback keep alive duration",
+                            "newKeepAliveInterval"_attr = keepAliveInterval,
+                            "oldKeepAliveInterval"_attr = oldKeepAliveInterval);
             }
         }
-
         Reporter reporter(executor,
                           makePrepareReplSetUpdatePositionCommandFn(replCoord, syncTarget, bgsync),
                           syncTarget,
@@ -234,9 +252,12 @@ void SyncSourceFeedback::run(executor::TaskExecutor* executor,
 
         auto status = _updateUpstream(&reporter);
         if (!status.isOK()) {
-            LOG(1) << "The replication progress command (replSetUpdatePosition) failed and will be "
-                      "retried: "
-                   << status;
+            LOGV2_DEBUG(
+                21763,
+                1,
+                "The replication progress command (replSetUpdatePosition) failed and will be "
+                "retried",
+                "error"_attr = status);
         }
     }
 }

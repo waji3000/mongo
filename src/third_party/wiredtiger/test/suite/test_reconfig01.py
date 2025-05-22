@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Public Domain 2014-2018 MongoDB, Inc.
+# Public Domain 2014-present MongoDB, Inc.
 # Public Domain 2008-2014 WiredTiger, Inc.
 #
 # This is free and unencumbered software released into the public domain.
@@ -25,6 +25,10 @@
 # OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
 # ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
 # OTHER DEALINGS IN THE SOFTWARE.
+#
+# [TEST_TAGS]
+# connection_api:reconfigure
+# [END_TAGS]
 
 import time
 import wiredtiger, wttest
@@ -36,33 +40,6 @@ class test_reconfig01(wttest.WiredTigerTestCase):
 
     def test_reconfig_shared_cache(self):
         self.conn.reconfigure("shared_cache=(name=pool,size=300M)")
-
-    def test_reconfig_async(self):
-        # Async starts off.  Reconfigure through all the various cases, each
-        # building from the previous state.
-        # Async is off, and remains off.
-        self.conn.reconfigure("async=(enabled=false)")
-        # Async is off, turn it on.
-        self.conn.reconfigure("async=(enabled=true)")
-        # Async is on, and remains on.
-        self.conn.reconfigure("async=(enabled=true)")
-        # Async is on, turn it off.
-        self.conn.reconfigure("async=(enabled=false)")
-        # Async is off, turn it on with ops_max and threads.
-        self.conn.reconfigure("async=(enabled=true,ops_max=512,threads=10)")
-        # Reconfigure and use same thread count. (no-op)
-        self.conn.reconfigure("async=(threads=10)")
-        # Reconfigure more threads.
-        self.conn.reconfigure("async=(threads=14)")
-        # Reconfigure fewer threads.
-        self.conn.reconfigure("async=(threads=8)")
-        # Reconfigure illegal ops_max (ignored).
-        self.conn.reconfigure("async=(ops_max=1024)")
-        # Turn async off.
-        self.conn.reconfigure("async=(enabled=false)")
-        # Async is off, turn it on.  Should end up with the
-        # same ops_max of 512 and thread of 8.
-        self.conn.reconfigure("async=(enabled=true)")
 
     def test_reconfig_eviction(self):
         # Increase the max number of running threads (default 8).
@@ -83,28 +60,17 @@ class test_reconfig01(wttest.WiredTigerTestCase):
         # Set eviction checkpoint target with an absolute value
         self.conn.reconfigure("eviction_checkpoint_target=50M")
 
-    def test_reconfig_lsm_manager(self):
-        # We create and populate a tiny LSM so that we can start off with
-        # the LSM threads running and change the numbers of threads.
-        # Take all the defaults.
-        uri = "lsm:test_reconfig"
-        nrecs = 10
-        SimpleDataSet(self, uri, nrecs).populate()
-        # Sleep to make sure all threads are started.
-        time.sleep(2)
-        # Now that an LSM tree exists, reconfigure LSM manager threads.
-        # We start with the default, which is 4.  Configure more threads.
-        self.conn.reconfigure("lsm_manager=(worker_thread_max=10)")
-        # Generate some work
-        nrecs = 20
-        SimpleDataSet(self, uri, nrecs).populate()
-        # Now reconfigure fewer threads.
-        self.conn.reconfigure("lsm_manager=(worker_thread_max=3)")
-
     def test_reconfig_statistics(self):
         self.conn.reconfigure("statistics=(all)")
         self.conn.reconfigure("statistics=(fast)")
         self.conn.reconfigure("statistics=(none)")
+
+    def test_reconfig_capacity(self):
+        self.conn.reconfigure("io_capacity=(total=80M)")
+        self.conn.reconfigure("io_capacity=(total=100M)")
+        msg = '/below minimum/'
+        self.assertRaisesWithMessage(wiredtiger.WiredTigerError,
+            lambda: self.conn.reconfigure("io_capacity=(total=16K)"), msg)
 
     def test_reconfig_checkpoints(self):
         self.conn.reconfigure("checkpoint=(wait=0)")
@@ -120,8 +86,6 @@ class test_reconfig01(wttest.WiredTigerTestCase):
         self.conn.reconfigure("statistics_log=(wait=0)")
         self.conn.reconfigure("statistics_log=(wait=2,on_close=true)")
         self.conn.reconfigure("statistics_log=(wait=0)")
-        self.conn.reconfigure("statistics_log=(wait=2,sources=[lsm:])")
-        self.conn.reconfigure("statistics_log=(wait=0)")
         self.conn.reconfigure("statistics_log=(wait=2,timestamp=\"t%b %d\")")
         self.conn.reconfigure("statistics_log=(wait=0)")
 
@@ -136,6 +100,3 @@ class test_reconfig01(wttest.WiredTigerTestCase):
         self.conn.reconfigure("file_manager=(close_idle_time=4)")
         self.conn.reconfigure(
             "file_manager=(close_idle_time=4,close_scan_interval=100)")
-
-if __name__ == '__main__':
-    wttest.run()

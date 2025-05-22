@@ -1,7 +1,6 @@
 // Test auth of the explain command.
 
 var conn = MongoRunner.runMongod({auth: ""});
-var authzErrorCode = 13;
 
 var admin = conn.getDB("admin");
 admin.createUser({user: "adminUser", pwd: "pwd", roles: ["root"]});
@@ -10,7 +9,7 @@ admin.auth({user: "adminUser", pwd: "pwd"});
 var db = conn.getDB("explain_auth_db");
 var coll = db.explain_auth_coll;
 
-assert.writeOK(coll.insert({_id: 1, a: 1}));
+assert.commandWorked(coll.insert({_id: 1, a: 1}));
 
 /**
  * Runs explains of find, count, remove, and update. Checks that they either succeed or fail with

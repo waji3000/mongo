@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Public Domain 2014-2018 MongoDB, Inc.
+# Public Domain 2014-present MongoDB, Inc.
 # Public Domain 2008-2014 WiredTiger, Inc.
 #
 # This is free and unencumbered software released into the public domain.
@@ -34,7 +34,7 @@ from workgen import *
 context = Context()
 conn_config="create,cache_size=4GB,session_max=1000,eviction=(threads_min=4,threads_max=8),log=(enabled=false),transaction_sync=(enabled=false),checkpoint_sync=true,checkpoint=(wait=10),statistics=(fast),statistics_log=(json,wait=1)"
 table_config="allocation_size=4k,memory_page_max=10MB,prefix_compression=false,split_pct=90,leaf_page_max=32k,internal_page_max=16k,type=file,block_compressor=snappy"
-conn = wiredtiger_open("WT_TEST", conn_config)
+conn = context.wiredtiger_open(conn_config)
 s = conn.open_session()
 tname = "file:test.wt"
 table_config="key_format=S,value_format=S,allocation_size=4k,memory_page_max=10MB,prefix_compression=false,split_pct=90,leaf_page_max=32k,leaf_value_max=64MB,internal_page_max=16k,type=file,block_compressor=snappy"
@@ -48,7 +48,8 @@ op = Operation(Operation.OP_INSERT, table)
 thread = Thread(op * 500)
 pop_workload = Workload(context, thread)
 print('populate:')
-pop_workload.run(conn)
+ret = pop_workload.run(conn)
+assert ret == 0, ret
 
 op = Operation(Operation.OP_INSERT, table, Key(Key.KEYGEN_UNIFORM, 10), Value(130 * 1024))
 op2 = Operation(Operation.OP_INSERT, table, Key(Key.KEYGEN_UNIFORM, 10), Value(100))
@@ -63,4 +64,5 @@ workload = Workload(context, t * 8 + read_thread)
 workload.options.run_time = 240
 workload.options.report_interval = 5
 print('workload:')
-workload.run(conn)
+ret = workload.run(conn)
+assert ret == 0, ret

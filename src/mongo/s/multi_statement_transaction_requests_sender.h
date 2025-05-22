@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,9 +29,29 @@
 
 #pragma once
 
+#include <memory>
+#include <vector>
+
+#include "mongo/client/read_preference.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/executor/task_executor.h"
 #include "mongo/s/async_requests_sender.h"
+#include "mongo/s/client/shard.h"
 
 namespace mongo {
+
+namespace transaction_request_sender_details {
+std::vector<AsyncRequestsSender::Request> attachTxnDetails(
+    OperationContext* opCtx, const std::vector<AsyncRequestsSender::Request>& requests);
+
+void processReplyMetadata(OperationContext* opCtx,
+                          const AsyncRequestsSender::Response& response,
+                          bool forAsyncGetMore = false);
+void processReplyMetadataForAsyncGetMore(OperationContext* opCtx,
+                                         const ShardId& shardId,
+                                         const BSONObj& responseBson);
+}  // namespace transaction_request_sender_details
 
 /**
  * Wrapper for AsyncRequestSender that attaches multi-statement transaction related fields to
@@ -43,26 +62,44 @@ class MultiStatementTransactionRequestsSender {
 public:
     /**
      * Constructs a new MultiStatementTransactionRequestsSender. The OperationContext* and
-     * TaskExecutor* must
-     * remain valid for the lifetime of the ARS.
+     * TaskExecutor* must remain valid for the lifetime of the ARS.
      */
     MultiStatementTransactionRequestsSender(
         OperationContext* opCtx,
-        executor::TaskExecutor* executor,
-        StringData dbName,
+        std::shared_ptr<executor::TaskExecutor> executor,
+        const DatabaseName& dbName,
         const std::vector<AsyncRequestsSender::Request>& requests,
         const ReadPreferenceSetting& readPreference,
-        Shard::RetryPolicy retryPolicy);
+        Shard::RetryPolicy retryPolicy,
+        AsyncRequestsSender::ShardHostMap designatedHostsMap = {});
 
-    bool done();
+    ~MultiStatementTransactionRequestsSender();
 
-    AsyncRequestsSender::Response next();
+    bool done() const;
+
+    /**
+     * Fetches the next response and validates it.
+     * Internally calls 'nextResponse()', then 'validateResponse()'. Throws if the response is not
+     * valid.
+     */
+    AsyncRequestsSender::Response next(bool forMergeCursors = false);
+
+    /**
+     * Fetches the next response, without validating it.
+     */
+    AsyncRequestsSender::Response nextResponse();
+
+    /**
+     * Validates a received response. Throws if the response is not valid.
+     */
+    void validateResponse(const AsyncRequestsSender::Response& response,
+                          bool forMergeCursors) const;
 
     void stopRetrying();
 
 private:
     OperationContext* _opCtx;
-    AsyncRequestsSender _ars;
+    std::unique_ptr<AsyncRequestsSender> _ars;
 };
 
 }  // namespace mongo

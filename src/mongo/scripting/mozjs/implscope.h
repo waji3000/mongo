@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,10 +29,38 @@
 
 #pragma once
 
+#include <atomic>
+#include <boost/optional/optional.hpp>
+#include <cstddef>
+#include <functional>
+#include <js/CompileOptions.h>
+#include <js/Context.h>
+#include <js/GCAPI.h>
+#include <js/RootingAPI.h>
+#include <js/TypeDecls.h>
+#include <js/Value.h>
 #include <jsapi.h>
+#include <jsfriendapi.h>
+#include <memory>
+#include <mongo/scripting/mozjs/freeOpToJSContext.h>
+#include <string>
+#include <thread>
+#include <type_traits>
+#include <utility>
+#include <vector>
 #include <vm/PosixNSPR.h>
 
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsontypes_util.h"
+#include "mongo/bson/oid.h"
+#include "mongo/bson/timestamp.h"
 #include "mongo/client/dbclient_cursor.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/platform/decimal128.h"
+#include "mongo/scripting/engine.h"
 #include "mongo/scripting/mozjs/bindata.h"
 #include "mongo/scripting/mozjs/bson.h"
 #include "mongo/scripting/mozjs/code.h"
@@ -52,6 +79,7 @@
 #include "mongo/scripting/mozjs/jsthread.h"
 #include "mongo/scripting/mozjs/maxkey.h"
 #include "mongo/scripting/mozjs/minkey.h"
+#include "mongo/scripting/mozjs/module_loader.h"
 #include "mongo/scripting/mozjs/mongo.h"
 #include "mongo/scripting/mozjs/mongohelpers.h"
 #include "mongo/scripting/mozjs/nativefunction.h"
@@ -61,14 +89,31 @@
 #include "mongo/scripting/mozjs/object.h"
 #include "mongo/scripting/mozjs/oid.h"
 #include "mongo/scripting/mozjs/regexp.h"
+#include "mongo/scripting/mozjs/resumetoken.h"
 #include "mongo/scripting/mozjs/session.h"
 #include "mongo/scripting/mozjs/status.h"
 #include "mongo/scripting/mozjs/timestamp.h"
 #include "mongo/scripting/mozjs/uri.h"
-#include "mongo/stdx/unordered_set.h"
+#include "mongo/scripting/mozjs/wraptype.h"
+#include "mongo/stdx/condition_variable.h"
+#include "mongo/stdx/mutex.h"
+#include "mongo/stdx/thread.h"
+#include "mongo/stdx/unordered_map.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/static_immortal.h"
+#include "mongo/util/string_map.h"
 
 namespace mongo {
 namespace mozjs {
+
+/**
+ * Error messages or error message prefixes.
+ */
+namespace ErrorMessage {
+const StringData kUncaughtException = "uncaught exception";
+const StringData kOutOfMemory = "Out of memory";
+const StringData kUnknownError = "Unknown Failure from JSInterpreter";
+}  // namespace ErrorMessage
 
 /**
  * Implementation Scope for MozJS
@@ -83,11 +128,12 @@ namespace mozjs {
  * For more information about overriden fields, see mongo::Scope
  */
 class MozJSImplScope final : public Scope {
-    MONGO_DISALLOW_COPYING(MozJSImplScope);
+    MozJSImplScope(const MozJSImplScope&) = delete;
+    MozJSImplScope& operator=(const MozJSImplScope&) = delete;
 
 public:
-    explicit MozJSImplScope(MozJSScriptEngine* engine);
-    ~MozJSImplScope();
+    explicit MozJSImplScope(MozJSScriptEngine* engine, boost::optional<int> jsHeapLimitMB);
+    ~MozJSImplScope() override;
 
     void init(const BSONObj* data) override;
 
@@ -109,6 +155,8 @@ public:
 
     std::string getError() override;
 
+    std::string getBaseURL() const override;
+
     bool hasOutOfMemoryException() override;
 
     void gc() override;
@@ -124,6 +172,12 @@ public:
     std::string getString(const char* field) override;
     bool getBoolean(const char* field) override;
     BSONObj getObject(const char* field) override;
+    OID getOID(const char* field) override;
+    // Note: The resulting BSONBinData is only valid within the scope of the 'withBinData' callback.
+    void getBinData(const char* field,
+                    std::function<void(const BSONBinData&)> withBinData) override;
+    Timestamp getTimestamp(const char* field) override;
+    JSRegEx getRegEx(const char* field) override;
 
     void setNumber(const char* field, double val) override;
     void setString(const char* field, StringData val) override;
@@ -151,7 +205,7 @@ public:
               bool assertOnError,
               int timeoutMs) override;
 
-    void injectNative(const char* field, NativeFunction func, void* data = 0) override;
+    void injectNative(const char* field, NativeFunction func, void* data = nullptr) override;
 
     ScriptingFunction _createFunction(const char* code) override;
 
@@ -287,6 +341,12 @@ public:
     }
 
     template <typename T>
+    typename std::enable_if<std::is_same<T, ResumeTokenDataUtility>::value, WrapType<T>&>::type
+    getProto() {
+        return _resumeTokenDataProto;
+    }
+
+    template <typename T>
     typename std::enable_if<std::is_same<T, SessionInfo>::value, WrapType<T>&>::type getProto() {
         return _sessionProto;
     }
@@ -312,6 +372,7 @@ public:
         return _globalProto;
     }
 
+    static const char* const kInteractiveShellName;
     static const char* const kExecResult;
     static const char* const kInvokeResult;
 
@@ -337,29 +398,71 @@ public:
     template <typename T, typename... Args>
     T* trackedNew(Args&&... args) {
         T* t = new T(std::forward<Args>(args)...);
-        _asanHandles.addPointer(t);
+        ASANHandles::getInstance().addPointer(t);
         return t;
     }
 
     template <typename T>
     void trackedDelete(T* t) {
-        _asanHandles.removePointer(t);
+        ASANHandles::getInstance().removePointer(t);
         delete (t);
     }
 
-    struct ASANHandles {
-        ASANHandles();
-        ~ASANHandles();
+#if __has_feature(address_sanitizer)
+    class ASANHandlesNoLock {
+    public:
+        ~ASANHandlesNoLock() = default;
+        void addPointer(void* ptr);
+        void removePointer(void* ptr);
+
+    protected:
+        stdx::unordered_map<void*, size_t> _handles;
+    };
+#endif
+
+    class ASANHandles {
+    public:
+        ~ASANHandles() = default;
 
         void addPointer(void* ptr);
         void removePointer(void* ptr);
 
-        stdx::unordered_set<void*> _handles;
+        static ASANHandles& getInstance() {
+            // We can't guarantee static de-initialization order across different compilation units,
+            // so we run into problems with the destruction of the ASANHandles singleton taking
+            // place before the WellKnownParserAtoms singleton in libmozjs.so. To get around this
+            // problem, we make the singleton here a StaticImmortal, which prevents the destructor
+            // from being called, allowing WellKnownParserAtoms to finish its cleanup when the
+            // program exits.
+            static StaticImmortal<ASANHandles> singleton;
+            return *singleton;
+        }
 
-        static ASANHandles* getThreadASANHandles();
+        ASANHandles() = default;
+        ASANHandles(const ASANHandles&) = delete;
+        ASANHandles& operator=(const ASANHandles&) = delete;
+#if __has_feature(address_sanitizer)
+    private:
+        stdx::mutex _mutex;
+        ASANHandlesNoLock _handles;
+#endif
     };
 
     void setStatus(Status status);
+
+    ModuleLoader* getModuleLoader() const;
+
+    /**
+     * getJSContextForTest and getGlobalForTest should only be used from implscope_test.cpp, as we
+     * need a way to expose these members for some JS API calls.
+     */
+    JSContext* getJSContextForTest() {
+        return _context;
+    }
+
+    JS::HandleObject getGlobalForTest() {
+        return _global;
+    }
 
 private:
     template <typename ImplScopeFunction>
@@ -375,10 +478,7 @@ private:
      */
     struct MozRuntime {
     public:
-        MozRuntime(const MozJSScriptEngine* engine);
-
-        std::unique_ptr<PRThread, std::function<void(PRThread*)>> _thread;
-        std::unique_ptr<JSRuntime, std::function<void(JSRuntime*)>> _runtime;
+        MozRuntime(const MozJSScriptEngine* engine, boost::optional<int> jsHeapLimitMB);
         std::unique_ptr<JSContext, std::function<void(JSContext*)>> _context;
     };
 
@@ -393,10 +493,10 @@ private:
     struct MozJSEntry;
     friend struct MozJSEntry;
 
-    static void _reportError(JSContext* cx, const char* message, JSErrorReport* report);
     static bool _interruptCallback(JSContext* cx);
-    static void _gcCallback(JSRuntime* rt, JSGCStatus status, void* data);
+    static void _gcCallback(JSContext* rt, JSGCStatus status, JS::GCReason reason, void* data);
     bool _checkErrorState(bool success, bool reportError = true, bool assertOnError = true);
+    Status _checkForPendingException();
 
     void installDBAccess();
     void installBSONTypes();
@@ -404,31 +504,49 @@ private:
 
     void setCompileOptions(JS::CompileOptions* co);
 
-    ASANHandles _asanHandles;
+    static bool onSyncPromiseResolved(JSContext* cx, unsigned argc, JS::Value* vp);
+    static bool onSyncPromiseRejected(JSContext* cx, unsigned argc, JS::Value* vp);
+    static bool awaitPromise(JSContext* cx, JS::HandleObject promise, JS::MutableHandleValue out);
+
+    // SpiderMonkey requires that an environment preparer is installed in order to dynamically load
+    // modules.
+    struct EnvironmentPreparer final : public js::ScriptEnvironmentPreparer {
+        JSContext* _context;
+        explicit EnvironmentPreparer(JSContext* cx) : _context(cx) {
+            js::SetScriptEnvironmentPreparer(cx, this);
+        }
+        void invoke(JS::HandleObject global, Closure& closure) override;
+    };
+
     MozJSScriptEngine* _engine;
     MozRuntime _mr;
-    JSRuntime* _runtime;
     JSContext* _context;
     WrapType<GlobalInfo> _globalProto;
     JS::HandleObject _global;
     std::vector<JS::PersistentRootedValue> _funcs;
+    StringMap<ScriptingFunction> _funcCodeToHandleMap;
     InternedStringTable _internedStrings;
     Status _killStatus;
-    mutable std::mutex _mutex;
-    std::condition_variable _sleepCondition;
-    std::string _error;
-    unsigned int _opId;        // op id for this scope
-    OperationContext* _opCtx;  // Op context for DbEval
+    mutable stdx::mutex _mutex;
+    stdx::condition_variable _sleepCondition;
+    OperationContext* _opCtx;         // Op context for DbEval
+    stdx::thread::id _opCtxThreadId;  // Id of the thread that owns '_opCtx'
     std::size_t _inOp;
-    std::atomic<bool> _pendingGC;
+    std::atomic<bool> _pendingGC;  // NOLINT
     ConnectState _connectState;
     Status _status;
     std::string _parentStack;
     std::size_t _generation;
     bool _requireOwnedObjects;
+    std::string _baseURL;
     bool _hasOutOfMemoryException;
 
-    bool _inReportError;
+    std::unique_ptr<ModuleLoader> _moduleLoader;
+    std::unique_ptr<EnvironmentPreparer> _environmentPreparer;
+    // _promiseResult must be a persistentRootedValue (instead of a simple RootedValue). Using a
+    // simple RootedValue here affects the stack cleanup conditions in the promise's execution
+    // context.
+    JS::PersistentRootedValue _promiseResult;
 
     WrapType<BinDataInfo> _binDataProto;
     WrapType<BSONInfo> _bsonProto;
@@ -454,6 +572,7 @@ private:
     WrapType<ObjectInfo> _objectProto;
     WrapType<OIDInfo> _oidProto;
     WrapType<RegExpInfo> _regExpProto;
+    WrapType<ResumeTokenDataUtility> _resumeTokenDataProto;
     WrapType<SessionInfo> _sessionProto;
     WrapType<MongoStatusInfo> _statusProto;
     WrapType<TimestampInfo> _timestampProto;
@@ -464,9 +583,10 @@ inline MozJSImplScope* getScope(JSContext* cx) {
     return static_cast<MozJSImplScope*>(JS_GetContextPrivate(cx));
 }
 
-inline MozJSImplScope* getScope(JSFreeOp* fop) {
-    return static_cast<MozJSImplScope*>(JS_GetRuntimePrivate(fop->runtime()));
+inline MozJSImplScope* getScope(class JS::GCContext* gcCtx) {
+    return getScope(freeOpToJSContext(gcCtx));
 }
+
 
 }  // namespace mozjs
 }  // namespace mongo

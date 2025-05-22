@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Public Domain 2014-2018 MongoDB, Inc.
+# Public Domain 2014-present MongoDB, Inc.
 # Public Domain 2008-2014 WiredTiger, Inc.
 #
 # This is free and unencumbered software released into the public domain.
@@ -26,17 +26,31 @@
 # ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
 # OTHER DEALINGS IN THE SOFTWARE.
 #
+# [TEST_TAGS]
+# encryption
+# [END_TAGS]
+#
 # test_encrypt02.py
 #   Encryption using passwords
 #
 
-import os, run, random
-import wiredtiger, wttest
+import random
+import wttest
 from suite_subprocess import suite_subprocess
 from wtscenario import make_scenarios
 
 # Test basic encryption
 class test_encrypt02(wttest.WiredTigerTestCase, suite_subprocess):
+    # To test the sodium encryptor, we use secretkey= rather than
+    # setting a keyid, because for a "real" (vs. test-only) encryptor,
+    # keyids require some kind of key server, and (a) setting one up
+    # for testing would be a nuisance and (b) currently the sodium
+    # encryptor doesn't support any anyway.
+    #
+    # It expects secretkey= to provide a hex-encoded 256-bit chacha20 key.
+    # This key will serve for testing purposes.
+    sodium_testkey = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
+
     uri = 'file:test_encrypt02'
     encrypt_type = [
         ('noarg', dict( encrypt_args='name=rotn', secret_arg=None)),
@@ -44,6 +58,8 @@ class test_encrypt02(wttest.WiredTigerTestCase, suite_subprocess):
         ('pass', dict( encrypt_args='name=rotn', secret_arg='ABC')),
         ('keyid-pass', dict(
             encrypt_args='name=rotn,keyid=11', secret_arg='ABC')),
+        ('sodium-pass', dict( encrypt_args='name=sodium', secret_arg=sodium_testkey)),
+        # The other combinations for sodium, which are rejected, are checked in encrypt08.
     ]
     scenarios = make_scenarios(encrypt_type)
 
@@ -51,6 +67,7 @@ class test_encrypt02(wttest.WiredTigerTestCase, suite_subprocess):
         # Load the compression extension, skip the test if missing
         extlist.skip_if_missing = True
         extlist.extension('encryptors', 'rotn')
+        extlist.extension('encryptors', 'sodium')
 
     nrecords = 5000
     bigvalue = "abcdefghij" * 1001    # len(bigvalue) = 10010
@@ -70,7 +87,7 @@ class test_encrypt02(wttest.WiredTigerTestCase, suite_subprocess):
         cursor = self.session.open_cursor(self.uri, None)
         r = random.Random()
         r.seed(0)
-        for idx in xrange(1,self.nrecords):
+        for idx in range(1,self.nrecords):
             start = r.randint(0,9)
             key = self.bigvalue[start:r.randint(0,100)] + str(idx)
             val = self.bigvalue[start:r.randint(0,10000)] + str(idx)
@@ -85,13 +102,13 @@ class test_encrypt02(wttest.WiredTigerTestCase, suite_subprocess):
 
         cursor = self.session.open_cursor(self.uri, None)
         r.seed(0)
-        for idx in xrange(1,self.nrecords):
+        for idx in range(1,self.nrecords):
             start = r.randint(0,9)
             key = self.bigvalue[start:r.randint(0,100)] + str(idx)
             val = self.bigvalue[start:r.randint(0,10000)] + str(idx)
             cursor.set_key(key)
             self.assertEqual(cursor.search(), 0)
-            self.assertEquals(cursor.get_value(), val)
+            self.assertEqual(cursor.get_value(), val)
         cursor.close()
 
         wtargs = []
@@ -100,6 +117,3 @@ class test_encrypt02(wttest.WiredTigerTestCase, suite_subprocess):
         wtargs += ['dump', self.uri]
         self.runWt(wtargs, outfilename='dump.out')
         self.check_non_empty_file('dump.out')
-
-if __name__ == '__main__':
-    wttest.run()

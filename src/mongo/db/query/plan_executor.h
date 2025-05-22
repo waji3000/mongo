@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,27 +29,96 @@
 
 #pragma once
 
-#include <boost/optional.hpp>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <exception>
+#include <string>
+#include <variant>
+#include <vector>
 
 #include "mongo/base/status.h"
-#include "mongo/db/catalog/util/partitioned.h"
-#include "mongo/db/query/query_solution.h"
-#include "mongo/db/storage/snapshot.h"
-#include "mongo/stdx/unordered_set.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/plan_stats.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/query/canonical_query.h"
+#include "mongo/db/query/plan_explainer.h"
+#include "mongo/db/query/plan_yield_policy.h"
+#include "mongo/db/query/restore_context.h"
+#include "mongo/db/query/write_ops/update_result.h"
+#include "mongo/db/record_id.h"
+#include "mongo/db/repl/oplog.h"
+#include "mongo/db/repl/optime.h"
+#include "mongo/db/s/scoped_collection_metadata.h"
+#include "mongo/db/shard_role.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/decorable.h"
+#include "mongo/util/future.h"
 
 namespace mongo {
 
-class BSONObj;
-class CappedInsertNotifier;
-struct CappedInsertNotifierData;
-class Collection;
-class CursorManager;
-class PlanExecutor;
-class PlanStage;
-class PlanYieldPolicy;
-class RecordId;
-struct PlanStageStats;
-class WorkingSet;
+// TODO: SERVER-76397 Remove this once we use CollectionAcquisition everywhere.
+class VariantCollectionPtrOrAcquisition {
+public:
+    VariantCollectionPtrOrAcquisition(const CollectionPtr* collectionPtr)
+        : _collectionPtrOrAcquisition(collectionPtr) {}
+    VariantCollectionPtrOrAcquisition(CollectionAcquisition collection)
+        : _collectionPtrOrAcquisition(collection) {}
+
+    const std::variant<const CollectionPtr*, CollectionAcquisition>& get() {
+        return _collectionPtrOrAcquisition;
+    };
+
+    const CollectionPtr& getCollectionPtr() const;
+
+    bool isCollectionPtr() const {
+        return holds_alternative<const CollectionPtr*>(_collectionPtrOrAcquisition);
+    }
+
+    bool isAcquisition() const {
+        return holds_alternative<CollectionAcquisition>(_collectionPtrOrAcquisition);
+    }
+
+    const CollectionAcquisition& getAcquisition() const {
+        return std::get<CollectionAcquisition>(_collectionPtrOrAcquisition);
+    }
+
+    boost::optional<ScopedCollectionFilter> getShardingFilter(OperationContext* opCtx) const;
+
+    const NamespaceString& nss() const {
+        return std::visit([](const auto& choice) -> const NamespaceString& { return nss(choice); },
+                          _collectionPtrOrAcquisition);
+    }
+
+    const RecordStore* getRecordStore() const {
+        return std::visit(
+            [](const auto& choice) -> const RecordStore* { return recordStore(choice); },
+            _collectionPtrOrAcquisition);
+    }
+
+private:
+    static const NamespaceString& nss(const CollectionPtr* collectionPtr) {
+        return (*collectionPtr)->ns();
+    }
+
+    static const NamespaceString& nss(const CollectionAcquisition& acquisition) {
+        return acquisition.nss();
+    }
+
+    static const RecordStore* recordStore(const CollectionPtr* collectionPtr) {
+        return (*collectionPtr)->getRecordStore();
+    }
+
+    static const RecordStore* recordStore(const CollectionAcquisition& acquisition) {
+        return acquisition.getCollectionPtr()->getRecordStore();
+    }
+
+    std::variant<const CollectionPtr*, CollectionAcquisition> _collectionPtrOrAcquisition;
+};
 
 /**
  * If a getMore command specified a lastKnownCommittedOpTime (as secondaries do), we want to stop
@@ -59,8 +127,30 @@ class WorkingSet;
  * 'clientsLastKnownCommittedOpTime' represents the time passed to the getMore command.
  * If the replication coordinator ever reports a higher committed op time, we should stop waiting
  * for inserts and return immediately to speed up the propagation of commit level changes.
+ *
+ * A boost::none value opts out of the commit point propagation. A null optime compares less than
+ * any non-null optimes and thus will always trigger an empty batch for commit point propagation.
  */
-extern const OperationContext::Decoration<repl::OpTime> clientsLastKnownCommittedOpTime;
+extern const OperationContext::Decoration<boost::optional<repl::OpTime>>
+    clientsLastKnownCommittedOpTime;
+
+
+struct PlanExecutorShardingState {
+    /**
+     * If a plan yielded because it encountered a sharding critical section, 'criticalSectionFuture'
+     * will be set to a future that becomes ready when the critical section ends. This future can be
+     * waited on to hold off resuming the plan execution while the critical section is still active.
+     */
+    boost::optional<SharedSemiFuture<void>> criticalSectionFuture;
+    /**
+     * If a plan yielded because it needed to refresh a sharding catalog cache, then
+     * 'catalogCacheRefreshRequired' will be set to the nss for which the CatalogCache needs to be
+     * refreshed.
+     */
+    boost::optional<NamespaceString> catalogCacheRefreshRequired;
+};
+
+extern const OperationContext::Decoration<PlanExecutorShardingState> planExecutorShardingState;
 
 /**
  * A PlanExecutor is the abstraction that knows how to crank a tree of stages into execution.
@@ -73,75 +163,30 @@ extern const OperationContext::Decoration<repl::OpTime> clientsLastKnownCommitte
 class PlanExecutor {
 public:
     enum ExecState {
-        // We successfully populated the out parameter.
+        // Successfully returned the next document and/or record id.
         ADVANCED,
 
-        // We're EOF.  We won't return any more results (edge case exception: capped+tailable).
+        // Execution is complete. There is no next document to return.
         IS_EOF,
-
-        // We were killed. This is a special failure case in which we cannot rely on the
-        // collection or database to still be valid.
-        // If the underlying PlanStage has any information on the error, it will be available in
-        // the objOut parameter. Call WorkingSetCommon::toStatusString() to retrieve the error
-        // details from the output BSON object.
-        DEAD,
-
-        // getNext was asked for data it cannot provide, or the underlying PlanStage had an
-        // unrecoverable error.
-        // If the underlying PlanStage has any information on the error, it will be available in
-        // the objOut parameter. Call WorkingSetCommon::toStatusString() to retrieve the error
-        // details from the output BSON object.
-        FAILURE,
     };
 
-    /**
-     * The yielding policy of the plan executor. By default, an executor does not yield itself
-     * (NO_YIELD).
-     */
-    enum YieldPolicy {
-        // Any call to getNext() may yield. In particular, the executor may be killed during any
-        // call to getNext().  If this occurs, getNext() will return DEAD. Additionally, this
-        // will handle all WriteConflictExceptions that occur while processing the query.
-        YIELD_AUTO,
+    // Describes whether callers should acquire locks when using a PlanExecutor. Not all cursors
+    // have the same locking behavior. In particular, find executors using the legacy PlanStage
+    // engine require the caller to lock the collection in MODE_IS. Aggregate executors and SBE
+    // executors, on the other hand, may access multiple collections and acquire their own locks on
+    // any involved collections while producing query results. Therefore, the caller need not
+    // explicitly acquire any locks for such PlanExecutors.
+    //
+    // The policy is consulted on getMore in order to determine locking behavior, since during
+    // getMore we otherwise could not easily know what flavor of cursor we're using.
+    enum class LockPolicy {
+        // The caller is responsible for locking the collection over which this PlanExecutor
+        // executes.
+        kLockExternally,
 
-        // This will handle WriteConflictExceptions that occur while processing the query, but will
-        // not yield locks. abandonSnapshot() will be called if a WriteConflictException occurs so
-        // callers must be prepared to get a new snapshot. The caller must hold their locks
-        // continuously from construction to destruction, since a PlanExecutor with this policy will
-        // not be registered to receive kill notifications.
-        WRITE_CONFLICT_RETRY_ONLY,
-
-        // Use this policy if you want to disable auto-yielding, but will release locks while using
-        // the PlanExecutor. Any WriteConflictExceptions will be raised to the caller of getNext().
-        YIELD_MANUAL,
-
-        // Can be used in one of the following scenarios:
-        //  - The caller will hold a lock continuously for the lifetime of this PlanExecutor.
-        //  - This PlanExecutor doesn't logically belong to a Collection, and so does not need to be
-        //    locked during execution. For example, a PlanExecutor containing a PipelineProxyStage
-        //    which is being used to execute an aggregation pipeline.
-        NO_YIELD,
-
-        // Will not yield locks or storage engine resources, but will check for interrupt.
-        INTERRUPT_ONLY,
-
-        // Used for testing, this yield policy will cause the PlanExecutor to time out on the first
-        // yield, returning DEAD with an error object encoding a ErrorCodes::ExceededTimeLimit
-        // message.
-        ALWAYS_TIME_OUT,
-
-        // Used for testing, this yield policy will cause the PlanExecutor to be marked as killed on
-        // the first yield, returning DEAD with an error object encoding a
-        // ErrorCodes::QueryPlanKilled message.
-        ALWAYS_MARK_KILLED,
+        // The caller need not hold no locks; this PlanExecutor acquires any necessary locks itself.
+        kLocksInternally,
     };
-
-    /**
-     * RegistrationToken is the type of key used to register this PlanExecutor with the
-     * CursorManager.
-     */
-    using RegistrationToken =
-        boost::optional<Partitioned<stdx::unordered_set<PlanExecutor*>>::PartitionId>;
 
     /**
      * This class will ensure a PlanExecutor is disposed before it is deleted.
@@ -154,8 +199,7 @@ public:
          */
         Deleter() = default;
 
-        inline Deleter(OperationContext* opCtx, CursorManager* cursorManager)
-            : _opCtx(opCtx), _cursorManager(cursorManager) {}
+        inline Deleter(OperationContext* opCtx) : _opCtx(opCtx) {}
 
         /**
          * If an owner of a std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> wants to assume
@@ -167,16 +211,15 @@ public:
         }
 
         /**
-         * If 'execPtr' hasn't already been disposed, will call dispose(). Also, if 'execPtr' has
-         * been registered with the CursorManager, will deregister it. If 'execPtr' is a yielding
-         * PlanExecutor, callers must hold a lock on the collection in at least MODE_IS.
+         * If 'execPtr' hasn't already been disposed, will call dispose(). If 'execPtr' is a
+         * yielding PlanExecutor, callers must hold a lock on the collection in at least MODE_IS.
          */
         inline void operator()(PlanExecutor* execPtr) {
             try {
                 // It is illegal to invoke operator() on a default constructed Deleter.
                 invariant(_opCtx);
                 if (!_dismissed) {
-                    execPtr->dispose(_opCtx, _cursorManager);
+                    execPtr->dispose(_opCtx);
                 }
                 delete execPtr;
             } catch (...) {
@@ -187,96 +230,27 @@ public:
 
     private:
         OperationContext* _opCtx = nullptr;
-        CursorManager* _cursorManager = nullptr;
 
         bool _dismissed = false;
     };
 
-    //
-    // Factory methods.
-    //
-    // On success, return a new PlanExecutor, owned by the caller.
-    //
-    // Passing YIELD_AUTO to any of these factories will construct a yielding executor which
-    // may yield in the following circumstances:
-    //   - During plan selection inside the call to make().
-    //   - On any call to getNext().
-    //   - On any call to restoreState().
-    //   - While executing the plan inside executePlan().
-    //
-    // The executor will also be automatically registered to receive notifications in the case of
-    // YIELD_AUTO or YIELD_MANUAL.
-    //
+    /**
+     * Helper method to aid in displaying an ExecState for debug or other recreational purposes.
+     */
+    static std::string stateToStr(ExecState s);
 
     /**
-     * Used when there is no canonical query and no query solution.
-     *
-     * Right now this is only for idhack updates which neither canonicalize nor go through normal
-     * planning.
+     * Throws a user exception if "planExecutorAlwaysFails" is enabled.
      */
-    static StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> make(
-        OperationContext* opCtx,
-        std::unique_ptr<WorkingSet> ws,
-        std::unique_ptr<PlanStage> rt,
-        const Collection* collection,
-        YieldPolicy yieldPolicy);
-
-    /**
-     * Used when we have a NULL collection and no canonical query. In this case, we need to
-     * explicitly pass a namespace to the plan executor.
-     */
-    static StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> make(
-        OperationContext* opCtx,
-        std::unique_ptr<WorkingSet> ws,
-        std::unique_ptr<PlanStage> rt,
-        NamespaceString nss,
-        YieldPolicy yieldPolicy);
-
-    /**
-     * Used when there is a canonical query but no query solution (e.g. idhack queries, queries
-     * against a NULL collection, queries using the subplan stage).
-     */
-    static StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> make(
-        OperationContext* opCtx,
-        std::unique_ptr<WorkingSet> ws,
-        std::unique_ptr<PlanStage> rt,
-        std::unique_ptr<CanonicalQuery> cq,
-        const Collection* collection,
-        YieldPolicy yieldPolicy);
-
-    /**
-     * The constructor for the normal case, when you have a collection, a canonical query, and a
-     * query solution.
-     */
-    static StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> make(
-        OperationContext* opCtx,
-        std::unique_ptr<WorkingSet> ws,
-        std::unique_ptr<PlanStage> rt,
-        std::unique_ptr<QuerySolution> qs,
-        std::unique_ptr<CanonicalQuery> cq,
-        const Collection* collection,
-        YieldPolicy yieldPolicy);
+    static void checkFailPointPlanExecAlwaysFails();
 
     /**
      * A PlanExecutor must be disposed before destruction. In most cases, this will happen
      * automatically through a PlanExecutor::Deleter or a ClientCursor.
      */
     PlanExecutor() = default;
+
     virtual ~PlanExecutor() = default;
-
-    //
-    // Accessors
-    //
-
-    /**
-     * Get the working set used by this executor, without transferring ownership.
-     */
-    virtual WorkingSet* getWorkingSet() const = 0;
-
-    /**
-     * Get the stage tree wrapped by this executor, without transferring ownership.
-     */
-    virtual PlanStage* getRootStage() const = 0;
 
     /**
      * Get the query that this executor is executing, without transferring ownership.
@@ -284,18 +258,30 @@ public:
     virtual CanonicalQuery* getCanonicalQuery() const = 0;
 
     /**
-     * Return the NS that the query is running over.
+     * Get the pipeline that this executor is executing, without transferring ownership.
+     */
+    virtual Pipeline* getPipeline() const {
+        return nullptr;
+    }
+
+    /**
+     * Return the namespace that the query is running over.
+     *
+     * WARNING: In general, a query execution plan can involve multiple collections, and therefore
+     * there is not a single namespace associated with a PlanExecutor. This method is here for
+     * legacy reasons, and new call sites should not be added.
      */
     virtual const NamespaceString& nss() const = 0;
+
+    /**
+     * Returns a vector of secondary namespaces that are relevant to this executor.
+     */
+    virtual const std::vector<NamespaceStringOrUUID>& getSecondaryNamespaces() const = 0;
 
     /**
      * Return the OperationContext that the plan is currently executing within.
      */
     virtual OperationContext* getOpCtx() const = 0;
-
-    //
-    // Methods that just pass down to the PlanStage tree.
-    //
 
     /**
      * Save any state required to recover from changes to the underlying collection's data.
@@ -309,6 +295,10 @@ public:
      * Restores the state saved by a saveState() call. When this method returns successfully, the
      * execution tree can once again be executed via work().
      *
+     * RestoreContext is a context containing external state needed by plan stages to be able to
+     * restore into a valid state. The RequiresCollectionStage requires a valid CollectionPtr for
+     * example.
+     *
      * Throws a UserException if the state cannot be successfully restored (e.g. a collection was
      * dropped or the position of a capped cursor was lost during a yield). If restore fails, it is
      * only safe to call dispose(), detachFromOperationContext(), or the destructor.
@@ -317,7 +307,7 @@ public:
      * WriteConflictException is encountered. If the time limit is exceeded during this retry
      * process, throws ErrorCodes::MaxTimeMSExpired.
      */
-    virtual void restoreState() = 0;
+    virtual void restoreState(const RestoreContext& context) = 0;
 
     /**
      * Detaches from the OperationContext and releases any storage-engine state.
@@ -337,29 +327,63 @@ public:
     virtual void reattachToOperationContext(OperationContext* opCtx) = 0;
 
     /**
-     * Same as restoreState but without the logic to retry if a WriteConflictException is
-     * thrown.
-     *
-     * This is only public for PlanYieldPolicy. DO NOT CALL ANYWHERE ELSE.
+     * Releases all storage engine resources that the plan executor has acquired. The plan will be
+     * left in the "saved" state so a call to restoreState() will be necessary afterwards.
      */
-    virtual void restoreStateWithoutRetrying() = 0;
-
-    //
-    // Running Support
-    //
+    void releaseAllAcquiredResources();
 
     /**
-     * Return the next result from the underlying execution tree.
+     * Produces the next document from the query execution plan. The caller can request that the
+     * executor returns documents by passing a non-null pointer for the 'objOut' output parameter,
+     * and similarly can request the RecordId by passing a non-null pointer for 'dlOut'. Both 'out'
+     * and 'dlOut' may be null if the caller wants to execute the query without producing documents,
+     * e.g. for count queries or to collect stats for explain.
      *
-     * For read operations, objOut or dlOut are populated with another query result.
+     * If a query-fatal error occurs, this method will throw an exception. If an exception is
+     * thrown, then the PlanExecutor is no longer capable of executing. The caller may extract stats
+     * from the underlying plan stages, but should not attempt to do anything else with the executor
+     * other than dispose() and destroy it.
      *
-     * For write operations, the return depends on the particulars of the write stage.
-     *
-     * If a YIELD_AUTO policy is set, then this method may yield.
+     * If the plan's YieldPolicy allows yielding, then any call to this method can result in a
+     * yield. This relinquishes any locks that were previously acquired, regardless of the use of
+     * any RAII locking helpers such as 'AutoGetCollection'. Furthermore, if an error is encountered
+     * during yield recovery, an exception can be thrown while locks are not held. Callers cannot
+     * expect locks to be held when this method throws an exception.
      */
-    virtual ExecState getNextSnapshotted(Snapshotted<BSONObj>* objOut, RecordId* dlOut) = 0;
+    virtual ExecState getNext(BSONObj* out, RecordId* dlOut) = 0;
 
-    virtual ExecState getNext(BSONObj* objOut, RecordId* dlOut) = 0;
+    /**
+     * This function allows the caller of an executor to specify how a batched execution should
+     * handle the next BSON object ('obj') produced by the executor. The field 'numAppended' is
+     * provided to indicate the number of results appended prior to 'obj'. On a successful call,
+     * 'pbrt' will be set to the latest postBatchResumeToken. This function returns whether or not
+     * the executor should continue appending; note that 'numAppended' is not incremented if
+     * append() returns false.
+     *
+     * See getNextBatch() below for use.
+     */
+    using AppendBSONObjFn =
+        std::function<bool(const BSONObj& obj, const BSONObj& pbrt, const size_t numAppended)>;
+
+    /**
+     * Looping version of getNext() which appends BSONObjs produced by the execution plan up to the
+     * 'batchSize', or until the provided append() function returns false. The 'pbrt' is an output
+     * parameter for storing the post-batch resume token for the last successful append(). Note that
+     * getNextBatch() will stash the current object on a failed append().
+     *
+     * Like getNext(), the caller can indicate that they wish to discard the entire batch of results
+     * by passing a null 'append' callback.
+     */
+    virtual size_t getNextBatch(size_t batchSize, AppendBSONObjFn append);
+
+    /**
+     * Similar to 'getNext()', but returns a Document rather than a BSONObj.
+     *
+     * Callers should generally prefer the BSONObj variant, since not all implementations of
+     * PlanExecutor use Document/Value as their runtime value format. These implementations will
+     * typically just convert the BSON to Document on behalf of the caller.
+     */
+    virtual ExecState getNextDocument(Document* objOut, RecordId* dlOut) = 0;
 
     /**
      * Returns 'true' if the plan is done producing results (or writing), 'false' otherwise.
@@ -367,38 +391,86 @@ public:
      * Tailable cursors are a possible exception to this: they may have further results even if
      * isEOF() returns true.
      */
-    virtual bool isEOF() = 0;
+    virtual bool isEOF() const = 0;
 
     /**
-     * Execute the plan to completion, throwing out the results.  Used when you want to work the
-     * underlying tree without getting results back.
-     *
-     * If a YIELD_AUTO policy is set on this executor, then this will automatically yield.
-     *
-     * Returns ErrorCodes::QueryPlanKilled if the plan executor was killed during a yield. If this
-     * error occurs, it is illegal to subsequently access the collection, since it may have been
-     * dropped.
+     * If this plan executor was constructed to execute a count implementation, e.g. it was obtained
+     * by calling 'getExecutorCount()', then executes the count operation and returns the result.
+     * Illegal to call on other plan executors.
      */
-    virtual Status executePlan() = 0;
+    virtual long long executeCount() = 0;
+
+    /**
+     * If this plan executor was constructed to execute an update, e.g. it was obtained by calling
+     * 'getExecutorUpdate()', then executes the update operation and returns an 'UpdateResult'
+     * describing the outcome.
+     *
+     * Illegal to call on other plan executors (for operations that are not updates). Also illegal
+     * to call for update statements that return either the pre-image or post-image. In this case,
+     * the caller should instead use 'executeFindAndModify()'.
+     */
+    UpdateResult executeUpdate();
+
+    /**
+     * If this plan executor has already executed an update operation, returns the an 'UpdateResult'
+     * describing the outcome of the update. Illegal to call if either 1) the PlanExecutor is not
+     * an update PlanExecutor, or 2) the PlanExecutor has not yet been executed either with
+     * 'executeUpdate()' or by calling 'getNext()' until ADVANCED or end-of-stream.
+     */
+    virtual UpdateResult getUpdateResult() const = 0;
+
+    /**
+     * If this plan executor was constructed to execute a delete, e.g. it was obtained by calling
+     * 'getExecutorDelete()', then executes the delete operation and returns the number of documents
+     * that were deleted.
+     *
+     * Illegal to call on other plan executors (for operations that are not delete). Also illegal to
+     * call for delete statements that return documents. In this case, the caller should instead use
+     * 'executeFindAndModify()' or should iterate the executor using 'getNext()' for multi-deletes
+     * that return the deleted documents.
+     */
+    long long executeDelete();
+
+    /**
+     * If this plan executor has already executed a delete operation, returns the the number of
+     * documents that were deleted. Illegal to call if either 1) the PlanExecutor is not a delete
+     * PlanExecutor, or 2) the PlanExecutor has not yet been executed either with 'executeDelete()'
+     * or by calling 'getNext()' until ADVANCED or end-of-stream.
+     */
+    virtual long long getDeleteResult() const = 0;
+
+    /**
+     * If this plan executor has already executed a batched delete operation, returns the
+     * 'BatchedDeleteStats' describing the outcome of the batched delete. Illegal to call if either
+     * 1) the PlanExecutor is not a delete PlanExecutor that executed a batched delete, or 2) the
+     * PlanExecutor has not yet been executed either with 'executeDelete()' or by calling
+     * 'getNext()' until end-of-stream.
+     */
+    virtual BatchedDeleteStats getBatchedDeleteStats() = 0;
+
+    /**
+     * Executes a findAndModify operation (which may either perform a single update or single
+     * delete). Returns the resulting document as called for by the findAndModify (the deleted
+     * document, the update pre-image, or the update post-image), or returns boost::none if no write
+     * occurred.
+     */
+    boost::optional<BSONObj> executeFindAndModify();
 
     //
     // Concurrency-related methods.
     //
 
     /**
-     * If we're yielding locks, the database we're operating over or any collection we're relying on
-     * may be dropped. Plan executors are notified of such events by calling markAsKilled().
-     * Callers must specify the reason for why this executor is being killed. Subsequent calls to
-     * getNext() will return DEAD, and fill 'objOut' with an error reflecting 'killStatus'. If this
-     * method is called multiple times, only the first 'killStatus' will be retained. It is an error
-     * to call this method with Status::OK.
+     * Notifies a PlanExecutor that it should die. Callers must specify the reason for why this
+     * executor is being killed. Subsequent calls to getNext() will throw a query-fatal exception
+     * with an error reflecting 'killStatus'. If this method is called multiple times, only the
+     * first 'killStatus' will be retained. It is illegal to call this method with Status::OK.
      */
     virtual void markAsKilled(Status killStatus) = 0;
 
     /**
      * Cleans up any state associated with this PlanExecutor. Must be called before deleting this
-     * PlanExecutor. It is illegal to use a PlanExecutor after calling dispose(). 'cursorManager'
-     * may be null.
+     * PlanExecutor. It is illegal to use a PlanExecutor after calling dispose().
      *
      * There are multiple cleanup scenarios:
      *  - This PlanExecutor will only ever use one OperationContext. In this case the
@@ -408,58 +480,108 @@ public:
      *    is the owner's responsibility to call dispose() with a valid OperationContext before
      *    deleting the PlanExecutor.
      */
-    virtual void dispose(OperationContext* opCtx, CursorManager* cursorManager) = 0;
+    virtual void dispose(OperationContext* opCtx) = 0;
 
     /**
-     * Helper method to aid in displaying an ExecState for debug or other recreational purposes.
+     * Forces all stages in the execution plan that are able to spill their data.
      */
-    static std::string statestr(ExecState s);
+    virtual void forceSpill() = 0;
 
     /**
-     * Stash the BSONObj so that it gets returned from the PlanExecutor on a later call to
-     * getNext().
+     * Stash the BSONObj so that it gets returned from the PlanExecutor a subsequent call to
+     * getNext(). Implementations should NOT support returning stashed BSON objects using
+     * 'getNextDocument()'. Only 'getNext()' should return the stashed BSON objects.
      *
-     * Enqueued documents are returned in FIFO order. The queued results are exhausted before
+     * Enqueued documents are returned in LIFO order. The stashed results are exhausted before
      * generating further results from the underlying query plan.
      *
      * Subsequent calls to getNext() must request the BSONObj and *not* the RecordId.
-     *
-     * If used in combination with getNextSnapshotted(), then the SnapshotId associated with
-     * 'obj' will be null when 'obj' is dequeued.
      */
-    virtual void enqueue(const BSONObj& obj) = 0;
-
-    /**
-     * Helper method which returns a set of BSONObj, where each represents a sort order of our
-     * output.
-     */
-    virtual BSONObjSet getOutputSorts() const = 0;
-
-    /**
-     * Communicate to this PlanExecutor that it is no longer registered with the CursorManager as a
-     * 'non-cached PlanExecutor'.
-     */
-    virtual void unsetRegistered() = 0;
-    virtual RegistrationToken getRegistrationToken() const& = 0;
-    void getRegistrationToken() && = delete;
-    virtual void setRegistrationToken(RegistrationToken token) & = 0;
+    virtual void stashResult(const BSONObj& obj) = 0;
 
     virtual bool isMarkedAsKilled() const = 0;
-    virtual Status getKillStatus() = 0;
+    virtual Status getKillStatus() const = 0;
 
     virtual bool isDisposed() const = 0;
-    virtual bool isDetached() const = 0;
 
     /**
      * If the last oplog timestamp is being tracked for this PlanExecutor, return it.
      * Otherwise return a null timestamp.
      */
-    virtual Timestamp getLatestOplogTimestamp() = 0;
+    virtual Timestamp getLatestOplogTimestamp() const = 0;
 
     /**
-     * Turns a BSONObj representing an error status produced by getNext() into a Status.
+     * If this PlanExecutor is tracking change stream or other resume tokens, returns the most
+     * recent token for the batch that is currently being built. Otherwise, returns an empty object.
      */
-    virtual Status getMemberObjectStatus(const BSONObj& memberObj) const = 0;
+    virtual BSONObj getPostBatchResumeToken() const = 0;
+
+    virtual LockPolicy lockPolicy() const = 0;
+
+    /**
+     * Returns a PlanExplainer instance to generate plan details and execution stats tracked by this
+     * executor.
+     *
+     * Implementations must be able to successfully generate and return stats even if the
+     * PlanExecutor has issued a query-fatal exception and the executor cannot be used for further
+     * query execution.
+     */
+    virtual const PlanExplainer& getPlanExplainer() const = 0;
+
+    /**
+     * For queries that have multiple executors, this can be used to differentiate between them.
+     */
+    virtual boost::optional<StringData> getExecutorType() const {
+        return boost::none;
+    }
+
+    /**
+     * Describes the query framework which an executor used.
+     */
+    enum class QueryFramework {
+        // Null value.
+        kUnknown,
+        // The entirety of this plan was executed in the classic execution engine.
+        kClassicOnly,
+        // This plan was executed using classic document source and any find pushdown was executed
+        // in the classic execution engine.
+        kClassicHybrid,
+        // The entirety of this plan was exectued in SBE via stage builders.
+        kSBEOnly,
+        // A portion of this plan was executed in SBE via stage builders.
+        kSBEHybrid
+    };
+
+    /**
+     * Returns the query framework that this executor used.
+     */
+    virtual QueryFramework getQueryFramework() const = 0;
+
+    /**
+     * Sets whether the executor needs to return owned data.
+     */
+    virtual void setReturnOwnedData(bool returnOwnedData) {};
+
+    /** TODO: SERVER-76397 Remove this once we use acquisitions everywhere.
+     *
+     * Returns whether the plan executor uses shard role acquisitions or the legacy
+     * CollectionPtr/AutoGet approach.
+     */
+    virtual bool usesCollectionAcquisitions() const = 0;
+
+    virtual bool isUsingDistinctScan() const {
+        return false;
+    }
+
+private:
+    // Used by 'executeWrite()'.
+    enum class PlanExecWriteType { kUpdate, kDelete, kFindAndModify };
+    std::string writeTypeToStr(PlanExecWriteType);
+
+    // Helper for executing PlanExecutors for updates or deletes, including findAndModify-style
+    // update or delete which return a document. The return value is boost::none unless the
+    // operation is a findAndModify that performed a write.
+    boost::optional<BSONObj> executeWrite(PlanExecWriteType writeType);
 };
 
 }  // namespace mongo

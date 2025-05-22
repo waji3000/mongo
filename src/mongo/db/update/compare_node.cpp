@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,11 +27,11 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
 
-#include "mongo/db/update/compare_node.h"
+#include <boost/smart_ptr/intrusive_ptr.hpp>
 
 #include "mongo/db/query/collation/collator_interface.h"
+#include "mongo/db/update/compare_node.h"
 
 namespace mongo {
 
@@ -49,8 +48,8 @@ void CompareNode::setCollator(const CollatorInterface* collator) {
     _collator = collator;
 }
 
-ModifierNode::ModifyResult CompareNode::updateExistingElement(
-    mutablebson::Element* element, std::shared_ptr<FieldRef> elementPath) const {
+ModifierNode::ModifyResult CompareNode::updateExistingElement(mutablebson::Element* element,
+                                                              const FieldRef& elementPath) const {
     const auto compareVal = element->compareWithBSONElement(_val, _collator, false);
     if ((compareVal == 0) || ((_mode == CompareMode::kMax) ? (compareVal > 0) : (compareVal < 0))) {
         return ModifyResult::kNoOp;

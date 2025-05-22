@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Public Domain 2014-2018 MongoDB, Inc.
+# Public Domain 2014-present MongoDB, Inc.
 # Public Domain 2008-2014 WiredTiger, Inc.
 #
 # This is free and unencumbered software released into the public domain.
@@ -34,7 +34,7 @@
 # See also the usage() function.
 #
 from __future__ import print_function
-import os, shutil, sys, tempfile
+import os, shutil, sys, subprocess, tempfile
 
 def eprint(*args, **kwargs):
     print(*args, file=sys.stderr, **kwargs)
@@ -85,7 +85,9 @@ class Translator:
                            'readonly', 'reopen_connection', 'run_ops',
                            'sample_interval', 'sess_config', 'table_config',
                            'table_count', 'threads', 'transaction_config',
-                           'value_sz' ]
+                           'value_sz',
+                           'max_idle_table_cycle',
+                           'max_idle_table_cycle_fatal' ]
 
     def set_opt(self, optname, val):
         if optname not in self.supported_opt_list:
@@ -155,8 +157,6 @@ class Translator:
     # "(abc=123,def=234,ghi=(hi=1,bye=2))" would return 3 items.
     def split_config_parens(self, s):
         if s[0:1] != '(':
-            import pdb
-            pdb.set_trace()
             self.fatal_error('missing left paren', 'config parse error')
         if s[-1:] != ')':
             self.fatal_error('missing right paren', 'config parse error')
@@ -201,16 +201,21 @@ class Translator:
             result += '      '
         return result
 
+    def copy_file(self, srcname, destdir, destname):
+        dest_fullname = os.path.join(destdir, destname)
+        suffix = 0
+        while os.path.exists(dest_fullname):
+            suffix += 1
+            dest_fullname = os.path.join(destdir, destname + str(suffix))
+        shutil.copyfile(srcname, dest_fullname)
+
     def copy_config(self):
         # Note: If we add the capability of setting options on the command
         # line, we won't be able to do a simple copy.
-        config_save = os.path.join(self.homedir, 'CONFIG.wtperf')
-        suffix = 0
-        while os.path.exists(config_save):
-            suffix += 1
-            config_save = os.path.join(self.homedir, \
-                                       'CONFIG.wtperf.' + str(suffix))
-        shutil.copyfile(self.filename, config_save)
+        self.copy_file(self.filename, self.homedir, 'CONFIG.wtperf')
+
+    def copy_python_source(self, srcname):
+        self.copy_file(srcname, self.homedir, 'RUN.py')
 
     # Wtperf's throttle is based on the number of regular operations,
     # not including log_like operations.  Workgen counts all operations,
@@ -271,6 +276,9 @@ class Translator:
             topts.read = 0
             topts.reads = 0
             topts.throttle = 0
+            # Workgen's throttle_burst variable has a default of 1.0 .  Since we
+            # are always explicitly setting it, set our own value to the same.
+            topts.throttle_burst = 1.0
             topts.update = 0
             topts.updates = 0
             topts.random_range = 0
@@ -325,7 +333,7 @@ class Translator:
                         '# Note that op_multi_table has already multiplied\n' +\
                         '# the number of operations by the number of tables.\n'
                 tdecls += 'ops = ops * (' + \
-                          str(run_ops) + ' / (' + str(topts.count) + \
+                          str(run_ops) + ' // (' + str(topts.count) + \
                           ' * table_count))' + \
                           '     # run_ops = ' + str(run_ops) + \
                           ', thread.count = ' + str(topts.count) + '\n'
@@ -333,8 +341,11 @@ class Translator:
             if topts.throttle > 0:
                 (throttle, comment) = self.calc_throttle(topts, log_like_table)
                 tdecls += comment
-                tdecls += self.assign_str(thread_name + '.options.throttle',
-                                          throttle)
+                tdecls += self.assign_str(
+                    thread_name + '.options.throttle', throttle)
+                tdecls += self.assign_str(
+                    thread_name + '.options.throttle_burst',
+                    topts.throttle_burst)
             tdecls += '\n'
             if topts.count > 1:
                 tnames += str(topts.count) + ' * '
@@ -384,7 +395,7 @@ class Translator:
     def translate_table_create(self):
         opts = self.options
         s = ''
-        s += 'wtperf_table_config = "key_format=S,value_format=S,type=lsm," +\\\n'
+        s += 'wtperf_table_config = "key_format=S,value_format=S," +\\\n'
         s += '    "exclusive=true,allocation_size=4kb," +\\\n'
         s += '    "internal_page_max=64kb,leaf_page_max=4kb,split_pct=100,"\n'
         if opts.compression != '':
@@ -411,7 +422,7 @@ class Translator:
             s += indent + 'table.options.random_value = True\n'
         if opts.random_range != 0:
             # In wtperf, the icount plus random_range is the key range
-            table_range = (opts.random_range + opts.icount) / opts.table_count
+            table_range = (opts.random_range + opts.icount) // opts.table_count
             s += indent + 'table.options.range = ' + str(table_range) + '\n'
         if opts.compressibility != 100:
             s += indent + 'table.options.value_compressibility = ' + \
@@ -466,7 +477,7 @@ class Translator:
             s += 'pop_ops = op_multi_table(pop_ops, tables)\n'
 
         if need_ops_per_thread:
-            s += 'nops_per_thread = icount / (populate_threads * table_count)\n'
+            s += 'nops_per_thread = icount // (populate_threads * table_count)\n'
             op_mult = ' * nops_per_thread'
         else:
             op_mult = ''
@@ -479,34 +490,18 @@ class Translator:
         s += 'pop_workload = Workload(context, populate_threads * pop_thread)\n'
         if self.verbose > 0:
             s += 'print("populate:")\n'
-        s += 'pop_workload.run(conn)\n'
-
-        # If configured, compact to allow LSM merging to complete.  We
-        # set an unlimited timeout because if we close the connection
-        # then any in-progress compact/merge is aborted.
-        if opts.compact:
-            if opts.async_threads == 0:
-                self.fatal_error('unexpected value for async_threads')
-            s += '\n'
-            if self.verbose > 0:
-                s += 'print("compact after populate:")\n'
-            s += 'import time\n'
-            s += 'start_time = time.time()\n'
-            s += 'async_callback = WtperfAsyncCallback()\n'
-            s += 'for i in range(0, table_count):\n'
-            s += '    op = conn.async_new_op(tables[i]._uri, "timeout=0", async_callback)\n'
-            s += '    op.compact()\n'
-            s += 'conn.async_flush()\n'
-            s += 'print("compact completed in {} seconds".format(' + \
-                'time.time() - start_time))\n'
+        s += 'ret = pop_workload.run(conn)\n'
+        s += 'assert ret == 0, ret\n'
 
         return s
 
     def translate_inner(self):
         workloadopts = ''
+        input_as_string = ''
         with open(self.filename) as fin:
             for line in fin:
                 self.linenum += 1
+                input_as_string += line
                 commentpos = line.find('#')
                 if commentpos >= 0:
                     line = line[0:commentpos]
@@ -542,8 +537,9 @@ class Translator:
         self.get_boolean_opt('random_value', False)
         self.get_string_opt('transaction_config', '')
         self.get_boolean_opt('compact', False)
-        self.get_int_opt('async_threads', 0)
         self.get_int_opt('pareto', 0)
+        self.get_int_opt('max_idle_table_cycle', 0)
+        self.get_boolean_opt('max_idle_table_cycle_fatal', False)
         opts = self.options
         if opts.range_partition and opts.random_range == 0:
             self.fatal_error('range_partition requires random_range to be set')
@@ -556,6 +552,14 @@ class Translator:
             workloadopts += 'workload.options.sample_interval_ms = ' + \
                 str(self.options.sample_interval_ms) + '\n'
 
+        if self.options.max_idle_table_cycle > 0:
+            workloadopts += 'workload.options.max_idle_table_cycle = ' + \
+            str(self.options.max_idle_table_cycle) + '\n'
+
+        if self.options.max_idle_table_cycle_fatal:
+            workloadopts += 'workload.options.max_idle_table_cycle_fatal = ' + \
+            str(self.options.max_idle_table_cycle_fatal) + '\n'
+
         s = '#/usr/bin/env python\n'
         s += '# generated from ' + self.filename + '\n'
         s += self.prefix
@@ -563,33 +567,15 @@ class Translator:
         s += 'from wiredtiger import *\n'
         s += 'from workgen import *\n'
         s += '\n'
-        async_config = ''
-        if opts.compact and opts.async_threads == 0:
-            opts.async_threads = 2;
-        if opts.async_threads > 0:
-            # Assume the default of 1024 for the max ops, although we
-            # could bump that up to 4096 if needed.
-            async_config = ',async=(enabled=true,threads=' + \
-                str(opts.async_threads) + ')'
-            s += '# this can be further customized\n'
-            s += 'class WtperfAsyncCallback(AsyncCallback):\n'
-            s += '    def __init__(self):\n'
-            s += '        pass\n'
-            s += '    def notify_error(self, key, value, optype, desc):\n'
-            s += '        print("ERROR: async notify(" + str(key) + "," + \\\n'
-            s += '             str(value) + "," + str(optype) + "): " + desc)\n'
-            s += '    def notify(self, op, op_ret, flags):\n'
-            s += '        if op_ret != 0:\n'
-            s += '            self.notify_error(op._key, op._value,\\\n'
-            s += '                op._optype, wiredtiger_strerror(op_ret))\n'
-            s += '        return op_ret\n'
+        s += '\'\'\' The original wtperf input file follows:\n'
+        s += input_as_string
+        if not input_as_string.endswith('\n'):
             s += '\n'
+        s += '\'\'\'\n\n'
         s += 'context = Context()\n'
         extra_config = ''
         s += 'conn_config = ""\n'
 
-        if async_config != '':
-            s += 'conn_config += ",' + async_config + '"  # async config\n'
         if conn_config != '':
             s += 'conn_config += ",' + conn_config + '"   # explicitly added\n'
         if compression != '':
@@ -599,8 +585,7 @@ class Translator:
                 s += 'conn_config += extensions_config(["compressors/' + \
                     compression + '"])\n'
             compression = 'block_compressor=' + compression + ','
-        s += 'conn = wiredtiger_open("' + self.homedir + \
-             '", "create," + conn_config)\n'
+        s += 'conn = context.wiredtiger_open("create," + conn_config)\n'
         s += 's = conn.open_session("' + sess_config + '")\n'
         s += '\n'
         s += self.translate_table_create()
@@ -618,16 +603,16 @@ class Translator:
                 s += 'conn.close()\n'
                 if readonly:
                     'conn_config += ",readonly=true"\n'
-                s += 'conn = wiredtiger_open(' + \
-                     '"' + self.homedir + '", "create," + conn_config)\n'
+                s += 'conn = context.wiredtiger_open("create," + conn_config)\n'
                 s += '\n'
             s += 'workload = Workload(context, ' + t_var + ')\n'
             s += workloadopts
 
             if self.verbose > 0:
                 s += 'print("workload:")\n'
-            s += 'workload.run(conn)\n\n'
-            s += 'latency_filename = "' + self.homedir + '/latency.out"\n'
+            s += 'ret = workload.run(conn)\n'
+            s += 'assert ret == 0, ret\n'
+            s += 'latency_filename = context.args.home + "/latency.out"\n'
             s += 'latency.workload_latency(workload, latency_filename)\n'
 
         if close_conn:
@@ -678,22 +663,28 @@ for arg in sys.argv[1:]:
             print(pysrc)
         else:
             (outfd, tmpfile) = tempfile.mkstemp(suffix='.py')
-            os.write(outfd, pysrc)
+            os.write(outfd, pysrc.encode())
             os.close(outfd)
             # We make a copy of the configuration file in the home
             # directory after the run, because the wiredtiger_open
             # in the generated code will clean out the directory first.
             raised = None
+            ret = 0
             try:
-                execfile(tmpfile)
-            except Exception, exception:
+                # Run python on the generated script
+                ret = subprocess.call([sys.executable, tmpfile])
+            except (KeyboardInterrupt, Exception) as exception:
                 raised = exception
             if not os.path.isdir(homedir):
                 os.makedirs(homedir)
             translator.copy_config()
+            translator.copy_python_source(tmpfile)
             os.remove(tmpfile)
             if raised != None:
                 raise raised
+            if ret != 0:
+                raise Exception('Running generated program returned ' +
+                                str(ret))
     else:
         usage()
         sys.exit(1)

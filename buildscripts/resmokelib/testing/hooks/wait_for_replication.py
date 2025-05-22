@@ -1,16 +1,15 @@
 """Test hook to wait for replication to complete on a replica set."""
 
-from __future__ import absolute_import
-
 import time
 
-from buildscripts.resmokelib import core
-from buildscripts.resmokelib import errors
+from buildscripts.resmokelib import core, errors
 from buildscripts.resmokelib.testing.hooks import interface
 
 
 class WaitForReplication(interface.Hook):
     """Wait for replication to complete."""
+
+    IS_BACKGROUND = False
 
     def __init__(self, hook_logger, fixture):
         """Initialize WaitForReplication."""
@@ -24,10 +23,25 @@ class WaitForReplication(interface.Hook):
         """Run mongo shell to call replSetTest.awaitReplication()."""
         start_time = time.time()
         client_conn = self.fixture.get_driver_connection_url()
-        js_cmds = "conn = '{}'; rst = new ReplSetTest(conn); rst.awaitReplication();".format(
-            client_conn)
-        shell_options = {"nodb": "", "eval": js_cmds}
-        shell_proc = core.programs.mongo_shell_program(self.hook_logger, **shell_options)
+        js_cmds = """
+            const {{ReplSetTest}} = await import("jstests/libs/replsettest.js");
+            const conn = '{}';
+            try {{
+                const rst = new ReplSetTest(conn);
+                rst.awaitReplication();
+            }} catch (e) {{
+                jsTestLog("WaitForReplication got error: " + tojson(e));
+                if (!e.message.includes('The server is in quiesce mode and will shut down')) {{
+                    throw e;
+                }}
+                jsTestLog("Ignoring shutdown error in quiesce mode");
+            }}"""
+        shell_options = {"nodb": "", "eval": js_cmds.format(client_conn)}
+        shell_proc = core.programs.mongo_shell_program(
+            self.hook_logger,
+            test_name="wait_for_replication",
+            **shell_options,
+        )
         shell_proc.start()
         return_code = shell_proc.wait()
         if return_code:

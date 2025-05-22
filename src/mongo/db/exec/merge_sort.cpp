@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,42 +29,43 @@
 
 #include "mongo/db/exec/merge_sort.h"
 
-#include "mongo/db/exec/scoped_timer.h"
-#include "mongo/db/exec/working_set.h"
-#include "mongo/db/exec/working_set_common.h"
-#include "mongo/db/query/collation/collator_interface.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/util/mongoutils/str.h"
+#include <cstddef>
+#include <memory>
+#include <string>
+#include <utility>
+
+#include <absl/container/node_hash_map.h>
+
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/query/collation/collation_index_key.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 
-using std::list;
 using std::string;
 using std::unique_ptr;
-using std::vector;
-using stdx::make_unique;
 
 // static
 const char* MergeSortStage::kStageType = "SORT_MERGE";
 
-MergeSortStage::MergeSortStage(OperationContext* opCtx,
+MergeSortStage::MergeSortStage(ExpressionContext* expCtx,
                                const MergeSortStageParams& params,
                                WorkingSet* ws)
-    : PlanStage(kStageType, opCtx),
+    : PlanStage(kStageType, expCtx),
       _ws(ws),
       _pattern(params.pattern),
-      _collator(params.collator),
       _dedup(params.dedup),
+      _recordIdDeduplicator(expCtx),
       _merging(StageWithValueComparison(ws, params.pattern, params.collator)) {}
 
-void MergeSortStage::addChild(PlanStage* child) {
-    _children.emplace_back(child);
+void MergeSortStage::addChild(std::unique_ptr<PlanStage> child) {
+    _children.emplace_back(std::move(child));
 
     // We have to call work(...) on every child before we can pick a min.
-    _noResultToMerge.push(child);
+    _noResultToMerge.push(_children.back().get());
 }
 
-bool MergeSortStage::isEOF() {
+bool MergeSortStage::isEOF() const {
     // If we have no more results to return, and we have no more children that we can call
     // work(...) on to get results, we're done.
     return _merging.empty() && _noResultToMerge.empty();
@@ -95,16 +95,14 @@ PlanStage::StageState MergeSortStage::doWork(WorkingSetID* out) {
                 } else {
                     ++_specificStats.dupsTested;
                     // ...and there's a RecordId and and we've seen the RecordId before
-                    if (_seen.end() != _seen.find(member->recordId)) {
+                    if (!_recordIdDeduplicator.insert(member->recordId)) {
                         // ...drop it.
                         _ws->free(id);
                         ++_specificStats.dupsDropped;
                         return PlanStage::NEED_TIME;
                     } else {
-                        // Otherwise, note that we've seen it.
-                        _seen.insert(member->recordId);
-                        // We're going to use the result from the child, so we remove it from
-                        // the queue of children without a result.
+                        // Otherwise, we're going to use the result from the child, so we remove it
+                        // from the queue of children without a result.
                         _noResultToMerge.pop();
                     }
                 }
@@ -131,12 +129,6 @@ PlanStage::StageState MergeSortStage::doWork(WorkingSetID* out) {
             // anymore.
             _noResultToMerge.pop();
             return PlanStage::NEED_TIME;
-        } else if (PlanStage::FAILURE == code || PlanStage::DEAD == code) {
-            // The stage which produces a failure is responsible for allocating a working set member
-            // with error details.
-            invariant(WorkingSet::INVALID_ID != id);
-            *out = id;
-            return code;
         } else if (PlanStage::NEED_YIELD == code) {
             *out = id;
             return code;
@@ -146,7 +138,7 @@ PlanStage::StageState MergeSortStage::doWork(WorkingSetID* out) {
     }
 
     // If we're here, for each non-EOF child, we have a valid WSID.
-    verify(!_merging.empty());
+    MONGO_verify(!_merging.empty());
 
     // Get the 'min' WSID.  _merging is a priority queue so its top is the smallest.
     MergingRef top = _merging.top();
@@ -179,13 +171,50 @@ bool MergeSortStage::StageWithValueComparison::operator()(const MergingRef& lhs,
         string fn = patternElt.fieldName();
 
         BSONElement lhsElt;
-        verify(lhsMember->getFieldDotted(fn, &lhsElt));
+        MONGO_verify(lhsMember->getFieldDotted(fn, &lhsElt));
+
+        // Determine if the left-hand side sort key part comes from an index key.
+        auto lhsIsFromIndexKey = !lhsMember->hasObj();
 
         BSONElement rhsElt;
-        verify(rhsMember->getFieldDotted(fn, &rhsElt));
+        MONGO_verify(rhsMember->getFieldDotted(fn, &rhsElt));
+
+        // Determine if the right-hand side sort key part comes from an index key.
+        auto rhsIsFromIndexKey = !rhsMember->hasObj();
+
+        // A collator to use for comparing the sort keys. We need a collator when values of both
+        // operands are supplied from a document and the query is collated. Otherwise bit-wise
+        // comparison should be used.
+        const CollatorInterface* collatorToUse = nullptr;
+        BSONObj collationEncodedKeyPart;  // A backing storage for a collation-encoded key part
+                                          // (according to collator '_collator') of one of the
+                                          // operands - either 'lhsElt' or 'rhsElt'.
+
+        if (nullptr == _collator || (lhsIsFromIndexKey && rhsIsFromIndexKey)) {
+            // Either the query has no collation or both sort key parts come directly from index
+            // keys. If the query has no collation, then the query planner should have guaranteed
+            // that we don't need to perform any collation-aware comparisons here. If both sort key
+            // parts come from index keys, we may need to respect a collation but the index keys are
+            // already collation-encoded, therefore we don't need to perform a collation-aware
+            // comparison here.
+        } else if (!lhsIsFromIndexKey && !rhsIsFromIndexKey) {
+            // Both sort key parts were extracted from fetched documents. These parts are not
+            // collation-encoded, so we will need to perform a collation-aware comparison.
+            collatorToUse = _collator;
+        } else {
+            // One of the sort key parts was extracted from fetched documents. Encode that part
+            // using the query's collation.
+            auto& keyPartFetchedFromDocument = rhsIsFromIndexKey ? lhsElt : rhsElt;
+
+            // Encode the sort key part only if it contains some value.
+            if (keyPartFetchedFromDocument.ok()) {
+                collationEncodedKeyPart = encodeKeyPartWithCollation(keyPartFetchedFromDocument);
+                keyPartFetchedFromDocument = collationEncodedKeyPart.firstElement();
+            }
+        }
 
         // false means don't compare field name.
-        int x = lhsElt.woCompare(rhsElt, false, _collator);
+        int x = lhsElt.woCompare(rhsElt, false, collatorToUse);
         if (-1 == patternElt.number()) {
             x = -x;
         }
@@ -200,13 +229,21 @@ bool MergeSortStage::StageWithValueComparison::operator()(const MergingRef& lhs,
     return false;
 }
 
+BSONObj MergeSortStage::StageWithValueComparison::encodeKeyPartWithCollation(
+    const BSONElement& keyPart) {
+    BSONObjBuilder objectBuilder;
+    CollationIndexKey::collationAwareIndexKeyAppend(keyPart, _collator, &objectBuilder);
+    return objectBuilder.obj();
+}
+
 unique_ptr<PlanStageStats> MergeSortStage::getStats() {
     _commonStats.isEOF = isEOF();
 
     _specificStats.sortPattern = _pattern;
 
-    unique_ptr<PlanStageStats> ret = make_unique<PlanStageStats>(_commonStats, STAGE_SORT_MERGE);
-    ret->specific = make_unique<MergeSortStats>(_specificStats);
+    unique_ptr<PlanStageStats> ret =
+        std::make_unique<PlanStageStats>(_commonStats, STAGE_SORT_MERGE);
+    ret->specific = std::make_unique<MergeSortStats>(_specificStats);
     for (size_t i = 0; i < _children.size(); ++i) {
         ret->children.emplace_back(_children[i]->getStats());
     }

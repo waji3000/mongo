@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -27,30 +26,33 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kExecutor
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/client/fetcher.h"
-
+#include <mutex>
 #include <ostream>
 #include <utility>
 
-#include "mongo/db/jsobj.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/client/dbclient_base.h"
+#include "mongo/client/fetcher.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/logv2/log.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/destructor_guard.h"
-#include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
 #include "mongo/util/scopeguard.h"
+#include "mongo/util/str.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kExecutor
+
 
 namespace mongo {
 
 namespace {
-
-using executor::RemoteCommandRequest;
-using executor::RemoteCommandResponse;
 
 using RemoteCommandCallbackArgs = executor::TaskExecutor::RemoteCommandCallbackArgs;
 const char* kCursorFieldName = "cursor";
@@ -59,6 +61,7 @@ const char* kNamespaceFieldName = "ns";
 
 const char* kFirstBatchFieldName = "firstBatch";
 const char* kNextBatchFieldName = "nextBatch";
+const char* kPostBatchResumeTokenFieldName = "postBatchResumeToken";
 
 /**
  * Parses cursor response in command result for cursor ID, namespace and documents.
@@ -76,13 +79,12 @@ Status parseCursorResponse(const BSONObj& obj,
     if (cursorElement.eoo()) {
         return Status(ErrorCodes::FailedToParse,
                       str::stream() << "cursor response must contain '" << kCursorFieldName
-                                    << "' field: "
-                                    << obj);
+                                    << "' field: " << obj);
     }
     if (!cursorElement.isABSONObj()) {
-        return Status(
-            ErrorCodes::FailedToParse,
-            str::stream() << "'" << kCursorFieldName << "' field must be an object: " << obj);
+        return Status(ErrorCodes::FailedToParse,
+                      str::stream()
+                          << "'" << kCursorFieldName << "' field must be an object: " << obj);
     }
     BSONObj cursorObj = cursorElement.Obj();
 
@@ -90,17 +92,13 @@ Status parseCursorResponse(const BSONObj& obj,
     if (cursorIdElement.eoo()) {
         return Status(ErrorCodes::FailedToParse,
                       str::stream() << "cursor response must contain '" << kCursorFieldName << "."
-                                    << kCursorIdFieldName
-                                    << "' field: "
-                                    << obj);
+                                    << kCursorIdFieldName << "' field: " << obj);
     }
     if (cursorIdElement.type() != mongo::NumberLong) {
         return Status(ErrorCodes::FailedToParse,
                       str::stream() << "'" << kCursorFieldName << "." << kCursorIdFieldName
                                     << "' field must be a 'long' but was a '"
-                                    << typeName(cursorIdElement.type())
-                                    << "': "
-                                    << obj);
+                                    << typeName(cursorIdElement.type()) << "': " << obj);
     }
     batchData->cursorId = cursorIdElement.numberLong();
 
@@ -108,25 +106,20 @@ Status parseCursorResponse(const BSONObj& obj,
     if (namespaceElement.eoo()) {
         return Status(ErrorCodes::FailedToParse,
                       str::stream() << "cursor response must contain "
-                                    << "'"
-                                    << kCursorFieldName
-                                    << "."
-                                    << kNamespaceFieldName
-                                    << "' field: "
-                                    << obj);
+                                    << "'" << kCursorFieldName << "." << kNamespaceFieldName
+                                    << "' field: " << obj);
     }
     if (namespaceElement.type() != mongo::String) {
         return Status(ErrorCodes::FailedToParse,
                       str::stream() << "'" << kCursorFieldName << "." << kNamespaceFieldName
-                                    << "' field must be a string: "
-                                    << obj);
+                                    << "' field must be a string: " << obj);
     }
-    const NamespaceString tempNss(namespaceElement.valueStringData());
+    const NamespaceString tempNss = NamespaceStringUtil::deserialize(
+        boost::none, namespaceElement.valueStringData(), SerializationContext::stateDefault());
     if (!tempNss.isValid()) {
         return Status(ErrorCodes::BadValue,
                       str::stream() << "'" << kCursorFieldName << "." << kNamespaceFieldName
-                                    << "' contains an invalid namespace: "
-                                    << obj);
+                                    << "' contains an invalid namespace: " << obj);
     }
     batchData->nss = tempNss;
 
@@ -134,27 +127,20 @@ Status parseCursorResponse(const BSONObj& obj,
     if (batchElement.eoo()) {
         return Status(ErrorCodes::FailedToParse,
                       str::stream() << "cursor response must contain '" << kCursorFieldName << "."
-                                    << batchFieldName
-                                    << "' field: "
-                                    << obj);
+                                    << batchFieldName << "' field: " << obj);
     }
     if (!batchElement.isABSONObj()) {
         return Status(ErrorCodes::FailedToParse,
                       str::stream() << "'" << kCursorFieldName << "." << batchFieldName
-                                    << "' field must be an array: "
-                                    << obj);
+                                    << "' field must be an array: " << obj);
     }
     BSONObj batchObj = batchElement.Obj();
     for (auto itemElement : batchObj) {
         if (!itemElement.isABSONObj()) {
             return Status(ErrorCodes::FailedToParse,
                           str::stream() << "found non-object " << itemElement << " in "
-                                        << "'"
-                                        << kCursorFieldName
-                                        << "."
-                                        << batchFieldName
-                                        << "' field: "
-                                        << obj);
+                                        << "'" << kCursorFieldName << "." << batchFieldName
+                                        << "' field: " << obj);
         }
         batchData->documents.push_back(itemElement.Obj());
     }
@@ -163,6 +149,19 @@ Status parseCursorResponse(const BSONObj& obj,
         doc.shareOwnershipWith(obj);
     }
 
+    BSONElement postBatchResumeToken = cursorObj.getField(kPostBatchResumeTokenFieldName);
+    if (!postBatchResumeToken.eoo()) {
+        if (postBatchResumeToken.type() != BSONType::Object) {
+            return Status(ErrorCodes::FailedToParse,
+                          str::stream()
+                              << "'" << kCursorFieldName << "." << kPostBatchResumeTokenFieldName
+                              << "' field must be of type object " << obj);
+        }
+
+        batchData->otherFields.postBatchResumeToken.emplace(postBatchResumeToken.Obj().getOwned());
+    }
+
+
     return Status::OK();
 }
 
@@ -170,13 +169,14 @@ Status parseCursorResponse(const BSONObj& obj,
 
 Fetcher::Fetcher(executor::TaskExecutor* executor,
                  const HostAndPort& source,
-                 const std::string& dbname,
+                 const DatabaseName& dbname,
                  const BSONObj& findCmdObj,
                  CallbackFn work,
                  const BSONObj& metadata,
                  Milliseconds findNetworkTimeout,
                  Milliseconds getMoreNetworkTimeout,
-                 std::unique_ptr<RemoteCommandRetryScheduler::RetryPolicy> firstCommandRetryPolicy)
+                 std::unique_ptr<RemoteCommandRetryScheduler::RetryPolicy> firstCommandRetryPolicy,
+                 transport::ConnectSSLMode sslMode)
     : _executor(executor),
       _source(source),
       _dbname(dbname),
@@ -187,14 +187,25 @@ Fetcher::Fetcher(executor::TaskExecutor* executor,
       _getMoreNetworkTimeout(getMoreNetworkTimeout),
       _firstRemoteCommandScheduler(
           _executor,
-          RemoteCommandRequest(_source, _dbname, _cmdObj, _metadata, nullptr, _findNetworkTimeout),
+          [&] {
+              RemoteCommandRequest request(
+                  _source, _dbname, _cmdObj, _metadata, nullptr, _findNetworkTimeout);
+              request.sslMode = sslMode;
+              return request;
+          }(),
           [this](const auto& x) { return this->_callback(x, kFirstBatchFieldName); },
-          std::move(firstCommandRetryPolicy)) {
+          std::move(firstCommandRetryPolicy)),
+      _sslMode(sslMode) {
     uassert(ErrorCodes::BadValue, "callback function cannot be null", _work);
 }
 
 Fetcher::~Fetcher() {
-    DESTRUCTOR_GUARD(shutdown(); join(););
+    try {
+        shutdown();
+        _join();
+    } catch (...) {
+        reportFailedDestructor(MONGO_SOURCE_LOCATION());
+    }
 }
 
 HostAndPort Fetcher::getSource() const {
@@ -218,10 +229,10 @@ std::string Fetcher::getDiagnosticString() const {
     str::stream output;
     output << "Fetcher";
     output << " source: " << _source.toString();
-    output << " database: " << _dbname;
+    output << " database: " << toStringForLogging(_dbname);
     output << " query: " << _cmdObj;
     output << " query metadata: " << _metadata;
-    output << " active: " << _isActive_inlock();
+    output << " active: " << _isActive(lk);
     output << " findNetworkTimeout: " << _findNetworkTimeout;
     output << " getMoreNetworkTimeout: " << _getMoreNetworkTimeout;
     output << " shutting down?: " << _isShuttingDown_inlock();
@@ -238,10 +249,10 @@ std::string Fetcher::getDiagnosticString() const {
 
 bool Fetcher::isActive() const {
     stdx::lock_guard<stdx::mutex> lk(_mutex);
-    return _isActive_inlock();
+    return _isActive(lk);
 }
 
-bool Fetcher::_isActive_inlock() const {
+bool Fetcher::_isActive(WithLock lk) const {
     return State::kRunning == _state || State::kShuttingDown == _state;
 }
 
@@ -274,6 +285,7 @@ void Fetcher::shutdown() {
         case State::kPreStart:
             // Transition directly from PreStart to Complete if not started yet.
             _state = State::kComplete;
+            _completionPromise.emplaceValue();
             return;
         case State::kRunning:
             _state = State::kShuttingDown;
@@ -291,9 +303,19 @@ void Fetcher::shutdown() {
     }
 }
 
-void Fetcher::join() {
-    stdx::unique_lock<stdx::mutex> lk(_mutex);
-    _condition.wait(lk, [this]() { return !_isActive_inlock(); });
+Status Fetcher::join(Interruptible* interruptible) {
+    try {
+        stdx::unique_lock<stdx::mutex> lk(_mutex);
+        interruptible->waitForConditionOrInterrupt(
+            _condition, lk, [&]() { return !_isActive(lk); });
+        return Status::OK();
+    } catch (const DBException&) {
+        return exceptionToStatus();
+    }
+}
+
+void Fetcher::_join() {
+    invariantStatusOK(join(Interruptible::notInterruptible()));
 }
 
 Fetcher::State Fetcher::getState_forTest() const {
@@ -316,11 +338,14 @@ Status Fetcher::_scheduleGetMore(const BSONObj& cmdObj) {
         return Status(ErrorCodes::CallbackCanceled,
                       "fetcher was shut down after previous batch was processed");
     }
+
+    RemoteCommandRequest request(
+        _source, _dbname, cmdObj, _metadata, nullptr, _getMoreNetworkTimeout);
+    request.sslMode = _sslMode;
+
     StatusWith<executor::TaskExecutor::CallbackHandle> scheduleResult =
         _executor->scheduleRemoteCommand(
-            RemoteCommandRequest(
-                _source, _dbname, cmdObj, _metadata, nullptr, _getMoreNetworkTimeout),
-            [this](const auto& x) { return this->_callback(x, kNextBatchFieldName); });
+            request, [this](const auto& x) { return this->_callback(x, kNextBatchFieldName); });
 
     if (!scheduleResult.isOK()) {
         return scheduleResult.getStatus();
@@ -333,8 +358,11 @@ Status Fetcher::_scheduleGetMore(const BSONObj& cmdObj) {
 
 void Fetcher::_callback(const RemoteCommandCallbackArgs& rcbd, const char* batchFieldName) {
     QueryResponse batchData;
-    auto finishCallbackGuard = MakeGuard([this, &batchData] {
-        if (batchData.cursorId && !batchData.nss.isEmpty()) {
+    NextAction nextAction = NextAction::kNoAction;
+
+    ScopeGuard finishCallbackGuard([this, &batchData, &nextAction] {
+        if (batchData.cursorId && !batchData.nss.isEmpty() &&
+            nextAction != NextAction::kExitAndKeepCursorAlive) {
             _sendKillCursors(batchData.cursorId, batchData.nss);
         }
         _finishCallback();
@@ -363,15 +391,13 @@ void Fetcher::_callback(const RemoteCommandCallbackArgs& rcbd, const char* batch
         return;
     }
 
-    batchData.otherFields.metadata = std::move(rcbd.response.data);
-    batchData.elapsedMillis = rcbd.response.elapsedMillis.value_or(Milliseconds{0});
+    batchData.otherFields.metadata = rcbd.response.data;
+    batchData.elapsed = rcbd.response.elapsed.value_or(Microseconds{0});
     {
         stdx::lock_guard<stdx::mutex> lk(_mutex);
         batchData.first = _first;
         _first = false;
     }
-
-    NextAction nextAction = NextAction::kNoAction;
 
     if (!batchData.cursorId) {
         _work(StatusWith<QueryResponse>(batchData), &nextAction, nullptr);
@@ -403,27 +429,33 @@ void Fetcher::_callback(const RemoteCommandCallbackArgs& rcbd, const char* batch
         return;
     }
 
-    finishCallbackGuard.Dismiss();
+    finishCallbackGuard.dismiss();
 }
 
 void Fetcher::_sendKillCursors(const CursorId id, const NamespaceString& nss) {
     if (id) {
         auto logKillCursorsResult = [](const RemoteCommandCallbackArgs& args) {
             if (!args.response.isOK()) {
-                warning() << "killCursors command task failed: " << redact(args.response.status);
+                LOGV2_WARNING(23918,
+                              "killCursors command task failed",
+                              "error"_attr = redact(args.response.status));
                 return;
             }
             auto status = getStatusFromCommandResult(args.response.data);
             if (!status.isOK()) {
-                warning() << "killCursors command failed: " << redact(status);
+                LOGV2_WARNING(23919, "killCursors command failed", "error"_attr = redact(status));
             }
         };
+
         auto cmdObj = BSON("killCursors" << nss.coll() << "cursors" << BSON_ARRAY(id));
-        auto scheduleResult = _executor->scheduleRemoteCommand(
-            RemoteCommandRequest(_source, _dbname, cmdObj, nullptr), logKillCursorsResult);
+        RemoteCommandRequest request(_source, _dbname, cmdObj, nullptr);
+        request.sslMode = _sslMode;
+
+        auto scheduleResult = _executor->scheduleRemoteCommand(request, logKillCursorsResult);
         if (!scheduleResult.isOK()) {
-            warning() << "failed to schedule killCursors command: "
-                      << redact(scheduleResult.getStatus());
+            LOGV2_WARNING(23920,
+                          "Failed to schedule killCursors command",
+                          "error"_attr = redact(scheduleResult.getStatus()));
         }
     }
 }
@@ -440,6 +472,8 @@ void Fetcher::_finishCallback() {
     _state = State::kComplete;
     _first = false;
     _condition.notify_all();
+
+    _completionPromise.emplaceValue();
 
     invariant(_work);
     std::swap(_work, tempWork);

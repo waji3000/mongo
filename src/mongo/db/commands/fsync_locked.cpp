@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,18 +27,21 @@
  *    it in the license file.
  */
 
+#include <functional>
+#include <utility>
+
 #include "mongo/db/commands/fsync_locked.h"
 
 namespace mongo {
 namespace {
-stdx::function<bool()> lockedForWritingImpl;
+std::function<bool()> lockedForWritingImpl;
 }  // namespace
 
 bool lockedForWriting() {
     return lockedForWritingImpl();
 }
 
-void setLockedForWritingImpl(stdx::function<bool()> impl) {
+void setLockedForWritingImpl(std::function<bool()> impl) {
     lockedForWritingImpl = std::move(impl);
 }
 }  // namespace mongo

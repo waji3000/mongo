@@ -1,16 +1,12 @@
 // Provides convenience methods for confirming system.profile content.
 
 // Given a command, build its expected shape in the system profiler.
-function buildCommandProfile(command, sharded) {
+export function buildCommandProfile(command, sharded) {
     let commandProfile = {};
 
-    if (sharded && command.mapReduce) {
-        // Unlike other read commands, mapReduce is rewritten to a different format when sent to
-        // shards if the input collection is sharded, because it is executed in two phases.
-        // We do not check for the 'map' and 'reduce' fields, because they are functions, and
-        // we cannot compaare functions for equality.
-        commandProfile["command.out"] = {$regex: "^tmp.mrs"};
-        commandProfile["command.shardedFirstPass"] = true;
+    if (command.mapReduce) {
+        // MapReduce is rewritten to an aggregate pipeline.
+        commandProfile["command.aggregate"] = command.mapReduce;
     } else if (command.update) {
         // Updates are batched, but only allow using buildCommandProfile() for an update batch that
         // contains a single update, since the profiler generates separate entries for each update
@@ -39,27 +35,21 @@ function buildCommandProfile(command, sharded) {
     return commandProfile;
 }
 
-// Retrieve latest system.profile entry.
-function getLatestProfilerEntry(profileDB, filter) {
+// Retrieve N latest system.profile entries.
+export function getNLatestProfilerEntries(profileDB, count, filter) {
     if (filter === null) {
         filter = {};
     }
-    var cursor = profileDB.system.profile.find(filter).sort({$natural: -1});
+    var cursor = profileDB.system.profile.find(filter).sort({$natural: -1}).limit(count);
     assert(
         cursor.hasNext(),
         "could not find any entries in the profile collection matching filter: " + tojson(filter));
-    return cursor.next();
+    return cursor.toArray();
 }
 
-// Returns a string representing the wire protocol used for commands run on the given connection.
-// This string matches the system.profile "protocol" field when commands are profiled.
-function getProfilerProtocolStringForCommand(conn) {
-    const protocols = conn.getClientRPCProtocols();
-    if ("all" === protocols || /Msg/.test(protocols))
-        return "op_msg";
-    if (/Query/.test(protocols))
-        return "op_query";
-    doassert(`Unknown prototocol string ${protocols}`);
+// Retrieve latest system.profile entry.
+export function getLatestProfilerEntry(profileDB, filter) {
+    return getNLatestProfilerEntries(profileDB, 1, filter)[0];
 }
 
 /**
@@ -67,7 +57,7 @@ function getProfilerProtocolStringForCommand(conn) {
  * "filter", or if there are no matches. Optional arguments "errorMsgFilter" and "errorMsgProj"
  * limit profiler output if this asserts.
  */
-function profilerHasAtLeastOneAtMostNumMatchingEntriesOrThrow(
+export function profilerHasAtLeastOneAtMostNumMatchingEntriesOrThrow(
     {profileDB, filter, maxExpectedMatches, errorMsgFilter, errorMsgProj}) {
     assert(typeof maxExpectedMatches === 'number' && maxExpectedMatches > 0,
            "'maxExpectedMatches' must be a number > 0");
@@ -91,7 +81,7 @@ function profilerHasAtLeastOneAtMostNumMatchingEntriesOrThrow(
  * matching "filter". Optional arguments "errorMsgFilter" and "errorMsgProj" limit profiler output
  * if this asserts.
  */
-function profilerHasNumMatchingEntriesOrThrow(
+export function profilerHasNumMatchingEntriesOrThrow(
     {profileDB, filter, numExpectedMatches, errorMsgFilter, errorMsgProj}) {
     assert(typeof numExpectedMatches === 'number' && numExpectedMatches >= 0,
            "'numExpectedMatches' must be a number >= 0");
@@ -107,7 +97,7 @@ function profilerHasNumMatchingEntriesOrThrow(
  * Throws an assertion if the profiler does not contain any entries matching "filter". Optional
  * arguments "errorMsgFilter" and "errorMsgProj" limit profiler output if this asserts.
  */
-function profilerHasAtLeastOneMatchingEntryOrThrow(
+export function profilerHasAtLeastOneMatchingEntryOrThrow(
     {profileDB, filter, errorMsgFilter, errorMsgProj}) {
     assert.gte(profileDB.system.profile.find(filter).itcount(),
                1,
@@ -119,7 +109,8 @@ function profilerHasAtLeastOneMatchingEntryOrThrow(
  * Throws an assertion if the profiler does not contain exactly one entry matching "filter".
  * Optional arguments "errorMsgFilter" and "errorMsgProj" limit profiler output if this asserts.
  */
-function profilerHasSingleMatchingEntryOrThrow({profileDB, filter, errorMsgFilter, errorMsgProj}) {
+export function profilerHasSingleMatchingEntryOrThrow(
+    {profileDB, filter, errorMsgFilter, errorMsgProj}) {
     profilerHasNumMatchingEntriesOrThrow({
         profileDB: profileDB,
         filter: filter,
@@ -133,7 +124,8 @@ function profilerHasSingleMatchingEntryOrThrow({profileDB, filter, errorMsgFilte
  * Throws an assertion if the profiler contains any entries matching "filter". Optional arguments
  * "errorMsgFilter" and "errorMsgProj" limit profiler output if this asserts.
  */
-function profilerHasZeroMatchingEntriesOrThrow({profileDB, filter, errorMsgFilter, errorMsgProj}) {
+export function profilerHasZeroMatchingEntriesOrThrow(
+    {profileDB, filter, errorMsgFilter, errorMsgProj}) {
     profilerHasNumMatchingEntriesOrThrow({
         profileDB: profileDB,
         filter: filter,

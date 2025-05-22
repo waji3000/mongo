@@ -1,6 +1,3 @@
-// timer_stats.h
-
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -32,7 +29,8 @@
 
 #pragma once
 
-#include "mongo/db/jsobj.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/platform/atomic_word.h"
 #include "mongo/util/timer.h"
 
 namespace mongo {
@@ -58,8 +56,8 @@ public:
     }
 
 private:
-    AtomicInt64 _num;
-    AtomicInt64 _totalMillis;
+    AtomicWord<long long> _num;
+    AtomicWord<long long> _totalMillis;
 };
 
 /**
@@ -91,4 +89,4 @@ private:
     bool _recorded;
     Timer _t;
 };
-}
+}  // namespace mongo

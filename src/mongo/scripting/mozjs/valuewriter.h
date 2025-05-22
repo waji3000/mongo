@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,10 +29,22 @@
 
 #pragma once
 
+#include <cstdint>
+#include <functional>
+#include <js/RootingAPI.h>
+#include <js/TypeDecls.h>
 #include <jsapi.h>
 #include <string>
 
+#include "mongo/base/string_data.h"
 #include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes_util.h"
+#include "mongo/bson/oid.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/platform/decimal128.h"
+#include "mongo/scripting/engine.h"
+#include "mongo/scripting/mozjs/jsstringwrapper.h"
 #include "mongo/scripting/mozjs/objectwrapper.h"
 
 namespace mongo {
@@ -63,6 +74,11 @@ public:
     int64_t toInt64();
     Decimal128 toDecimal128();
     bool toBoolean();
+    OID toOID();
+    // Note: The resulting BSONBinData is only valid within the scope of the 'withBinData' callback.
+    void toBinData(std::function<void(const BSONBinData&)> withBinData);
+    Timestamp toTimestamp();
+    JSRegEx toRegEx();
 
     /**
      * Provides the type of the value. For objects, it fetches the class name if possible.

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,46 +27,62 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include "mongo/transport/session.h"
-
+#include "mongo/config.h"  // IWYU pragma: keep
 #include "mongo/platform/atomic_word.h"
+#include "mongo/transport/session_manager.h"
 #include "mongo/transport/transport_layer.h"
-#include "mongo/util/net/ssl_types.h"
 
 namespace mongo {
 namespace transport {
 
 namespace {
 
-AtomicUInt64 sessionIdCounter(0);
+AtomicWord<unsigned long long> sessionIdCounter(0);
 
 }  // namespace
 
-Session::Session() : _id(sessionIdCounter.addAndFetch(1)), _tags(kPending) {}
-
-void Session::setTags(TagMask tagsToSet) {
-    mutateTags([tagsToSet](TagMask originalTags) { return (originalTags | tagsToSet); });
+Session::Session() : _id(sessionIdCounter.addAndFetch(1)) {}
+Session::~Session() {
+    if (_inOperation) {
+        // Session died while OperationContext was still active.
+        // Mark operation completed in SessionManager to resolve counts.
+        if (auto sm = _sessionManager.lock()) {
+            sm->_completedOperations.fetchAndAddRelaxed(1);
+        }
+    }
 }
 
-void Session::unsetTags(TagMask tagsToUnset) {
-    mutateTags([tagsToUnset](TagMask originalTags) { return (originalTags & ~tagsToUnset); });
-}
+void Session::setInOperation(bool state) {
+    // On first call, resolve the SessionManager associated with
+    // this session and store a weak reference to it on the base Session.
+    // This is necessary because if we need access to it in the destructor,
+    // we won't be able to refer to the vtable's getTransportLayer().
+    // As a bonus, subsequent invocations of setInOpertion() also end up with the
+    // stashed copy of SessionManager rather than having to walk the pointer tree.
+    auto sm = [this] {
+        if (auto smgr = _sessionManager.lock())
+            return smgr;
 
-void Session::mutateTags(const stdx::function<TagMask(TagMask)>& mutateFunc) {
-    TagMask oldValue, newValue;
-    do {
-        oldValue = _tags.load();
-        newValue = mutateFunc(oldValue);
+        auto* tl = getTransportLayer();
+        if (MONGO_unlikely(!tl))
+            return std::shared_ptr<SessionManager>();
+        auto smgr = tl->getSharedSessionManager();
+        _sessionManager = smgr;
+        return smgr;
+    }();
+    if (MONGO_unlikely(!sm))
+        return;
 
-        // Any change to the session tags automatically clears kPending status.
-        newValue &= ~kPending;
-    } while (_tags.compareAndSwap(oldValue, newValue) != oldValue);
-}
-
-Session::TagMask Session::getTags() const {
-    return _tags.load();
+    auto oldState = std::exchange(_inOperation, state);
+    if (state) {
+        uassert(ErrorCodes::InvalidOptions,
+                "Operation started on session already in an active operation",
+                !oldState);
+        sm->_totalOperations.fetchAndAddRelaxed(1);
+    } else if (oldState) {
+        sm->_completedOperations.fetchAndAddRelaxed(1);
+    }
 }
 
 }  // namespace transport

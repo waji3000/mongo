@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,22 +27,24 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/matcher/schema/expression_internal_schema_num_properties.h"
+#include "mongo/bson/bsonobj.h"
 
 namespace mongo {
 
 void InternalSchemaNumPropertiesMatchExpression::debugString(StringBuilder& debug,
-                                                             int level) const {
-    _debugAddSpace(debug, level);
+                                                             int indentationLevel) const {
+    _debugAddSpace(debug, indentationLevel);
     BSONObjBuilder builder;
-    serialize(&builder);
-    debug << builder.obj().toString() << "\n";
+    serialize(&builder, {});
+    debug << builder.obj().toString();
+    _debugStringAttachTagInfo(&debug);
 }
 
-void InternalSchemaNumPropertiesMatchExpression::serialize(BSONObjBuilder* out) const {
-    out->append(_name, _numProperties);
+void InternalSchemaNumPropertiesMatchExpression::serialize(BSONObjBuilder* out,
+                                                           const SerializationOptions& opts,
+                                                           bool includePath) const {
+    opts.appendLiteral(out, _name, _numProperties);
 }
 
 bool InternalSchemaNumPropertiesMatchExpression::equivalent(const MatchExpression* other) const {

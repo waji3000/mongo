@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -31,18 +30,21 @@
 #pragma once
 
 #include <boost/filesystem/path.hpp>
+#include <cstdint>
 #include <memory>
+#include <string>
 #include <tuple>
 #include <vector>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
 #include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/db/ftdc/collector.h"
 #include "mongo/db/ftdc/config.h"
 #include "mongo/db/ftdc/file_writer.h"
 #include "mongo/db/ftdc/util.h"
-#include "mongo/db/jsobj.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo {
 
@@ -54,7 +56,8 @@ class Client;
  * Manages file rotation, and directory size management.
  */
 class FTDCFileManager {
-    MONGO_DISALLOW_COPYING(FTDCFileManager);
+    FTDCFileManager(const FTDCFileManager&) = delete;
+    FTDCFileManager& operator=(const FTDCFileManager&) = delete;
 
 public:
     ~FTDCFileManager();
@@ -69,10 +72,12 @@ public:
      * Recovers data from the interim file as needed.
      * Rotates files if needed.
      */
-    static StatusWith<std::unique_ptr<FTDCFileManager>> create(const FTDCConfig* config,
-                                                               const boost::filesystem::path& path,
-                                                               FTDCCollectorCollection* collection,
-                                                               Client* client);
+    static StatusWith<std::unique_ptr<FTDCFileManager>> create(
+        const FTDCConfig* config,
+        const boost::filesystem::path& path,
+        FTDCCollectorCollection* collection,
+        Client* client,
+        UseMultiServiceSchema multiServiceSchema);
 
     /**
      * Rotates files
@@ -85,6 +90,10 @@ public:
      * Rotates files as needed.
      */
     Status writeSampleAndRotateIfNeeded(Client* client, const BSONObj& sample, Date_t date);
+
+    Status writePeriodicMetadataSampleAndRotateIfNeeded(Client* client,
+                                                        const BSONObj& sample,
+                                                        Date_t date);
 
     /**
      * Closes the current file manager down.
@@ -102,7 +111,8 @@ public:
 private:
     FTDCFileManager(const FTDCConfig* config,
                     const boost::filesystem::path& path,
-                    FTDCCollectorCollection* collection);
+                    FTDCCollectorCollection* collection,
+                    UseMultiServiceSchema multiServiceSchema);
 
     /**
      * Gets a list of metrics files in a directory.
@@ -120,7 +130,7 @@ private:
     /**
      * Removes the oldest files if the directory is over quota
      */
-    void trimDirectory(std::vector<boost::filesystem::path>& files);
+    Status trimDirectory(std::vector<boost::filesystem::path>& files);
 
     /**
      * Open a new file for writing.
@@ -155,6 +165,9 @@ private:
 
     // collection of collectors to add to new files on rotation, and server restart
     FTDCCollectorCollection* const _rotateCollectors;
+
+    // Whether or not to use the multiversion schema for FTDC file output
+    UseMultiServiceSchema _multiServiceSchema;
 };
 
 }  // namespace mongo

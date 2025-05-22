@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,27 +27,45 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
 
-#include "mongo/platform/basic.h"
+#include <memory>
+#include <string>
 
-#include <set>
+#include <boost/move/utility_core.hpp>
 
-#include "mongo/db/audit.h"
-#include "mongo/db/auth/action_set.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
-#include "mongo/db/client.h"
+#include "mongo/db/auth/resource_pattern.h"
+#include "mongo/db/cluster_role.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/database_name.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/read_concern_args.h"
+#include "mongo/db/repl/read_concern_level.h"
+#include "mongo/db/repl/repl_client_info.h"
+#include "mongo/db/s/config/remove_shard_command_helpers.h"
 #include "mongo/db/s/config/sharding_catalog_manager.h"
-#include "mongo/s/catalog/type_database.h"
-#include "mongo/s/catalog_cache.h"
+#include "mongo/db/s/replica_set_endpoint_feature_flag.h"
+#include "mongo/db/server_options.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/shard_id.h"
+#include "mongo/logv2/log.h"
+#include "mongo/s/client/shard.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
-#include "mongo/util/log.h"
+#include "mongo/s/request_types/remove_shard_gen.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/decorable.h"
 #include "mongo/util/scopeguard.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
+
 
 namespace mongo {
 namespace {
@@ -56,9 +73,17 @@ namespace {
 /**
  * Internal sharding command run on config servers to remove a shard from the cluster.
  */
-class ConfigSvrRemoveShardCommand : public BasicCommand {
+class ConfigSvrRemoveShardCommand final
+    : public BasicCommandWithRequestParser<ConfigSvrRemoveShardCommand> {
 public:
-    ConfigSvrRemoveShardCommand() : BasicCommand("_configsvrRemoveShard") {}
+    using Request = ConfigSvrRemoveShard;
+
+    ConfigSvrRemoveShardCommand() : BasicCommandWithRequestParser() {}
+
+    bool skipApiVersionCheck() const override {
+        // Internal command (server to server).
+        return true;
+    }
 
     std::string help() const override {
         return "Internal command, which is exported by the sharding config server. Do not call "
@@ -77,113 +102,92 @@ public:
         return true;
     }
 
-    Status checkAuthForCommand(Client* client,
-                               const std::string& dbname,
-                               const BSONObj& cmdObj) const override {
-        if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
-                ResourcePattern::forClusterResource(), ActionType::internal)) {
+    Status checkAuthForOperation(OperationContext* opCtx,
+                                 const DatabaseName& dbName,
+                                 const BSONObj&) const override {
+        if (!AuthorizationSession::get(opCtx->getClient())
+                 ->isAuthorizedForActionsOnResource(
+                     ResourcePattern::forClusterResource(dbName.tenantId()),
+                     ActionType::internal)) {
             return Status(ErrorCodes::Unauthorized, "Unauthorized");
         }
         return Status::OK();
     }
 
-    bool run(OperationContext* opCtx,
-             const std::string& dbname,
-             const BSONObj& cmdObj,
-             BSONObjBuilder& result) override {
+    bool runWithRequestParser(OperationContext* opCtx,
+                              const DatabaseName&,
+                              const BSONObj& cmdObj,
+                              const RequestParser& requestParser,
+                              BSONObjBuilder& result) override {
+        opCtx->setAlwaysInterruptAtStepDownOrUp_UNSAFE();
+
         uassert(ErrorCodes::IllegalOperation,
                 "_configsvrRemoveShard can only be run on config servers",
-                serverGlobalParams.clusterRole == ClusterRole::ConfigServer);
+                serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer));
+        CommandHelpers::uassertCommandRunWithMajority(getName(), opCtx->getWriteConcern());
+
+        ON_BLOCK_EXIT([&opCtx] {
+            try {
+                repl::ReplClientInfo::forClient(opCtx->getClient())
+                    .setLastOpToSystemLastOpTime(opCtx);
+            } catch (const ExceptionFor<ErrorCategory::Interruption>&) {
+                // This can throw if the opCtx was interrupted. Catch to prevent crashing.
+            }
+        });
 
         // Set the operation context read concern level to local for reads into the config database.
         repl::ReadConcernArgs::get(opCtx) =
             repl::ReadConcernArgs(repl::ReadConcernLevel::kLocalReadConcern);
 
-        uassert(ErrorCodes::TypeMismatch,
-                str::stream() << "Field '" << cmdObj.firstElement().fieldName()
-                              << "' must be of type string",
-                cmdObj.firstElement().type() == BSONType::String);
-        const std::string target = cmdObj.firstElement().str();
+        const auto& request = requestParser.request();
+        const auto shardIdOrUrl = request.getCommandParameter();
+        boost::optional<ShardId> shardId;
 
-        uassert(ErrorCodes::InvalidOptions,
-                str::stream() << "removeShard must be called with majority writeConcern, got "
-                              << cmdObj,
-                opCtx->getWriteConcern().wMode == WriteConcernOptions::kMajority);
-
-        const auto shardStatus =
-            Grid::get(opCtx)->shardRegistry()->getShard(opCtx, ShardId(target));
-        if (!shardStatus.isOK()) {
-            std::string msg(str::stream() << "Could not drop shard '" << target
-                                          << "' because it does not exist");
-            log() << msg;
-            uasserted(ErrorCodes::ShardNotFound, msg);
-        }
-        const auto& shard = shardStatus.getValue();
-
-        const auto shardingCatalogManager = ShardingCatalogManager::get(opCtx);
-
-        const auto shardDrainingStatus =
-            uassertStatusOK(shardingCatalogManager->removeShard(opCtx, shard->getId()));
-
-        std::vector<std::string> databases =
-            uassertStatusOK(shardingCatalogManager->getDatabasesForShard(opCtx, shard->getId()));
-
-        // Get BSONObj containing:
-        // 1) note about moving or dropping databases in a shard
-        // 2) list of databases (excluding 'local' database) that need to be moved
-        const auto dbInfo = [&] {
-            BSONObjBuilder dbInfoBuilder;
-            dbInfoBuilder.append("note", "you need to drop or movePrimary these databases");
-
-            BSONArrayBuilder dbs(dbInfoBuilder.subarrayStart("dbsToMove"));
-            for (const auto& db : databases) {
-                if (db != NamespaceString::kLocalDb) {
-                    dbs.append(db);
+        const auto shardDrainingStatus = [&] {
+            try {
+                auto swShard = Grid::get(opCtx)->shardRegistry()->getShard(opCtx, shardIdOrUrl);
+                if (swShard == ErrorCodes::ShardNotFound) {
+                    // If the replica set endpoint is not active, then it isn't safe to allow direct
+                    // connections again after a second shard has been added. Unsharded collections
+                    // are allowed to be tracked and moved as soon as a second shard is added to the
+                    // cluster, and these collections will not handle direct connections properly.
+                    if (replica_set_endpoint::isFeatureFlagEnabled(
+                            VersionContext::getDecoration(opCtx))) {
+                        uassertStatusOK(ShardingCatalogManager::get(opCtx)
+                                            ->updateClusterCardinalityParameterIfNeeded(opCtx));
+                    }
+                    return RemoveShardProgress(ShardDrainingStateEnum::kCompleted);
                 }
-            }
-            dbs.doneFast();
+                const auto shard = uassertStatusOK(swShard);
+                shardId.emplace(shard->getId());
 
-            return dbInfoBuilder.obj();
+                uassert(ErrorCodes::IllegalOperation,
+                        "Cannot remove the config server as a shard using removeShard. To "
+                        "transition the "
+                        "config shard to a dedicated config server use the "
+                        "transitionToDedicatedConfigServer command.",
+                        *shardId != ShardId::kConfigServerId);
+
+                return topology_change_helpers::removeShard(opCtx, *shardId);
+            } catch (const DBException& ex) {
+                LOGV2(21923,
+                      "Failed to remove shard",
+                      "shardId"_attr = shardId ? *shardId : shardIdOrUrl,
+                      "error"_attr = redact(ex));
+                throw;
+            }
         }();
 
-        // TODO: Standardize/separate how we append to the result object
-        switch (shardDrainingStatus) {
-            case ShardDrainingStatus::STARTED:
-                result.append("msg", "draining started successfully");
-                result.append("state", "started");
-                result.append("shard", shard->getId().toString());
-                result.appendElements(dbInfo);
-                break;
-            case ShardDrainingStatus::ONGOING: {
-                const auto swChunks = Grid::get(opCtx)->catalogClient()->getChunks(
-                    opCtx,
-                    BSON(ChunkType::shard(shard->getId().toString())),
-                    BSONObj(),
-                    boost::none,  // return all
-                    nullptr,
-                    repl::ReadConcernArgs::get(opCtx).getLevel());
-                uassertStatusOK(swChunks.getStatus());
-
-                const auto& chunks = swChunks.getValue();
-                result.append("msg", "draining ongoing");
-                result.append("state", "ongoing");
-                result.append("remaining",
-                              BSON("chunks" << static_cast<long long>(chunks.size()) << "dbs"
-                                            << static_cast<long long>(databases.size())));
-                result.appendElements(dbInfo);
-                break;
-            }
-            case ShardDrainingStatus::COMPLETED:
-                result.append("msg", "removeshard completed successfully");
-                result.append("state", "completed");
-                result.append("shard", shard->getId().toString());
-                break;
-        }
+        const auto shardingCatalogManager = ShardingCatalogManager::get(opCtx);
+        shardingCatalogManager->appendShardDrainingStatus(
+            opCtx, result, shardDrainingStatus, shardId ? *shardId : shardIdOrUrl);
 
         return true;
     }
 
-} configsvrRemoveShardCmd;
+    void validateResult(const BSONObj& resultObj) final {}
+};
+MONGO_REGISTER_COMMAND(ConfigSvrRemoveShardCommand).forShard();
 
 }  // namespace
 }  // namespace mongo

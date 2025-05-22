@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Public Domain 2014-2018 MongoDB, Inc.
+# Public Domain 2014-present MongoDB, Inc.
 # Public Domain 2008-2014 WiredTiger, Inc.
 #
 # This is free and unencumbered software released into the public domain.
@@ -38,15 +38,16 @@ class test_cursor_pin(wttest.WiredTigerTestCase):
     nentries = 10000
     config = 'allocation_size=512,leaf_page_max=512'
     scenarios = make_scenarios([
-        ('recno', dict(keyfmt='r')),
-        ('string', dict(keyfmt='S')),
+        ('recno-fix', dict(keyfmt='r', valfmt='8t')),
+        ('recno', dict(keyfmt='r', valfmt='S')),
+        ('string', dict(keyfmt='S', valfmt='S')),
     ])
 
     # Create a multi-page file, confirm that a simple search to the local
     # page works, followed by a search to a different page.
     def test_smoke(self):
         ds = SimpleDataSet(self, self.uri, self.nentries,
-            config=self.config, key_format=self.keyfmt)
+            config=self.config, key_format=self.keyfmt, value_format=self.valfmt)
         ds.populate()
         self.reopen_conn()
         c = self.session.open_cursor(self.uri, None)
@@ -111,11 +112,8 @@ class test_cursor_pin(wttest.WiredTigerTestCase):
         for i in range(self.nentries + 1000, self.nentries + 2001):
             c[ds.key(i)] = ds.value(i)
         self.forward(c, ds, self.nentries + 5000,
-            list(range(self.nentries + 1, self.nentries + 1000) +\
-                 range(self.nentries + 2001, self.nentries + 3000)))
+            list(list(range(self.nentries + 1, self.nentries + 1000)) +\
+                 list(range(self.nentries + 2001, self.nentries + 3000))))
         self.backward(c, ds, self.nentries + 5000,
-            list(range(self.nentries + 1, self.nentries + 1000) +\
-                 range(self.nentries + 2001, self.nentries + 3000)))
-
-if __name__ == '__main__':
-    wttest.run()
+            list(list(range(self.nentries + 1, self.nentries + 1000)) +\
+                 list(range(self.nentries + 2001, self.nentries + 3000))))

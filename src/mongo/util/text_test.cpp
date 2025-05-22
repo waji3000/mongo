@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -32,8 +31,9 @@
 #include <string>
 #include <vector>
 
+#include "mongo/stdx/type_traits.h"
 #include "mongo/unittest/unittest.h"
-#include "mongo/util/text.h"
+#include "mongo/util/text.h"  // IWYU pragma: keep
 
 using namespace mongo;
 
@@ -44,7 +44,7 @@ static std::vector<std::string> svec(const char* first, ...) {
         va_list ap;
         va_start(ap, first);
         const char* curr;
-        while (NULL != (curr = va_arg(ap, const char*))) {
+        while (nullptr != (curr = va_arg(ap, const char*))) {
             result.push_back(curr);
         }
         va_end(ap);
@@ -53,20 +53,21 @@ static std::vector<std::string> svec(const char* first, ...) {
 }
 
 TEST(WindowsCommandLineConstruction, EmptyCommandLine) {
-    ASSERT_EQUALS("", constructUtf8WindowsCommandLine(svec(NULL)));
+    ASSERT_EQUALS("", constructUtf8WindowsCommandLine(svec(nullptr)));
 }
 
 TEST(WindowsCommandLineConstruction, NothingToQuote) {
-    ASSERT_EQUALS("abc d \"\" e", constructUtf8WindowsCommandLine(svec("abc", "d", "", "e", NULL)));
+    ASSERT_EQUALS("abc d \"\" e",
+                  constructUtf8WindowsCommandLine(svec("abc", "d", "", "e", nullptr)));
 }
 
 TEST(WindowsCommandLineConstruction, ThingsToQuote) {
     ASSERT_EQUALS("a\\\\\\b \"de fg\" h",
-                  constructUtf8WindowsCommandLine(svec("a\\\\\\b", "de fg", "h", NULL)));
+                  constructUtf8WindowsCommandLine(svec("a\\\\\\b", "de fg", "h", nullptr)));
     ASSERT_EQUALS("\"a\\\\b c\" d e",
-                  constructUtf8WindowsCommandLine(svec("a\\\\b c", "d", "e", NULL)));
-    ASSERT_EQUALS("\"a \\\\\" \\", constructUtf8WindowsCommandLine(svec("a \\", "\\", NULL)));
-    ASSERT_EQUALS("\"\\\\\\\\\\\"\"", constructUtf8WindowsCommandLine(svec("\\\\\"", NULL)));
+                  constructUtf8WindowsCommandLine(svec("a\\\\b c", "d", "e", nullptr)));
+    ASSERT_EQUALS("\"a \\\\\" \\", constructUtf8WindowsCommandLine(svec("a \\", "\\", nullptr)));
+    ASSERT_EQUALS("\"\\\\\\\\\\\"\"", constructUtf8WindowsCommandLine(svec("\\\\\"", nullptr)));
 }
 
 TEST(WindowsCommandLineConstruction, RegressionSERVER_7252) {
@@ -89,5 +90,5 @@ TEST(WindowsCommandLineConstruction, RegressionSERVER_7252) {
                                              "C:\\mongo\\logs\\mongo_config.log.txt",
                                              "--configsvr",
                                              "--service",
-                                             NULL)));
+                                             nullptr)));
 }

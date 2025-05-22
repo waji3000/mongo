@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -33,22 +32,24 @@
 #include <cstddef>
 #include <cstring>
 #include <limits>
+#include <utility>
 
 #include "mongo/base/data_range.h"
 #include "mongo/base/data_type.h"
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
 #include "mongo/platform/endian.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
 class ConstDataRangeCursor : public ConstDataRange {
 public:
-    ConstDataRangeCursor(const char* begin, const char* end, std::ptrdiff_t debug_offset = 0)
-        : ConstDataRange(begin, end, debug_offset) {}
-
+    using ConstDataRange::ConstDataRange;
     ConstDataRangeCursor(ConstDataRange cdr) : ConstDataRange(cdr) {}
 
-    Status advance(size_t advance) {
+    Status advanceNoThrow(size_t advance) noexcept try {
         if (advance > length()) {
             return makeAdvanceStatus(advance);
         }
@@ -57,10 +58,16 @@ public:
         _debug_offset += advance;
 
         return Status::OK();
+    } catch (const DBException& e) {
+        return e.toStatus();
+    }
+
+    void advance(size_t advance) {
+        uassertStatusOK(advanceNoThrow(advance));
     }
 
     template <typename T>
-    Status skip() {
+    Status skipNoThrow() noexcept {
         size_t advanced = 0;
 
         Status x = DataType::load<T>(nullptr, _begin, _end - _begin, &advanced, _debug_offset);
@@ -74,7 +81,12 @@ public:
     }
 
     template <typename T>
-    Status readAndAdvance(T* t) {
+    void skip() {
+        uassertStatusOK(skipNoThrow<T>());
+    }
+
+    template <typename T>
+    Status readAndAdvanceNoThrow(T* t) noexcept {
         size_t advanced = 0;
 
         Status x = DataType::load(t, _begin, _end - _begin, &advanced, _debug_offset);
@@ -88,15 +100,36 @@ public:
     }
 
     template <typename T>
-    StatusWith<T> readAndAdvance() {
+    void readAndAdvance(T* t) {
+        return uassertStatusOK(readAndAdvanceNoThrow(t));
+    }
+
+    template <typename T>
+    StatusWith<T> readAndAdvanceNoThrow() noexcept {
         T out(DataType::defaultConstruct<T>());
-        Status x = readAndAdvance(&out);
+        Status x = readAndAdvanceNoThrow(&out);
 
         if (x.isOK()) {
             return StatusWith<T>(std::move(out));
         } else {
             return StatusWith<T>(std::move(x));
         }
+    }
+
+    template <typename T>
+    T readAndAdvance() {
+        return uassertStatusOK(readAndAdvanceNoThrow<T>());
+    }
+
+    /**
+     * Return a ConstDataRange based on `splitPoint`
+     * and advance the cursor past there.
+     */
+    template <typename ByteLike>
+    ConstDataRange sliceAndAdvance(const ByteLike& splitPoint) {
+        auto ret = slice(splitPoint);
+        advance(ret.length());
+        return ret;
     }
 
 private:
@@ -105,16 +138,14 @@ private:
 
 class DataRangeCursor : public DataRange {
 public:
-    DataRangeCursor(char* begin, char* end, std::ptrdiff_t debug_offset = 0)
-        : DataRange(begin, end, debug_offset) {}
-
+    using DataRange::DataRange;
     DataRangeCursor(DataRange range) : DataRange(range) {}
 
     operator ConstDataRangeCursor() const {
         return ConstDataRangeCursor(ConstDataRange(_begin, _end, _debug_offset));
     }
 
-    Status advance(size_t advance) {
+    Status advanceNoThrow(size_t advance) noexcept {
         if (advance > length()) {
             return makeAdvanceStatus(advance);
         }
@@ -125,8 +156,12 @@ public:
         return Status::OK();
     }
 
+    void advance(size_t advance) {
+        uassertStatusOK(advanceNoThrow(advance));
+    }
+
     template <typename T>
-    Status skip() {
+    Status skipNoThrow() noexcept {
         size_t advanced = 0;
 
         Status x = DataType::load<T>(nullptr, _begin, _end - _begin, &advanced, _debug_offset);
@@ -140,7 +175,12 @@ public:
     }
 
     template <typename T>
-    Status readAndAdvance(T* t) {
+    void skip() {
+        uassertStatusOK(skipNoThrow<T>());
+    }
+
+    template <typename T>
+    Status readAndAdvanceNoThrow(T* t) noexcept {
         size_t advanced = 0;
 
         Status x = DataType::load(t, _begin, _end - _begin, &advanced, _debug_offset);
@@ -154,9 +194,14 @@ public:
     }
 
     template <typename T>
-    StatusWith<T> readAndAdvance() {
+    void readAndAdvance(T* t) {
+        uassertStatusOK(readAndAdvanceNoThrow(t));
+    }
+
+    template <typename T>
+    StatusWith<T> readAndAdvanceNoThrow() noexcept {
         T out(DataType::defaultConstruct<T>());
-        Status x = readAndAdvance(&out);
+        Status x = readAndAdvanceNoThrow(&out);
 
         if (x.isOK()) {
             return StatusWith<T>(std::move(out));
@@ -166,7 +211,12 @@ public:
     }
 
     template <typename T>
-    Status writeAndAdvance(const T& value) {
+    T readAndAdvance() {
+        return uassertStatusOK(readAndAdvanceNoThrow<T>());
+    }
+
+    template <typename T>
+    Status writeAndAdvanceNoThrow(const T& value) noexcept {
         size_t advanced = 0;
 
         Status x = DataType::store(
@@ -178,6 +228,22 @@ public:
         }
 
         return x;
+    }
+
+    template <typename T>
+    void writeAndAdvance(const T& value) {
+        uassertStatusOK(writeAndAdvanceNoThrow(value));
+    }
+
+    /**
+     * Return a DataRange based on `splitPoint`
+     * and advance the cursor past there.
+     */
+    template <typename ByteLike>
+    DataRange sliceAndAdvance(const ByteLike& splitPoint) {
+        auto ret = slice(splitPoint);
+        advance(ret.length());
+        return ret;
     }
 
 private:

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,10 +29,16 @@
 
 #pragma once
 
+#include <iosfwd>
 #include <string>
 
 #include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bson_depth.h"
 #include "mongo/bson/bsonobj.h"
+#include "mongo/bson/oid.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo {
 
@@ -46,30 +51,19 @@ namespace mongo {
  * used when specifying field names and std::string values instead of double
  * quotes.  JSON unicode escape sequences (of the form \uXXXX) are
  * converted to utf8.
+ * `str` must be a null terminated string.
  *
- * @throws AssertionException if parsing fails.  The message included with
- * this assertion includes the character offset where parsing failed.
+ * `str` must be completely consumed by the parse.
+ * Trailing whitespace is tolerated.
+ *
+ * Throws with `ErrorCodes::FailedToParse` on failure.
+ *   - If the parse failed because the `str` was incompletely consumed,
+ *     the exception message will indicate "Garbage at end".
+ *   - Otherwise, the message includes the character offset where parsing failed.
  */
-BSONObj fromjson(const std::string& str);
 
-/** @param len will be size of JSON object in text chars. */
-BSONObj fromjson(const char* str, int* len = NULL);
 
-/**
- * Tests whether the JSON string is an Array.
- *
- * Useful for assigning the result of fromjson to the right object type. Either:
- *  BSONObj
- *  BSONArray
- *
- * @example Using the method to select the proper type.
- *  If this method returns true, the user could store the result of fromjson
- *  inside a BSONArray, rather than a BSONObj, in order to have it print as an
- *  array when passed to tojson.
- *
- * @param obj The JSON string to test.
- */
-bool isArray(StringData str);
+BSONObj fromjson(StringData str);
 
 /**
  * Convert a BSONArray to a JSON string.
@@ -78,7 +72,9 @@ bool isArray(StringData str);
  * @param format The JSON format (TenGen, Strict).
  * @param pretty Enables pretty output.
  */
-std::string tojson(const BSONArray& arr, JsonStringFormat format = Strict, bool pretty = false);
+std::string tojson(const BSONArray& arr,
+                   JsonStringFormat format = ExtendedCanonicalV2_0_0,
+                   bool pretty = false);
 
 /**
  * Convert a BSONObj to a JSON string.
@@ -87,7 +83,11 @@ std::string tojson(const BSONArray& arr, JsonStringFormat format = Strict, bool 
  * @param format The JSON format (JS, TenGen, Strict).
  * @param pretty Enables pretty output.
  */
-std::string tojson(const BSONObj& obj, JsonStringFormat format = Strict, bool pretty = false);
+std::string tojson(const BSONObj& obj,
+                   JsonStringFormat format = ExtendedCanonicalV2_0_0,
+                   bool pretty = false);
+
+class JParseUtil;
 
 /**
  * Parser class.  A BSONObj is constructed incrementally by passing a
@@ -95,8 +95,11 @@ std::string tojson(const BSONObj& obj, JsonStringFormat format = Strict, bool pr
  * element parsed is described before each function.
  */
 class JParse {
+    friend class JParseUtil;
+
 public:
-    explicit JParse(StringData str);
+    constexpr static int kMaxDepth = BSONDepth::kDefaultMaxAllowableDepth;
+    explicit JParse(StringData str) : _buf(str), _input(str) {}
 
     /*
      * Notation: All-uppercase symbols denote non-terminals; all other
@@ -130,8 +133,9 @@ public:
      *
      *   | new CONSTRUCTOR
      */
+
 private:
-    Status value(StringData fieldName, BSONObjBuilder&);
+    Status value(StringData fieldName, BSONObjBuilder&, int depth);
 
     /*
      * OBJECT :
@@ -161,7 +165,7 @@ private:
      *
      */
 public:
-    Status object(StringData fieldName, BSONObjBuilder&, bool subObj = true);
+    Status object(StringData fieldName, BSONObjBuilder&, bool subObj = true, int depth = 0);
     Status parse(BSONObjBuilder& builder);
     bool isArray();
 
@@ -182,6 +186,12 @@ private:
      *              indicating the data type> }
      */
     Status binaryObject(StringData fieldName, BSONObjBuilder&);
+
+    /*
+     * UUIDOBJECT :
+     *     { FIELD("$uuid") : <string representation of UUID, in hexadecimal per RFC 4122> }
+     */
+    Status uuidObject(StringData fieldName, BSONObjBuilder&);
 
     /*
      * DATEOBJECT :
@@ -208,13 +218,23 @@ private:
     Status regexObject(StringData fieldName, BSONObjBuilder&);
 
     /*
+     *     NOTE: the rules for the body of the regex are different here,
+     *     since it is quoted instead of surrounded by slashes.
+     * REGEXOBJECT :
+     *     { FIELD("$regularExpression") : {
+     *         FIELD("pattern") : <string representing body of regex>,
+     *         FIELD("options") : <string representing regex options> } }
+     */
+    Status regexObjectCanonical(StringData fieldName, BSONObjBuilder&);
+
+    /*
      * REFOBJECT :
      *     { FIELD("$ref") : <string representing collection name>,
      *          FIELD("$id") : <24 character hex std::string> }
      *   | { FIELD("$ref") : std::string , FIELD("$id") : OBJECTID }
      *   | { FIELD("$ref") : std::string , FIELD("$id") : OIDOBJECT }
      */
-    Status dbRefObject(StringData fieldName, BSONObjBuilder&);
+    Status dbRefObject(StringData fieldName, BSONObjBuilder&, int depth);
 
     /*
      * UNDEFINEDOBJECT :
@@ -223,10 +243,22 @@ private:
     Status undefinedObject(StringData fieldName, BSONObjBuilder&);
 
     /*
+     * NUMBERINTOBJECT :
+     *     { FIELD("$numberInt") : "<number>" }
+     */
+    Status numberIntObject(StringData fieldName, BSONObjBuilder&);
+
+    /*
      * NUMBERLONGOBJECT :
      *     { FIELD("$numberLong") : "<number>" }
      */
     Status numberLongObject(StringData fieldName, BSONObjBuilder&);
+
+    /*
+     * NUMBERDOUBLEOBJECT :
+     *     { FIELD("$numberDouble") : "<number>" }
+     */
+    Status numberDoubleObject(StringData fieldName, BSONObjBuilder&);
 
     /*
      * NUMBERDECIMALOBJECT :
@@ -255,7 +287,7 @@ private:
      *     VALUE
      *   | VALUE , ELEMENTS
      */
-    Status array(StringData fieldName, BSONObjBuilder&, bool subObj = true);
+    Status array(StringData fieldName, BSONObjBuilder&, bool subObj, int depth);
 
     /*
      * NOTE: Currently only Date can be preceded by the "new" keyword
@@ -286,6 +318,12 @@ private:
     Status objectId(StringData fieldName, BSONObjBuilder&);
 
     /*
+     * UUID :
+     *     UUID( <36 character [<hex>, '-'] std::string> )
+     */
+    Status uuid(StringData fieldName, BSONObjBuilder& builder);
+
+    /*
      * NUMBERLONG :
      *     NumberLong( <number> )
      */
@@ -307,7 +345,7 @@ private:
      * DBREF :
      *     Dbref( <namespace std::string> , <24 character hex std::string> )
      */
-    Status dbRef(StringData fieldName, BSONObjBuilder&);
+    Status dbRef(StringData fieldName, BSONObjBuilder&, int depth);
 
     /*
      * REGEX :
@@ -411,7 +449,7 @@ private:
      * string, but there is no guarantee that it will not contain other
      * null characters.
      */
-    Status chars(std::string* result, const char* terminalSet, const char* allowedSet = NULL);
+    Status chars(std::string* result, const char* terminalSet, const char* allowedSet = nullptr);
 
     /**
      * Converts the two byte Unicode code point to its UTF8 character
@@ -427,7 +465,7 @@ private:
      * we reach the end of our buffer.  Do not update the pointer to our
      * buffer (same as calling readTokenImpl with advance=false).
      */
-    inline bool peekToken(const char* token);
+    inline bool peekToken(StringData token);
 
     /**
      * @return true if the given token matches the next non whitespace
@@ -435,7 +473,7 @@ private:
      * we reach the end of our buffer.  Updates the pointer to our
      * buffer (same as calling readTokenImpl with advance=true).
      */
-    inline bool readToken(const char* token);
+    [[nodiscard]] inline bool readToken(StringData token);
 
     /**
      * @return true if the given token matches the next non whitespace
@@ -443,7 +481,7 @@ private:
      * we reach the end of our buffer.  Do not update the pointer to our
      * buffer if advance is false.
      */
-    bool readTokenImpl(const char* token, bool advance = true);
+    bool readTokenImpl(StringData token, bool advance = true);
 
     /**
      * @return true if the next field in our stream matches field.
@@ -469,31 +507,47 @@ private:
     bool isBase64String(StringData) const;
 
     /**
+     * Assumes there is a parse error at the current offset, appends a snippet of text from around
+     * the bad input to 'errorBuffer'.
+     */
+    void addBadInputSnippet(std::ostringstream& errorBuffer) const;
+
+    /**
+     * Assumes there is a parse error at the current offset, appends the full input, then a newline,
+     * then another line with a "^" character just below the offset of the problem. For example:
+     * {$and: [{a: {$eq: 2}, {b: {$eq: 3}}]}
+     *                       ^
+     */
+    void indicateOffsetPosition(std::ostringstream& errorBuffer) const;
+
+    /**
      * @return FailedToParse status with the given message and some
      * additional context information
      */
     Status parseError(StringData msg);
 
+    /**
+     * @returns a valid Date_t or FailedToParse status.
+     * Updates _input to past the end of the parsed date.
+     */
+    StatusWith<Date_t> parseDate();
+
 public:
-    inline int offset() {
-        return (_input - _buf);
+    inline int offset() const {
+        return _input.data() - _buf.data();
+    }
+
+    inline int length() const {
+        return _buf.size();
     }
 
 private:
-    /*
-     * _buf - start of our input buffer
-     * _input - cursor we advance in our input buffer
-     * _input_end - sentinel for the end of our input buffer
-     *
-     * _buf is the null terminated buffer containing the JSON std::string we
-     * are parsing.  _input_end points to the null byte at the end of
-     * the buffer.  strtoll, strtol, and strtod will access the null
-     * byte at the end of the buffer because they are assuming a c-style
-     * string.
+    /**
+     * _buf is the buffer containing the JSON string we are parsing.
+     * _input is the not-yet-parsed part of the buffer
      */
-    const char* const _buf;
-    const char* _input;
-    const char* const _input_end;
+    StringData _buf;
+    StringData _input;
 };
 
 }  // namespace mongo

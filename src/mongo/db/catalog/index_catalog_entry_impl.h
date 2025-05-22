@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,71 +29,71 @@
 
 #pragma once
 
+#include <boost/intrusive_ptr.hpp>
 #include <boost/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+#include <memory>
 #include <string>
 
-#include "mongo/base/owned_pointer_vector.h"
+#include "mongo/base/status.h"
 #include "mongo/bson/ordering.h"
-#include "mongo/bson/timestamp.h"
+#include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/catalog/index_catalog_entry.h"
+#include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/index/multikey_paths.h"
-#include "mongo/db/matcher/expression.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/query/collation/collator_interface.h"
 #include "mongo/db/record_id.h"
-#include "mongo/db/storage/kv/kv_prefix.h"
-#include "mongo/platform/atomic_word.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/db/storage/ident.h"
+#include "mongo/db/storage/key_string/key_string.h"
+#include "mongo/db/update_index_data.h"
+#include "mongo/util/intrusive_counter.h"
 
 namespace mongo {
 
 class CollatorInterface;
-class CollectionCatalogEntry;
-class CollectionInfoCache;
-class HeadManager;
+class ExpressionContext;
 class IndexAccessMethod;
-class IndexDescriptor;
 class MatchExpression;
 class OperationContext;
 
 class IndexCatalogEntryImpl : public IndexCatalogEntry {
-    MONGO_DISALLOW_COPYING(IndexCatalogEntryImpl);
-
 public:
-    explicit IndexCatalogEntryImpl(
-        OperationContext* opCtx,
-        StringData ns,
-        CollectionCatalogEntry* collection,           // not owned
-        std::unique_ptr<IndexDescriptor> descriptor,  // ownership passes to me
-        CollectionInfoCache* infoCache);              // not owned, optional
+    IndexCatalogEntryImpl(OperationContext* opCtx,
+                          const CollectionPtr& collection,
+                          const std::string& ident,
+                          IndexDescriptor&& descriptor,
+                          bool isFrozen);
 
-    ~IndexCatalogEntryImpl() final;
+    ~IndexCatalogEntryImpl() override;
 
-    const std::string& ns() const final {
-        return _ns;
+    const std::string& getIdent() const final {
+        return _shared->_ident;
     }
 
-    void setNs(NamespaceString ns) final;
+    std::shared_ptr<Ident> getSharedIdent() const final;
 
-    void init(std::unique_ptr<IndexAccessMethod> accessMethod) final;
+    void setIdent(std::shared_ptr<Ident> newIdent) final;
 
     IndexDescriptor* descriptor() final {
-        return _descriptor.get();
+        return &_descriptor;
     }
     const IndexDescriptor* descriptor() const final {
-        return _descriptor.get();
+        return &_descriptor;
     }
 
-    IndexAccessMethod* accessMethod() final {
-        return _accessMethod.get();
-    }
-    const IndexAccessMethod* accessMethod() const final {
-        return _accessMethod.get();
+    IndexAccessMethod* accessMethod() const final {
+        return _shared->_accessMethod.get();
     }
 
-    bool isBuilding() const final {
+    void setAccessMethod(std::unique_ptr<IndexAccessMethod> accessMethod) final;
+
+    bool isHybridBuilding() const final {
         return _indexBuildInterceptor != nullptr;
     }
 
-    IndexBuildInterceptor* indexBuildInterceptor() final {
+    IndexBuildInterceptor* indexBuildInterceptor() const final {
         return _indexBuildInterceptor;
     }
 
@@ -102,36 +101,30 @@ public:
         _indexBuildInterceptor = interceptor;
     }
 
-    const Ordering& ordering() const final {
-        return _ordering;
-    }
+    const Ordering& ordering() const final;
 
     const MatchExpression* getFilterExpression() const final {
-        return _filterExpression.get();
+        return _shared->_filterExpression.get();
     }
 
     const CollatorInterface* getCollator() const final {
-        return _collator.get();
+        return _shared->_collator.get();
     }
+
+    NamespaceString getNSSFromCatalog(OperationContext* opCtx) const final;
 
     /// ---------------------
 
-    const RecordId& head(OperationContext* opCtx) const final;
-
-    void setHead(OperationContext* opCtx, RecordId newHead) final;
-
     void setIsReady(bool newIsReady) final;
 
-    HeadManager* headManager() const final {
-        return _headManager.get();
-    }
+    void setIsFrozen(bool newIsFrozen) final;
 
     // --
 
     /**
      * Returns true if this index is multikey, and returns false otherwise.
      */
-    bool isMultikey(OperationContext* opCtx) const final;
+    bool isMultikey(OperationContext* opCtx, const CollectionPtr& collection) const final;
 
     /**
      * Returns the path components that cause this index to be multikey if this index supports
@@ -142,7 +135,8 @@ public:
      * returns a vector with size equal to the number of elements in the index key pattern where
      * each element in the vector is an empty set.
      */
-    MultikeyPaths getMultikeyPaths(OperationContext* opCtx) const final;
+    MultikeyPaths getMultikeyPaths(OperationContext* opCtx,
+                                   const CollectionPtr& collection) const final;
 
     /**
      * Sets this index to be multikey. Information regarding which newly detected path components
@@ -159,100 +153,95 @@ public:
      * namespace, index name, and multikey paths on the OperationContext rather than set the index
      * as multikey here.
      */
-    void setMultikey(OperationContext* opCtx, const MultikeyPaths& multikeyPaths) final;
+    void setMultikey(OperationContext* opCtx,
+                     const CollectionPtr& coll,
+                     const KeyStringSet& multikeyMetadataKeys,
+                     const MultikeyPaths& multikeyPaths) const final;
 
-    // TODO SERVER-36385 Remove this function: we don't set the feature tracker bit in 4.4 because
-    // 4.4 can only downgrade to 4.2 which can read long TypeBits.
-    void setIndexKeyStringWithLongTypeBitsExistsOnDisk(OperationContext* opCtx) final;
+    void forceSetMultikey(OperationContext* opCtx,
+                          const CollectionPtr& coll,
+                          bool isMultikey,
+                          const MultikeyPaths& multikeyPaths) const final;
 
-    // if this ready is ready for queries
-    bool isReady(OperationContext* opCtx) const final;
-
-    KVPrefix getPrefix() const final {
-        return _prefix;
+    bool isReady() const final {
+        return _isReady;
     }
 
-    /**
-     * If return value is not boost::none, reads with majority read concern using an older snapshot
-     * must treat this index as unfinished.
-     */
-    boost::optional<Timestamp> getMinimumVisibleSnapshot() final {
-        return _minVisibleSnapshot;
+    bool isFrozen() const final;
+
+    bool shouldValidateDocument() const final;
+
+    const UpdateIndexData& getIndexedPaths() const final {
+        return _shared->_indexedPaths;
     }
 
-    void setMinimumVisibleSnapshot(Timestamp name) final {
-        _minVisibleSnapshot = name;
-    }
+    std::unique_ptr<const IndexCatalogEntry> getNormalizedEntry(
+        OperationContext* opCtx, const CollectionPtr& coll) const final;
+
+    std::unique_ptr<const IndexCatalogEntry> cloneWithDifferentDescriptor(
+        IndexDescriptor) const final;
 
 private:
-    class SetMultikeyChange;
-    class SetHeadChange;
-
-    bool _catalogIsReady(OperationContext* opCtx) const;
-    bool _catalogIsPresent(OperationContext* opCtx) const;
-    RecordId _catalogHead(OperationContext* opCtx) const;
+    /**
+     * Sets this index to be multikey when we are running inside a multi-document transaction.
+     * Used by setMultikey() only.
+     */
+    Status _setMultikeyInMultiDocumentTransaction(OperationContext* opCtx,
+                                                  const CollectionPtr& collection,
+                                                  const MultikeyPaths& multikeyPaths) const;
 
     /**
      * Retrieves the multikey information associated with this index from '_collection',
      *
      * See CollectionCatalogEntry::isIndexMultikey() for more details.
      */
-    bool _catalogIsMultikey(OperationContext* opCtx, MultikeyPaths* multikeyPaths) const;
+    bool _catalogIsMultikey(OperationContext* opCtx,
+                            const CollectionPtr& collection,
+                            MultikeyPaths* multikeyPaths) const;
 
-    KVPrefix _catalogGetPrefix(OperationContext* opCtx) const;
+    /**
+     * Sets on-disk multikey flag for this index.
+     */
+    void _catalogSetMultikey(OperationContext* opCtx,
+                             const CollectionPtr& collection,
+                             const MultikeyPaths& multikeyPaths) const;
 
-    // -----
+    /**
+     * Holder of shared state between IndexCatalogEntryImpl clones
+     */
+    struct SharedState : public RefCountable {
+        SharedState(const std::string& ident, const RecordId& catalogId)
+            : _ident(ident), _catalogId(catalogId) {}
 
-    std::string _ns;
+        const std::string _ident;
 
-    CollectionCatalogEntry* _collection;  // not owned here
+        const RecordId _catalogId;  // Location in the durable catalog of the collection entry
+                                    // containing this index entry.
 
-    std::unique_ptr<IndexDescriptor> _descriptor;  // owned here
+        std::unique_ptr<IndexAccessMethod> _accessMethod;
 
-    CollectionInfoCache* _infoCache;  // not owned here
+        std::unique_ptr<CollatorInterface> _collator;
+        std::unique_ptr<MatchExpression> _filterExpression;
 
-    std::unique_ptr<IndexAccessMethod> _accessMethod;
+        // Special ExpressionContext used to evaluate the partial filter expression.
+        boost::intrusive_ptr<ExpressionContext> _expCtxForFilter;
+
+        // Describes the paths indexed by this index.
+        UpdateIndexData _indexedPaths;
+    };
 
     IndexBuildInterceptor* _indexBuildInterceptor = nullptr;  // not owned here
 
-    // Owned here.
-    std::unique_ptr<HeadManager> _headManager;
-    std::unique_ptr<CollatorInterface> _collator;
-    std::unique_ptr<MatchExpression> _filterExpression;
+    boost::intrusive_ptr<SharedState> _shared;
 
-    // cached stuff
+    IndexDescriptor _descriptor;
 
-    Ordering _ordering;  // TODO: this might be b-tree specific
-    bool _isReady;       // cache of NamespaceDetails info
-    RecordId _head;      // cache of IndexDetails
+    bool _isReady;
+    bool _isFrozen;
+    bool _shouldValidateDocument;
 
-    // Set to true if this index supports path-level multikey tracking.
-    // '_indexTracksPathLevelMultikeyInfo' is effectively const after IndexCatalogEntry::init() is
-    // called.
-    bool _indexTracksPathLevelMultikeyInfo = false;
-
-    // Set to true if this index is multikey. '_isMultikey' serves as a cache of the information
-    // stored in the NamespaceDetails or KVCatalog.
-    AtomicWord<bool> _isMultikey;
-
-    // Controls concurrent access to '_indexMultikeyPaths'. We acquire this mutex rather than the
-    // RESOURCE_METADATA lock as a performance optimization so that it is cheaper to detect whether
-    // there is actually any path-level multikey information to update or not.
-    mutable stdx::mutex _indexMultikeyPathsMutex;
-
-    // Non-empty only if '_indexTracksPathLevelMultikeyInfo' is true.
-    //
-    // If non-empty, '_indexMultikeyPaths' is a vector with size equal to the number of elements
-    // in the index key pattern. Each element in the vector is an ordered set of positions (starting
-    // at 0) into the corresponding indexed field that represent what prefixes of the indexed field
-    // causes the index to be multikey.
-    MultikeyPaths _indexMultikeyPaths;
-
-    // KVPrefix used to differentiate between index entries in different logical indexes sharing the
-    // same underlying sorted data interface.
-    const KVPrefix _prefix;
-
-    // The earliest snapshot that is allowed to read this index.
-    boost::optional<Timestamp> _minVisibleSnapshot;
+    // Offset of this index within the Collection metadata. Used to improve lookups without having
+    // to search for the index name accessing the collection metadata.
+    int _indexOffset;
 };
 }  // namespace mongo

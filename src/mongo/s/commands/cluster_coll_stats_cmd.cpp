@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,18 +27,179 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
 
-#include "mongo/platform/basic.h"
+#include <algorithm>
+#include <initializer_list>
+#include <map>
+#include <string>
+#include <utility>
+#include <vector>
 
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/client/read_preference.h"
+#include "mongo/db/auth/action_type.h"
+#include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/legacy_runtime_constants_gen.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/shard_id.h"
+#include "mongo/db/timeseries/timeseries_commands_conversion_helper.h"
+#include "mongo/executor/remote_command_response.h"
+#include "mongo/logv2/log.h"
 #include "mongo/rpc/get_status_from_command_result.h"
+#include "mongo/s/async_requests_sender.h"
+#include "mongo/s/catalog_cache.h"
+#include "mongo/s/chunk_manager.h"
+#include "mongo/s/client/shard.h"
 #include "mongo/s/cluster_commands_helpers.h"
-#include "mongo/s/grid.h"
-#include "mongo/util/log.h"
+#include "mongo/s/collection_routing_info_targeter.h"
+#include "mongo/s/router_role.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/debug_util.h"
+#include "mongo/util/decorable.h"
+#include "mongo/util/namespace_string_util.h"
+#include "mongo/util/str.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
+
 
 namespace mongo {
 namespace {
+
+Rarely _sampler;
+
+auto fieldIsAnyOf = [](StringData v, std::initializer_list<StringData> il) {
+    auto ei = il.end();
+    return std::find(il.begin(), ei, v) != ei;
+};
+
+BSONObj scaleIndividualShardStatistics(const BSONObj& shardStats, int scale) {
+    BSONObjBuilder builder;
+
+    for (const auto& element : shardStats) {
+        std::string fieldName = element.fieldName();
+
+        if (fieldIsAnyOf(fieldName,
+                         {"size", "maxSize", "storageSize", "totalIndexSize", "totalSize"})) {
+            builder.appendNumber(fieldName, element.numberLong() / scale);
+        } else if (fieldName == "scaleFactor") {
+            // Explicitly change the scale factor as we removed the scaling before getting the
+            // individual shards statistics.
+            builder.appendNumber(fieldName, scale);
+        } else if (fieldName == "indexSizes") {
+            BSONObjBuilder indexSizesBuilder(builder.subobjStart(fieldName));
+            for (const auto& entry : shardStats.getField(fieldName).Obj()) {
+                indexSizesBuilder.appendNumber(entry.fieldName(), entry.numberLong() / scale);
+            }
+            indexSizesBuilder.done();
+        } else {
+            // All the other fields that do not require further scaling.
+            builder.append(element);
+        }
+    }
+
+    return builder.obj();
+}
+
+/**
+ * Takes the shard's "shardTimeseriesStats" and adds it to the sum across shards saved in
+ * "clusterTimeseriesStats". All of the mongod "timeseries" collStats are numbers except for the
+ * "bucketsNs" field, which we specially track in "timeseriesBucketsNs". We also track
+ * "timeseriesTotalBucketSize" specially for calculating "avgBucketSize".
+ * "avgNumMeasurementsPerCommit" is specially calculated using "numMeasurementsCommitted" and
+ * "numCommits"
+ *
+ * Invariants that "shardTimeseriesStats" is non-empty.
+ */
+void aggregateTimeseriesStats(const BSONObj& shardTimeseriesStats,
+                              std::map<std::string, long long>* clusterTimeseriesStats,
+                              std::string* timeseriesBucketsNs,
+                              long long* timeseriesTotalBucketSize) {
+    invariant(!shardTimeseriesStats.isEmpty());
+
+    for (const auto& shardTimeseriesStat : shardTimeseriesStats) {
+        // "bucketsNs" is the only timeseries stat that is not a number, so it requires special
+        // handling.
+        if (shardTimeseriesStat.type() == BSONType::String) {
+            invariant(shardTimeseriesStat.fieldNameStringData() == "bucketsNs",
+                      str::stream() << "Found an unexpected field '"
+                                    << shardTimeseriesStat.fieldNameStringData()
+                                    << "' in a shard's 'timeseries' subobject: "
+                                    << shardTimeseriesStats.toString());
+            if (timeseriesBucketsNs->empty()) {
+                *timeseriesBucketsNs = shardTimeseriesStat.String();
+            } else {
+                // All shards should have the same timeseries buckets collection namespace.
+                invariant(*timeseriesBucketsNs == shardTimeseriesStat.String(),
+                          str::stream()
+                              << "Found different timeseries buckets collection namespaces on "
+                              << "different shards, for the same collection. Previous shard's ns: "
+                              << *timeseriesBucketsNs
+                              << ", current shard's ns: " << shardTimeseriesStat.String());
+            }
+        } else if (shardTimeseriesStat.fieldNameStringData() == "avgBucketSize") {
+            // Special logic to handle average aggregation.
+            tassert(5758901,
+                    str::stream()
+                        << "Cannot aggregate avgBucketSize when bucketCount field is not number.",
+                    shardTimeseriesStats.getField("bucketCount").isNumber());
+            *timeseriesTotalBucketSize +=
+                shardTimeseriesStats.getField("bucketCount").numberLong() *
+                shardTimeseriesStat.numberLong();
+        } else {
+            // Simple summation for other types of stats.
+            // Use 'numberLong' to ensure integers are safely converted to long type.
+            tassert(5758902,
+                    str::stream() << "Index stats '" << shardTimeseriesStat.fieldName()
+                                  << "' should be number.",
+                    shardTimeseriesStat.isNumber());
+            (*clusterTimeseriesStats)[shardTimeseriesStat.fieldName()] +=
+                shardTimeseriesStat.numberLong();
+        }
+    }
+    (*clusterTimeseriesStats)["avgBucketSize"] = (*clusterTimeseriesStats)["bucketCount"]
+        ? *timeseriesTotalBucketSize / (*clusterTimeseriesStats)["bucketCount"]
+        : 0;
+    (*clusterTimeseriesStats)["avgNumMeasurementsPerCommit"] =
+        (*clusterTimeseriesStats)["numCommits"]
+        ? (*clusterTimeseriesStats)["numMeasurementsCommitted"] /
+            (*clusterTimeseriesStats)["numCommits"]
+        : 0;
+}
+
+/**
+ * Adds a "timeseries" field to "result" that contains the summed timeseries statistics in
+ * "clusterTimeseriesStats". "timeseriesBucketNs" is specially handled and added to the "timeseries"
+ * sub-document because it is the only non-number timeseries statistic. "avgBucketSize" is also
+ * calculated specially through the aggregated "timeseriesTotalBucketSize".
+ *
+ * Invariants that "clusterTimeseriesStats" and "timeseriesBucketNs" are set.
+ */
+void appendTimeseriesInfoToResult(const std::map<std::string, long long>& clusterTimeseriesStats,
+                                  const std::string& timeseriesBucketNs,
+                                  BSONObjBuilder* result) {
+    invariant(!clusterTimeseriesStats.empty());
+    invariant(!timeseriesBucketNs.empty());
+
+    BSONObjBuilder timeseriesSubObjBuilder(result->subobjStart("timeseries"));
+    timeseriesSubObjBuilder.append("bucketsNs", timeseriesBucketNs);
+    for (const auto& statEntry : clusterTimeseriesStats) {
+        timeseriesSubObjBuilder.appendNumber(statEntry.first, statEntry.second);
+    }
+    timeseriesSubObjBuilder.done();
+}
 
 class CollectionStats : public BasicCommand {
 public:
@@ -53,162 +213,240 @@ public:
         return false;
     }
 
-    std::string parseNs(const std::string& dbname, const BSONObj& cmdObj) const override {
-        return CommandHelpers::parseNsCollectionRequired(dbname, cmdObj).ns();
+    bool maintenanceOk() const override {
+        return false;
+    }
+
+    NamespaceString parseNs(const DatabaseName& dbName, const BSONObj& cmdObj) const override {
+        return CommandHelpers::parseNsCollectionRequired(dbName, cmdObj);
     }
 
     bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
 
-    void addRequiredPrivileges(const std::string& dbname,
-                               const BSONObj& cmdObj,
-                               std::vector<Privilege>* out) const override {
-        ActionSet actions;
-        actions.addAction(ActionType::collStats);
-        out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
+    Status checkAuthForOperation(OperationContext* opCtx,
+                                 const DatabaseName& dbName,
+                                 const BSONObj& cmdObj) const override {
+        auto* as = AuthorizationSession::get(opCtx->getClient());
+        if (!as->isAuthorizedForActionsOnResource(parseResourcePattern(dbName, cmdObj),
+                                                  ActionType::collStats)) {
+            return {ErrorCodes::Unauthorized, "unauthorized"};
+        }
+
+        return Status::OK();
     }
 
     bool run(OperationContext* opCtx,
-             const std::string& dbName,
+             const DatabaseName& dbName,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) override {
+        if (_sampler.tick())
+            LOGV2_WARNING(7024601,
+                          "The collStats command is deprecated. For more information, see "
+                          "https://dochub.mongodb.org/core/collStats-deprecated");
+
         const NamespaceString nss(parseNs(dbName, cmdObj));
 
-        auto routingInfo =
-            uassertStatusOK(Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(opCtx, nss));
-        if (routingInfo.cm()) {
+        const auto targeter = CollectionRoutingInfoTargeter(opCtx, nss);
+        const auto cri = targeter.getRoutingInfo();
+        const auto& cm = cri.getChunkManager();
+        if (cm.isSharded()) {
             result.appendBool("sharded", true);
         } else {
             result.appendBool("sharded", false);
-            result.append("primary", routingInfo.db().primaryId().toString());
+            result.append("primary", cri.getDbPrimaryShardId().toString());
         }
 
-        auto shardResults = scatterGatherVersionedTargetByRoutingTable(
-            opCtx,
-            nss.db(),
-            nss,
-            routingInfo,
-            CommandHelpers::filterCommandRequestForPassthrough(cmdObj),
-            ReadPreferenceSetting::get(opCtx),
-            Shard::RetryPolicy::kIdempotent,
-            {},
-            {});
+        int scale = 1;
+        if (cmdObj["scale"].isNumber()) {
+            scale = cmdObj["scale"].safeNumberInt();
+            uassert(4390200, "scale has to be >= 1", scale >= 1);
+        } else if (cmdObj["scale"].trueValue()) {
+            uasserted(4390201, "scale has to be a number >= 1");
+        }
 
-        BSONObjBuilder shardStats;
-        std::map<std::string, long long> counts;
-        std::map<std::string, long long> indexSizes;
+        // Re-construct the command's BSONObj without any scaling to be applied.
+        BSONObj cmdObjToSend = cmdObj.removeField("scale");
 
-        long long maxSize = 0;
-        long long unscaledCollSize = 0;
+        // Translate command collection namespace for time-series collection.
+        if (targeter.timeseriesNamespaceNeedsRewrite(nss)) {
+            cmdObjToSend =
+                timeseries::makeTimeseriesCommand(cmdObjToSend, nss, getName(), boost::none);
+        }
 
-        int nindexes = 0;
-        bool warnedAboutIndexes = false;
+        return routing_context_utils::withValidatedRoutingContext(
+            opCtx, {{targeter.getNS(), cri}}, [&](RoutingContext& routingCtx) {
+                // Unscaled individual shard results. This is required to apply scaling after
+                // summing the statistics from individual shards as opposed to adding the summation
+                // of the scaled statistics.
+                auto unscaledShardResults = scatterGatherVersionedTargetByRoutingTable(
+                    opCtx,
+                    targeter.getNS(),
+                    routingCtx,
+                    applyReadWriteConcern(
+                        opCtx,
+                        this,
+                        CommandHelpers::filterCommandRequestForPassthrough(cmdObjToSend)),
+                    ReadPreferenceSetting::get(opCtx),
+                    Shard::RetryPolicy::kIdempotent,
+                    {} /*query*/,
+                    {} /*collation*/,
+                    boost::none /*letParameters*/,
+                    boost::none /*runtimeConstants*/);
 
-        for (const auto& shardResult : shardResults) {
-            const auto& shardId = shardResult.shardId;
-            const auto shardResponse = uassertStatusOK(std::move(shardResult.swResponse));
-            uassertStatusOK(shardResponse.status);
+                BSONObjBuilder shardStats;
+                std::map<std::string, long long> counts;
+                std::map<std::string, long long> indexSizes;
+                std::map<std::string, long long> clusterTimeseriesStats;
 
-            const auto& res = shardResponse.data;
-            uassertStatusOK(getStatusFromCommandResult(res));
+                long long maxSize = 0;
+                long long unscaledCollSize = 0;
 
-            // We don't know the order that we will encounter the count and size, so we save them
-            // until we've iterated through all the fields before updating unscaledCollSize
-            const auto shardObjCount = static_cast<long long>(res["count"].Number());
+                int nindexes = 0;
+                bool warnedAboutIndexes = false;
+                std::string timeseriesBucketsNs;
+                long long timeseriesTotalBucketSize = 0;
 
-            for (const auto& e : res) {
-                if (str::equals(e.fieldName(), "ns") ||              //
-                    str::equals(e.fieldName(), "ok") ||              //
-                    str::equals(e.fieldName(), "lastExtentSize") ||  //
-                    str::equals(e.fieldName(), "paddingFactor")) {
-                    // Ignored fields
-                    continue;
-                } else if (str::equals(e.fieldName(), "userFlags") ||          //
-                           str::equals(e.fieldName(), "capped") ||             //
-                           str::equals(e.fieldName(), "max") ||                //
-                           str::equals(e.fieldName(), "paddingFactorNote") ||  //
-                           str::equals(e.fieldName(), "indexDetails") ||       //
-                           str::equals(e.fieldName(), "wiredTiger")) {
-                    // Fields that are copied from the first shard only, because they need to match
-                    // across shards
-                    if (!result.hasField(e.fieldName()))
-                        result.append(e);
-                } else if (str::equals(e.fieldName(), "count") ||        //
-                           str::equals(e.fieldName(), "size") ||         //
-                           str::equals(e.fieldName(), "storageSize") ||  //
-                           str::equals(e.fieldName(), "numExtents") ||   //
-                           str::equals(e.fieldName(), "totalIndexSize")) {
-                    counts[e.fieldName()] += e.numberLong();
-                } else if (str::equals(e.fieldName(), "avgObjSize")) {
-                    const auto shardAvgObjSize = e.numberLong();
-                    unscaledCollSize += shardAvgObjSize * shardObjCount;
-                } else if (str::equals(e.fieldName(), "maxSize")) {
-                    const auto shardMaxSize = e.numberLong();
-                    maxSize = std::max(maxSize, shardMaxSize);
-                } else if (str::equals(e.fieldName(), "indexSizes")) {
-                    BSONObjIterator k(e.Obj());
-                    while (k.more()) {
-                        BSONElement temp = k.next();
-                        indexSizes[temp.fieldName()] += temp.numberLong();
-                    }
-                } else if (str::equals(e.fieldName(), "nindexes")) {
-                    int myIndexes = e.numberInt();
+                for (const auto& shardResult : unscaledShardResults) {
+                    const auto& shardId = shardResult.shardId;
+                    const auto shardResponse = uassertStatusOK(std::move(shardResult.swResponse));
+                    uassertStatusOK(shardResponse.status);
 
-                    if (nindexes == 0) {
-                        nindexes = myIndexes;
-                    } else if (nindexes == myIndexes) {
-                        // no-op
-                    } else {
-                        // hopefully this means we're building an index
+                    const auto& res = shardResponse.data;
+                    uassertStatusOK(getStatusFromCommandResult(res));
 
-                        if (myIndexes > nindexes)
-                            nindexes = myIndexes;
+                    // We don't know the order that we will encounter the count and size, so we save
+                    // them until we've iterated through all the fields before updating
+                    // unscaledCollSize Timeseries bucket collection does not provide 'count' or
+                    // 'avgObjSize'.
+                    BSONElement countField = res.getField("count");
+                    const auto shardObjCount =
+                        static_cast<long long>(!countField.eoo() ? countField.Number() : 0);
 
-                        if (!warnedAboutIndexes) {
-                            result.append("warning",
-                                          "indexes don't all match - ok if ensureIndex is running");
-                            warnedAboutIndexes = true;
+                    for (const auto& e : res) {
+                        StringData fieldName = e.fieldNameStringData();
+                        if (fieldIsAnyOf(fieldName,
+                                         {"ns", "ok", "lastExtentSize", "paddingFactor"})) {
+                            continue;
+                        }
+                        if (fieldIsAnyOf(fieldName,
+                                         {"userFlags",
+                                          "capped",
+                                          "max",
+                                          "paddingFactorNote",
+                                          "indexDetails",
+                                          "wiredTiger"})) {
+                            // Fields that are copied from the first shard only, because they need
+                            // to match across shards
+                            if (!result.hasField(e.fieldName()))
+                                result.append(e);
+                        } else if (fieldName == "timeseries") {
+                            aggregateTimeseriesStats(e.Obj(),
+                                                     &clusterTimeseriesStats,
+                                                     &timeseriesBucketsNs,
+                                                     &timeseriesTotalBucketSize);
+                        } else if (fieldIsAnyOf(fieldName,
+                                                {"count",
+                                                 "size",
+                                                 "storageSize",
+                                                 "totalIndexSize",
+                                                 "totalSize"})) {
+                            counts[e.fieldName()] += e.numberLong();
+                        } else if (fieldName == "avgObjSize") {
+                            const auto shardAvgObjSize = e.numberLong();
+                            uassert(5688300,
+                                    "'avgObjSize' provided but not 'count'",
+                                    !countField.eoo());
+                            unscaledCollSize += shardAvgObjSize * shardObjCount;
+                        } else if (fieldName == "maxSize") {
+                            const auto shardMaxSize = e.numberLong();
+                            maxSize = std::max(maxSize, shardMaxSize);
+                        } else if (fieldName == "indexSizes") {
+                            BSONObjIterator k(e.Obj());
+                            while (k.more()) {
+                                BSONElement temp = k.next();
+                                indexSizes[temp.fieldName()] += temp.numberLong();
+                            }
+                        } else if (fieldName == "nindexes") {
+                            int myIndexes = e.numberInt();
+
+                            if (nindexes == 0) {
+                                nindexes = myIndexes;
+                            } else if (nindexes == myIndexes) {
+                                // no-op
+                            } else {
+                                // hopefully this means we're building an index
+
+                                if (myIndexes > nindexes)
+                                    nindexes = myIndexes;
+
+                                if (!warnedAboutIndexes) {
+                                    result.append(
+                                        "warning",
+                                        "indexes don't all match - ok if ensureIndex is running");
+                                    warnedAboutIndexes = true;
+                                }
+                            }
+                        } else {
+                            LOGV2(22749,
+                                  "Unexpected field for mongos collStats",
+                                  "fieldName"_attr = e.fieldName());
                         }
                     }
-                } else {
-                    log() << "mongos collstats doesn't know about: " << e.fieldName();
+
+                    shardStats.append(shardId.toString(),
+                                      scaleIndividualShardStatistics(res, scale));
                 }
-            }
 
-            shardStats.append(shardId.toString(), res);
-        }
+                result.append(
+                    "ns",
+                    NamespaceStringUtil::serialize(nss, SerializationContext::stateDefault()));
 
-        result.append("ns", nss.ns());
+                for (const auto& countEntry : counts) {
+                    if (fieldIsAnyOf(countEntry.first,
+                                     {"size", "storageSize", "totalIndexSize", "totalSize"})) {
+                        result.appendNumber(countEntry.first, countEntry.second / scale);
+                    } else {
+                        result.appendNumber(countEntry.first, countEntry.second);
+                    }
+                }
 
-        for (const auto& countEntry : counts) {
-            result.appendNumber(countEntry.first, countEntry.second);
-        }
+                if (!clusterTimeseriesStats.empty() || !timeseriesBucketsNs.empty()) {
+                    // 'clusterTimeseriesStats' and 'timeseriesBucketsNs' should both be set. If
+                    // only one is ever set, the error will be caught in
+                    // appendTimeseriesInfoToResult().
+                    appendTimeseriesInfoToResult(
+                        clusterTimeseriesStats, timeseriesBucketsNs, &result);
+                }
 
-        {
-            BSONObjBuilder ib(result.subobjStart("indexSizes"));
-            for (const auto& entry : indexSizes) {
-                ib.appendNumber(entry.first, entry.second);
-            }
-            ib.done();
-        }
+                {
+                    BSONObjBuilder ib(result.subobjStart("indexSizes"));
+                    for (const auto& entry : indexSizes) {
+                        ib.appendNumber(entry.first, entry.second / scale);
+                    }
+                    ib.done();
+                }
 
-        // The unscaled avgObjSize for each shard is used to get the unscaledCollSize because the
-        // raw size returned by the shard is affected by the command's scale parameter
-        if (counts["count"] > 0)
-            result.append("avgObjSize", (double)unscaledCollSize / (double)counts["count"]);
-        else
-            result.append("avgObjSize", 0.0);
+                // The unscaled avgObjSize for each shard is used to get the unscaledCollSize
+                // because the raw size returned by the shard is affected by the command's scale
+                // parameter
+                if (counts["count"] > 0)
+                    result.append("avgObjSize", (double)unscaledCollSize / (double)counts["count"]);
+                else
+                    result.append("avgObjSize", 0.0);
 
-        result.append("maxSize", maxSize);
-        result.append("nindexes", nindexes);
-        result.append("nchunks", (routingInfo.cm() ? routingInfo.cm()->numChunks() : 1));
-        result.append("shards", shardStats.obj());
+                result.append("maxSize", maxSize / scale);
+                result.append("nindexes", nindexes);
+                result.append("scaleFactor", scale);
+                result.append("nchunks", cm.numChunks());
+                result.append("shards", shardStats.obj());
 
-        return true;
+                return true;
+            });
     }
-
-} collectionStatsCmd;
+};
+MONGO_REGISTER_COMMAND(CollectionStats).forRouter();
 
 }  // namespace
 }  // namespace mongo

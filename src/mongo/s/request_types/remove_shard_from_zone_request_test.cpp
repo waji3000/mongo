@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,11 +27,14 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <memory>
 
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/s/request_types/remove_shard_from_zone_request_type.h"
-
-#include "mongo/db/jsobj.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
@@ -41,10 +43,9 @@ namespace {
 
 TEST(RemoveShardFromZoneRequest, BasicValidMongosCommand) {
     auto requestStatus =
-        RemoveShardFromZoneRequest::parseFromMongosCommand(BSON("removeShardFromZone"
-                                                                << "a"
-                                                                << "zone"
-                                                                << "z"));
+        RemoveShardFromZoneRequest::parseFromMongosCommand(BSON("removeShardFromZone" << "a"
+                                                                                      << "zone"
+                                                                                      << "z"));
     ASSERT_OK(requestStatus.getStatus());
 
     auto request = requestStatus.getValue();
@@ -54,10 +55,9 @@ TEST(RemoveShardFromZoneRequest, BasicValidMongosCommand) {
 
 TEST(RemoveShardFromZoneRequest, CommandBuilderShouldAlwaysCreateConfigCommand) {
     auto requestStatus =
-        RemoveShardFromZoneRequest::parseFromMongosCommand(BSON("removeShardFromZone"
-                                                                << "a"
-                                                                << "zone"
-                                                                << "z"));
+        RemoveShardFromZoneRequest::parseFromMongosCommand(BSON("removeShardFromZone" << "a"
+                                                                                      << "zone"
+                                                                                      << "z"));
     ASSERT_OK(requestStatus.getStatus());
 
     auto request = requestStatus.getValue();
@@ -66,55 +66,50 @@ TEST(RemoveShardFromZoneRequest, CommandBuilderShouldAlwaysCreateConfigCommand) 
     request.appendAsConfigCommand(&builder);
     auto cmdObj = builder.obj();
 
-    ASSERT_BSONOBJ_EQ(BSON("_configsvrRemoveShardFromZone"
-                           << "a"
-                           << "zone"
-                           << "z"),
+    ASSERT_BSONOBJ_EQ(BSON("_configsvrRemoveShardFromZone" << "a"
+                                                           << "zone"
+                                                           << "z"),
                       cmdObj);
 }
 
 TEST(RemoveShardFromZoneRequest, MissingZoneErrors) {
-    auto request = RemoveShardFromZoneRequest::parseFromMongosCommand(BSON("removeShardFromZone"
-                                                                           << "a"));
+    auto request =
+        RemoveShardFromZoneRequest::parseFromMongosCommand(BSON("removeShardFromZone" << "a"));
     ASSERT_EQ(ErrorCodes::NoSuchKey, request.getStatus());
 }
 
 TEST(RemoveShardFromZoneRequest, MissingShardNameErrors) {
-    auto request = RemoveShardFromZoneRequest::parseFromMongosCommand(BSON("zone"
-                                                                           << "z"));
+    auto request = RemoveShardFromZoneRequest::parseFromMongosCommand(BSON("zone" << "z"));
     ASSERT_EQ(ErrorCodes::NoSuchKey, request.getStatus());
 }
 
 TEST(RemoveShardFromZoneRequest, WrongShardNameTypeErrors) {
-    auto request = RemoveShardFromZoneRequest::parseFromMongosCommand(
-        BSON("removeShardFromZone" << 1234 << "zone"
-                                   << "z"));
+    auto request = RemoveShardFromZoneRequest::parseFromMongosCommand(BSON("removeShardFromZone"
+                                                                           << 1234 << "zone"
+                                                                           << "z"));
     ASSERT_EQ(ErrorCodes::TypeMismatch, request.getStatus());
 }
 
 TEST(RemoveShardFromZoneRequest, WrongZoneNameTypeErrors) {
     auto request = RemoveShardFromZoneRequest::parseFromMongosCommand(BSON("removeShardFromZone"
                                                                            << "a"
-                                                                           << "zone"
-                                                                           << 1234));
+                                                                           << "zone" << 1234));
     ASSERT_EQ(ErrorCodes::TypeMismatch, request.getStatus());
 }
 
 TEST(RemoveShardFromZoneRequest, CannotUseMongosToParseConfigCommand) {
-    auto request =
-        RemoveShardFromZoneRequest::parseFromMongosCommand(BSON("_configsvrRemoveShardFromZone"
-                                                                << "a"
-                                                                << "zone"
-                                                                << "z"));
+    auto request = RemoveShardFromZoneRequest::parseFromMongosCommand(
+        BSON("_configsvrRemoveShardFromZone" << "a"
+                                             << "zone"
+                                             << "z"));
     ASSERT_EQ(ErrorCodes::NoSuchKey, request.getStatus());
 }
 
 TEST(CfgRemoveShardFromZoneRequest, BasicValidConfigCommand) {
-    auto requestStatus =
-        RemoveShardFromZoneRequest::parseFromConfigCommand(BSON("_configsvrRemoveShardFromZone"
-                                                                << "a"
-                                                                << "zone"
-                                                                << "z"));
+    auto requestStatus = RemoveShardFromZoneRequest::parseFromConfigCommand(
+        BSON("_configsvrRemoveShardFromZone" << "a"
+                                             << "zone"
+                                             << "z"));
     ASSERT_OK(requestStatus.getStatus());
 
     auto request = requestStatus.getValue();
@@ -125,23 +120,20 @@ TEST(CfgRemoveShardFromZoneRequest, BasicValidConfigCommand) {
     request.appendAsConfigCommand(&builder);
     auto cmdObj = builder.obj();
 
-    ASSERT_BSONOBJ_EQ(BSON("_configsvrRemoveShardFromZone"
-                           << "a"
-                           << "zone"
-                           << "z"),
+    ASSERT_BSONOBJ_EQ(BSON("_configsvrRemoveShardFromZone" << "a"
+                                                           << "zone"
+                                                           << "z"),
                       cmdObj);
 }
 
 TEST(CfgRemoveShardFromZoneRequest, MissingZoneErrors) {
-    auto request =
-        RemoveShardFromZoneRequest::parseFromConfigCommand(BSON("_configsvrRemoveShardFromZone"
-                                                                << "a"));
+    auto request = RemoveShardFromZoneRequest::parseFromConfigCommand(
+        BSON("_configsvrRemoveShardFromZone" << "a"));
     ASSERT_EQ(ErrorCodes::NoSuchKey, request.getStatus());
 }
 
 TEST(CfgRemoveShardFromZoneRequest, MissingShardNameErrors) {
-    auto request = RemoveShardFromZoneRequest::parseFromConfigCommand(BSON("zone"
-                                                                           << "z"));
+    auto request = RemoveShardFromZoneRequest::parseFromConfigCommand(BSON("zone" << "z"));
     ASSERT_EQ(ErrorCodes::NoSuchKey, request.getStatus());
 }
 
@@ -153,19 +145,16 @@ TEST(CfgRemoveShardFromZoneRequest, WrongShardNameTypeErrors) {
 }
 
 TEST(CfgRemoveShardFromZoneRequest, WrongZoneNameTypeErrors) {
-    auto request =
-        RemoveShardFromZoneRequest::parseFromConfigCommand(BSON("_configsvrRemoveShardFromZone"
-                                                                << "a"
-                                                                << "zone"
-                                                                << 1234));
+    auto request = RemoveShardFromZoneRequest::parseFromConfigCommand(
+        BSON("_configsvrRemoveShardFromZone" << "a"
+                                             << "zone" << 1234));
     ASSERT_EQ(ErrorCodes::TypeMismatch, request.getStatus());
 }
 
 TEST(CfgRemoveShardFromZoneRequest, CannotUseConfigToParseMongosCommand) {
     auto request = RemoveShardFromZoneRequest::parseFromConfigCommand(BSON("removeShardFromZone"
                                                                            << "a"
-                                                                           << "zone"
-                                                                           << 1234));
+                                                                           << "zone" << 1234));
     ASSERT_EQ(ErrorCodes::NoSuchKey, request.getStatus());
 }
 

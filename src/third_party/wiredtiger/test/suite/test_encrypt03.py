@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Public Domain 2014-2018 MongoDB, Inc.
+# Public Domain 2014-present MongoDB, Inc.
 # Public Domain 2008-2014 WiredTiger, Inc.
 #
 # This is free and unencumbered software released into the public domain.
@@ -30,7 +30,6 @@
 #   Test some error conditions with encryption.
 #
 
-import os, run, random
 import wiredtiger, wttest
 from wtscenario import make_scenarios
 
@@ -73,6 +72,3 @@ class test_encrypt03(wttest.WiredTigerTestCase):
 
         self.assertRaisesWithMessage(wiredtiger.WiredTigerError, lambda:
             self.session.create(self.uri, params), msg)
-
-if __name__ == '__main__':
-    wttest.run()

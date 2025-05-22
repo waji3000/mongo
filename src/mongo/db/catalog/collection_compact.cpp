@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,136 +27,100 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
 
 #include "mongo/db/catalog/collection_compact.h"
 
+#include <cstdint>
+#include <memory>
+#include <string>
+
+#include <boost/cstdint.hpp>
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/collection_catalog.h"
+#include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/document_validation.h"
-#include "mongo/db/catalog/index_key_validate.h"
-#include "mongo/db/catalog/multi_index_block.h"
-#include "mongo/db/catalog/multi_index_block_impl.h"
-#include "mongo/db/index/index_access_method.h"
-#include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/catalog/index_catalog.h"
+#include "mongo/db/catalog_raii.h"
+#include "mongo/db/concurrency/d_concurrency.h"
+#include "mongo/db/concurrency/lock_manager_defs.h"
+#include "mongo/db/db_raii.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/timeseries/catalog_helper.h"
+#include "mongo/db/transaction_resources.h"
+#include "mongo/db/views/view.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/log.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/str.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 namespace mongo {
 
-StatusWith<CompactStats> compactCollection(OperationContext* opCtx,
-                                           Collection* collection,
-                                           const CompactOptions* compactOptions) {
-    dassert(opCtx->lockState()->isCollectionLockedForMode(collection->ns().toString(), MODE_X));
+MONGO_FAIL_POINT_DEFINE(pauseCompactCommandBeforeWTCompact);
 
+using logv2::LogComponent;
+
+StatusWith<int64_t> compactCollection(OperationContext* opCtx,
+                                      const CompactOptions& options,
+                                      const CollectionPtr& collection) {
     DisableDocumentValidation validationDisabler(opCtx);
 
+    auto collectionNss = collection->ns();
     auto recordStore = collection->getRecordStore();
-    auto indexCatalog = collection->getIndexCatalog();
 
     if (!recordStore->compactSupported())
-        return StatusWith<CompactStats>(ErrorCodes::CommandNotSupported,
-                                        str::stream()
-                                            << "cannot compact collection with record store: "
-                                            << recordStore->name());
+        return Status(ErrorCodes::CommandNotSupported,
+                      str::stream() << "cannot compact collection with record store: "
+                                    << recordStore->name());
 
-    if (recordStore->compactsInPlace()) {
-        CompactStats stats;
-        Status status = recordStore->compact(opCtx);
-        if (!status.isOK())
-            return StatusWith<CompactStats>(status);
+    LOGV2_OPTIONS(20284, {LogComponent::kCommand}, "Compact begin", logAttrs(collectionNss));
 
-        // Compact all indexes (not including unfinished indexes)
-        std::unique_ptr<IndexCatalog::IndexIterator> ii(
-            indexCatalog->getIndexIterator(opCtx, false));
-        while (ii->more()) {
-            IndexCatalogEntry* entry = ii->next();
-            IndexDescriptor* descriptor = entry->descriptor();
-            IndexAccessMethod* iam = entry->accessMethod();
+    auto& ru = *shard_role_details::getRecoveryUnit(opCtx);
+    auto bytesBefore = recordStore->storageSize(ru) + collection->getIndexSize(opCtx);
+    auto indexCatalog = collection->getIndexCatalog();
 
-            LOG(1) << "compacting index: " << descriptor->toString();
-            Status status = iam->compact(opCtx);
-            if (!status.isOK()) {
-                error() << "failed to compact index: " << descriptor->toString();
-                return status;
-            }
-        }
+    pauseCompactCommandBeforeWTCompact.pauseWhileSet();
 
-        return StatusWith<CompactStats>(stats);
+    auto compactCollectionStatus = recordStore->compact(opCtx, options);
+    if (!compactCollectionStatus.isOK())
+        return compactCollectionStatus;
+
+    // Compact all indexes (not including unfinished indexes)
+    auto compactIndexesStatus = indexCatalog->compactIndexes(opCtx, options);
+    if (!compactIndexesStatus.isOK())
+        return compactIndexesStatus;
+
+    // The compact operation might grow the file size if there is little free space left, because
+    // running a compact also triggers a checkpoint, which requires some space. Additionally, it is
+    // possible for concurrent writes and index builds to cause the size to grow while compact is
+    // running. So it is possible for the size after a compact to be larger than before it.
+    if (options.dryRun) {
+        // When a dry run is triggered, each compact call returns an estimated number of bytes that
+        // can be reclaimed.
+        int64_t estimatedBytes =
+            compactCollectionStatus.getValue() + compactIndexesStatus.getValue();
+        LOGV2(8352600,
+              "Compact end",
+              logAttrs(collectionNss),
+              "estimatedBytes"_attr = estimatedBytes);
+        return estimatedBytes;
+    } else {
+        auto bytesAfter = recordStore->storageSize(ru) + collection->getIndexSize(opCtx);
+        auto bytesDiff = static_cast<int64_t>(bytesBefore) - static_cast<int64_t>(bytesAfter);
+        LOGV2(7386700,
+              "Compact end",
+              logAttrs(collectionNss),
+              "bytesBefore"_attr = bytesBefore,
+              "bytesAfter"_attr = bytesAfter,
+              "bytesDiff"_attr = bytesDiff);
+        return bytesDiff;
     }
-
-    if (indexCatalog->numIndexesInProgress(opCtx))
-        return StatusWith<CompactStats>(ErrorCodes::BadValue,
-                                        "cannot compact when indexes in progress");
-
-    std::vector<BSONObj> indexSpecs;
-    {
-        std::unique_ptr<IndexCatalog::IndexIterator> ii(
-            indexCatalog->getIndexIterator(opCtx, false));
-        while (ii->more()) {
-            IndexDescriptor* descriptor = ii->next()->descriptor();
-
-            // Compact always creates the new index in the foreground.
-            const BSONObj spec =
-                descriptor->infoObj().removeField(IndexDescriptor::kBackgroundFieldName);
-            const BSONObj key = spec.getObjectField("key");
-            const Status keyStatus =
-                index_key_validate::validateKeyPattern(key, descriptor->version());
-            if (!keyStatus.isOK()) {
-                return StatusWith<CompactStats>(
-                    ErrorCodes::CannotCreateIndex,
-                    str::stream() << "Cannot compact collection due to invalid index " << spec
-                                  << ": "
-                                  << keyStatus.reason()
-                                  << " For more info see"
-                                  << " http://dochub.mongodb.org/core/index-validation");
-            }
-            indexSpecs.push_back(spec);
-        }
-    }
-
-    // Give a chance to be interrupted *before* we drop all indexes.
-    opCtx->checkForInterrupt();
-
-    {
-        // note that the drop indexes call also invalidates all clientcursors for the namespace,
-        // which is important and wanted here
-        WriteUnitOfWork wunit(opCtx);
-        log() << "compact dropping indexes";
-        indexCatalog->dropAllIndexes(opCtx, true);
-        wunit.commit();
-    }
-
-    CompactStats stats;
-
-    MultiIndexBlockImpl indexer(opCtx, collection);
-    indexer.allowInterruption();
-    indexer.ignoreUniqueConstraint();  // in compact we should be doing no checking
-
-    Status status = indexer.init(indexSpecs).getStatus();
-    if (!status.isOK())
-        return StatusWith<CompactStats>(status);
-
-    // The MMAPv1 storage engine used to add documents to indexer through the
-    // RecordStoreCompactAdaptor interface.
-    status = recordStore->compact(opCtx);
-    if (!status.isOK())
-        return StatusWith<CompactStats>(status);
-
-    log() << "starting index commits";
-    status = indexer.doneInserting();
-    if (!status.isOK())
-        return StatusWith<CompactStats>(status);
-
-    {
-        WriteUnitOfWork wunit(opCtx);
-        status = indexer.commit();
-        if (!status.isOK()) {
-            return StatusWith<CompactStats>(status);
-        }
-        wunit.commit();
-    }
-
-    return StatusWith<CompactStats>(stats);
 }
 
 }  // namespace mongo

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -32,14 +31,30 @@
 
 #include <string>
 
+#include "mongo/base/string_data.h"
+#include "mongo/logv2/log_severity.h"
+#include "mongo/util/duration.h"
 
 namespace mongo {
 
-void setSocketKeepAliveParams(int sock,
-                              unsigned int maxKeepIdleSecs = 300,
-                              unsigned int maxKeepIntvlSecs = 300);
+inline constexpr Seconds kMaxKeepIdleSecs{300};
+inline constexpr Seconds kMaxKeepIntvlSecs{1};
 
-std::string makeUnixSockPath(int port);
+
+void setSocketKeepAliveParams(int sock,
+                              logv2::LogSeverity errorLogSeverity,
+                              Seconds maxKeepIdleSecs = kMaxKeepIdleSecs,
+                              Seconds maxKeepIntvlSecs = kMaxKeepIntvlSecs);
+
+std::string makeUnixSockPath(int port, StringData label = "");
+
+inline bool isUnixDomainSocket(StringData hostname) {
+    return hostname.find('/') != std::string::npos;
+}
+
+#ifndef _WIN32
+void setUnixDomainSocketPermissions(const std::string& path, int permissions);
+#endif
 
 // If an ip address is passed in, just return that.  If a hostname is passed
 // in, look up its ip and return that.  Returns "" on failure.
@@ -55,10 +70,15 @@ std::string getHostName();
  * will be stale */
 std::string getHostNameCached();
 
-/** Returns getHostNameCached():<port>. */
-std::string getHostNameCachedAndPort();
 
-/** Returns getHostNameCached(), or getHostNameCached():<port> if running on a non-default port. */
-std::string prettyHostName();
+/**
+ * Returns getHostNameCached():<port>.
+ */
+std::string prettyHostNameAndPort(int port);
+
+/**
+ * Returns getHostNameCached(), or getHostNameCached():<port> if running on a non-default port.
+ */
+std::string prettyHostName(int port);
 
 }  // namespace mongo

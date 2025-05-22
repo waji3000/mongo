@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -41,6 +40,7 @@ using ::std::future_status;  // NOLINT
 using ::std::launch;         // NOLINT
 using ::std::packaged_task;  // NOLINT
 using ::std::promise;        // NOLINT
+using ::std::shared_future;  // NOLINT
 
 }  // namespace stdx
 }  // namespace mongo

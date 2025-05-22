@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -32,6 +31,7 @@
 
 #include <string>
 
+#include "mongo/base/status.h"
 #include "mongo/util/duration.h"
 
 namespace mongo {

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,12 +29,19 @@
 
 #include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/catalog/collection_options.h"
+#include "mongo/db/coll_mod_gen.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/repl/oplog.h"
+#include "mongo/db/shard_role.h"
 
 namespace mongo {
 class BSONObj;
 class BSONObjBuilder;
 class Collection;
+class CollectionPtr;
 class NamespaceString;
 class OperationContext;
 
@@ -46,29 +52,36 @@ class OperationContext;
 void addCollectionUUIDs(OperationContext* opCtx);
 
 /**
- * Performs the collection modification described in "cmdObj" on the collection "ns".
+ * Checks if the collMod request is converting an index to unique.
  */
-Status collMod(OperationContext* opCtx,
-               const NamespaceString& ns,
-               const BSONObj& cmdObj,
-               BSONObjBuilder* result);
+bool isCollModIndexUniqueConversion(const CollModRequest& request);
 
 /**
- * Applies the collMod operation and optionally updates formatVersion of unique indexes belonging
- * to collection "nss".
+ * Constructs a valid collMod dry-run request from the original request.
+ * The 'dryRun' option can only be used with the index 'unique' option, so we assume 'request' must
+ * have the 'unique' option. The function will also remove other options from the original request.
  */
-Status collModWithUpgrade(OperationContext* opCtx,
-                          const NamespaceString& nss,
-                          const BSONObj& cmdObj);
+CollModRequest makeCollModDryRunRequest(const CollModRequest& request);
 
-/*
- * Updates the unique indexes to timestamp safe unique index format on setFCV=4.2. It also updates
- * non-replicated unique indexes indirectly by calling updateNonReplicatedUniqueIndexes().
+/**
+ * Performs the collection modification described in "cmd" on the collection "ns". The 'acquisition'
+ * parameter is intended to be used for internal collMod commands where the collection has already
+ * been acquired with the necessary X lock. If omitted, the collection will be looked up and locked
+ * appropriately.
  */
-void updateUniqueIndexesOnUpgrade(OperationContext* opCtx);
+Status processCollModCommand(OperationContext* opCtx,
+                             const NamespaceStringOrUUID& nsOrUUID,
+                             const CollMod& cmd,
+                             CollectionAcquisition* acquisition,
+                             BSONObjBuilder* result);
 
-/*
- * Updates non-replicated unique indexes to timestamp safe unique index format.
+/**
+ * Performs the collection modification described in "cmd" on the collection "ns". Only checks for
+ * duplicates for the 'applyOps' command.
  */
-Status updateNonReplicatedUniqueIndexes(OperationContext* opCtx);
+Status processCollModCommandForApplyOps(OperationContext* opCtx,
+                                        const NamespaceStringOrUUID& nsOrUUID,
+                                        const CollMod& cmd,
+                                        repl::OplogApplication::Mode mode);
+
 }  // namespace mongo

@@ -27,19 +27,35 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#include <string>
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/s/sharding_logging.h"
-
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobj.h"
-#include "mongo/db/s/sharding_state.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/oid.h"
+#include "mongo/client/read_preference.h"
+#include "mongo/db/client.h"
+#include "mongo/db/cluster_role.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/s/sharding_logging.h"
 #include "mongo/db/server_options.h"
+#include "mongo/db/shard_id.h"
 #include "mongo/executor/network_interface.h"
+#include "mongo/logv2/log.h"
 #include "mongo/s/catalog/type_changelog.h"
+#include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
-#include "mongo/util/log.h"
+#include "mongo/s/sharding_state.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/decorable.h"
+#include "mongo/util/net/hostandport.h"
+#include "mongo/util/str.h"
+#include "mongo/util/time_support.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
+
 
 namespace mongo {
 
@@ -47,18 +63,12 @@ namespace {
 
 const std::string kActionLogCollectionName("actionlog");
 const int kActionLogCollectionSizeMB = 20 * 1024 * 1024;
-
-const std::string kChangeLogCollectionName("changelog");
 const int kChangeLogCollectionSizeMB = 200 * 1024 * 1024;
 
 // Global ShardingLogging instance
 const auto shardingLogging = ServiceContext::declareDecoration<ShardingLogging>();
 
 }  // namespace
-
-ShardingLogging::ShardingLogging() = default;
-
-ShardingLogging::~ShardingLogging() = default;
 
 ShardingLogging* ShardingLogging::get(ServiceContext* serviceContext) {
     return &shardingLogging(serviceContext);
@@ -70,17 +80,24 @@ ShardingLogging* ShardingLogging::get(OperationContext* operationContext) {
 
 Status ShardingLogging::logAction(OperationContext* opCtx,
                                   const StringData what,
-                                  const StringData ns,
-                                  const BSONObj& detail) {
+                                  const NamespaceString& ns,
+                                  const BSONObj& detail,
+                                  std::shared_ptr<Shard> configShard,
+                                  ShardingCatalogClient* catalogClient) {
+    auto configShardToUse =
+        configShard ? std::move(configShard) : Grid::get(opCtx)->shardRegistry()->getConfigShard();
+    auto catalogClientToUse = catalogClient ? catalogClient : Grid::get(opCtx)->catalogClient();
+
     if (_actionLogCollectionCreated.load() == 0) {
         Status result = _createCappedConfigCollection(opCtx,
                                                       kActionLogCollectionName,
                                                       kActionLogCollectionSizeMB,
-                                                      ShardingCatalogClient::kMajorityWriteConcern);
+                                                      defaultMajorityWriteConcernDoNotUse(),
+                                                      std::move(configShardToUse));
         if (result.isOK()) {
             _actionLogCollectionCreated.store(1);
         } else {
-            log() << "couldn't create config.actionlog collection:" << causedBy(result);
+            LOGV2(22078, "Couldn't create config.actionlog collection", "error"_attr = result);
             return result;
         }
     }
@@ -90,69 +107,98 @@ Status ShardingLogging::logAction(OperationContext* opCtx,
                 what,
                 ns,
                 detail,
-                ShardingCatalogClient::kMajorityWriteConcern);
+                defaultMajorityWriteConcernDoNotUse(),
+                catalogClientToUse);
 }
 
 Status ShardingLogging::logChangeChecked(OperationContext* opCtx,
                                          const StringData what,
-                                         const StringData ns,
+                                         const NamespaceString& ns,
                                          const BSONObj& detail,
-                                         const WriteConcernOptions& writeConcern) {
-    invariant(serverGlobalParams.clusterRole == ClusterRole::ConfigServer ||
-              writeConcern.wMode == WriteConcernOptions::kMajority);
+                                         const WriteConcernOptions& writeConcern,
+                                         std::shared_ptr<Shard> configShard,
+                                         ShardingCatalogClient* catalogClient) {
+    if (serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer)) {
+        // If we're using a non-majority write concern, we should have provided an overriden
+        // configShard and catalogClient to perform local operations.
+        invariant(writeConcern.isMajority() || (configShard && catalogClient));
+    } else {
+        invariant(writeConcern.isMajority());
+    }
+
+    auto configShardToUse =
+        configShard ? std::move(configShard) : Grid::get(opCtx)->shardRegistry()->getConfigShard();
+    auto catalogClientToUse = catalogClient ? catalogClient : Grid::get(opCtx)->catalogClient();
+
     if (_changeLogCollectionCreated.load() == 0) {
-        Status result = _createCappedConfigCollection(
-            opCtx, kChangeLogCollectionName, kChangeLogCollectionSizeMB, writeConcern);
+        Status result = _createCappedConfigCollection(opCtx,
+                                                      ChangeLogType::ConfigNS.coll(),
+                                                      kChangeLogCollectionSizeMB,
+                                                      writeConcern,
+                                                      std::move(configShardToUse));
         if (result.isOK()) {
             _changeLogCollectionCreated.store(1);
         } else {
-            log() << "couldn't create config.changelog collection:" << causedBy(result);
+            LOGV2(22079, "Couldn't create config.changelog collection", "error"_attr = result);
             return result;
         }
     }
 
-    return _log(opCtx, kChangeLogCollectionName, what, ns, detail, writeConcern);
+    return _log(
+        opCtx, ChangeLogType::ConfigNS.coll(), what, ns, detail, writeConcern, catalogClientToUse);
 }
 
 Status ShardingLogging::_log(OperationContext* opCtx,
                              const StringData logCollName,
                              const StringData what,
-                             const StringData operationNS,
+                             const NamespaceString& operationNS,
                              const BSONObj& detail,
-                             const WriteConcernOptions& writeConcern) {
+                             const WriteConcernOptions& writeConcern,
+                             ShardingCatalogClient* catalogClient) {
     Date_t now = Grid::get(opCtx)->getNetwork()->now();
-    const std::string serverName = str::stream() << Grid::get(opCtx)->getNetwork()->getHostName()
-                                                 << ":" << serverGlobalParams.port;
-    const std::string changeId = str::stream() << serverName << "-" << now.toString() << "-"
-                                               << OID::gen();
+
+    const auto& session = opCtx->getClient()->session();
+    const std::string sessionStr = session ? fmt::format(":{}", session->toBSON().toString()) : "";
+    const std::string serverName = str::stream()
+        << Grid::get(opCtx)->getNetwork()->getHostName() << sessionStr;
+    const std::string changeId = str::stream()
+        << serverName << "-" << now.toString() << "-" << OID::gen();
 
     ChangeLogType changeLog;
     changeLog.setChangeId(changeId);
     changeLog.setServer(serverName);
-    if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
+    if (serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer)) {
         changeLog.setShard("config");
-    } else {
-        auto shardingState = ShardingState::get(opCtx);
-        if (shardingState->enabled()) {
-            changeLog.setShard(shardingState->shardId().toString());
-        }
+    }
+    auto shardingState = ShardingState::get(opCtx);
+    if (shardingState->enabled()) {
+        changeLog.setShard(shardingState->shardId().toString());
     }
     changeLog.setClientAddr(opCtx->getClient()->clientAddress(true));
     changeLog.setTime(now);
-    changeLog.setNS(operationNS.toString());
+    changeLog.setNS(operationNS);
     changeLog.setWhat(what.toString());
+    // TODO SERVER-99655, SERVER-99552: update once gSnapshotFCVInDDLCoordinators is enabled on the
+    // lastLTS and the OFCV is snapshotted for DDLs that do not pass by coordinators.
+    if (auto& vCtx = VersionContext::getDecoration(opCtx); vCtx.isInitialized()) {
+        changeLog.setVersionContext(vCtx);
+    }
     changeLog.setDetails(detail);
 
     BSONObj changeLogBSON = changeLog.toBSON();
-    log() << "about to log metadata event into " << logCollName << ": " << redact(changeLogBSON);
+    LOGV2(22080,
+          "About to log metadata event",
+          "namespace"_attr = logCollName,
+          "event"_attr = redact(changeLogBSON));
 
-    const NamespaceString nss("config", logCollName);
-    Status result = Grid::get(opCtx)->catalogClient()->insertConfigDocument(
-        opCtx, nss, changeLogBSON, writeConcern);
+    const NamespaceString nss(NamespaceString::makeGlobalConfigCollection(logCollName));
+    Status result = catalogClient->insertConfigDocument(opCtx, nss, changeLogBSON, writeConcern);
 
     if (!result.isOK()) {
-        warning() << "Error encountered while logging config change with ID [" << changeId
-                  << "] into collection " << logCollName << ": " << redact(result);
+        LOGV2_WARNING(5538900,
+                      "Error encountered while logging config change",
+                      "changeDocument"_attr = changeLog,
+                      "error"_attr = redact(result));
     }
 
     return result;
@@ -161,37 +207,40 @@ Status ShardingLogging::_log(OperationContext* opCtx,
 Status ShardingLogging::_createCappedConfigCollection(OperationContext* opCtx,
                                                       StringData collName,
                                                       int cappedSize,
-                                                      const WriteConcernOptions& writeConcern) {
-    BSONObj createCmd = BSON("create" << collName << "capped" << true << "size" << cappedSize
-                                      << WriteConcernOptions::kWriteConcernField
-                                      << writeConcern.toBSON());
+                                                      const WriteConcernOptions& writeConcern,
+                                                      std::shared_ptr<Shard> configShard) {
+    BSONObj createCmd =
+        BSON("create" << collName << "capped" << true << "size" << cappedSize
+                      << WriteConcernOptions::kWriteConcernField << writeConcern.toBSON());
 
-    auto result =
-        Grid::get(opCtx)->shardRegistry()->getConfigShard()->runCommandWithFixedRetryAttempts(
+    while (true) {
+        auto result = configShard->runCommandWithFixedRetryAttempts(
             opCtx,
             ReadPreferenceSetting{ReadPreference::PrimaryOnly},
-            "config",
+            DatabaseName::kConfig,
             createCmd,
-            Shard::kDefaultConfigCommandTimeout,
+            Milliseconds(defaultConfigCommandTimeoutMS.load()),
             Shard::RetryPolicy::kIdempotent);
 
-    if (!result.isOK()) {
-        return result.getStatus();
-    }
-
-    if (!result.getValue().commandStatus.isOK()) {
-        if (result.getValue().commandStatus == ErrorCodes::NamespaceExists) {
-            if (result.getValue().writeConcernStatus.isOK()) {
-                return Status::OK();
-            } else {
-                return result.getValue().writeConcernStatus;
-            }
-        } else {
-            return result.getValue().commandStatus;
+        if (!result.isOK()) {
+            return result.getStatus();
         }
-    }
 
-    return result.getValue().writeConcernStatus;
+        if (!result.getValue().commandStatus.isOK()) {
+            if (result.getValue().commandStatus == ErrorCodes::NamespaceExists) {
+                if (result.getValue().writeConcernStatus.isOK()) {
+                    return Status::OK();
+                } else {
+                    // Retry command in case of config server step down
+                    continue;
+                }
+            } else {
+                return result.getValue().commandStatus;
+            }
+        }
+
+        return result.getValue().writeConcernStatus;
+    }
 }
 
 }  // namespace mongo

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,46 +27,120 @@
  *    it in the license file.
  */
 
-#include <exception>
+#include <boost/exception/exception.hpp>
+#include <fmt/format.h>
+#include <functional>
 #include <stdexcept>
 #include <string>
 
-#include <boost/exception/exception.hpp>
+#include <boost/optional/optional.hpp>
 
 #include "mongo/base/status.h"
-#include "mongo/config.h"
-#include "mongo/db/json.h"
+#include "mongo/bson/json.h"
+#include "mongo/config.h"  // IWYU pragma: keep
 #include "mongo/unittest/death_test.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 namespace {
 
-TEST(Basic, Accessors) {
+
+static constexpr const char* kReason = "reason";
+static const std::string& kReasonString = *new std::string{kReason};
+
+// Check a reason argument specified in various types.
+template <typename R>
+void checkReason(R&& r, std::string expected = kReasonString) {
+    ASSERT_EQUALS(Status(ErrorCodes::MaxError, std::forward<R>(r)).reason(), expected)
+        << fmt::format("type {}", demangleName(typeid(decltype(r))));
+};
+
+struct CanString {
+    operator std::string() const {
+        return kReason;
+    }
+};
+
+struct CanStringExplicit {
+    explicit operator std::string() const {
+        return kReason;
+    }
+};
+
+struct CanStringOrStringData {
+    operator StringData() const {
+        return "bad choice"_sd;
+    }
+    operator std::string() const {
+        return "good choice";
+    }
+};
+
+struct CanStringRef {
+    operator const std::string&() const {
+        return kReasonString;
+    }
+};
+
+template <typename... Args>
+constexpr bool usableStatusArgs = std::is_constructible_v<Status, Args...>;
+
+TEST(Status, ReasonStrings) {
+    // Try several types of `reason` arguments.
+    checkReason(kReason);
+    checkReason(kReasonString);
+    checkReason(std::string_view{kReason});  // NOLINT
+    checkReason(std::string{kReason});
+    checkReason(StringData{kReason});
+    checkReason(str::stream{} << kReason);
+    checkReason(CanStringOrStringData{}, "good choice");
+    checkReason(CanStringRef{});
+
+    ASSERT((usableStatusArgs<ErrorCodes::Error, std::string>));
+    ASSERT((usableStatusArgs<ErrorCodes::Error, std::string&>));
+    ASSERT((usableStatusArgs<ErrorCodes::Error, const std::string&>));
+    ASSERT((usableStatusArgs<ErrorCodes::Error, std::string&&>));
+    ASSERT((usableStatusArgs<ErrorCodes::Error, StringData>));
+    ASSERT((usableStatusArgs<ErrorCodes::Error, StringData&>));
+    ASSERT((usableStatusArgs<ErrorCodes::Error, const StringData&>));
+    ASSERT((usableStatusArgs<ErrorCodes::Error, StringData&&>));
+    ASSERT((!usableStatusArgs<ErrorCodes::Error, boost::optional<std::string>>));
+    ASSERT((usableStatusArgs<ErrorCodes::Error, CanString>));
+    ASSERT((usableStatusArgs<ErrorCodes::Error, CanStringExplicit>));
+    ASSERT((usableStatusArgs<ErrorCodes::Error, CanStringOrStringData>));
+    ASSERT((usableStatusArgs<ErrorCodes::Error, CanStringRef>));
+    ASSERT((usableStatusArgs<ErrorCodes::Error, std::reference_wrapper<std::string>>));
+    ASSERT((usableStatusArgs<ErrorCodes::Error, std::reference_wrapper<const std::string>>));
+    ASSERT((usableStatusArgs<ErrorCodes::Error, std::reference_wrapper<const char*>>));
+    ASSERT((usableStatusArgs<ErrorCodes::Error, std::reference_wrapper<const char*>>));
+}
+
+TEST(Status, Accessors) {
     Status status(ErrorCodes::MaxError, "error");
     ASSERT_EQUALS(status.code(), ErrorCodes::MaxError);
     ASSERT_EQUALS(status.reason(), "error");
 }
 
-TEST(Basic, IsA) {
-    ASSERT(!Status(ErrorCodes::BadValue, "").isA<ErrorCategory::Interruption>());
-    ASSERT(Status(ErrorCodes::Interrupted, "").isA<ErrorCategory::Interruption>());
-    ASSERT(!Status(ErrorCodes::Interrupted, "").isA<ErrorCategory::ShutdownError>());
+TEST(Status, IsA) {
+    ASSERT(!Status(ErrorCodes::BadValue, "").isA<ErrorCategory::NetworkError>());
+    ASSERT(Status(ErrorCodes::HostUnreachable, "").isA<ErrorCategory::NetworkError>());
+    ASSERT(!Status(ErrorCodes::HostUnreachable, "").isA<ErrorCategory::ShutdownError>());
 }
 
-TEST(Basic, OKIsAValidStatus) {
+TEST(Status, OKIsAValidStatus) {
     Status status = Status::OK();
     ASSERT_EQUALS(status.code(), ErrorCodes::OK);
 }
 
-TEST(Basic, Compare) {
+TEST(Status, Compare) {
     Status errMax(ErrorCodes::MaxError, "error");
     ASSERT_EQ(errMax, errMax);
     ASSERT_NE(errMax, Status::OK());
 }
 
-TEST(Basic, WithReason) {
+TEST(Status, WithReason) {
     const Status orig(ErrorCodes::MaxError, "error");
 
     const auto copy = orig.withReason("reason");
@@ -78,162 +151,100 @@ TEST(Basic, WithReason) {
     ASSERT_EQ(orig.reason(), "error");
 }
 
-TEST(Basic, WithContext) {
+TEST(Status, WithContext) {
     const Status orig(ErrorCodes::MaxError, "error");
 
     const auto copy = orig.withContext("context");
     ASSERT_EQ(copy.code(), ErrorCodes::MaxError);
-    ASSERT(str::startsWith(copy.reason(), "context ")) << copy.reason();
-    ASSERT(str::endsWith(copy.reason(), " error")) << copy.reason();
+    ASSERT_STRING_SEARCH_REGEX(copy.reason(), "^context .* error$");
 
     ASSERT_EQ(orig.code(), ErrorCodes::MaxError);
     ASSERT_EQ(orig.reason(), "error");
 }
 
-TEST(Cloning, Copy) {
+TEST(Status, CloningCopy) {
     Status orig(ErrorCodes::MaxError, "error");
-    ASSERT_EQUALS(orig.refCount(), 1U);
-
     Status dest(orig);
     ASSERT_EQUALS(dest.code(), ErrorCodes::MaxError);
     ASSERT_EQUALS(dest.reason(), "error");
-
-    ASSERT_EQUALS(dest.refCount(), 2U);
-    ASSERT_EQUALS(orig.refCount(), 2U);
 }
 
-TEST(Cloning, MoveCopyOK) {
+TEST(Status, CloningMoveConstructOK) {
     Status orig = Status::OK();
     ASSERT_TRUE(orig.isOK());
-    ASSERT_EQUALS(orig.refCount(), 0U);
 
     Status dest(std::move(orig));
 
-    ASSERT_TRUE(orig.isOK());
-    ASSERT_EQUALS(orig.refCount(), 0U);
-
+    ASSERT_TRUE(orig.isOK());  // NOLINT(bugprone-use-after-move)
     ASSERT_TRUE(dest.isOK());
-    ASSERT_EQUALS(dest.refCount(), 0U);
 }
 
-TEST(Cloning, MoveCopyError) {
+TEST(Status, CloningMoveConstructError) {
     Status orig(ErrorCodes::MaxError, "error");
-    ASSERT_FALSE(orig.isOK());
-    ASSERT_EQUALS(orig.refCount(), 1U);
 
     Status dest(std::move(orig));
 
-    ASSERT_TRUE(orig.isOK());
-    ASSERT_EQUALS(orig.refCount(), 0U);
-
+    ASSERT_TRUE(orig.isOK());  // NOLINT(bugprone-use-after-move)
     ASSERT_FALSE(dest.isOK());
-    ASSERT_EQUALS(dest.refCount(), 1U);
     ASSERT_EQUALS(dest.code(), ErrorCodes::MaxError);
     ASSERT_EQUALS(dest.reason(), "error");
 }
 
-TEST(Cloning, MoveAssignOKToOK) {
+TEST(Status, CloningMoveAssignOKToOK) {
     Status orig = Status::OK();
-    ASSERT_TRUE(orig.isOK());
-    ASSERT_EQUALS(orig.refCount(), 0U);
-
     Status dest = Status::OK();
-    ASSERT_TRUE(dest.isOK());
-    ASSERT_EQUALS(dest.refCount(), 0U);
 
     dest = std::move(orig);
 
-    ASSERT_TRUE(orig.isOK());
-    ASSERT_EQUALS(orig.refCount(), 0U);
-
+    ASSERT_TRUE(orig.isOK());  // NOLINT(bugprone-use-after-move)
     ASSERT_TRUE(dest.isOK());
-    ASSERT_EQUALS(dest.refCount(), 0U);
 }
 
-TEST(Cloning, MoveAssignErrorToError) {
+TEST(Status, CloningMoveAssignErrorToError) {
     Status orig = Status(ErrorCodes::MaxError, "error");
-    ASSERT_FALSE(orig.isOK());
-    ASSERT_EQUALS(orig.refCount(), 1U);
-    ASSERT_EQUALS(orig.code(), ErrorCodes::MaxError);
-    ASSERT_EQUALS(orig.reason(), "error");
-
     Status dest = Status(ErrorCodes::InternalError, "error2");
-    ASSERT_FALSE(dest.isOK());
-    ASSERT_EQUALS(dest.refCount(), 1U);
-    ASSERT_EQUALS(dest.code(), ErrorCodes::InternalError);
-    ASSERT_EQUALS(dest.reason(), "error2");
 
     dest = std::move(orig);
 
-    ASSERT_TRUE(orig.isOK());
-    ASSERT_EQUALS(orig.refCount(), 0U);
-
+    ASSERT_TRUE(orig.isOK());  // NOLINT(bugprone-use-after-move)
     ASSERT_FALSE(dest.isOK());
-    ASSERT_EQUALS(dest.refCount(), 1U);
     ASSERT_EQUALS(dest.code(), ErrorCodes::MaxError);
     ASSERT_EQUALS(dest.reason(), "error");
 }
 
-TEST(Cloning, MoveAssignErrorToOK) {
+TEST(Status, CloningMoveAssignErrorToOK) {
     Status orig = Status(ErrorCodes::MaxError, "error");
-    ASSERT_FALSE(orig.isOK());
-    ASSERT_EQUALS(orig.refCount(), 1U);
-    ASSERT_EQUALS(orig.code(), ErrorCodes::MaxError);
-    ASSERT_EQUALS(orig.reason(), "error");
-
     Status dest = Status::OK();
-    ASSERT_TRUE(dest.isOK());
-    ASSERT_EQUALS(dest.refCount(), 0U);
 
     dest = std::move(orig);
 
-    ASSERT_TRUE(orig.isOK());
-    ASSERT_EQUALS(orig.refCount(), 0U);
-
+    ASSERT_TRUE(orig.isOK());  // NOLINT(bugprone-use-after-move)
     ASSERT_FALSE(dest.isOK());
-    ASSERT_EQUALS(dest.refCount(), 1U);
     ASSERT_EQUALS(dest.code(), ErrorCodes::MaxError);
     ASSERT_EQUALS(dest.reason(), "error");
 }
 
-TEST(Cloning, MoveAssignOKToError) {
+TEST(Status, CloningMoveAssignOKToError) {
     Status orig = Status::OK();
-    ASSERT_TRUE(orig.isOK());
-    ASSERT_EQUALS(orig.refCount(), 0U);
-
     Status dest = Status(ErrorCodes::MaxError, "error");
-    ASSERT_FALSE(dest.isOK());
-    ASSERT_EQUALS(dest.refCount(), 1U);
-    ASSERT_EQUALS(dest.code(), ErrorCodes::MaxError);
-    ASSERT_EQUALS(dest.reason(), "error");
 
     orig = std::move(dest);
 
     ASSERT_FALSE(orig.isOK());
-    ASSERT_EQUALS(orig.refCount(), 1U);
     ASSERT_EQUALS(orig.code(), ErrorCodes::MaxError);
     ASSERT_EQUALS(orig.reason(), "error");
 
-    ASSERT_TRUE(dest.isOK());
-    ASSERT_EQUALS(dest.refCount(), 0U);
+    ASSERT_TRUE(dest.isOK());  // NOLINT(bugprone-use-after-move)
 }
 
-TEST(Cloning, OKIsNotRefCounted) {
-    ASSERT_EQUALS(Status::OK().refCount(), 0U);
-
-    Status myOk = Status::OK();
-    ASSERT_EQUALS(myOk.refCount(), 0U);
-    ASSERT_EQUALS(Status::OK().refCount(), 0U);
-}
-
-TEST(Parsing, CodeToEnum) {
+TEST(Status, ParsingCodeToEnum) {
     ASSERT_EQUALS(ErrorCodes::TypeMismatch, ErrorCodes::Error(int(ErrorCodes::TypeMismatch)));
     ASSERT_EQUALS(ErrorCodes::UnknownError, ErrorCodes::Error(int(ErrorCodes::UnknownError)));
     ASSERT_EQUALS(ErrorCodes::MaxError, ErrorCodes::Error(int(ErrorCodes::MaxError)));
     ASSERT_EQUALS(ErrorCodes::OK, ErrorCodes::duplicateCodeForTest(0));
 }
 
-TEST(Transformers, ExceptionToStatus) {
+TEST(Status, ExceptionToStatus) {
     using mongo::DBException;
     using mongo::exceptionToStatus;
 
@@ -279,15 +290,28 @@ TEST(Transformers, ExceptionToStatus) {
     ASSERT_EQUALS(fromBoostExcept, ErrorCodes::UnknownError);
     // Reason should include that it was a boost::exception
     ASSERT_TRUE(fromBoostExcept.reason().find("boost::exception") != std::string::npos);
+
+    Status fromUnknownExceptionType = [=]() {
+        try {
+            throw 7;
+        } catch (...) {
+            return exceptionToStatus();
+        }
+    }();
+
+    ASSERT_NOT_OK(fromUnknownExceptionType);
+    ASSERT_EQUALS(fromUnknownExceptionType, ErrorCodes::UnknownError);
+    // Reason should include that it was an unknown exception
+    ASSERT_TRUE(fromUnknownExceptionType.reason().find("unknown type") != std::string::npos);
 }
 
-DEATH_TEST(ErrorExtraInfo, InvariantAllRegistered, "Invariant failure parsers::") {
+DEATH_TEST_REGEX(ErrorExtraInfo, InvariantAllRegistered, "Invariant failure.*parsers::") {
     ErrorExtraInfo::invariantHaveAllParsers();
 }
 
 #ifdef MONGO_CONFIG_DEBUG_BUILD
-DEATH_TEST(ErrorExtraInfo, DassertShouldHaveExtraInfo, "Fatal Assertion 40680") {
-    Status(ErrorCodes::ForTestingErrorExtraInfo, "");
+DEATH_TEST_REGEX(ErrorExtraInfo, DassertShouldHaveExtraInfo, "Fatal assertion.*40680") {
+    (void)Status(ErrorCodes::ForTestingErrorExtraInfo, "");
 }
 #else
 TEST(ErrorExtraInfo, ConvertCodeOnMissingExtraInfo) {
@@ -295,6 +319,68 @@ TEST(ErrorExtraInfo, ConvertCodeOnMissingExtraInfo) {
     ASSERT_EQ(status, ErrorCodes::duplicateCodeForTest(40671));
 }
 #endif
+
+TEST(ErrorExtraInfo, StatusCtorExtraAndReason) {
+    using Extra = OptionalErrorExtraInfoExample;
+    // Check another ctor
+    ASSERT((usableStatusArgs<Extra, std::string>));
+    ASSERT((usableStatusArgs<Extra, std::string&>));
+    ASSERT((usableStatusArgs<Extra, const std::string&>));
+    ASSERT((usableStatusArgs<Extra, std::string&&>));
+    ASSERT((usableStatusArgs<Extra, StringData>));
+    ASSERT((usableStatusArgs<Extra, StringData&>));
+    ASSERT((usableStatusArgs<Extra, const StringData&>));
+    ASSERT((usableStatusArgs<Extra, StringData&&>));
+    ASSERT((!usableStatusArgs<Extra, boost::optional<std::string>>));
+    ASSERT((usableStatusArgs<Extra, CanString>));
+    ASSERT((usableStatusArgs<Extra, CanStringExplicit>));
+    ASSERT((usableStatusArgs<Extra, CanStringOrStringData>));
+    ASSERT((usableStatusArgs<Extra, CanStringRef>));
+    ASSERT((usableStatusArgs<Extra, std::reference_wrapper<std::string>>));
+    ASSERT((usableStatusArgs<Extra, std::reference_wrapper<const std::string>>));
+    ASSERT((usableStatusArgs<Extra, std::reference_wrapper<const char*>>));
+    ASSERT((usableStatusArgs<Extra, std::reference_wrapper<const char*>>));
+}
+
+
+TEST(ErrorExtraInfo, OptionalExtraInfoDoesNotThrowAndReturnsOriginalError) {
+    const auto status = Status(ErrorCodes::ForTestingOptionalErrorExtraInfo, "");
+    ASSERT_EQ(status, ErrorCodes::ForTestingOptionalErrorExtraInfo);
+    // The ErrorExtraInfo pointer should be nullptr.
+    ASSERT(!status.extraInfo());
+}
+
+TEST(ErrorExtraInfo, OptionalExtraInfoStatusParserThrows) {
+    OptionalErrorExtraInfoExample::EnableParserForTest whenInScope;
+    bool failed = false;
+
+    auto pars = ErrorExtraInfo::parserFor(ErrorCodes::ForTestingOptionalErrorExtraInfo);
+    try {
+        pars(fromjson("{a: 1}"));
+    } catch (const DBException&) {
+        failed = true;
+    }
+
+    ASSERT(failed);
+}
+
+TEST(ErrorExtraInfo, OptionalExtraInfoStatusParserWorks) {
+    OptionalErrorExtraInfoExample::EnableParserForTest whenInScope;
+    const auto status =
+        Status(ErrorCodes::ForTestingOptionalErrorExtraInfo, "", fromjson("{data: 123}"));
+    ASSERT_EQ(status, ErrorCodes::ForTestingOptionalErrorExtraInfo);
+    ASSERT(status.extraInfo());
+    ASSERT(status.extraInfo<OptionalErrorExtraInfoExample>());
+    ASSERT_EQ(status.extraInfo<OptionalErrorExtraInfoExample>()->data, 123);
+}
+
+TEST(ErrorExtraInfo, MissingOptionalExtraInfoStatus) {
+    OptionalErrorExtraInfoExample::EnableParserForTest whenInScope;
+    const auto status = Status(ErrorCodes::ForTestingOptionalErrorExtraInfo, "");
+    ASSERT_EQ(status, ErrorCodes::ForTestingOptionalErrorExtraInfo);
+    ASSERT_FALSE(status.extraInfo());
+    ASSERT_FALSE(status.extraInfo<OptionalErrorExtraInfoExample>());
+}
 
 TEST(ErrorExtraInfo, TypedConstructorWorks) {
     const auto status = Status(ErrorExtraInfoExample(123), "");
@@ -318,6 +404,24 @@ TEST(ErrorExtraInfo, StatusParserWorks) {
     ASSERT(status.extraInfo());
     ASSERT(status.extraInfo<ErrorExtraInfoExample>());
     ASSERT_EQ(status.extraInfo<ErrorExtraInfoExample>()->data, 123);
+}
+
+TEST(ErrorExtraInfo, StatusParserWorksNested) {
+    nested::twice::NestedErrorExtraInfoExample::EnableParserForTest whenInScope;
+    auto status = Status(
+        ErrorCodes::ForTestingErrorExtraInfoWithExtraInfoInNamespace, "", fromjson("{data: 123}"));
+    ASSERT_EQ(status, ErrorCodes::ForTestingErrorExtraInfoWithExtraInfoInNamespace);
+    ASSERT(status.extraInfo());
+    ASSERT(status.extraInfo<nested::twice::NestedErrorExtraInfoExample>());
+    ASSERT_EQ(status.extraInfo<nested::twice::NestedErrorExtraInfoExample>()->data, 123);
+}
+
+TEST(ErrorExtraInfo, StatusWhenParserThrowsNested) {
+    auto status = Status(
+        ErrorCodes::ForTestingErrorExtraInfoWithExtraInfoInNamespace, "", fromjson("{data: 123}"));
+    ASSERT_EQ(status, ErrorCodes::duplicateCodeForTest(51100));
+    ASSERT(!status.extraInfo());
+    ASSERT(!status.extraInfo<nested::twice::NestedErrorExtraInfoExample>());
 }
 
 }  // namespace

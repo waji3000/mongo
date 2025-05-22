@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,11 +29,29 @@
 
 #pragma once
 
+#include <set>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/pipeline/dependencies.h"
 #include "mongo/db/pipeline/document_source.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/pipeline.h"
+#include "mongo/db/pipeline/stage_constraints.h"
+#include "mongo/db/pipeline/variables.h"
+#include "mongo/db/query/query_shape/serialization_options.h"
+#include "mongo/util/intrusive_counter.h"
 
 namespace mongo {
 
-class DocumentSourceLimit final : public DocumentSource, public NeedsMergerDocumentSource {
+class DocumentSourceLimit final : public DocumentSource {
 public:
     static constexpr StringData kStageName = "$limit"_sd;
 
@@ -51,22 +68,26 @@ public:
         BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
 
     StageConstraints constraints(Pipeline::SplitState pipeState) const final {
-        return {StreamType::kStreaming,
-                PositionRequirement::kNone,
-                HostTypeRequirement::kNone,
-                DiskUseRequirement::kNoDiskUse,
-                FacetRequirement::kAllowed,
-                TransactionRequirement::kAllowed};
+        StageConstraints constraints{StreamType::kStreaming,
+                                     PositionRequirement::kNone,
+                                     HostTypeRequirement::kNone,
+                                     DiskUseRequirement::kNoDiskUse,
+                                     FacetRequirement::kAllowed,
+                                     TransactionRequirement::kAllowed,
+                                     LookupRequirement::kAllowed,
+                                     UnionRequirement::kAllowed};
+        constraints.noFieldModifications = true;
+        return constraints;
     }
 
-    GetNextResult getNext() final;
     const char* getSourceName() const final {
-        return kStageName.rawData();
+        return kStageName.data();
     }
 
-    BSONObjSet getOutputSorts() final {
-        return pSource ? pSource->getOutputSorts()
-                       : SimpleBSONObjComparator::kInstance.makeBSONObjSet();
+    static const Id& id;
+
+    Id getId() const override {
+        return id;
     }
 
     /**
@@ -74,28 +95,22 @@ public:
      */
     Pipeline::SourceContainer::iterator doOptimizeAt(Pipeline::SourceContainer::iterator itr,
                                                      Pipeline::SourceContainer* container) final;
-    Value serialize(boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final;
+    Value serialize(const SerializationOptions& opts = SerializationOptions{}) const final;
 
     DepsTracker::State getDependencies(DepsTracker* deps) const final {
         return DepsTracker::State::SEE_NEXT;  // This doesn't affect needed fields
     }
 
     /**
-     * Returns the current DocumentSourceLimit for use in the shards pipeline. Running this stage on
-     * the shards is an optimization, but is not strictly necessary in order to produce correct
-     * pipeline output.
+     * Returns a DistributedPlanLogic with two identical $limit stages; one for the shards pipeline
+     * and one for the merging pipeline.
      */
-    boost::intrusive_ptr<DocumentSource> getShardSource() final {
-        return this;
-    }
-
-    /**
-     * Returns a new DocumentSourceLimit with the same limit as the current stage, for use in the
-     * merge pipeline. Unlike the shards source, it is necessary for this stage to run on the
-     * merging host in order to produce correct pipeline output.
-     */
-    MergingLogic mergingLogic() final {
-        return {DocumentSourceLimit::create(pExpCtx, _limit)};
+    boost::optional<DistributedPlanLogic> distributedPlanLogic() final {
+        // Running this stage on the shards is an optimization, but is not strictly necessary in
+        // order to produce correct pipeline output.
+        // {shardsStage, mergingStage, sortPattern}
+        return DistributedPlanLogic{
+            this, DocumentSourceLimit::create(pExpCtx, _limit), boost::none};
     }
 
     long long getLimit() const {
@@ -105,8 +120,11 @@ public:
         _limit = newLimit;
     }
 
+    void addVariableRefs(std::set<Variables::Id>* refs) const final {}
+
 private:
     DocumentSourceLimit(const boost::intrusive_ptr<ExpressionContext>& pExpCtx, long long limit);
+    GetNextResult doGetNext() final;
 
     long long _limit;
     long long _nReturned = 0;

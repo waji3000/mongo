@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Public Domain 2014-2018 MongoDB, Inc.
+# Public Domain 2014-present MongoDB, Inc.
 # Public Domain 2008-2014 WiredTiger, Inc.
 #
 # This is free and unencumbered software released into the public domain.
@@ -25,8 +25,12 @@
 # OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
 # ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
 # OTHER DEALINGS IN THE SOFTWARE.
+#
+# [TEST_TAGS]
+# transactions
+# [END_TAGS]
 
-import wiredtiger, wttest
+import wttest
 from wtscenario import make_scenarios
 
 # test_txn01.py
@@ -110,8 +114,8 @@ class test_txn01(wttest.WiredTigerTestCase):
         cursor = self.session.open_cursor(self.uri, None)
         self.check(cursor, 0, 0)
         self.session.begin_transaction()
-        for i in xrange(self.nentries):
-            if i > 0 and i % (self.nentries / 37) == 0:
+        for i in range(self.nentries):
+            if i > 0 and i % (self.nentries // 37) == 0:
                 self.check(cursor, committed, i)
                 self.session.commit_transaction()
                 committed = i
@@ -160,6 +164,3 @@ class test_read_committed_default(wttest.WiredTigerTestCase):
         self.assertEqual(self.cursor_count(cursor), 1)
         s.commit_transaction()
         s.close()
-
-if __name__ == '__main__':
-    wttest.run()

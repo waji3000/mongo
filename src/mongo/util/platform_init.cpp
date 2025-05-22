@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,34 +27,72 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kControl
-
-#include "mongo/platform/basic.h"
 
 #ifdef _WIN32
 #include <crtdbg.h>
+#include <cstdio>
+#include <cstdlib>
 #include <mmsystem.h>
-#include <stdio.h>
-#include <stdlib.h>
 #endif
 
-#include "mongo/base/init.h"
-#include "mongo/util/log.h"
-#include "mongo/util/stacktrace.h"
+#include "mongo/base/init.h"        // IWYU pragma: keep
+#include "mongo/logv2/log.h"        // IWYU pragma: keep
+#include "mongo/util/stacktrace.h"  // IWYU pragma: keep
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
+
 
 #ifdef _WIN32
 
 namespace mongo {
+namespace {
+
+StringData firstLine(const char* s) {
+    const char* eol = s;
+    while (*eol && *eol != '\n')
+        ++eol;
+    return StringData(s, eol - s);
+}
+
+StringData severity(int t) {
+    switch (t) {
+        case _CRT_WARN:
+            return "WARN"_sd;
+        case _CRT_ERROR:
+            return "ERROR"_sd;
+        case _CRT_ASSERT:
+            return "ASSERT"_sd;
+    }
+    return ""_sd;
+}
+
+extern "C" {
+// Print C runtime message, then fassert if it's more severe than a warning.
+int __cdecl crtDebugCallback(int nRptType, char* originalMessage, int* returnValue) noexcept {
+    *returnValue = 0;  // Returned by _CrtDbgReport. (1: starts the debugger).
+    bool die = (nRptType != _CRT_WARN);
+    LOGV2(23325,
+          "*** C runtime debug report ***",
+          "severity_nRptType"_attr = severity(nRptType),
+          "firstLine_originalMessage"_attr = firstLine(originalMessage),
+          "die_terminating_sd_sd"_attr = (die ? ", terminating"_sd : ""_sd));
+    if (die) {
+        fassertFailed(17006);
+    }
+    return TRUE;
+}
+}  // extern "C"
+}  // namespace
 
 MONGO_INITIALIZER(Behaviors_Win32)(InitializerContext*) {
     // do not display dialog on abort()
     _set_abort_behavior(0, _CALL_REPORTFAULT | _WRITE_ABORT_MSG);
 
     // hook the C runtime's error display
-    _CrtSetReportHook(crtDebugCallback);
+    _CrtSetReportHook(&crtDebugCallback);
 
-    if (_setmaxstdio(2048) == -1) {
-        warning() << "Failed to increase max open files limit from default of 512 to 2048";
+    if (_setmaxstdio(8192) == -1) {
+        LOGV2_WARNING(23326, "Failed to increase max open files limit from default of 512 to 8192");
     }
 
     // Let's try to set minimum Windows Kernel quantum length to smallest viable timer resolution in
@@ -67,17 +104,15 @@ MONGO_INITIALIZER(Behaviors_Win32)(InitializerContext*) {
     int timerResolution;
 
     if (timeGetDevCaps(&tc, sizeof(TIMECAPS)) != TIMERR_NOERROR) {
-        warning() << "Failed to read timer resolution range.";
+        LOGV2_WARNING(23327, "Failed to read timer resolution range.");
         if (timeBeginPeriod(1) != TIMERR_NOERROR) {
-            warning() << "Failed to set minimum timer resolution to 1 millisecond.";
+            LOGV2_WARNING(23328, "Failed to set minimum timer resolution to 1 millisecond.");
         }
     } else {
         timerResolution =
             std::min(std::max(int(tc.wPeriodMin), targetResolution), int(tc.wPeriodMax));
         invariant(timeBeginPeriod(timerResolution) == TIMERR_NOERROR);
     }
-
-    return Status::OK();
 }
 
 }  // namespace mongo

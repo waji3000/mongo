@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,16 +27,29 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <boost/move/utility_core.hpp>
+#include <list>
 
-#include "mongo/db/pipeline/document_source_sample.h"
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
 
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
 #include "mongo/db/client.h"
-#include "mongo/db/pipeline/document.h"
-#include "mongo/db/pipeline/expression.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/document_metadata_fields.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/document_source_limit.h"
+#include "mongo/db/pipeline/document_source_sample.h"
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/lite_parsed_document_source.h"
-#include "mongo/db/pipeline/value.h"
+#include "mongo/db/query/allowed_contexts.h"
+#include "mongo/platform/random.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 using boost::intrusive_ptr;
@@ -45,30 +57,35 @@ using boost::intrusive_ptr;
 constexpr StringData DocumentSourceSample::kStageName;
 
 DocumentSourceSample::DocumentSourceSample(const intrusive_ptr<ExpressionContext>& pExpCtx)
-    : DocumentSource(pExpCtx), _size(0) {}
+    : DocumentSource(kStageName, pExpCtx), _size(0) {}
 
 REGISTER_DOCUMENT_SOURCE(sample,
                          LiteParsedDocumentSourceDefault::parse,
-                         DocumentSourceSample::createFromBson);
+                         DocumentSourceSample::createFromBson,
+                         AllowedWithApiStrict::kAlways);
+ALLOCATE_DOCUMENT_SOURCE_ID(sample, DocumentSourceSample::id)
 
-DocumentSource::GetNextResult DocumentSourceSample::getNext() {
-    if (_size == 0)
+DocumentSource::GetNextResult DocumentSourceSample::doGetNext() {
+    if (_size == 0) {
+        pSource->dispose();
         return GetNextResult::makeEOF();
-
-    pExpCtx->checkForInterrupt();
+    }
 
     if (!_sortStage->isPopulated()) {
         // Exhaust source stage, add random metadata, and push all into sorter.
-        PseudoRandom& prng = pExpCtx->opCtx->getClient()->getPrng();
+        PseudoRandom& prng = pExpCtx->getOperationContext()->getClient()->getPrng();
         auto nextInput = pSource->getNext();
         for (; nextInput.isAdvanced(); nextInput = pSource->getNext()) {
             MutableDocument doc(nextInput.releaseDocument());
-            doc.setRandMetaField(prng.nextCanonicalDouble());
+            doc.metadata().setRandVal(prng.nextCanonicalDouble());
             _sortStage->loadDocument(doc.freeze());
         }
         switch (nextInput.getStatus()) {
             case GetNextResult::ReturnStatus::kAdvanced: {
                 MONGO_UNREACHABLE;  // We consumed all advances above.
+            }
+            case GetNextResult::ReturnStatus::kAdvancedControlDocument: {
+                tasserted(10358901, "Sample does not support control events");
             }
             case GetNextResult::ReturnStatus::kPauseExecution: {
                 return nextInput;  // Propagate the pause.
@@ -83,28 +100,26 @@ DocumentSource::GetNextResult DocumentSourceSample::getNext() {
     return _sortStage->getNext();
 }
 
-Value DocumentSourceSample::serialize(boost::optional<ExplainOptions::Verbosity> explain) const {
-    return Value(DOC(kStageName << DOC("size" << _size)));
+Value DocumentSourceSample::serialize(const SerializationOptions& opts) const {
+    return Value(DOC(kStageName << DOC("size" << opts.serializeLiteral(_size))));
 }
 
 namespace {
-const BSONObj randSortSpec = BSON("$rand" << BSON("$meta"
-                                                  << "randVal"));
+const BSONObj randSortSpec = BSON("$rand" << BSON("$meta" << "randVal"));
 }  // namespace
 
 intrusive_ptr<DocumentSource> DocumentSourceSample::createFromBson(
     BSONElement specElem, const intrusive_ptr<ExpressionContext>& expCtx) {
     uassert(28745, "the $sample stage specification must be an object", specElem.type() == Object);
-    intrusive_ptr<DocumentSourceSample> sample(new DocumentSourceSample(expCtx));
 
     bool sizeSpecified = false;
+    long long size;
     for (auto&& elem : specElem.embeddedObject()) {
         auto fieldName = elem.fieldNameStringData();
 
         if (fieldName == "size") {
             uassert(28746, "size argument to $sample must be a number", elem.isNumber());
-            uassert(28747, "size argument to $sample must not be negative", elem.numberLong() >= 0);
-            sample->_size = elem.numberLong();
+            size = elem.safeNumberLong();
             sizeSpecified = true;
         } else {
             uasserted(28748, str::stream() << "unrecognized option to $sample: " << fieldName);
@@ -112,22 +127,35 @@ intrusive_ptr<DocumentSource> DocumentSourceSample::createFromBson(
     }
     uassert(28749, "$sample stage must specify a size", sizeSpecified);
 
-    sample->_sortStage = DocumentSourceSort::create(expCtx, randSortSpec, sample->_size);
+    return DocumentSourceSample::create(expCtx, size);
+}
 
+boost::intrusive_ptr<DocumentSource> DocumentSourceSample::create(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx, long long size) {
+    uassert(28747, "size argument to $sample must be a positive integer", size > 0);
+
+    intrusive_ptr<DocumentSourceSample> sample(new DocumentSourceSample(expCtx));
+    sample->_size = size;
+    sample->_sortStage = DocumentSourceSort::create(
+        expCtx, {randSortSpec, expCtx}, {.limit = static_cast<uint64_t>(sample->_size)});
     return sample;
 }
 
-intrusive_ptr<DocumentSource> DocumentSourceSample::getShardSource() {
-    return this;
-}
-
-NeedsMergerDocumentSource::MergingLogic DocumentSourceSample::mergingLogic() {
+boost::optional<DocumentSource::DistributedPlanLogic> DocumentSourceSample::distributedPlanLogic() {
     // On the merger we need to merge the pre-sorted documents by their random values, then limit to
-    // the number we need. Here we don't use 'randSortSpec' because it uses a metadata sort which
-    // the merging logic does not understand. The merging logic will use the serialized sort key,
-    // and this sort pattern is just used to communicate ascending/descending information. A pattern
-    // like {$meta: "randVal"} is neither ascending nor descending, and so will not be useful when
-    // constructing the merging logic.
-    return {_size > 0 ? DocumentSourceLimit::create(pExpCtx, _size) : nullptr, BSON("$rand" << -1)};
+    // the number we need.
+    DistributedPlanLogic logic;
+    logic.shardsStage = this;
+    if (_size > 0) {
+        logic.mergingStages = {DocumentSourceLimit::create(pExpCtx, _size)};
+    }
+
+    // Here we don't use 'randSortSpec' because it uses a metadata sort which the merging logic does
+    // not understand. The merging logic will use the serialized sort key, and this sort pattern is
+    // just used to communicate ascending/descending information. A pattern like {$meta: "randVal"}
+    // is neither ascending nor descending, and so will not be useful when constructing the merging
+    // logic.
+    logic.mergeSortPattern = BSON("$rand" << -1);
+    return logic;
 }
 }  // namespace mongo

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,59 +27,71 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
 
-#include "mongo/platform/basic.h"
-
-#include <set>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+// IWYU pragma: no_include "cxxabi.h"
+#include <memory>
 #include <string>
+#include <variant>
 #include <vector>
 
-#include "mongo/client/remote_command_targeter_mock.h"
-#include "mongo/db/client.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/oid.h"
+#include "mongo/bson/timestamp.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/ops/write_ops.h"
+#include "mongo/db/generic_argument_util.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/query/find_command.h"
+#include "mongo/db/query/query_request_helper.h"
+#include "mongo/db/query/write_ops/write_ops.h"
+#include "mongo/db/query/write_ops/write_ops_gen.h"
+#include "mongo/db/query/write_ops/write_ops_parsers.h"
 #include "mongo/db/storage/duplicate_key_error_info.h"
 #include "mongo/db/write_concern.h"
+#include "mongo/executor/network_connection_hook.h"
 #include "mongo/executor/network_interface_mock.h"
-#include "mongo/executor/task_executor.h"
-#include "mongo/rpc/metadata/repl_set_metadata.h"
-#include "mongo/s/catalog/dist_lock_manager_mock.h"
+#include "mongo/executor/network_test_env.h"
+#include "mongo/executor/remote_command_request.h"
+#include "mongo/rpc/op_msg.h"
+#include "mongo/rpc/write_concern_error_detail.h"
+#include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/catalog/sharding_catalog_client_impl.h"
-#include "mongo/s/catalog/type_changelog.h"
-#include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/catalog/type_collection.h"
-#include "mongo/s/catalog/type_database.h"
-#include "mongo/s/catalog/type_shard.h"
-#include "mongo/s/client/shard_registry.h"
-#include "mongo/s/grid.h"
-#include "mongo/s/sharding_router_test_fixture.h"
+#include "mongo/s/sharding_mongos_test_fixture.h"
 #include "mongo/s/write_ops/batched_command_response.h"
-#include "mongo/stdx/future.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/util/log.h"
+#include "mongo/unittest/unittest.h"
+#include "mongo/util/net/hostandport.h"
+#include "mongo/util/uuid.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
+
 
 namespace mongo {
 namespace {
 
-using executor::NetworkInterfaceMock;
 using executor::RemoteCommandRequest;
-using executor::RemoteCommandResponse;
-using executor::TaskExecutor;
-using std::set;
 using std::string;
 using std::vector;
-using unittest::assertGet;
 
 using InsertRetryTest = ShardingTestFixture;
 using UpdateRetryTest = ShardingTestFixture;
 
-const NamespaceString kTestNamespace("config.TestColl");
+const NamespaceString kTestNamespace =
+    NamespaceString::createNamespaceString_forTest("config.TestColl");
 const HostAndPort kTestHosts[] = {
     HostAndPort("TestHost1:12345"), HostAndPort("TestHost2:12345"), HostAndPort("TestHost3:12345")};
 
 Status getMockDuplicateKeyError() {
-    return {DuplicateKeyErrorInfo(BSON("mock" << 1)), "Mock duplicate key error"};
+    return {DuplicateKeyErrorInfo(
+                BSON("mock" << 1), BSON("" << 1), BSONObj{}, std::monostate{}, boost::none),
+            "Mock duplicate key error"};
 }
 
 TEST_F(InsertRetryTest, RetryOnInterruptedAndNetworkErrorSuccess) {
@@ -90,18 +101,15 @@ TEST_F(InsertRetryTest, RetryOnInterruptedAndNetworkErrorSuccess) {
                                      << "TestValue");
 
     auto future = launchAsync([&] {
-        Status status =
-            catalogClient()->insertConfigDocument(operationContext(),
-                                                  kTestNamespace,
-                                                  objToInsert,
-                                                  ShardingCatalogClient::kMajorityWriteConcern);
+        Status status = catalogClient()->insertConfigDocument(
+            operationContext(), kTestNamespace, objToInsert, defaultMajorityWriteConcernDoNotUse());
         ASSERT_OK(status);
     });
 
     onCommand([&](const RemoteCommandRequest& request) {
         ASSERT_EQ(request.target, kTestHosts[0]);
         configTargeter()->setFindHostReturnValue({kTestHosts[1]});
-        return Status(ErrorCodes::InterruptedDueToStepDown, "Interruption");
+        return Status(ErrorCodes::InterruptedDueToReplStateChange, "Interruption");
     });
 
     onCommand([&](const RemoteCommandRequest& request) {
@@ -112,7 +120,7 @@ TEST_F(InsertRetryTest, RetryOnInterruptedAndNetworkErrorSuccess) {
 
     expectInserts(kTestNamespace, {objToInsert});
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(InsertRetryTest, RetryOnNetworkErrorFails) {
@@ -122,11 +130,8 @@ TEST_F(InsertRetryTest, RetryOnNetworkErrorFails) {
                                      << "TestValue");
 
     auto future = launchAsync([&] {
-        Status status =
-            catalogClient()->insertConfigDocument(operationContext(),
-                                                  kTestNamespace,
-                                                  objToInsert,
-                                                  ShardingCatalogClient::kMajorityWriteConcern);
+        Status status = catalogClient()->insertConfigDocument(
+            operationContext(), kTestNamespace, objToInsert, defaultMajorityWriteConcernDoNotUse());
         ASSERT_EQ(ErrorCodes::NetworkTimeout, status.code());
     });
 
@@ -147,7 +152,14 @@ TEST_F(InsertRetryTest, RetryOnNetworkErrorFails) {
         return Status(ErrorCodes::NetworkTimeout, "Network timeout");
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
+}
+
+void assertFindRequestHasFilter(const RemoteCommandRequest& request, BSONObj filter) {
+    // If there is no '$db', append it.
+    auto cmd = static_cast<OpMsgRequest>(request).body;
+    auto query = query_request_helper::makeFromFindCommandForTests(cmd);
+    ASSERT_BSONOBJ_EQ(filter, query->getFilter());
 }
 
 TEST_F(InsertRetryTest, DuplicateKeyErrorAfterNetworkErrorMatch) {
@@ -157,11 +169,8 @@ TEST_F(InsertRetryTest, DuplicateKeyErrorAfterNetworkErrorMatch) {
                                      << "TestValue");
 
     auto future = launchAsync([&] {
-        Status status =
-            catalogClient()->insertConfigDocument(operationContext(),
-                                                  kTestNamespace,
-                                                  objToInsert,
-                                                  ShardingCatalogClient::kMajorityWriteConcern);
+        Status status = catalogClient()->insertConfigDocument(
+            operationContext(), kTestNamespace, objToInsert, defaultMajorityWriteConcernDoNotUse());
         ASSERT_OK(status);
     });
 
@@ -178,14 +187,12 @@ TEST_F(InsertRetryTest, DuplicateKeyErrorAfterNetworkErrorMatch) {
 
     onFindCommand([&](const RemoteCommandRequest& request) {
         ASSERT_EQ(request.target, kTestHosts[1]);
-        auto query =
-            assertGet(QueryRequest::makeFromFindCommand(kTestNamespace, request.cmdObj, false));
-        ASSERT_BSONOBJ_EQ(BSON("_id" << 1), query->getFilter());
+        assertFindRequestHasFilter(request, BSON("_id" << 1));
 
         return vector<BSONObj>{objToInsert};
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(InsertRetryTest, DuplicateKeyErrorAfterNetworkErrorNotFound) {
@@ -195,11 +202,8 @@ TEST_F(InsertRetryTest, DuplicateKeyErrorAfterNetworkErrorNotFound) {
                                      << "TestValue");
 
     auto future = launchAsync([&] {
-        Status status =
-            catalogClient()->insertConfigDocument(operationContext(),
-                                                  kTestNamespace,
-                                                  objToInsert,
-                                                  ShardingCatalogClient::kMajorityWriteConcern);
+        Status status = catalogClient()->insertConfigDocument(
+            operationContext(), kTestNamespace, objToInsert, defaultMajorityWriteConcernDoNotUse());
         ASSERT_EQ(ErrorCodes::DuplicateKey, status.code());
     });
 
@@ -216,14 +220,11 @@ TEST_F(InsertRetryTest, DuplicateKeyErrorAfterNetworkErrorNotFound) {
 
     onFindCommand([&](const RemoteCommandRequest& request) {
         ASSERT_EQ(request.target, kTestHosts[1]);
-        auto query =
-            assertGet(QueryRequest::makeFromFindCommand(kTestNamespace, request.cmdObj, false));
-        ASSERT_BSONOBJ_EQ(BSON("_id" << 1), query->getFilter());
-
+        assertFindRequestHasFilter(request, BSON("_id" << 1));
         return vector<BSONObj>();
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(InsertRetryTest, DuplicateKeyErrorAfterNetworkErrorMismatch) {
@@ -233,11 +234,8 @@ TEST_F(InsertRetryTest, DuplicateKeyErrorAfterNetworkErrorMismatch) {
                                      << "TestValue");
 
     auto future = launchAsync([&] {
-        Status status =
-            catalogClient()->insertConfigDocument(operationContext(),
-                                                  kTestNamespace,
-                                                  objToInsert,
-                                                  ShardingCatalogClient::kMajorityWriteConcern);
+        Status status = catalogClient()->insertConfigDocument(
+            operationContext(), kTestNamespace, objToInsert, defaultMajorityWriteConcernDoNotUse());
         ASSERT_EQ(ErrorCodes::DuplicateKey, status.code());
     });
 
@@ -254,15 +252,13 @@ TEST_F(InsertRetryTest, DuplicateKeyErrorAfterNetworkErrorMismatch) {
 
     onFindCommand([&](const RemoteCommandRequest& request) {
         ASSERT_EQ(request.target, kTestHosts[1]);
-        auto query =
-            assertGet(QueryRequest::makeFromFindCommand(kTestNamespace, request.cmdObj, false));
-        ASSERT_BSONOBJ_EQ(BSON("_id" << 1), query->getFilter());
+        assertFindRequestHasFilter(request, BSON("_id" << 1));
 
         return vector<BSONObj>{BSON("_id" << 1 << "Value"
                                           << "TestValue has changed")};
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(InsertRetryTest, DuplicateKeyErrorAfterWriteConcernFailureMatch) {
@@ -272,16 +268,13 @@ TEST_F(InsertRetryTest, DuplicateKeyErrorAfterWriteConcernFailureMatch) {
                                      << "TestValue");
 
     auto future = launchAsync([&] {
-        Status status =
-            catalogClient()->insertConfigDocument(operationContext(),
-                                                  kTestNamespace,
-                                                  objToInsert,
-                                                  ShardingCatalogClient::kMajorityWriteConcern);
+        Status status = catalogClient()->insertConfigDocument(
+            operationContext(), kTestNamespace, objToInsert, defaultMajorityWriteConcernDoNotUse());
         ASSERT_OK(status);
     });
 
     onCommand([&](const RemoteCommandRequest& request) {
-        const auto opMsgRequest = OpMsgRequest::fromDBAndBody(request.dbname, request.cmdObj);
+        const auto opMsgRequest = static_cast<OpMsgRequest>(request);
         const auto insertOp = InsertOp::parse(opMsgRequest);
         ASSERT_EQUALS(kTestNamespace, insertOp.getNamespace());
 
@@ -289,7 +282,7 @@ TEST_F(InsertRetryTest, DuplicateKeyErrorAfterWriteConcernFailureMatch) {
         response.setStatus(Status::OK());
         response.setN(1);
 
-        auto wcError = stdx::make_unique<WriteConcernErrorDetail>();
+        auto wcError = std::make_unique<WriteConcernErrorDetail>();
 
         WriteConcernResult wcRes;
         wcRes.err = "timeout";
@@ -310,14 +303,12 @@ TEST_F(InsertRetryTest, DuplicateKeyErrorAfterWriteConcernFailureMatch) {
 
     onFindCommand([&](const RemoteCommandRequest& request) {
         ASSERT_EQ(request.target, kTestHosts[0]);
-        auto query =
-            assertGet(QueryRequest::makeFromFindCommand(kTestNamespace, request.cmdObj, false));
-        ASSERT_BSONOBJ_EQ(BSON("_id" << 1), query->getFilter());
+        assertFindRequestHasFilter(request, BSON("_id" << 1));
 
         return vector<BSONObj>{objToInsert};
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(UpdateRetryTest, Success) {
@@ -325,22 +316,20 @@ TEST_F(UpdateRetryTest, Success) {
 
     BSONObj objToUpdate = BSON("_id" << 1 << "Value"
                                      << "TestValue");
-    BSONObj updateExpr = BSON("$set" << BSON("Value"
-                                             << "NewTestValue"));
+    BSONObj updateExpr = BSON("$set" << BSON("Value" << "NewTestValue"));
 
     auto future = launchAsync([&] {
-        auto status =
-            catalogClient()->updateConfigDocument(operationContext(),
-                                                  kTestNamespace,
-                                                  objToUpdate,
-                                                  updateExpr,
-                                                  false,
-                                                  ShardingCatalogClient::kMajorityWriteConcern);
+        auto status = catalogClient()->updateConfigDocument(operationContext(),
+                                                            kTestNamespace,
+                                                            objToUpdate,
+                                                            updateExpr,
+                                                            false,
+                                                            defaultMajorityWriteConcernDoNotUse());
         ASSERT_OK(status);
     });
 
     onCommand([&](const RemoteCommandRequest& request) {
-        const auto opMsgRequest = OpMsgRequest::fromDBAndBody(request.dbname, request.cmdObj);
+        const auto opMsgRequest = static_cast<OpMsgRequest>(request);
         const auto updateOp = UpdateOp::parse(opMsgRequest);
         ASSERT_EQUALS(kTestNamespace, updateOp.getNamespace());
 
@@ -351,102 +340,98 @@ TEST_F(UpdateRetryTest, Success) {
         return response.toBSON();
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
-TEST_F(UpdateRetryTest, NotMasterErrorReturnedPersistently) {
+TEST_F(UpdateRetryTest, NotWritablePrimaryErrorReturnedPersistently) {
     configTargeter()->setFindHostReturnValue(HostAndPort("TestHost1"));
 
     BSONObj objToUpdate = BSON("_id" << 1 << "Value"
                                      << "TestValue");
-    BSONObj updateExpr = BSON("$set" << BSON("Value"
-                                             << "NewTestValue"));
+    BSONObj updateExpr = BSON("$set" << BSON("Value" << "NewTestValue"));
 
     auto future = launchAsync([&] {
-        auto status =
-            catalogClient()->updateConfigDocument(operationContext(),
-                                                  kTestNamespace,
-                                                  objToUpdate,
-                                                  updateExpr,
-                                                  false,
-                                                  ShardingCatalogClient::kMajorityWriteConcern);
-        ASSERT_EQUALS(ErrorCodes::NotMaster, status);
+        auto status = catalogClient()->updateConfigDocument(operationContext(),
+                                                            kTestNamespace,
+                                                            objToUpdate,
+                                                            updateExpr,
+                                                            false,
+                                                            defaultMajorityWriteConcernDoNotUse());
+        ASSERT_EQUALS(ErrorCodes::NotWritablePrimary, status);
     });
 
     for (int i = 0; i < 3; ++i) {
         onCommand([](const RemoteCommandRequest& request) {
             BSONObjBuilder bb;
-            CommandHelpers::appendCommandStatusNoThrow(bb, {ErrorCodes::NotMaster, "not master"});
+            CommandHelpers::appendCommandStatusNoThrow(
+                bb, {ErrorCodes::NotWritablePrimary, "not primary"});
             return bb.obj();
         });
     }
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
-TEST_F(UpdateRetryTest, NotMasterReturnedFromTargeter) {
-    configTargeter()->setFindHostReturnValue(Status(ErrorCodes::NotMaster, "not master"));
+TEST_F(UpdateRetryTest, NotWritablePrimaryReturnedFromTargeter) {
+    configTargeter()->setFindHostReturnValue(Status(ErrorCodes::NotWritablePrimary, "not primary"));
 
     BSONObj objToUpdate = BSON("_id" << 1 << "Value"
                                      << "TestValue");
-    BSONObj updateExpr = BSON("$set" << BSON("Value"
-                                             << "NewTestValue"));
+    BSONObj updateExpr = BSON("$set" << BSON("Value" << "NewTestValue"));
 
     auto future = launchAsync([&] {
-        auto status =
-            catalogClient()->updateConfigDocument(operationContext(),
-                                                  kTestNamespace,
-                                                  objToUpdate,
-                                                  updateExpr,
-                                                  false,
-                                                  ShardingCatalogClient::kMajorityWriteConcern);
-        ASSERT_EQUALS(ErrorCodes::NotMaster, status);
+        auto status = catalogClient()->updateConfigDocument(operationContext(),
+                                                            kTestNamespace,
+                                                            objToUpdate,
+                                                            updateExpr,
+                                                            false,
+                                                            defaultMajorityWriteConcernDoNotUse());
+        ASSERT_EQUALS(ErrorCodes::NotWritablePrimary, status);
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
-TEST_F(UpdateRetryTest, NotMasterOnceSuccessAfterRetry) {
+TEST_F(UpdateRetryTest, NotWritablePrimaryOnceSuccessAfterRetry) {
     HostAndPort host1("TestHost1");
     HostAndPort host2("TestHost2");
     configTargeter()->setFindHostReturnValue(host1);
 
-    CollectionType collection;
-    collection.setNs(NamespaceString("db.coll"));
-    collection.setUpdatedAt(network()->now());
-    collection.setUnique(true);
-    collection.setEpoch(OID::gen());
-    collection.setKeyPattern(KeyPattern(BSON("_id" << 1)));
+    CollectionType collection(NamespaceString::createNamespaceString_forTest("db.coll"),
+                              OID::gen(),
+                              Timestamp(1, 1),
+                              network()->now(),
+                              UUID::gen(),
+                              BSON("_id" << 1));
 
     BSONObj objToUpdate = BSON("_id" << 1 << "Value"
                                      << "TestValue");
-    BSONObj updateExpr = BSON("$set" << BSON("Value"
-                                             << "NewTestValue"));
+    BSONObj updateExpr = BSON("$set" << BSON("Value" << "NewTestValue"));
 
     auto future = launchAsync([&] {
-        ASSERT_OK(
-            catalogClient()->updateConfigDocument(operationContext(),
-                                                  kTestNamespace,
-                                                  objToUpdate,
-                                                  updateExpr,
-                                                  false,
-                                                  ShardingCatalogClient::kMajorityWriteConcern));
+        ASSERT_OK(catalogClient()->updateConfigDocument(operationContext(),
+                                                        kTestNamespace,
+                                                        objToUpdate,
+                                                        updateExpr,
+                                                        false,
+                                                        defaultMajorityWriteConcernDoNotUse()));
     });
 
     onCommand([&](const RemoteCommandRequest& request) {
         ASSERT_EQUALS(host1, request.target);
 
         // Ensure that when the catalog manager tries to retarget after getting the
-        // NotMaster response, it will get back a new target.
+        // NotWritablePrimary response, it will get back a new target.
         configTargeter()->setFindHostReturnValue(host2);
 
         BSONObjBuilder bb;
-        CommandHelpers::appendCommandStatusNoThrow(bb, {ErrorCodes::NotMaster, "not master"});
+        CommandHelpers::appendCommandStatusNoThrow(bb,
+                                                   {ErrorCodes::NotWritablePrimary, "not primary"});
         return bb.obj();
     });
 
     onCommand([&](const RemoteCommandRequest& request) {
-        const auto opMsgRequest = OpMsgRequest::fromDBAndBody(request.dbname, request.cmdObj);
+        const auto opMsgRequest = static_cast<OpMsgRequest>(request);
         const auto updateOp = UpdateOp::parse(opMsgRequest);
         ASSERT_EQUALS(kTestNamespace, updateOp.getNamespace());
 
@@ -457,7 +442,7 @@ TEST_F(UpdateRetryTest, NotMasterOnceSuccessAfterRetry) {
         return response.toBSON();
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(UpdateRetryTest, OperationInterruptedDueToPrimaryStepDown) {
@@ -465,38 +450,33 @@ TEST_F(UpdateRetryTest, OperationInterruptedDueToPrimaryStepDown) {
 
     BSONObj objToUpdate = BSON("_id" << 1 << "Value"
                                      << "TestValue");
-    BSONObj updateExpr = BSON("$set" << BSON("Value"
-                                             << "NewTestValue"));
+    BSONObj updateExpr = BSON("$set" << BSON("Value" << "NewTestValue"));
 
     auto future = launchAsync([&] {
-        auto status =
-            catalogClient()->updateConfigDocument(operationContext(),
-                                                  kTestNamespace,
-                                                  objToUpdate,
-                                                  updateExpr,
-                                                  false,
-                                                  ShardingCatalogClient::kMajorityWriteConcern);
+        auto status = catalogClient()->updateConfigDocument(operationContext(),
+                                                            kTestNamespace,
+                                                            objToUpdate,
+                                                            updateExpr,
+                                                            false,
+                                                            defaultMajorityWriteConcernDoNotUse());
         ASSERT_OK(status);
     });
 
     onCommand([&](const RemoteCommandRequest& request) {
-        const auto opMsgRequest = OpMsgRequest::fromDBAndBody(request.dbname, request.cmdObj);
+        const auto opMsgRequest = static_cast<OpMsgRequest>(request);
         const auto updateOp = UpdateOp::parse(opMsgRequest);
         ASSERT_EQUALS(kTestNamespace, updateOp.getNamespace());
 
         BatchedCommandResponse response;
         response.setStatus(Status::OK());
-
-        auto writeErrDetail = stdx::make_unique<WriteErrorDetail>();
-        writeErrDetail->setIndex(0);
-        writeErrDetail->setStatus({ErrorCodes::InterruptedDueToStepDown, "Operation interrupted"});
-        response.addToErrDetails(writeErrDetail.release());
+        response.addToErrDetails(write_ops::WriteError(
+            0, {ErrorCodes::InterruptedDueToReplStateChange, "Operation interrupted"}));
 
         return response.toBSON();
     });
 
     onCommand([&](const RemoteCommandRequest& request) {
-        const auto opMsgRequest = OpMsgRequest::fromDBAndBody(request.dbname, request.cmdObj);
+        const auto opMsgRequest = static_cast<OpMsgRequest>(request);
         const auto updateOp = UpdateOp::parse(opMsgRequest);
         ASSERT_EQUALS(kTestNamespace, updateOp.getNamespace());
 
@@ -507,7 +487,7 @@ TEST_F(UpdateRetryTest, OperationInterruptedDueToPrimaryStepDown) {
         return response.toBSON();
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(UpdateRetryTest, WriteConcernFailure) {
@@ -515,22 +495,20 @@ TEST_F(UpdateRetryTest, WriteConcernFailure) {
 
     BSONObj objToUpdate = BSON("_id" << 1 << "Value"
                                      << "TestValue");
-    BSONObj updateExpr = BSON("$set" << BSON("Value"
-                                             << "NewTestValue"));
+    BSONObj updateExpr = BSON("$set" << BSON("Value" << "NewTestValue"));
 
     auto future = launchAsync([&] {
-        auto status =
-            catalogClient()->updateConfigDocument(operationContext(),
-                                                  kTestNamespace,
-                                                  objToUpdate,
-                                                  updateExpr,
-                                                  false,
-                                                  ShardingCatalogClient::kMajorityWriteConcern);
+        auto status = catalogClient()->updateConfigDocument(operationContext(),
+                                                            kTestNamespace,
+                                                            objToUpdate,
+                                                            updateExpr,
+                                                            false,
+                                                            defaultMajorityWriteConcernDoNotUse());
         ASSERT_OK(status);
     });
 
     onCommand([&](const RemoteCommandRequest& request) {
-        const auto opMsgRequest = OpMsgRequest::fromDBAndBody(request.dbname, request.cmdObj);
+        const auto opMsgRequest = static_cast<OpMsgRequest>(request);
         const auto updateOp = UpdateOp::parse(opMsgRequest);
         ASSERT_EQUALS(kTestNamespace, updateOp.getNamespace());
 
@@ -538,7 +516,7 @@ TEST_F(UpdateRetryTest, WriteConcernFailure) {
         response.setStatus(Status::OK());
         response.setNModified(1);
 
-        auto wcError = stdx::make_unique<WriteConcernErrorDetail>();
+        auto wcError = std::make_unique<WriteConcernErrorDetail>();
 
         WriteConcernResult wcRes;
         wcRes.err = "timeout";
@@ -553,7 +531,7 @@ TEST_F(UpdateRetryTest, WriteConcernFailure) {
     });
 
     onCommand([&](const RemoteCommandRequest& request) {
-        const auto opMsgRequest = OpMsgRequest::fromDBAndBody(request.dbname, request.cmdObj);
+        const auto opMsgRequest = static_cast<OpMsgRequest>(request);
         const auto updateOp = UpdateOp::parse(opMsgRequest);
         ASSERT_EQUALS(kTestNamespace, updateOp.getNamespace());
 
@@ -564,7 +542,7 @@ TEST_F(UpdateRetryTest, WriteConcernFailure) {
         return response.toBSON();
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 }  // namespace

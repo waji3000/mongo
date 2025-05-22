@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,29 +29,54 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <functional>
+#include <memory>
 #include <string>
+#include <vector>
 
-#include "mongo/base/disallow_copying.h"
+#include "mongo/base/status.h"
 #include "mongo/base/string_data.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/oid.h"
+#include "mongo/bson/timestamp.h"
 #include "mongo/client/connection_string.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/repl/optime.h"
+#include "mongo/db/repl/replica_set_aware_service.h"
 #include "mongo/db/s/active_migrations_registry.h"
 #include "mongo/db/s/collection_sharding_runtime.h"
+#include "mongo/db/s/migration_batch_fetcher.h"
+#include "mongo/db/s/migration_batch_inserter.h"
+#include "mongo/db/s/migration_recipient_recovery_document_gen.h"
 #include "mongo/db/s/migration_session_id.h"
 #include "mongo/db/s/session_catalog_migration_destination.h"
-#include "mongo/s/shard_id.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/session/logical_session_id.h"
+#include "mongo/db/session/logical_session_id_gen.h"
+#include "mongo/db/shard_id.h"
+#include "mongo/db/write_concern_options.h"
+#include "mongo/platform/atomic_word.h"
+#include "mongo/s/catalog/type_chunk.h"
+#include "mongo/s/catalog_cache.h"
+#include "mongo/s/chunk_manager.h"
 #include "mongo/stdx/condition_variable.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/stdx/thread.h"
+#include "mongo/util/cancellation.h"
 #include "mongo/util/concurrency/with_lock.h"
+#include "mongo/util/future.h"
+#include "mongo/util/future_impl.h"
 #include "mongo/util/timer.h"
+#include "mongo/util/uuid.h"
 
 namespace mongo {
 
 class OperationContext;
+
 class StartChunkCloneRequest;
 class Status;
 struct WriteConcernOptions;
@@ -61,27 +85,45 @@ namespace repl {
 class OpTime;
 }
 
+struct CollectionOptionsAndIndexes {
+    UUID uuid;
+    std::vector<BSONObj> indexSpecs;
+    BSONObj idIndexSpec;
+    BSONObj options;
+};
+
 /**
  * Drives the receiving side of the MongoD migration process. One instance exists per shard.
  */
-class MigrationDestinationManager {
-    MONGO_DISALLOW_COPYING(MigrationDestinationManager);
+class MigrationDestinationManager
+    : public ReplicaSetAwareServiceShardSvr<MigrationDestinationManager> {
+    MigrationDestinationManager(const MigrationDestinationManager&) = delete;
+    MigrationDestinationManager& operator=(const MigrationDestinationManager&) = delete;
 
 public:
-    enum State { READY, CLONE, CATCHUP, STEADY, COMMIT_START, DONE, FAIL, ABORT };
+    enum State {
+        kReady,
+        kClone,
+        kCatchup,
+        kSteady,
+        kCommitStart,
+        kEnteredCritSec,
+        kExitCritSec,
+        kDone,
+        kFail,
+        kAbort
+    };
 
     MigrationDestinationManager();
-    ~MigrationDestinationManager();
+    ~MigrationDestinationManager() override;
 
     /**
      * Returns the singleton instance of the migration destination manager.
-     *
-     * TODO (SERVER-25333): This should become per-collection instance instead of singleton.
      */
+    static MigrationDestinationManager* get(ServiceContext* serviceContext);
     static MigrationDestinationManager* get(OperationContext* opCtx);
 
     State getState() const;
-    void setState(State newState);
 
     /**
      * Checks whether the MigrationDestinationManager is currently handling a migration.
@@ -97,25 +139,36 @@ public:
      * Returns a report on the active migration, if the migration is active. Otherwise return an
      * empty BSONObj.
      */
-    BSONObj getMigrationStatusReport();
+    BSONObj getMigrationStatusReport(
+        const CollectionShardingRuntime::ScopedSharedCollectionShardingRuntime& scopedCsrLock);
 
     /**
-     * Returns OK if migration started successfully.
+     * Returns OK if migration started successfully. Requires a ScopedReceiveChunk, which guarantees
+     * that there can only be one start() or restoreRecoveredMigrationState() call at any given
+     * time.
      */
     Status start(OperationContext* opCtx,
                  const NamespaceString& nss,
                  ScopedReceiveChunk scopedReceiveChunk,
-                 StartChunkCloneRequest cloneRequest,
-                 const OID& epoch,
+                 const StartChunkCloneRequest& cloneRequest,
                  const WriteConcernOptions& writeConcern);
+
+    /**
+     * Restores the MigrationDestinationManager state for a migration recovered on step-up. Requires
+     * a ScopedReceiveChunk, which guarantees that there can only be one start() or
+     * restoreRecoveredMigrationState() call at any given time.
+     */
+    Status restoreRecoveredMigrationState(OperationContext* opCtx,
+                                          ScopedReceiveChunk scopedReceiveChunk,
+                                          const MigrationRecipientRecoveryDocument& recoveryDoc);
 
     /**
      * Clones documents from a donor shard.
      */
-    static void cloneDocumentsFromDonor(
+    static repl::OpTime fetchAndApplyBatch(
         OperationContext* opCtx,
-        stdx::function<void(OperationContext*, BSONObj)> insertBatchFn,
-        stdx::function<BSONObj(OperationContext*)> fetchBatchFn);
+        std::function<bool(OperationContext*, BSONObj)> applyBatchFn,
+        std::function<bool(OperationContext*, BSONObj*)> fetchBatchFn);
 
     /**
      * Idempotent method, which causes the current ongoing migration to abort only if it has the
@@ -131,12 +184,64 @@ public:
 
     Status startCommit(const MigrationSessionId& sessionId);
 
-    /**
-     * Creates the collection nss on the shard and clones the indexes and options from fromShardId.
+    /*
+     * Refreshes the filtering metadata and releases the migration recipient critical section for
+     * the specified migration session. If no session is ongoing or the session doesn't match the
+     * current one, it does nothing and returns OK.
      */
-    static void cloneCollectionIndexesAndOptions(OperationContext* opCtx,
-                                                 const NamespaceString& nss,
-                                                 const ShardId& fromShardId);
+    Status exitCriticalSection(OperationContext* opCtx, const MigrationSessionId& sessionId);
+
+    /**
+     * Gets the collection indexes from fromShardId. If given a chunk manager, will fetch the
+     * indexes using the shard version protocol. if expandSimpleCollation is true, this will add
+     * simple collation to a secondary index spec if the index spec has no collation.
+     */
+    struct IndexesAndIdIndex {
+        std::vector<BSONObj> indexSpecs;
+        BSONObj idIndexSpec;
+    };
+    static IndexesAndIdIndex getCollectionIndexes(OperationContext* opCtx,
+                                                  const NamespaceString& nss,
+                                                  const ShardId& fromShardId,
+                                                  const boost::optional<CollectionRoutingInfo>& cri,
+                                                  boost::optional<Timestamp> afterClusterTime,
+                                                  bool expandSimpleCollation = false);
+
+
+    bool isParallelFetchingSupported() {
+        return _parallelFetchersSupported;
+    }
+
+    /**
+     * Gets the collection uuid and options from fromShardId. If given a chunk manager, will fetch
+     * the collection options using the database version protocol.
+     */
+    struct CollectionOptionsAndUUID {
+        BSONObj options;
+        UUID uuid;
+    };
+
+    static CollectionOptionsAndUUID getCollectionOptions(
+        OperationContext* opCtx,
+        const NamespaceStringOrUUID& nssOrUUID,
+        boost::optional<Timestamp> afterClusterTime);
+
+    static CollectionOptionsAndUUID getCollectionOptions(
+        OperationContext* opCtx,
+        const NamespaceStringOrUUID& nssOrUUID,
+        const ShardId& fromShardId,
+        const boost::optional<DatabaseVersion>& dbVersion,
+        boost::optional<Timestamp> afterClusterTime);
+
+    /**
+     * Creates the collection on the shard and clones the indexes and options.
+     * If the collection already exists, it will be updated to match the target options and indexes,
+     * including dropping any indexes not specified in the target index specs.
+     */
+    static void cloneCollectionIndexesAndOptions(
+        OperationContext* opCtx,
+        const NamespaceString& nss,
+        const CollectionOptionsAndIndexes& collectionOptionsAndIndexes);
 
 private:
     /**
@@ -146,14 +251,16 @@ private:
     void _setStateFail(StringData msg);
     void _setStateFailWarn(StringData msg);
 
+    void _setState(State newState);
+
     /**
      * Thread which drives the migration apply process on the recipient side.
      */
-    void _migrateThread();
+    void _migrateThread(CancellationToken cancellationToken, bool skipToCritSecTaken = false);
 
-    void _migrateDriver(OperationContext* opCtx);
+    void _migrateDriver(OperationContext* opCtx, bool skipToCritSecTaken = false);
 
-    bool _applyMigrateOp(OperationContext* opCtx, const BSONObj& xfer, repl::OpTime* lastOpApplied);
+    bool _applyMigrateOp(OperationContext* opCtx, const BSONObj& xfer);
 
     bool _flushPendingWrites(OperationContext* opCtx, const repl::OpTime& lastOpApplied);
 
@@ -163,8 +270,7 @@ private:
      * it schedules deletion of any documents in the range, so that process must be seen to be
      * complete before migrating any new documents in.
      */
-    CollectionShardingRuntime::CleanupNotification _notePending(OperationContext*,
-                                                                ChunkRange const&);
+    SharedSemiFuture<void> _notePending(OperationContext*, ChunkRange const&);
 
     /**
      * Stops tracking a chunk range between 'min' and 'max' that previously was having data
@@ -178,7 +284,36 @@ private:
      */
     bool _isActive(WithLock) const;
 
-    // Mutex to guard all fields
+    /**
+     * Waits for _state to transition to EXIT_CRIT_SEC. Then, it performs a filtering metadata
+     * refresh, releases the critical section and finally deletes the recovery document.
+     */
+    void awaitCriticalSectionReleaseSignalAndCompleteMigration(OperationContext* opCtx,
+                                                               const Timer& timeInCriticalSection);
+
+    /**
+     * ReplicaSetAwareService entry points.
+     */
+    void onStartup(OperationContext* opCtx) final {}
+    void onSetCurrentConfig(OperationContext* opCtx) final {}
+    void onConsistentDataAvailable(OperationContext* opCtx,
+                                   bool isMajority,
+                                   bool isRollback) final {}
+    void onShutdown() final {}
+    void onStepUpBegin(OperationContext* opCtx, long long term) final;
+    void onStepUpComplete(OperationContext* opCtx, long long term) final {}
+    void onStepDown() final;
+    void onRollbackBegin() final {}
+    void onBecomeArbiter() final {}
+    inline std::string getServiceName() const final {
+        return "MigrationDestinationManager";
+    }
+
+    // The number of session oplog entries recieved from the source shard. Not all oplog
+    // entries recieved from the source shard may be committed
+    AtomicWord<long long> _sessionOplogEntriesMigrated{0};
+
+    // Mutex to guard all fields below
     mutable stdx::mutex _mutex;
 
     // Migration session ID uniquely identifies the migration and indicates whether the prepare
@@ -191,6 +326,24 @@ private:
 
     stdx::thread _migrateThreadHandle;
 
+    long long _getNumCloned() {
+        return _migrationCloningProgress ? _migrationCloningProgress->getNumCloned() : 0;
+    }
+
+    long long _getNumBytesCloned() {
+        return _migrationCloningProgress ? _migrationCloningProgress->getNumBytes() : 0;
+    }
+
+    boost::optional<UUID> _migrationId;
+    boost::optional<UUID> _collectionUuid;
+
+    // State that is shared among all inserter threads.
+    std::shared_ptr<MigrationCloningProgressSharedState> _migrationCloningProgress;
+
+    bool _parallelFetchersSupported;
+
+    LogicalSessionId _lsid;
+    TxnNumber _txnNumber{kUninitializedTxnNumber};
     NamespaceString _nss;
     ConnectionString _fromShardConnString;
     ShardId _fromShard;
@@ -200,26 +353,33 @@ private:
     BSONObj _max;
     BSONObj _shardKeyPattern;
 
-    OID _epoch;
-
     WriteConcernOptions _writeConcern;
 
     // Set to true once we have accepted the chunk as pending into our metadata. Used so that on
     // failure we can perform the appropriate cleanup.
     bool _chunkMarkedPending{false};
 
-    long long _numCloned{0};
-    long long _clonedBytes{0};
     long long _numCatchup{0};
     long long _numSteady{0};
 
-    State _state{READY};
+    State _state{kReady};
     std::string _errmsg;
 
     std::unique_ptr<SessionCatalogMigrationDestination> _sessionMigration;
 
     // Condition variable, which is signalled every time the state of the migration changes.
     stdx::condition_variable _stateChangedCV;
+
+    // Promise that will be fulfilled when the donor has signaled us that we can release the
+    // critical section.
+    std::unique_ptr<SharedPromise<void>> _canReleaseCriticalSectionPromise;
+
+    // Promise that will be fulfilled when the migrateThread has finished its work.
+    std::unique_ptr<SharedPromise<State>> _migrateThreadFinishedPromise;
+
+    // Cancellation source that is cancelled on stepdowns. On stepup, a new cancellation source will
+    // be installed.
+    CancellationSource _cancellationSource;
 };
 
 }  // namespace mongo

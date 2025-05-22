@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,20 +27,41 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include <chrono>
+#include <compare>
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <set>
+#include <string>
+#include <thread>
+#include <utility>
+#include <vector>
 
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/simple_bsonobj_comparator.h"
+#include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/collection_options.h"
+#include "mongo/db/catalog_raii.h"
 #include "mongo/db/client.h"
-#include "mongo/db/client.h"
+#include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/deferred_writer.h"
-#include "mongo/db/db_raii.h"
+#include "mongo/db/concurrency/lock_manager_defs.h"
 #include "mongo/db/dbdirectclient.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/query/internal_plans.h"
-#include "mongo/dbtests/dbtests.h"
-#include "mongo/stdx/chrono.h"
+#include "mongo/db/query/plan_executor.h"
+#include "mongo/db/query/plan_yield_policy.h"
+#include "mongo/db/service_context.h"
+#include "mongo/dbtests/dbtests.h"  // IWYU pragma: keep
+#include "mongo/platform/atomic_word.h"
+#include "mongo/stdx/thread.h"
+#include "mongo/unittest/unittest.h"
 
+namespace mongo {
 namespace deferred_writer_tests {
 
 namespace {
@@ -58,9 +78,10 @@ struct BSONObjCompare {
         return SimpleBSONObjComparator::kInstance.compare(lhs, rhs) < 0;
     }
 };
-}
+}  // namespace
 
-static const NamespaceString kTestNamespace("unittests", "deferred_writer_tests");
+static const NamespaceString kTestNamespace =
+    NamespaceString::createNamespaceString_forTest("unittests", "deferred_writer_tests");
 
 /**
  * For exception-safe code with DeferredWriter.
@@ -71,7 +92,7 @@ static const NamespaceString kTestNamespace("unittests", "deferred_writer_tests"
 class RaiiWrapper {
 public:
     explicit RaiiWrapper(std::unique_ptr<DeferredWriter> writer) : _writer(std::move(writer)) {
-        _writer->startup("DeferredWriter test");
+        _writer->startup("DeferredWriter-test");
     }
 
     RaiiWrapper(RaiiWrapper&& other) : _writer(std::move(other._writer)) {}
@@ -98,12 +119,12 @@ public:
     virtual ~DeferredWriterTestBase() {}
 
     void createCollection(void) {
-        _client.createCollection(kTestNamespace.toString());
+        _client.createCollection(kTestNamespace);
     }
 
     void dropCollection(void) {
         if (AutoGetCollection(_opCtx.get(), kTestNamespace, MODE_IS).getCollection()) {
-            _client.dropCollection(kTestNamespace.toString());
+            _client.dropCollection(kTestNamespace);
         }
     }
 
@@ -120,12 +141,12 @@ public:
         ASSERT_TRUE(agc.getCollection());
 
         auto plan = InternalPlanner::collectionScan(
-            _opCtx.get(), kTestNamespace.ns(), agc.getCollection(), PlanExecutor::NO_YIELD);
+            _opCtx.get(), &agc.getCollection(), PlanYieldPolicy::YieldPolicy::INTERRUPT_ONLY);
 
         std::vector<BSONObj> result;
         BSONObj i;
         while (plan->getNext(&i, nullptr) == PlanExecutor::ExecState::ADVANCED) {
-            result.push_back(i);
+            result.push_back(i.getOwned());
         }
 
         return result;
@@ -136,7 +157,7 @@ public:
      */
     RaiiWrapper getWriter(CollectionOptions options = CollectionOptions(),
                           int64_t maxSize = 200'000) {
-        return RaiiWrapper(stdx::make_unique<DeferredWriter>(kTestNamespace, options, maxSize));
+        return RaiiWrapper(std::make_unique<DeferredWriter>(kTestNamespace, options, maxSize));
     }
 
     virtual void run(void) = 0;
@@ -173,9 +194,9 @@ private:
  */
 class DeferredWriterTestEmpty : public DeferredWriterTestBase {
 public:
-    ~DeferredWriterTestEmpty(){};
+    ~DeferredWriterTestEmpty() override {};
 
-    void run() {
+    void run() override {
         {
             auto gw = getWriter();
             auto writer = gw.get();
@@ -191,7 +212,7 @@ public:
  */
 class DeferredWriterTestConcurrent : public DeferredWriterTestBase {
 public:
-    ~DeferredWriterTestConcurrent(){};
+    ~DeferredWriterTestConcurrent() override {};
 
     void worker(DeferredWriter* writer) {
         for (int i = 0; i < kDocsPerWorker; ++i) {
@@ -199,7 +220,7 @@ public:
         }
     }
 
-    void run() {
+    void run() override {
         ensureEmpty();
         {
             auto gw = getWriter();
@@ -226,9 +247,9 @@ bool compareBsonObjects(const BSONObj& lhs, const BSONObj& rhs) {
  */
 class DeferredWriterTestConsistent : public DeferredWriterTestBase {
 public:
-    ~DeferredWriterTestConsistent() {}
+    ~DeferredWriterTestConsistent() override {}
 
-    void run() {
+    void run() override {
         ensureEmpty();
         {
             auto gw = getWriter();
@@ -263,7 +284,7 @@ private:
  */
 class DeferredWriterTestNoDeadlock : public DeferredWriterTestBase {
 public:
-    void run(void) {
+    void run(void) override {
         int nDocs = 1000;
         ensureEmpty();
         {
@@ -291,7 +312,7 @@ public:
  */
 class DeferredWriterTestCap : public DeferredWriterTestBase {
 public:
-    void run(void) {
+    void run(void) override {
         // Add a few hundred documents.
         int maxDocs = 500;
         // (more than can fit in a 2KB buffer).
@@ -347,7 +368,7 @@ public:
         }
     }
 
-    void run(void) {
+    void run(void) override {
         using namespace std::chrono_literals;
         ensureEmpty();
         ThreadLauncher launcher;
@@ -372,11 +393,11 @@ private:
     static const int kDocsPerWorker = 100;
 };
 
-class DeferredWriterTests : public Suite {
+class DeferredWriterTests : public unittest::OldStyleSuiteSpecification {
 public:
-    DeferredWriterTests() : Suite("deferred_writer_tests") {}
+    DeferredWriterTests() : OldStyleSuiteSpecification("deferred_writer_tests") {}
 
-    void setupTests() {
+    void setupTests() override {
         add<DeferredWriterTestEmpty>();
         add<DeferredWriterTestConcurrent>();
         add<DeferredWriterTestConsistent>();
@@ -384,5 +405,9 @@ public:
         add<DeferredWriterTestCap>();
         add<DeferredWriterTestAsync>();
     }
-} deferredWriterTests;
-}
+};
+
+unittest::OldStyleSuiteInitializer<DeferredWriterTests> deferredWriterTests;
+
+}  // namespace deferred_writer_tests
+}  // namespace mongo

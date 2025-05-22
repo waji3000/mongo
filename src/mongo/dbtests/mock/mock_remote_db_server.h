@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,19 +29,32 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
+#include <cstddef>
+#include <memory>
 #include <string>
 #include <vector>
 
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bson_field.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/client/connection_string.h"
-#include "mongo/client/query.h"
-#include "mongo/db/jsobj.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/query/find_command.h"
+#include "mongo/rpc/op_msg.h"
 #include "mongo/rpc/unique_message.h"
 #include "mongo/stdx/unordered_map.h"
 #include "mongo/util/concurrency/spin_lock.h"
+#include "mongo/util/net/hostandport.h"
+#include "mongo/util/uuid.h"
 
 namespace mongo {
+namespace projection_executor {
+class ProjectionExecutor;
+}  // namespace projection_executor
 
-const std::string IdentityNS("local.me");
+const NamespaceString IdentityNS = NamespaceString::createNamespaceString_forTest("local.me");
 const BSONField<std::string> HostField("host");
 
 /**
@@ -117,7 +129,7 @@ public:
      * @param cmdName the name of the command
      * @param replyObj the exact reply for the command
      */
-    void setCommandReply(const std::string& cmdName, const mongo::BSONObj& replyObj);
+    void setCommandReply(const std::string& cmdName, const StatusWith<mongo::BSONObj>& replyObj);
 
     /**
      * Sets the reply for a command.
@@ -129,25 +141,23 @@ public:
      *     that requires different results when calling a method.
      */
     void setCommandReply(const std::string& cmdName,
-                         const std::vector<mongo::BSONObj>& replySequence);
+                         const std::vector<StatusWith<mongo::BSONObj>>& replySequence);
 
     /**
      * Inserts a single document to this server.
      *
-     * @param ns the namespace to insert the document to.
+     * @param nss the namespace to insert the document to.
      * @param obj the document to insert.
-     * @param flags ignored.
      */
-    void insert(const std::string& ns, BSONObj obj, int flags = 0);
+    void insert(const NamespaceString& nss, BSONObj obj);
 
     /**
      * Removes documents from this server.
      *
-     * @param ns the namespace to remove documents from.
-     * @param query ignored.
-     * @param flags ignored.
+     * @param nss the namespace to remove documents from.
+     * @param filter ignored.
      */
-    void remove(const std::string& ns, Query query, int flags = 0);
+    void remove(const NamespaceString& nss, const BSONObj& filter);
 
     /**
      * Assign a UUID to a collection
@@ -155,21 +165,17 @@ public:
      * @param ns the namespace to be associated with the uuid.
      * @param uuid the uuid to associate with the namespace.
      */
-    void assignCollectionUuid(const std::string& ns, const mongo::UUID& uuid);
+    void assignCollectionUuid(StringData ns, const mongo::UUID& uuid);
 
     //
     // DBClientBase methods
     //
     rpc::UniqueReply runCommand(InstanceID id, const OpMsgRequest& request);
 
-    mongo::BSONArray query(InstanceID id,
-                           const NamespaceStringOrUUID& nsOrUuid,
-                           mongo::Query query = mongo::Query(),
-                           int nToReturn = 0,
-                           int nToSkip = 0,
-                           const mongo::BSONObj* fieldsToReturn = 0,
-                           int queryOptions = 0,
-                           int batchSize = 0);
+    /**
+     * Finds documents from this mock server according to 'findRequest'.
+     */
+    mongo::BSONArray find(InstanceID id, const FindCommandRequest& findRequest);
 
     //
     // Getters
@@ -180,12 +186,13 @@ public:
     double getSoTimeout() const;
 
     /**
-     * @return the exact std::string address passed to hostAndPort parameter of the
+     * @returns the value passed to hostAndPort parameter of the
      *     constructor. In other words, doesn't automatically append a
      *     'default' port if none is specified.
      */
     std::string getServerAddress() const;
     std::string toString();
+    const HostAndPort& getServerHostAndPort() const;
 
     //
     // Call counters
@@ -204,12 +211,12 @@ private:
         /**
          * Creates a new iterator with a deep copy of the vector.
          */
-        CircularBSONIterator(const std::vector<mongo::BSONObj>& replyVector);
-        mongo::BSONObj next();
+        CircularBSONIterator(const std::vector<StatusWith<mongo::BSONObj>>& replyVector);
+        StatusWith<mongo::BSONObj> next();
 
     private:
-        std::vector<mongo::BSONObj>::iterator _iter;
-        std::vector<mongo::BSONObj> _replyObjs;
+        std::vector<StatusWith<mongo::BSONObj>>::iterator _iter;
+        std::vector<StatusWith<mongo::BSONObj>> _replyObjs;
     };
 
     /**
@@ -219,13 +226,33 @@ private:
      */
     void checkIfUp(InstanceID id) const;
 
+    /**
+     * Creates a ProjectionExecutor to handle fieldsToReturn.
+     */
+    std::unique_ptr<projection_executor::ProjectionExecutor> createProjectionExecutor(
+        const BSONObj& projectionSpec);
+
+    /**
+     * Projects the object, unless the projectionExecutor is null, in which case returns a
+     * copy of the object.
+     */
+    BSONObj project(projection_executor::ProjectionExecutor* projectionExecutor, const BSONObj& o);
+
+    /**
+     * Logic shared between 'find()' and 'query()'. This can go away when the legacy 'query()' API
+     * is removed.
+     */
+    mongo::BSONArray findImpl(InstanceID id,
+                              const NamespaceStringOrUUID& nsOrUuid,
+                              BSONObj projection);
+
     typedef stdx::unordered_map<std::string, std::shared_ptr<CircularBSONIterator>> CmdToReplyObj;
     typedef stdx::unordered_map<std::string, std::vector<BSONObj>> MockDataMgr;
     typedef stdx::unordered_map<mongo::UUID, std::string, UUID::Hash> UUIDMap;
 
     bool _isRunning;
 
-    const std::string _hostAndPort;
+    const HostAndPort _hostAndPort;
     long long _delayMilliSec;
 
     //
@@ -246,6 +273,7 @@ private:
     InstanceID _instanceID;
 
     // protects this entire instance
-    mutable mongo::SpinLock _lock;
+    mutable SpinLock _lock;
 };
+
 }  // namespace mongo

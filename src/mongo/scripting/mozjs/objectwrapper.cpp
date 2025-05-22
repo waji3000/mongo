@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,20 +27,40 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/scripting/mozjs/objectwrapper.h"
-
-#include <js/Conversions.h>
+#include <boost/move/utility_core.hpp>
+#include <js/Array.h>
+#include <js/Class.h>
+#include <js/Object.h>
+#include <js/PropertySpec.h>
+#include <js/ValueArray.h>
 #include <jsapi.h>
+#include <new>
+#include <tuple>
+#include <utility>
+
+#include <boost/optional/optional.hpp>
+#include <js/AllocPolicy.h>
+#include <js/CallAndConstruct.h>
+#include <js/CallArgs.h>
+#include <js/GCVector.h>
+#include <js/Id.h>
+#include <js/RootingAPI.h>
+#include <js/TypeDecls.h>
 
 #include "mongo/base/error_codes.h"
 #include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/util/builder.h"
 #include "mongo/platform/decimal128.h"
+#include "mongo/scripting/mozjs/bson.h"
+#include "mongo/scripting/mozjs/dbref.h"
 #include "mongo/scripting/mozjs/idwrapper.h"
 #include "mongo/scripting/mozjs/implscope.h"
+#include "mongo/scripting/mozjs/objectwrapper.h"
 #include "mongo/scripting/mozjs/valuereader.h"
 #include "mongo/scripting/mozjs/valuewriter.h"
+#include "mongo/scripting/mozjs/wraptype.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 namespace mozjs {
@@ -59,9 +78,9 @@ void ObjectWrapper::Key::get(JSContext* cx, JS::HandleObject o, JS::MutableHandl
                 return;
             break;
         case Type::Id: {
-            JS::RootedId id(cx, _id);
+            JS::RootedId rid(cx, _id);
 
-            if (JS_GetPropertyById(cx, o, id, value))
+            if (JS_GetPropertyById(cx, o, rid, value))
                 return;
             break;
         }
@@ -109,29 +128,72 @@ void ObjectWrapper::Key::set(JSContext* cx, JS::HandleObject o, JS::HandleValue 
 void ObjectWrapper::Key::define(JSContext* cx,
                                 JS::HandleObject o,
                                 JS::HandleValue value,
-                                unsigned attrs,
-                                JSNative getter,
-                                JSNative setter) {
+                                unsigned attrs) {
     switch (_type) {
         case Type::Field:
-            if (JS_DefineProperty(cx, o, _field, value, attrs, getter, setter))
+            if (JS_DefineProperty(cx, o, _field, value, attrs))
                 return;
             break;
         case Type::Index:
-            if (JS_DefineElement(cx, o, _idx, value, attrs, getter, setter))
+            if (JS_DefineElement(cx, o, _idx, value, attrs))
                 return;
             break;
         case Type::Id: {
             JS::RootedId id(cx, _id);
 
-            if (JS_DefinePropertyById(cx, o, id, value, attrs, getter, setter))
+            if (JS_DefinePropertyById(cx, o, id, value, attrs))
                 return;
             break;
         }
         case Type::InternedString: {
             InternedStringId id(cx, _internedString);
 
-            if (JS_DefinePropertyById(cx, o, id, value, attrs, getter, setter))
+            if (JS_DefinePropertyById(cx, o, id, value, attrs))
+                return;
+            break;
+        }
+    }
+
+    throwCurrentJSException(cx, ErrorCodes::InternalError, "Failed to define value on a JSObject");
+}
+
+/*
+ * Wrapper functions to create wrappers with no corresponding JSJitInfo from API
+ * function arguments.
+ */
+static JSNativeWrapper NativeOpWrapper(JSNative native) {
+    JSNativeWrapper ret;
+    ret.op = native;
+    ret.info = nullptr;
+    return ret;
+}
+
+void ObjectWrapper::Key::define(
+    JSContext* cx, JS::HandleObject o, unsigned attrs, JSNative getter, JSNative setter) {
+    switch (_type) {
+        case Type::Field:
+            if (JS_DefineProperty(cx, o, _field, getter, setter, attrs))
+                return;
+            break;
+        case Type::Index: {
+            JS::RootedId rid1(cx);
+            if (!JS_IndexToId(cx, _idx, &rid1)) {
+                break;
+            }
+            if (JS_DefinePropertyById(cx, o, rid1, getter, setter, attrs))
+                return;
+            break;
+        }
+        case Type::Id: {
+            JS::RootedId rid2(cx, _id);
+            if (JS_DefinePropertyById(cx, o, rid2, getter, setter, attrs))
+                return;
+            break;
+        }
+        case Type::InternedString: {
+            InternedStringId id(cx, _internedString);
+
+            if (JS_DefinePropertyById(cx, o, id, getter, setter, attrs))
                 return;
             break;
         }
@@ -176,6 +238,41 @@ bool ObjectWrapper::Key::hasOwn(JSContext* cx, JS::HandleObject o) {
 
     switch (_type) {
         case Type::Field:
+            if (JS_HasOwnProperty(cx, o, _field, &has))
+                return has;
+            break;
+        case Type::Index: {
+            JS::RootedId id(cx);
+
+            // This is a little different because there is no JS_HasOwnElement
+            if (JS_IndexToId(cx, _idx, &id) && JS_HasOwnPropertyById(cx, o, id, &has))
+                return has;
+            break;
+        }
+        case Type::Id: {
+            JS::RootedId id(cx, _id);
+
+            if (JS_HasOwnPropertyById(cx, o, id, &has))
+                return has;
+            break;
+        }
+        case Type::InternedString: {
+            InternedStringId id(cx, _internedString);
+
+            if (JS_HasOwnPropertyById(cx, o, id, &has))
+                return has;
+            break;
+        }
+    }
+
+    throwCurrentJSException(cx, ErrorCodes::InternalError, "Failed to hasOwn value on a JSObject");
+}
+
+bool ObjectWrapper::Key::alreadyHasOwn(JSContext* cx, JS::HandleObject o) {
+    bool has;
+
+    switch (_type) {
+        case Type::Field:
             if (JS_AlreadyHasOwnProperty(cx, o, _field, &has))
                 return has;
             break;
@@ -199,7 +296,8 @@ bool ObjectWrapper::Key::hasOwn(JSContext* cx, JS::HandleObject o) {
         }
     }
 
-    throwCurrentJSException(cx, ErrorCodes::InternalError, "Failed to hasOwn value on a JSObject");
+    throwCurrentJSException(
+        cx, ErrorCodes::InternalError, "Failed to alreadyHasOwn value on a JSObject");
 }
 
 void ObjectWrapper::Key::del(JSContext* cx, JS::HandleObject o) {
@@ -255,13 +353,13 @@ StringData ObjectWrapper::Key::toStringData(JSContext* cx, JSStringWrapper* jsst
         rid.set(id);
     }
 
-    if (JSID_IS_INT(rid)) {
-        *jsstr = JSStringWrapper(JSID_TO_INT(rid));
+    if (rid.isInt()) {
+        *jsstr = JSStringWrapper(rid.toInt());
         return jsstr->toStringData();
     }
 
-    if (JSID_IS_STRING(rid)) {
-        *jsstr = JSStringWrapper(cx, JSID_TO_STRING(rid));
+    if (rid.isString()) {
+        *jsstr = JSStringWrapper(cx, rid.toString());
         return jsstr->toStringData();
     }
 
@@ -327,6 +425,34 @@ void ObjectWrapper::getValue(Key key, JS::MutableHandleValue value) {
     key.get(_context, _object, value);
 }
 
+OID ObjectWrapper::getOID(Key key) {
+    JS::RootedValue x(_context);
+    getValue(key, &x);
+
+    return ValueWriter(_context, x).toOID();
+}
+
+void ObjectWrapper::getBinData(Key key, std::function<void(const BSONBinData&)> withBinData) {
+    JS::RootedValue x(_context);
+    getValue(key, &x);
+
+    ValueWriter(_context, x).toBinData(std::move(withBinData));
+}
+
+Timestamp ObjectWrapper::getTimestamp(Key key) {
+    JS::RootedValue x(_context);
+    getValue(key, &x);
+
+    return ValueWriter(_context, x).toTimestamp();
+}
+
+JSRegEx ObjectWrapper::getRegEx(Key key) {
+    JS::RootedValue x(_context);
+    getValue(key, &x);
+
+    return ValueWriter(_context, x).toRegEx();
+}
+
 void ObjectWrapper::setNumber(Key key, double val) {
     JS::RootedValue jsValue(_context);
     ValueReader(_context, &jsValue).fromDouble(val);
@@ -390,9 +516,12 @@ void ObjectWrapper::setPrototype(JS::HandleObject object) {
     throwCurrentJSException(_context, ErrorCodes::InternalError, "Failed to set prototype");
 }
 
-void ObjectWrapper::defineProperty(
-    Key key, JS::HandleValue val, unsigned attrs, JSNative getter, JSNative setter) {
-    key.define(_context, _object, val, attrs, getter, setter);
+void ObjectWrapper::defineProperty(Key key, JS::HandleValue val, unsigned attrs) {
+    key.define(_context, _object, val, attrs);
+}
+
+void ObjectWrapper::defineProperty(Key key, unsigned attrs, JSNative getter, JSNative setter) {
+    key.define(_context, _object, attrs, getter, setter);
 }
 
 void ObjectWrapper::deleteProperty(Key key) {
@@ -418,12 +547,23 @@ void ObjectWrapper::rename(Key from, const char* to) {
     setValue(from, undefValue);
 }
 
+void ObjectWrapper::renameAndDeleteProperty(Key from, const char* to) {
+    JS::RootedValue value(_context);
+    getValue(from, &value);
+    setValue(to, value);
+    from.del(_context, _object);
+}
+
 bool ObjectWrapper::hasField(Key key) {
     return key.has(_context, _object);
 }
 
 bool ObjectWrapper::hasOwnField(Key key) {
     return key.hasOwn(_context, _object);
+}
+
+bool ObjectWrapper::alreadyHasOwnField(Key key) {
+    return key.alreadyHasOwn(_context, _object);
 }
 
 void ObjectWrapper::callMethod(const char* field,
@@ -436,7 +576,7 @@ void ObjectWrapper::callMethod(const char* field,
 }
 
 void ObjectWrapper::callMethod(const char* field, JS::MutableHandleValue out) {
-    JS::AutoValueVector args(_context);
+    JS::RootedValueVector args(_context);
 
     callMethod(field, args, out);
 }
@@ -451,7 +591,7 @@ void ObjectWrapper::callMethod(JS::HandleValue fun,
 }
 
 void ObjectWrapper::callMethod(JS::HandleValue fun, JS::MutableHandleValue out) {
-    JS::AutoValueVector args(_context);
+    JS::RootedValueVector args(_context);
 
     callMethod(fun, args, out);
 }
@@ -545,11 +685,8 @@ BSONObj ObjectWrapper::toBSON() {
     const int sizeWithEOO = b.len() + 1 /*EOO*/ - 4 /*BSONObj::Holder ref count*/;
     uassert(17260,
             str::stream() << "Converting from JavaScript to BSON failed: "
-                          << "Object size "
-                          << sizeWithEOO
-                          << " exceeds limit of "
-                          << BSONObjMaxInternalSize
-                          << " bytes.",
+                          << "Object size " << sizeWithEOO << " exceeds limit of "
+                          << BSONObjMaxInternalSize << " bytes.",
             sizeWithEOO <= BSONObjMaxInternalSize);
 
     return b.obj();
@@ -562,7 +699,7 @@ ObjectWrapper::WriteFieldRecursionFrame::WriteFieldRecursionFrame(JSContext* cx,
     : thisv(cx, obj), ids(cx, JS::IdVector(cx)) {
     bool isArray = false;
     if (parent) {
-        if (!JS_IsArrayObject(cx, thisv, &isArray)) {
+        if (!JS::IsArrayObject(cx, thisv, &isArray)) {
             throwCurrentJSException(
                 cx, ErrorCodes::JSInterpreterFailure, "Failure to check object is an array");
         }
@@ -572,7 +709,7 @@ ObjectWrapper::WriteFieldRecursionFrame::WriteFieldRecursionFrame(JSContext* cx,
 
     if (isArray) {
         uint32_t length;
-        if (!JS_GetArrayLength(cx, thisv, &length)) {
+        if (!JS::GetArrayLength(cx, thisv, &length)) {
             throwCurrentJSException(
                 cx, ErrorCodes::JSInterpreterFailure, "Failure to get array length");
         }
@@ -584,7 +721,7 @@ ObjectWrapper::WriteFieldRecursionFrame::WriteFieldRecursionFrame(JSContext* cx,
 
         JS::RootedId rid(cx);
         for (uint32_t i = 0; i < length; i++) {
-            rid.set(INT_TO_JSID(i));
+            rid.set(JS::PropertyKey::Int(i));
             ids.infallibleAppend(rid);
         }
     } else {
@@ -616,7 +753,7 @@ void ObjectWrapper::_writeField(BSONObjBuilder* b,
 }
 
 std::string ObjectWrapper::getClassName() {
-    auto jsclass = JS_GetClass(_object);
+    auto jsclass = JS::GetClass(_object);
 
     if (jsclass)
         return jsclass->name;

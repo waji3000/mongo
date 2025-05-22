@@ -1,7 +1,6 @@
-load('jstests/readonly/lib/read_only_test.js');
+import {runReadOnlyTest} from "jstests/readonly/lib/read_only_test.js";
 
 runReadOnlyTest(function() {
-    'use strict';
     return {
         name: 'count',
 
@@ -25,7 +24,7 @@ runReadOnlyTest(function() {
                 bulk.insert({x: 70});
             }
 
-            assert.writeOK(bulk.execute());
+            assert.commandWorked(bulk.execute());
         },
         exec: function(readableCollection) {
             assert.eq(readableCollection.find({x: {$lt: 10}}).count(), this.countLt10);

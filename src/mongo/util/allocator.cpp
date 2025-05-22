@@ -1,6 +1,3 @@
-// allocator.cpp
-
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,8 +27,6 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include <cstdlib>
 
 #include "mongo/util/signal_handlers_synchronous.h"
@@ -40,7 +35,7 @@ namespace mongo {
 
 void* mongoMalloc(size_t size) {
     void* x = std::malloc(size);
-    if (x == NULL) {
+    if (x == nullptr) {
         reportOutOfMemoryErrorAndExit();
     }
     return x;
@@ -48,7 +43,7 @@ void* mongoMalloc(size_t size) {
 
 void* mongoRealloc(void* ptr, size_t size) {
     void* x = std::realloc(ptr, size);
-    if (x == NULL) {
+    if (x == nullptr) {
         reportOutOfMemoryErrorAndExit();
     }
     return x;

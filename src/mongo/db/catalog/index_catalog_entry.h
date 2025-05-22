@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,54 +29,52 @@
 
 #pragma once
 
-#include <boost/optional.hpp>
+#include <memory>
 #include <string>
+#include <utility>
+#include <vector>
 
-#include "mongo/base/owned_pointer_vector.h"
 #include "mongo/bson/ordering.h"
-#include "mongo/bson/timestamp.h"
 #include "mongo/db/index/multikey_paths.h"
-#include "mongo/db/record_id.h"
-#include "mongo/db/storage/kv/kv_prefix.h"
-#include "mongo/platform/atomic_word.h"
-#include "mongo/stdx/functional.h"
-#include "mongo/stdx/mutex.h"
-#include "mongo/util/debug_util.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/storage/key_string/key_string.h"
 
 namespace mongo {
+
 class CollatorInterface;
+class Collection;
+class CollectionPtr;
+class CollectionCatalog;
 class CollectionCatalogEntry;
-class CollectionInfoCache;
-class HeadManager;
+class Ident;
 class IndexAccessMethod;
+class SortedDataIndexAccessMethod;
 class IndexBuildInterceptor;
 class IndexDescriptor;
 class MatchExpression;
 class OperationContext;
+class UpdateIndexData;
 
-class IndexCatalogEntry {
+class IndexCatalogEntry : public std::enable_shared_from_this<IndexCatalogEntry> {
 public:
     IndexCatalogEntry() = default;
     virtual ~IndexCatalogEntry() = default;
 
-    inline IndexCatalogEntry(IndexCatalogEntry&&) = delete;
-    inline IndexCatalogEntry& operator=(IndexCatalogEntry&&) = delete;
-
-    virtual const std::string& ns() const = 0;
-
-    virtual void init(std::unique_ptr<IndexAccessMethod> accessMethod) = 0;
+    virtual const std::string& getIdent() const = 0;
+    virtual std::shared_ptr<Ident> getSharedIdent() const = 0;
+    virtual void setIdent(std::shared_ptr<Ident> newIdent) = 0;
 
     virtual IndexDescriptor* descriptor() = 0;
 
     virtual const IndexDescriptor* descriptor() const = 0;
 
-    virtual IndexAccessMethod* accessMethod() = 0;
+    virtual IndexAccessMethod* accessMethod() const = 0;
 
-    virtual const IndexAccessMethod* accessMethod() const = 0;
+    virtual void setAccessMethod(std::unique_ptr<IndexAccessMethod> accessMethod) = 0;
 
-    virtual bool isBuilding() const = 0;
+    virtual bool isHybridBuilding() const = 0;
 
-    virtual IndexBuildInterceptor* indexBuildInterceptor() = 0;
+    virtual IndexBuildInterceptor* indexBuildInterceptor() const = 0;
 
     virtual void setIndexBuildInterceptor(IndexBuildInterceptor* interceptor) = 0;
 
@@ -87,22 +84,22 @@ public:
 
     virtual const CollatorInterface* getCollator() const = 0;
 
+    /**
+     *  Looks up the namespace name in the durable catalog. May do I/O.
+     */
+    virtual NamespaceString getNSSFromCatalog(OperationContext* opCtx) const = 0;
+
     /// ---------------------
 
-    virtual const RecordId& head(OperationContext* const opCtx) const = 0;
-
-    virtual void setHead(OperationContext* const opCtx, const RecordId newHead) = 0;
-
-    virtual void setIsReady(const bool newIsReady) = 0;
-
-    virtual HeadManager* headManager() const = 0;
+    virtual void setIsReady(bool newIsReady) = 0;
+    virtual void setIsFrozen(bool newIsFrozen) = 0;
 
     // --
 
     /**
      * Returns true if this index is multikey and false otherwise.
      */
-    virtual bool isMultikey(OperationContext* opCtx) const = 0;
+    virtual bool isMultikey(OperationContext* opCtx, const CollectionPtr& collection) const = 0;
 
     /**
      * Returns the path components that cause this index to be multikey if this index supports
@@ -113,7 +110,8 @@ public:
      * returns a vector with size equal to the number of elements in the index key pattern where
      * each element in the vector is an empty set.
      */
-    virtual MultikeyPaths getMultikeyPaths(OperationContext* const opCtx) const = 0;
+    virtual MultikeyPaths getMultikeyPaths(OperationContext* opCtx,
+                                           const CollectionPtr& collection) const = 0;
 
     /**
      * Sets this index to be multikey. Information regarding which newly detected path components
@@ -130,34 +128,56 @@ public:
      * namespace, index name, and multikey paths on the OperationContext rather than set the index
      * as multikey here.
      */
-    virtual void setMultikey(OperationContext* const opCtx, const MultikeyPaths& multikeyPaths) = 0;
+    virtual void setMultikey(OperationContext* opCtx,
+                             const CollectionPtr& coll,
+                             const KeyStringSet& multikeyMetadataKeys,
+                             const MultikeyPaths& multikeyPaths) const = 0;
 
     /**
-     * TODO SERVER-36385 Remove this function: we don't set the feature tracker bit in 4.4
-     * because 4.4 can only downgrade to 4.2 which can read long TypeBits.
+     * Sets the index to be multikey with the provided paths. This performs minimal validation of
+     * the inputs and is intended to be used internally to "correct" multikey metadata that drifts
+     * from the underlying data.
+     *
+     * This may also be used to allow indexes built before 3.4 to start tracking multikey path
+     * metadata in the catalog.
      */
-    virtual void setIndexKeyStringWithLongTypeBitsExistsOnDisk(OperationContext* const opCtx) = 0;
-
-    // if this ready is ready for queries
-    virtual bool isReady(OperationContext* const opCtx) const = 0;
-
-    virtual KVPrefix getPrefix() const = 0;
+    virtual void forceSetMultikey(OperationContext* opCtx,
+                                  const CollectionPtr& coll,
+                                  bool isMultikey,
+                                  const MultikeyPaths& multikeyPaths) const = 0;
 
     /**
-     * If return value is not boost::none, reads with majority read concern using an older snapshot
-     * must treat this index as unfinished.
+     * Returns whether this index is ready for queries.
      */
-    virtual boost::optional<Timestamp> getMinimumVisibleSnapshot() = 0;
+    virtual bool isReady() const = 0;
 
-    virtual void setMinimumVisibleSnapshot(const Timestamp name) = 0;
+    /**
+     * Returns true if this index is not ready, and it is not currently in the process of being
+     * built either.
+     */
+    virtual bool isFrozen() const = 0;
 
-    virtual void setNs(NamespaceString ns) = 0;
+    /**
+     * Returns true if the documents should be validated for incompatible values for this index.
+     */
+    virtual bool shouldValidateDocument() const = 0;
+
+    virtual const UpdateIndexData& getIndexedPaths() const = 0;
+
+    /**
+     * Returns a normalized entry as given by IndexCatalog::normalizeIndexSpecs.
+     */
+    virtual std::unique_ptr<const IndexCatalogEntry> getNormalizedEntry(
+        OperationContext* opCtx, const CollectionPtr& coll) const = 0;
+
+    virtual std::unique_ptr<const IndexCatalogEntry> cloneWithDifferentDescriptor(
+        IndexDescriptor descriptor) const = 0;
 };
 
 class IndexCatalogEntryContainer {
 public:
-    typedef std::vector<std::unique_ptr<IndexCatalogEntry>>::const_iterator const_iterator;
-    typedef std::vector<std::unique_ptr<IndexCatalogEntry>>::const_iterator iterator;
+    using const_iterator = std::vector<std::shared_ptr<const IndexCatalogEntry>>::const_iterator;
+    using iterator = std::vector<std::shared_ptr<const IndexCatalogEntry>>::const_iterator;
 
     const_iterator begin() const {
         return _entries.begin();
@@ -175,14 +195,6 @@ public:
         return _entries.end();
     }
 
-    // TODO: these have to be SUPER SUPER FAST
-    // maybe even some pointer trickery is in order
-    const IndexCatalogEntry* find(const IndexDescriptor* desc) const;
-    IndexCatalogEntry* find(const IndexDescriptor* desc);
-
-    IndexCatalogEntry* find(const std::string& name);
-
-
     unsigned size() const {
         return _entries.size();
     }
@@ -190,22 +202,24 @@ public:
     // -----------------
 
     /**
-     * Removes from _entries and returns the matching entry or NULL if none matches.
+     * Removes an entry matching the descriptor from _entries, and returns the matching entry or
+     * NULL if none matches.
      */
-    IndexCatalogEntry* release(const IndexDescriptor* desc);
+    virtual std::shared_ptr<const IndexCatalogEntry> release(const IndexDescriptor* desc);
 
     bool remove(const IndexDescriptor* desc) {
-        IndexCatalogEntry* entry = release(desc);
-        delete entry;
-        return entry;
+        return static_cast<bool>(release(desc));
     }
 
-    // pass ownership to EntryContainer
-    void add(IndexCatalogEntry* entry) {
-        _entries.push_back(std::unique_ptr<IndexCatalogEntry>{entry});
+    virtual void add(std::shared_ptr<const IndexCatalogEntry>&& entry) {
+        _entries.push_back(std::move(entry));
+    }
+
+    std::vector<std::shared_ptr<const IndexCatalogEntry>> getAllEntries() const {
+        return {_entries.begin(), _entries.end()};
     }
 
 private:
-    std::vector<std::unique_ptr<IndexCatalogEntry>> _entries;
+    std::vector<std::shared_ptr<const IndexCatalogEntry>> _entries;
 };
 }  // namespace mongo

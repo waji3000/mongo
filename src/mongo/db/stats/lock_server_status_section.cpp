@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,31 +27,39 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
+#include <memory>
+#include <mutex>
 #include <valarray>
 
+
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands/server_status.h"
 #include "mongo/db/concurrency/lock_stats.h"
-#include "mongo/db/jsobj.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/transaction_resources.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo {
 namespace {
 
 class GlobalLockServerStatusSection : public ServerStatusSection {
 public:
-    GlobalLockServerStatusSection() : ServerStatusSection("globalLock") {
+    GlobalLockServerStatusSection(std::string name, ClusterRole role)
+        : ServerStatusSection(name, role) {
         _started = curTimeMillis64();
     }
 
-    virtual bool includeByDefault() const {
+    bool includeByDefault() const override {
         return true;
     }
 
-    virtual BSONObj generateSection(OperationContext* opCtx,
-                                    const BSONElement& configElement) const {
+    BSONObj generateSection(OperationContext* opCtx,
+                            const BSONElement& configElement) const override {
         std::valarray<int> clientStatusCounts(5);
 
         // This returns the blocked lock states
@@ -62,9 +69,9 @@ public:
             stdx::unique_lock<Client> uniqueLock(*client);
 
             const OperationContext* clientOpCtx = client->getOperationContext();
-            auto state =
-                clientOpCtx ? clientOpCtx->lockState()->getClientState() : Locker::kInactive;
-            invariant(state < sizeof(clientStatusCounts));
+            auto state = clientOpCtx ? shard_role_details::getLocker(clientOpCtx)->getClientState()
+                                     : Locker::kInactive;
+            invariant(state < clientStatusCounts.size());
             clientStatusCounts[state]++;
         }
 
@@ -102,20 +109,21 @@ public:
 
 private:
     unsigned long long _started;
-
-} globalLockServerStatusSection;
+};
+auto& globalLockServerStatusSection =
+    *ServerStatusSectionBuilder<GlobalLockServerStatusSection>("globalLock").forShard();
 
 
 class LockStatsServerStatusSection : public ServerStatusSection {
 public:
-    LockStatsServerStatusSection() : ServerStatusSection("locks") {}
+    using ServerStatusSection::ServerStatusSection;
 
-    virtual bool includeByDefault() const {
+    bool includeByDefault() const override {
         return true;
     }
 
-    virtual BSONObj generateSection(OperationContext* opCtx,
-                                    const BSONElement& configElement) const {
+    BSONObj generateSection(OperationContext* opCtx,
+                            const BSONElement& configElement) const override {
         BSONObjBuilder ret;
 
         SingleThreadedLockStats stats;
@@ -125,8 +133,9 @@ public:
 
         return ret.obj();
     }
-
-} lockStatsServerStatusSection;
+};
+auto& lockStatsServerStatusSection =
+    *ServerStatusSectionBuilder<LockStatsServerStatusSection>("locks").forShard();
 
 }  // namespace
 }  // namespace mongo

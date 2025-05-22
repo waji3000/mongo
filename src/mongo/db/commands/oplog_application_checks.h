@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,14 +27,16 @@
  *    it in the license file.
  */
 #pragma once
-#include <string>
-
 #include "mongo/base/status.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/auth/authorization_session.h"
 #include "mongo/util/uuid.h"
 
 namespace mongo {
 class BSONElement;
 class BSONObj;
+class DatabaseName;
 class OperationContext;
 
 // OplogApplicationValidity represents special conditions relevant to authorization for
@@ -51,20 +52,18 @@ class OperationContext;
 // with a specified UUID, so both the forceUUID and useUUID actions must be authorized.
 //
 // kOk means no special conditions apply.
-//
-// Only kOk and kNeedsUseUUID are valid for 'doTxn'.  All are valid for 'applyOps'.
 enum class OplogApplicationValidity { kOk, kNeedsUseUUID, kNeedsForceAndUseUUID, kNeedsSuperuser };
 
-// OplogApplicationChecks contains helper functions for checking the applyOps and doTxn commands.
+// OplogApplicationChecks contains helper functions for checking the applyOps command.
 class OplogApplicationChecks {
 public:
     /**
      * Checks the authorization for an entire oplog application command.
      */
-    static Status checkAuthForCommand(OperationContext* opCtx,
-                                      const std::string& dbname,
-                                      const BSONObj& cmdObj,
-                                      OplogApplicationValidity validity);
+    static Status checkAuthForOperation(OperationContext* opCtx,
+                                        const DatabaseName& dbName,
+                                        const BSONObj& cmdObj,
+                                        OplogApplicationValidity validity);
 
     /**
      * Checks that 'opsElement' is an array and all elements of the array are valid operations.
@@ -79,10 +78,9 @@ private:
      * command.
      */
     static Status checkOperationAuthorization(OperationContext* opCtx,
-                                              const std::string& dbname,
+                                              const DatabaseName& dbName,
                                               const BSONObj& oplogEntry,
-                                              AuthorizationSession* authSession,
-                                              bool alwaysUpsert);
+                                              AuthorizationSession* authSession);
     /**
      * Returns OK if 'e' contains a valid operation.
      */

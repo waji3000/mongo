@@ -2,37 +2,40 @@
 // causing a secondary to crash in the initial sync of a replicate set in the case that invalid
 // views were present. This test ensures that crashes no longer occur in those circumstances.
 
-(function() {
-    'use strict';
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
-    const name = "initial_sync_invalid_views";
-    let replSet = new ReplSetTest({name: name, nodes: 1});
+const name = "initial_sync_invalid_views";
+let replSet = new ReplSetTest({name: name, nodes: 1});
 
-    let oplogSizeOnPrimary = 1;  // size in MB
-    replSet.startSet({oplogSize: oplogSizeOnPrimary});
-    replSet.initiate();
-    let primary = replSet.getPrimary();
+let oplogSizeOnPrimary = 1;  // size in MB
+replSet.startSet({oplogSize: oplogSizeOnPrimary});
+replSet.initiate();
+let primary = replSet.getPrimary();
 
-    let coll = primary.getDB('test').foo;
-    assert.writeOK(coll.insert({a: 1}));
+let coll = primary.getDB('test').foo;
+assert.commandWorked(coll.insert({a: 1}));
 
-    // Add a secondary node but make it hang before copying databases.
-    let secondary = replSet.add();
-    secondary.setSlaveOk();
+// Add a secondary node but make it hang before copying databases.
+let secondary = replSet.add({rsConfig: {votes: 0, priority: 0}});
+secondary.setSecondaryOk();
 
-    assert.commandWorked(secondary.getDB('admin').runCommand(
-        {configureFailPoint: 'initialSyncHangBeforeCopyingDatabases', mode: 'alwaysOn'}));
-    replSet.reInitiate();
+assert.commandWorked(secondary.getDB('admin').runCommand(
+    {configureFailPoint: 'initialSyncHangBeforeCopyingDatabases', mode: 'alwaysOn'}));
+replSet.reInitiate();
 
-    assert.writeOK(primary.getDB('test').system.views.insert({invalid: NumberLong(1000)}));
+assert.commandWorked(primary.getDB("test").createCollection("system.views"));
+assert.commandWorked(primary.adminCommand({
+    applyOps: [
+        {op: "i", ns: "test.system.views", o: {_id: "invalid_view_def", invalid: NumberLong(1000)}}
+    ]
+}));
 
-    assert.commandWorked(secondary.getDB('admin').runCommand(
-        {configureFailPoint: 'initialSyncHangBeforeCopyingDatabases', mode: 'off'}));
+assert.commandWorked(secondary.getDB('admin').runCommand(
+    {configureFailPoint: 'initialSyncHangBeforeCopyingDatabases', mode: 'off'}));
 
-    replSet.awaitSecondaryNodes(200 * 1000);
+replSet.awaitSecondaryNodes(200 * 1000);
 
-    // Skip collection validation during stopMongod if invalid views exists.
-    TestData.skipValidationOnInvalidViewDefinitions = true;
+// Skip collection validation during stopMongod if invalid views exists.
+TestData.skipValidationOnInvalidViewDefinitions = true;
 
-    replSet.stopSet();
-})();
+replSet.stopSet();

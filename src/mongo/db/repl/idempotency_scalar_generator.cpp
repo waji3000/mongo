@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,15 +27,15 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <climits>
+#include <cstddef>
+#include <cstdint>
 
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/repl/idempotency_scalar_generator.h"
-
-#include <vector>
-
-#include "mongo/bson/bsonobj.h"
-#include "mongo/bson/bsonobjbuilder.h"
-#include "mongo/db/pipeline/value.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 

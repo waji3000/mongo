@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,7 +29,15 @@
 
 #pragma once
 
+#include <js/Class.h>
+#include <js/PropertySpec.h>
+#include <js/TypeDecls.h>
+#include <memory>
+#include <utility>
+
 #include "mongo/client/dbclient_cursor.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/scripting/mozjs/base.h"
 #include "mongo/scripting/mozjs/wraptype.h"
 
 namespace mongo {
@@ -43,7 +50,9 @@ namespace mozjs {
  * callers are all via the Mongo object.
  */
 struct CursorHandleInfo : public BaseInfo {
-    static void finalize(JSFreeOp* fop, JSObject* obj);
+    enum Slots { CursorTrackerSlot, CursorHandleInfoSlotCount };
+
+    static void finalize(JS::GCContext* gcCtx, JSObject* obj);
 
     struct Functions {
         MONGO_DECLARE_JS_FUNCTION(zeroCursorId);
@@ -52,7 +61,8 @@ struct CursorHandleInfo : public BaseInfo {
     static const JSFunctionSpec methods[2];
 
     static const char* const className;
-    static const unsigned classFlags = JSCLASS_HAS_PRIVATE;
+    static const unsigned classFlags =
+        JSCLASS_HAS_RESERVED_SLOTS(CursorHandleInfoSlotCount) | BaseInfo::finalizeFlag;
     static const InstallType installType = InstallType::Private;
 
     /**

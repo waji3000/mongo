@@ -7,8 +7,12 @@
 
             <Publish Event="NewDialog" Value="MongoSetupTypeDlg" Dialog="LicenseAgreementDlg" Control="Next">LicenseAccepted = "1"</Publish>
             <Publish Event="NewDialog" Value="MongoSetupTypeDlg" Dialog="CustomizeDlg" Control="Back">WixUI_InstallMode = "InstallCustom"</Publish>
-            <Publish Event="NewDialog" Value="ServiceDlg" Dialog="CustomizeDlg" Control="Next"></Publish>
-	        <Publish Event="NewDialog" Value="CompassDlg" Dialog="VerifyReadyDlg" Control="Back"></Publish>
+            <Publish Event="NewDialog" Value="ServiceDlg" Dialog="CustomizeDlg" Control="Next">
+                <![CDATA[&Server = 3]]>
+            </Publish>
+            <Publish Event="NewDialog" Value="CompassDlg" Dialog="CustomizeDlg" Control="Next">
+                <![CDATA[NOT (&Server = 3)]]>
+            </Publish>
 
             <!-- A custom setup type dialog box with only Complete and Custom buttons -->
             <Dialog Id="MongoSetupTypeDlg" X="50" Y="50" Width="370" Height="270" Title="[ProductName] Setup">
@@ -35,6 +39,9 @@
                 <Control Id="BannerLine" Type="Line" X="0" Y="44" Width="370" Height="0" TabSkip="yes" Disabled="yes" />
                 <Control Id="TypicalText" Type="Text" X="60" Y="85" Width="280" Height="20" Text="All program features will be installed. Requires the most disk space. Recommended for most users." TabSkip="yes" />
                 <Control Id="CustomText" Type="Text" X="60" Y="138" Width="280" Height="30" Text="Allows users to choose which program features will be installed and where they will be installed. Recommended for advanced users." TabSkip="yes" />
+                <Control Id="MongoShellLink" Type="Hyperlink" X="40" Y="171" Width="300" Height="30" ToolTip="https://www.mongodb.com/try/download/shell">
+                    <Text>The Mongo Shell must be installed separately for Windows installations. <![CDATA[<a href="https://www.mongodb.com/try/download/shell">Download Now</a>]]></Text>
+                </Control>
             </Dialog>
 
             <!-- A custom dialog box to warn the user about an invalid service logon. -->
@@ -67,9 +74,10 @@
                     <Text>&amp;Next &gt;</Text>
                     <Publish Event="AddLocal" Value="ServerNoService">NOT MONGO_SERVICE_INSTALL</Publish>
                     <Publish Event="AddLocal" Value="ServerService">MONGO_SERVICE_INSTALL</Publish>
-                    <Publish Event="DoAction" Value="ValidateServiceLogon" Order="1"><![CDATA[MONGO_SERVICE_INSTALL AND MONGO_SERVICE_ACCOUNT_TYPE <> "ServiceLocalNetwork"]]></Publish>
-                    <Publish Event="SpawnDialog" Value="InvalidServiceAccount" Order="2">MONGO_SERVICE_ACCOUNT_VALID = "0"</Publish>
-                    <Publish Event="NewDialog" Value="CompassDlg" Order="2">NOT MONGO_SERVICE_INSTALL OR (MONGO_SERVICE_ACCOUNT_TYPE = "ServiceLocalNetwork" OR MONGO_SERVICE_ACCOUNT_VALID)</Publish>
+                    <Publish Property="MONGO_SERVICE_ACCOUNT_VALID" Value="1" Order="1"><![CDATA[MONGO_SERVICE_ACCOUNT_TYPE ~= "ServiceLocalNetwork"]]></Publish>
+                    <Publish Event="DoAction" Value="ValidateServiceLogon" Order="2"><![CDATA[MONGO_SERVICE_INSTALL AND MONGO_SERVICE_ACCOUNT_TYPE <> "ServiceLocalNetwork"]]></Publish>
+                    <Publish Event="SpawnDialog" Value="InvalidServiceAccount" Order="3">MONGO_SERVICE_ACCOUNT_VALID = "0"</Publish>
+                    <Publish Event="NewDialog" Value="CompassDlg" Order="3">NOT MONGO_SERVICE_INSTALL OR (MONGO_SERVICE_ACCOUNT_TYPE = "ServiceLocalNetwork" OR MONGO_SERVICE_ACCOUNT_VALID)</Publish>
                 </Control>
                 <Control Id="Cancel" Type="PushButton" X="309" Y="244" Width="56" Height="17" TabSkip="no">
                     <Text>Cancel</Text>
@@ -160,7 +168,19 @@
                 <Control Id="InstallCompass" CheckBoxValue="1" Property="SHOULD_INSTALL_COMPASS" X="15" Y="243" Width="150" Height="17" Text="Install MongoDB Compass" Type="CheckBox" />
 
                 <Control Id="Back" Type="PushButton" X="180" Y="243" Width="56" Height="17" Text="&amp;Back" TabSkip="no">
-                    <Publish Event="NewDialog" Value="ServiceDlg">1</Publish>
+                    <Publish Event="NewDialog" Value="ServiceDlg">
+                        <![CDATA[&Server = 3]]>
+                    </Publish>
+                    <Publish Event="NewDialog" Value="MongoSetupTypeDlg">
+                        <![CDATA[
+                            NOT (&Server = 3) AND (WixUI_InstallMode = "InstallTypical" OR WixUI_InstallMode = "InstallComplete")
+                        ]]>
+                    </Publish>
+                    <Publish Event="NewDialog" Value="CustomizeDlg" Order="2">
+                        <![CDATA[
+                            NOT (&Server = 3) AND WixUI_InstallMode = "InstallCustom"
+                        ]]>
+                    </Publish>
                 </Control>
                 <Control Id="Next" Type="PushButton" X="236" Y="243" Width="56" Height="17" Text="&amp;Next" TabSkip="no" Disabled="no" >
                     <Publish Event="NewDialog" Value="VerifyReadyDlg">1</Publish>

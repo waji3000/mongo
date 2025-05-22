@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,7 +29,6 @@
 
 #pragma once
 
-#include <atomic>
 #include <string>
 
 #include "mongo/platform/atomic_proxy.h"
@@ -48,6 +46,9 @@ namespace mongo {
 struct StorageGlobalParams {
     StorageGlobalParams();
     void reset();
+
+    // Returns directory path where the SpillKVEngine instance stores its data.
+    std::string getSpillDbPath() const;
 
     // Default data directory for mongod when running in non-config server mode.
     static const char* kDefaultDbPath;
@@ -75,15 +76,31 @@ struct StorageGlobalParams {
     // Runs a repair routine on all databases.
     bool repair;
 
-    bool dur;  // --dur durability (now --journal)
+    // --validate
+    // Runs validation on all collections.
+    bool validate;
+
+    // --restore
+    // This should only be used when restoring from a backup. Mongod will behave differently by
+    // handling collections with missing data files, allowing database renames, skipping oplog
+    // entries for collections not restored and more.
+    bool restore;
+
+    // --magicRestore
+    bool magicRestore;
+
+    // Whether the Storage Engine selected should be in-memory in nature or not.
+    bool inMemory = false;
 
     // --journalCommitInterval
-    static const int kMaxJournalCommitIntervalMs;
-    AtomicInt32 journalCommitIntervalMs;
+    // This parameter is both a server parameter and a configuration parameter, and to resolve
+    // conflicts between the two the default must be set here.
+    static constexpr int kMaxJournalCommitIntervalMs = 500;
+    AtomicWord<int> journalCommitIntervalMs{100};
 
     // --notablescan
     // no table scans allowed
-    AtomicBool noTableScan;
+    AtomicWord<bool> noTableScan;
 
     // --directoryperdb
     // Stores each database’s files in its own folder in the data directory.
@@ -92,24 +109,37 @@ struct StorageGlobalParams {
     bool directoryperdb;
 
     // --syncdelay
-    // Controls how much time can pass before MongoDB flushes data to the data files
-    // via an fsync operation.
+    // Delay in seconds between triggering the next checkpoint after the completion of the previous
+    // one. A value of 0 indicates that checkpointing will be skipped.
     // Do not set this value on production systems.
     // In almost every situation, you should use the default setting.
-    static const double kMaxSyncdelaySecs;
-    AtomicDouble syncdelay;  // seconds between fsyncs
+    // This parameter is both a server parameter and a configuration parameter, and to resolve
+    // conflicts between the two the default must be set here.
+    static constexpr double kMaxSyncdelaySecs = 60 * 60;  // 1hr
+    AtomicDouble syncdelay{60.0};                         // seconds between checkpoints
 
     // --queryableBackupMode
-    // Puts MongoD into "read-only" mode. MongoD will not write any data to the underlying
-    // filesystem. Note that read operations may require writes. For example, a sort on a large
-    // dataset may fail if it requires spilling to disk.
-    bool readOnly;
+    // Prevents user-originating operations from performing writes to the server. Internally
+    // generated writes are still permitted.
+    bool queryableBackupMode;
 
     // --groupCollections
     // Dictate to the storage engine that it should attempt to create new MongoDB collections from
     // an existing underlying MongoDB database level resource if possible. This can improve
     // workloads that rely heavily on creating many collections within a database.
     bool groupCollections;
+
+    // --oplogMinRetentionHours
+    // Controls what size the oplog should be in addition to oplogSize. If set, the oplog will only
+    // be truncated if it is over the capped size, and if the bucket of oldest oplog entries fall
+    // outside of the retention window which is set by this option.
+    AtomicWord<double> oplogMinRetentionHours;
+
+    // Controls whether we allow the OplogTruncateMarkers mechanism to delete oplog history on WT.
+    bool allowOplogTruncation;
+
+    // Test-only option. Disables table logging.
+    bool forceDisableTableLogging = false;
 };
 
 extern StorageGlobalParams storageGlobalParams;

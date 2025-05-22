@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,7 +29,6 @@
 
 #include "mongo/db/fts/fts_unicode_phrase_matcher.h"
 
-#include "mongo/db/fts/fts_language.h"
 #include "mongo/db/fts/unicode/string.h"
 
 namespace mongo {

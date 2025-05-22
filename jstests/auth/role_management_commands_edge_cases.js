@@ -4,6 +4,8 @@
  * @tags: [requires_sharding]
  */
 
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+
 function runTest(conn) {
     var db = conn.getDB('test');
     var admin = conn.getDB('admin');
@@ -92,10 +94,8 @@ function runTest(conn) {
             db.createRole({
                 role: 'role13',
                 roles: [],
-                privileges: [{
-                    resource: {db: "test", collection: "foo", cluster: true},
-                    actions: ['find']
-                }]
+                privileges:
+                    [{resource: {db: "test", collection: "foo", cluster: true}, actions: ['find']}]
             });
         });
         assert.throws(function() {
@@ -116,14 +116,13 @@ function runTest(conn) {
             db.createRole({
                 role: 'role16',
                 roles: [],
-                privileges:
-                    [{resource: {db: "test", collection: "foo"}, actions: ['fakeAction']}]
+                privileges: [{resource: {db: "test", collection: "foo"}, actions: ['fakeAction']}]
             });
         });
 
         // Try to create role containing itself in its roles array
         assert.throws(function() {
-            db.createRole({role: 'role17', roles: ['role10'], privileges: []});
+            db.createRole({role: 'role17', roles: ['role17'], privileges: []});
         });
 
         assert.eq(3, db.getRoles().length);
@@ -233,7 +232,6 @@ function runTest(conn) {
         assert.throws(function() {
             db.revokeRolesFromRole("readWrite", ['read']);
         });
-
     })();
 
     (function testGrantPrivilegesToRole() {
@@ -380,8 +378,6 @@ runTest(conn);
 MongoRunner.stopMongod(conn);
 
 jsTest.log('Test sharding');
-// TODO: Remove 'shardAsReplicaSet: false' when SERVER-32672 is fixed.
-var st = new ShardingTest(
-    {shards: 2, config: 3, keyFile: 'jstests/libs/key1', other: {shardAsReplicaSet: false}});
+var st = new ShardingTest({shards: 2, config: 3, keyFile: 'jstests/libs/key1'});
 runTest(st.s);
 st.stop();

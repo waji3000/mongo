@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Public Domain 2014-2018 MongoDB, Inc.
+# Public Domain 2014-present MongoDB, Inc.
 # Public Domain 2008-2014 WiredTiger, Inc.
 #
 # This is free and unencumbered software released into the public domain.
@@ -27,14 +27,26 @@
 # OTHER DEALINGS IN THE SOFTWARE.
 #
 # runner/__init__.py
-#	Used as a first import by runners, does any common initialization.
+#   Used as a first import by runners, does any common initialization.
 from __future__ import print_function
 
-import os, shutil, sys
+import os, sys
 thisdir = os.path.dirname(os.path.abspath(__file__))
 workgen_src = os.path.dirname(os.path.dirname(thisdir))
 wt_dir = os.path.dirname(os.path.dirname(workgen_src))
-wt_builddir = os.path.join(wt_dir, 'build_posix')
+curdir = os.getcwd()
+env_builddir = os.getenv('WT_BUILDDIR')
+if env_builddir:
+    wt_builddir = env_builddir
+elif os.path.isfile(os.path.join(curdir, 'wt')):
+    wt_builddir = curdir
+else:
+    # Print a warning that we can't find a useable WiredTiger build. We will
+    # proceed however in the chance the Python paths are set up correctly.
+    print('Warning: Unable to identify WiredTiger build. Please consider either:\n'
+            '- Setting \'WT_BUILDDIR\' environment variable to specify the build directory.\n'
+            '- Calling workgen from the root of the build directory.')
+    wt_builddir = ''
 
 def _prepend_env_path(pathvar, s):
     last = ''
@@ -56,23 +68,23 @@ except:
     try:
         import wiredtiger
     except:
-        # If the .libs directory is not in our library search path,
+        # If the WiredTiger libraries is not in our library search path,
         # we need to set it and retry.  However, the dynamic link
         # library has already cached its value, our only option is
         # to restart the Python interpreter.
         if '_workgen_init' not in os.environ:
             os.environ['_workgen_init'] = 'true'
-            dotlibs = os.path.join(wt_builddir, '.libs')
-            _prepend_env_path('LD_LIBRARY_PATH', dotlibs)
-            _prepend_env_path('DYLD_LIBRARY_PATH', dotlibs)
+            libsdir = os.path.join(wt_builddir)
+            _prepend_env_path('LD_LIBRARY_PATH', libsdir)
+            _prepend_env_path('DYLD_LIBRARY_PATH', libsdir)
             py_args = sys.argv
             py_args.insert(0, sys.executable)
             try:
                 os.execv(sys.executable, py_args)
-            except Exception, exception:
+            except Exception as exception:
                 print('re-exec failed: ' + str(exception), file=sys.stderr)
                 print('  exec(' + sys.executable + ', ' + str(py_args) + ')')
-                print('Try adding "' + dotlibs + '" to the', file=sys.stderr)
+                print('Try adding "' + libsdir + '" to the', file=sys.stderr)
                 print('LD_LIBRARY_PATH environment variable before running ' + \
                     'this program again.', file=sys.stderr)
                 sys.exit(1)
@@ -84,9 +96,5 @@ except:
     sys.path.insert(0, os.path.join(wt_builddir, 'bench', 'workgen'))
     import workgen
 
-# Clear out the WT_TEST directory.
-shutil.rmtree('WT_TEST', True)
-os.mkdir('WT_TEST')
-
-from .core import txn, extensions_config, op_append, op_group_transaction, op_log_like, op_multi_table, op_populate_with_range
+from .core import txn, extensions_config, op_append, op_group_transaction, op_log_like, op_multi_table, op_populate_with_range, sleep, timed
 from .latency import workload_latency

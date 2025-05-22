@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,26 +27,30 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <memory>
+#include <utility>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
 
 #include "mongo/db/exec/multi_iterator.h"
-
-#include "mongo/db/concurrency/write_conflict_exception.h"
-#include "mongo/db/exec/working_set_common.h"
-#include "mongo/stdx/memory.h"
+#include "mongo/db/query/plan_executor_impl.h"
+#include "mongo/db/record_id.h"
+#include "mongo/db/storage/record_data.h"
+#include "mongo/db/storage/recovery_unit.h"
+#include "mongo/db/transaction_resources.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 
 using std::unique_ptr;
-using std::vector;
-using stdx::make_unique;
 
 const char* MultiIteratorStage::kStageType = "MULTI_ITERATOR";
 
-MultiIteratorStage::MultiIteratorStage(OperationContext* opCtx,
+MultiIteratorStage::MultiIteratorStage(ExpressionContext* expCtx,
                                        WorkingSet* ws,
-                                       Collection* collection)
-    : RequiresCollectionStage(kStageType, opCtx, collection), _ws(ws) {}
+                                       VariantCollectionPtrOrAcquisition collection)
+    : RequiresCollectionStage(kStageType, expCtx, collection), _ws(ws) {}
 
 void MultiIteratorStage::addIterator(unique_ptr<RecordCursor> it) {
     _iterators.push_back(std::move(it));
@@ -55,18 +58,28 @@ void MultiIteratorStage::addIterator(unique_ptr<RecordCursor> it) {
 
 PlanStage::StageState MultiIteratorStage::doWork(WorkingSetID* out) {
     boost::optional<Record> record;
-    try {
-        while (!_iterators.empty()) {
-            record = _iterators.back()->next();
-            if (record)
-                break;
-            _iterators.pop_back();
-        }
-    } catch (const WriteConflictException&) {
-        // If _advance throws a WCE we shouldn't have moved.
-        invariant(!_iterators.empty());
-        *out = WorkingSet::INVALID_ID;
-        return NEED_YIELD;
+
+    const auto ret = handlePlanStageYield(
+        expCtx(),
+        "MultiIteratorStage",
+        [&] {
+            while (!_iterators.empty()) {
+                record = _iterators.back()->next();
+                if (record)
+                    break;
+                _iterators.pop_back();
+            }
+            return PlanStage::ADVANCED;
+        },
+        [&] {
+            // yieldHandler
+            // If _advance throws a WCE we shouldn't have moved.
+            invariant(!_iterators.empty());
+            *out = WorkingSet::INVALID_ID;
+        });
+
+    if (ret != PlanStage::ADVANCED) {
+        return ret;
     }
 
     if (!record)
@@ -74,23 +87,24 @@ PlanStage::StageState MultiIteratorStage::doWork(WorkingSetID* out) {
 
     *out = _ws->allocate();
     WorkingSetMember* member = _ws->get(*out);
-    member->recordId = record->id;
-    member->obj = {getOpCtx()->recoveryUnit()->getSnapshotId(), record->data.releaseToBson()};
+    member->recordId = std::move(record->id);
+    member->resetDocument(shard_role_details::getRecoveryUnit(opCtx())->getSnapshotId(),
+                          record->data.releaseToBson());
     _ws->transitionToRecordIdAndObj(*out);
     return PlanStage::ADVANCED;
 }
 
-bool MultiIteratorStage::isEOF() {
+bool MultiIteratorStage::isEOF() const {
     return _iterators.empty();
 }
 
-void MultiIteratorStage::saveState(RequiresCollTag) {
+void MultiIteratorStage::doSaveStateRequiresCollection() {
     for (auto&& iterator : _iterators) {
         iterator->save();
     }
 }
 
-void MultiIteratorStage::restoreState(RequiresCollTag) {
+void MultiIteratorStage::doRestoreStateRequiresCollection() {
     for (auto&& iterator : _iterators) {
         const bool couldRestore = iterator->restore();
         uassert(50991, "could not restore cursor for MULTI_ITERATOR stage", couldRestore);
@@ -105,14 +119,14 @@ void MultiIteratorStage::doDetachFromOperationContext() {
 
 void MultiIteratorStage::doReattachToOperationContext() {
     for (auto&& iterator : _iterators) {
-        iterator->reattachToOperationContext(getOpCtx());
+        iterator->reattachToOperationContext(opCtx());
     }
 }
 
 unique_ptr<PlanStageStats> MultiIteratorStage::getStats() {
     unique_ptr<PlanStageStats> ret =
-        make_unique<PlanStageStats>(_commonStats, STAGE_MULTI_ITERATOR);
-    ret->specific = make_unique<CollectionScanStats>();
+        std::make_unique<PlanStageStats>(_commonStats, STAGE_MULTI_ITERATOR);
+    ret->specific = std::make_unique<CollectionScanStats>();
     return ret;
 }
 

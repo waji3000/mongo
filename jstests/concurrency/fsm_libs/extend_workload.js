@@ -1,8 +1,7 @@
-'use strict';
+import {parseConfig} from "jstests/concurrency/fsm_libs/parse_config.js";
 
-load('jstests/concurrency/fsm_libs/parse_config.js');  // for parseConfig
-
-/** extendWorkload usage:
+/**
+ * extendWorkload usage:
  *
  * $config = extendWorkload($config, function($config, $super) {
  *   // ... modify $config ...
@@ -12,7 +11,7 @@ load('jstests/concurrency/fsm_libs/parse_config.js');  // for parseConfig
  *   return $config;
  * });
  */
-function extendWorkload($config, callback) {
+export function extendWorkload($config, callback) {
     assert.eq(2,
               arguments.length,
               'extendWorkload must be called with 2 arguments: $config and callback');

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,36 +27,36 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <boost/move/utility_core.hpp>
+#include <utility>
 
+#include <boost/optional/optional.hpp>
+
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/util/builder.h"
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/matcher/schema/expression_internal_schema_str_length.h"
-
-#include "mongo/bson/bsontypes.h"
 
 namespace mongo {
 
-InternalSchemaStrLengthMatchExpression::InternalSchemaStrLengthMatchExpression(MatchType type,
-                                                                               StringData path,
-                                                                               long long strLen,
-                                                                               StringData name)
-    : LeafMatchExpression(type, path), _name(name), _strLen(strLen) {}
+InternalSchemaStrLengthMatchExpression::InternalSchemaStrLengthMatchExpression(
+    MatchType type,
+    boost::optional<StringData> path,
+    long long strLen,
+    StringData name,
+    clonable_ptr<ErrorAnnotation> annotation)
+    : LeafMatchExpression(type, path, std::move(annotation)), _name(name), _strLen(strLen) {}
 
-void InternalSchemaStrLengthMatchExpression::debugString(StringBuilder& debug, int level) const {
-    _debugAddSpace(debug, level);
-    debug << path() << " " << _name << " " << _strLen << "\n";
-
-    MatchExpression::TagData* td = getTag();
-    if (nullptr != td) {
-        debug << " ";
-        td->debugString(&debug);
-    }
-    debug << "\n";
+void InternalSchemaStrLengthMatchExpression::debugString(StringBuilder& debug,
+                                                         int indentationLevel) const {
+    _debugAddSpace(debug, indentationLevel);
+    debug << path() << " " << _name << " " << _strLen;
+    _debugStringAttachTagInfo(&debug);
 }
 
-void InternalSchemaStrLengthMatchExpression::serialize(BSONObjBuilder* out) const {
-    BSONObjBuilder subBob(out->subobjStart(path()));
-    subBob.append(_name, _strLen);
-    subBob.doneFast();
+void InternalSchemaStrLengthMatchExpression::appendSerializedRightHandSide(
+    BSONObjBuilder* bob, const SerializationOptions& opts, bool includePath) const {
+    opts.appendLiteral(bob, _name, _strLen);
 }
 
 bool InternalSchemaStrLengthMatchExpression::equivalent(const MatchExpression* other) const {

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,7 +29,16 @@
 
 #pragma once
 
+#include <vector>
+
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/client/connection_string.h"
+#include "mongo/client/read_preference.h"
 #include "mongo/client/remote_command_targeter.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/util/cancellation.h"
+#include "mongo/util/future.h"
 #include "mongo/util/net/hostandport.h"
 
 namespace mongo {
@@ -48,12 +56,18 @@ public:
     StatusWith<HostAndPort> findHost(OperationContext* opCtx,
                                      const ReadPreferenceSetting& readPref) override;
 
-    Future<HostAndPort> findHostWithMaxWait(const ReadPreferenceSetting& readPref,
-                                            Milliseconds maxWait) override;
+    SemiFuture<HostAndPort> findHost(const ReadPreferenceSetting& readPref,
+                                     const CancellationToken& cancelToken) override;
 
-    void markHostNotMaster(const HostAndPort& host, const Status& status) override;
+
+    SemiFuture<std::vector<HostAndPort>> findHosts(const ReadPreferenceSetting& readPref,
+                                                   const CancellationToken& cancelToken) override;
+
+    void markHostNotPrimary(const HostAndPort& host, const Status& status) override;
 
     void markHostUnreachable(const HostAndPort& host, const Status& status) override;
+
+    void markHostShuttingDown(const HostAndPort& host, const Status& status) override;
 
 private:
     const HostAndPort _hostAndPort;

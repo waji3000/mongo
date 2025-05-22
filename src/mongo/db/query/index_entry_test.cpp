@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,10 +27,13 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <algorithm>
 
+#include <boost/container/vector.hpp>
+
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/query/index_entry.h"
-
 #include "mongo/unittest/death_test.h"
 #include "mongo/unittest/unittest.h"
 
@@ -40,12 +42,23 @@ namespace mongo {
 namespace {
 
 IndexEntry makeIndexEntry(BSONObj keyPattern, MultikeyPaths multiKeyPaths) {
-    IndexEntry entry{std::move(keyPattern)};
-    entry.multikeyPaths = std::move(multiKeyPaths);
-    entry.multikey = std::any_of(entry.multikeyPaths.cbegin(),
-                                 entry.multikeyPaths.cend(),
-                                 [](const auto& entry) { return !entry.empty(); });
-    return entry;
+    bool multiKey = std::any_of(multiKeyPaths.cbegin(),
+                                multiKeyPaths.cend(),
+                                [](const auto& entry) { return !entry.empty(); });
+
+    return {keyPattern,
+            IndexNames::nameToType(IndexNames::findPluginName(keyPattern)),
+            IndexConfig::kLatestIndexVersion,
+            multiKey,
+            multiKeyPaths,
+            {},
+            false,
+            false,
+            CoreIndexInfo::Identifier("test_foo"),
+            nullptr,
+            {},
+            nullptr,
+            nullptr};
 }
 
 TEST(QueryPlannerIXSelectTest, IndexedFieldHasMultikeyComponents) {
@@ -84,9 +97,9 @@ TEST(QueryPlannerIXSelectTest, IndexedFieldHasMultikeyComponents) {
     ASSERT_TRUE(indexEntry.pathHasMultikeyComponent("d"_sd));
 }
 
-DEATH_TEST(QueryPlannerIXSelectTest,
-           IndexedFieldHasMultikeyComponentsPassingInvalidFieldIsFatal,
-           "Invariant failure Hit a MONGO_UNREACHABLE!") {
+DEATH_TEST_REGEX(QueryPlannerIXSelectTest,
+                 IndexedFieldHasMultikeyComponentsPassingInvalidFieldIsFatal,
+                 "Invariant failure.*Hit a MONGO_UNREACHABLE!") {
     auto indexEntry = makeIndexEntry(BSON("a" << 1), {{}});
     indexEntry.pathHasMultikeyComponent("b"_sd);
 }

@@ -1,15 +1,17 @@
 /**
  * Commands supporting read and write concern.
  */
-var kCommandsSupportingReadConcern = new Set([
+export var kCommandsSupportingReadConcern = new Set([
     "aggregate",
     "count",
     "distinct",
     "find",
-    "geoSearch",
 ]);
 
-var kCommandsOnlySupportingReadConcernSnapshot = new Set([
+/**
+ * Write commands supporting snapshot readConcern in a transaction.
+ */
+export var kWriteCommandsSupportingSnapshotInTransaction = new Set([
     "delete",
     "findAndModify",
     "findandmodify",
@@ -17,19 +19,26 @@ var kCommandsOnlySupportingReadConcernSnapshot = new Set([
     "update",
 ]);
 
-var kCommandsSupportingWriteConcern = new Set([
+/**
+ * Commands supporting snapshot readConcern outside of transactions.
+ */
+export var kCommandsSupportingSnapshot = new Set([
+    "aggregate",
+    "distinct",
+    "find",
+]);
+
+export var kCommandsSupportingWriteConcern = new Set([
     "_configsvrAddShard",
     "_configsvrAddShardToZone",
-    "_configsvrCommitChunkMerge",
+    "_configsvrCommitChunksMerge",
     "_configsvrCommitChunkMigration",
     "_configsvrCommitChunkSplit",
+    "_configsvrCommitMergeAllChunksOnShard",
     "_configsvrCreateDatabase",
-    "_configsvrEnableSharding",
-    "_configsvrMoveChunk",
-    "_configsvrMovePrimary",
+    "_configsvrMoveRange",
     "_configsvrRemoveShard",
     "_configsvrRemoveShardFromZone",
-    "_configsvrShardCollection",
     "_configsvrUpdateZoneKeyRange",
     "_mergeAuthzCollections",
     "_recvChunkStart",
@@ -37,10 +46,8 @@ var kCommandsSupportingWriteConcern = new Set([
     "appendOplogNote",
     "applyOps",
     "aggregate",
-    "captrunc",
     "cleanupOrphaned",
     "clone",
-    "cloneCollection",
     "cloneCollectionAsCapped",
     "collMod",
     "commitTransaction",
@@ -51,7 +58,6 @@ var kCommandsSupportingWriteConcern = new Set([
     "createUser",
     "delete",
     "deleteIndexes",
-    "doTxn",
     "drop",
     "dropAllRolesFromDatabase",
     "dropAllUsersFromDatabase",
@@ -59,7 +65,6 @@ var kCommandsSupportingWriteConcern = new Set([
     "dropIndexes",
     "dropRole",
     "dropUser",
-    "emptycapped",
     "findAndModify",
     "findandmodify",
     "godinsert",
@@ -69,17 +74,17 @@ var kCommandsSupportingWriteConcern = new Set([
     "insert",
     "mapReduce",
     "mapreduce",
-    "mapreduce.shardedfinish",
     "moveChunk",
     "renameCollection",
     "revokePrivilegesFromRole",
     "revokeRolesFromRole",
     "revokeRolesFromUser",
     "setFeatureCompatibilityVersion",
+    "testInternalTransactions",
     "update",
     "updateRole",
     "updateUser",
 ]);
 
-var kCommandsSupportingWriteConcernInTransaction =
-    new Set(["doTxn", "abortTransaction", "commitTransaction"]);
+export var kCommandsSupportingWriteConcernInTransaction =
+    new Set(["abortTransaction", "commitTransaction"]);

@@ -15,14 +15,17 @@
 #pragma once
 #endif  // defined(_MSC_VER) && (_MSC_VER >= 1200)
 
-#include "asio/detail/config.hpp"
+#include <asio/detail/config.hpp>
 
-#include "asio/buffer.hpp"
-#include "asio/detail/static_mutex.hpp"
 #include "mongo/util/net/ssl/detail/openssl_types.hpp"
 #include "mongo/util/net/ssl/stream_base.hpp"
+#include <asio/buffer.hpp>
+#include <asio/detail/static_mutex.hpp>
+#include <asio/error_code.hpp>
+#include <boost/optional.hpp>
 
-#include "asio/detail/push_options.hpp"
+// This must be after all other includes
+#include <asio/detail/push_options.hpp>
 
 namespace asio {
 namespace ssl {
@@ -59,6 +62,8 @@ public:
 
     // Get the underlying implementation in the native type.
     ASIO_DECL SSL* native_handle();
+
+    boost::optional<std::string> get_sni();
 
     // Perform an SSL handshake using either SSL_connect (client-side) or
     // SSL_accept (server-side).
@@ -99,6 +104,8 @@ private:
     ASIO_DECL static asio::detail::static_mutex& accept_mutex();
 #endif  // (OPENSSL_VERSION_NUMBER < 0x10000000L)
 
+    ASIO_DECL void purge_error_state();
+
     // Perform one operation. Returns >= 0 on success or error, want_read if the
     // operation needs more input, or want_write if it needs to write some output
     // before the operation can complete.
@@ -128,13 +135,16 @@ private:
 
     // TLS SNI server name
     std::string _remoteHostName;
+
+    // TLS SNI name expected by incoming client
+    boost::optional<std::string> _sni;
 };
 
 }  // namespace detail
 }  // namespace ssl
 }  // namespace asio
 
-#include "asio/detail/pop_options.hpp"
+#include <asio/detail/pop_options.hpp>
 
 #if defined(ASIO_HEADER_ONLY)
 #include "mongo/util/net/ssl/detail/impl/engine_openssl.ipp"

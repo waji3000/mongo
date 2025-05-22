@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,99 +27,33 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/s/mongos_options.h"
-
+// IWYU pragma: no_include "ext/alloc_traits.h"
 #include <iostream>
+#include <memory>
 #include <string>
 #include <vector>
 
+#include "mongo/base/error_codes.h"
 #include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
-#include "mongo/bson/util/builder.h"
-#include "mongo/config.h"
+#include "mongo/config.h"  // IWYU pragma: keep
 #include "mongo/db/server_options.h"
 #include "mongo/db/server_options_server_helpers.h"
+#include "mongo/logv2/log.h"
+#include "mongo/s/mongos_options.h"
 #include "mongo/s/version_mongos.h"
-#include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/net/hostandport.h"
 #include "mongo/util/net/socket_utils.h"
 #include "mongo/util/options_parser/startup_options.h"
-#include "mongo/util/startup_test.h"
-#include "mongo/util/stringutils.h"
+#include "mongo/util/str.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
+
 
 namespace mongo {
 
 MongosGlobalParams mongosGlobalParams;
-
-Status addMongosOptions(moe::OptionSection* options) {
-    moe::OptionSection general_options("General options");
-
-    Status ret = addGeneralServerOptions(&general_options);
-    if (!ret.isOK()) {
-        return ret;
-    }
-
-#if defined(_WIN32)
-    moe::OptionSection windows_scm_options("Windows Service Control Manager options");
-
-    ret = addWindowsServerOptions(&windows_scm_options);
-    if (!ret.isOK()) {
-        return ret;
-    }
-#endif
-
-    moe::OptionSection sharding_options("Sharding options");
-
-    sharding_options.addOptionChaining("sharding.configDB",
-                                       "configdb",
-                                       moe::String,
-                                       "Connection string for communicating with config servers:\n"
-                                       "<config replset name>/<host1:port>,<host2:port>,[...]");
-
-    sharding_options.addOptionChaining(
-        "replication.localPingThresholdMs",
-        "localThreshold",
-        moe::Int,
-        "ping time (in ms) for a node to be considered local (default 15ms)");
-
-    sharding_options.addOptionChaining("test", "test", moe::Switch, "just run unit tests")
-        .setSources(moe::SourceAllLegacy);
-
-    /** Javascript Options
-     *  As a general rule, js enable/disable options are ignored for mongos.
-     *  However, we define and hide these options so that if someone
-     *  were to use these args in a set of options meant for both
-     *  mongos and mongod runs, the mongos won't fail on an unknown argument.
-     *
-     *  These options have no affect on how the mongos runs.
-     *  Setting either or both to *any* value will provoke a warning message
-     *  and nothing more.
-     */
-    sharding_options
-        .addOptionChaining("noscripting", "noscripting", moe::Switch, "disable scripting engine")
-        .hidden()
-        .setSources(moe::SourceAllLegacy);
-
-    general_options
-        .addOptionChaining(
-            "security.javascriptEnabled", "", moe::Bool, "Enable javascript execution")
-        .hidden()
-        .setSources(moe::SourceYAMLConfig);
-
-    options->addSection(general_options).transitional_ignore();
-
-#if defined(_WIN32)
-    options->addSection(windows_scm_options).transitional_ignore();
-#endif
-
-    options->addSection(sharding_options).transitional_ignore();
-
-    return Status::OK();
-}
 
 void printMongosHelp(const moe::OptionSection& options) {
     std::cout << options.helpString() << std::endl;
@@ -133,13 +66,12 @@ bool handlePreValidationMongosOptions(const moe::Environment& params,
         return false;
     }
     if (params.count("version") && params["version"].as<bool>() == true) {
-        printShardingVersionInfo(true);
+        logMongosVersionInfo(&std::cout);
         return false;
     }
     if (params.count("test") && params["test"].as<bool>() == true) {
-        ::mongo::logger::globalLogDomain()->setMinimumLoggedSeverity(
-            ::mongo::logger::LogSeverity::Debug(5));
-        StartupTest::runTests();
+        logv2::LogManager::global().getGlobalSettings().setMinimumLoggedSeverity(
+            mongo::logv2::LogComponent::kDefault, ::mongo::logv2::LogSeverity::Debug(5));
         return false;
     }
 
@@ -161,6 +93,21 @@ Status canonicalizeMongosOptions(moe::Environment* params) {
         return ret;
     }
 
+    // "security.javascriptEnabled" comes from the config file, so override it if "noscripting"
+    // is set since that comes from the command line.
+    if (params->count("noscripting")) {
+        auto status = params->set("security.javascriptEnabled",
+                                  moe::Value(!(*params)["noscripting"].as<bool>()));
+        if (!status.isOK()) {
+            return status;
+        }
+
+        status = params->remove("noscripting");
+        if (!status.isOK()) {
+            return status;
+        }
+    }
+
     return Status::OK();
 }
 
@@ -170,21 +117,8 @@ Status storeMongosOptions(const moe::Environment& params) {
         return ret;
     }
 
-    if (params.count("net.port")) {
-        int port = params["net.port"].as<int>();
-        if (port <= 0 || port > 65535) {
-            return Status(ErrorCodes::BadValue, "error: port number must be between 1 and 65535");
-        }
-    }
-
-    if (params.count("replication.localPingThresholdMs")) {
-        serverGlobalParams.defaultLocalThresholdMillis =
-            params["replication.localPingThresholdMs"].as<int>();
-    }
-
-    if (params.count("noscripting") || params.count("security.javascriptEnabled")) {
-        warning() << "The Javascript enabled/disabled options are not supported for mongos. "
-                     "(\"noscripting\" and/or \"security.javascriptEnabled\" are set.)";
+    if (params.count("security.javascriptEnabled")) {
+        mongosGlobalParams.scriptingEnabled = params["security.javascriptEnabled"].as<bool>();
     }
 
     if (!params.count("sharding.configDB")) {
@@ -198,7 +132,8 @@ Status storeMongosOptions(const moe::Environment& params) {
         return configdbConnectionString.getStatus();
     }
 
-    if (configdbConnectionString.getValue().type() != ConnectionString::SET) {
+    if (configdbConnectionString.getValue().type() !=
+        ConnectionString::ConnectionType::kReplicaSet) {
         return Status(ErrorCodes::BadValue,
                       str::stream() << "configdb supports only replica set connection string");
     }
@@ -216,11 +151,16 @@ Status storeMongosOptions(const moe::Environment& params) {
     }
     if (!resolvedSomeSeedSever) {
         if (!hostbyname(configdbConnectionString.getValue().getSetName().c_str()).empty()) {
-            warning() << "The replica set name \""
-                      << escape(configdbConnectionString.getValue().getSetName())
-                      << "\" resolves as a host name, but none of the servers in the seed list do. "
-                         "Did you reverse the replica set name and the seed list in "
-                      << escape(configdbConnectionString.getValue().toString()) << "?";
+            LOGV2_WARNING(24131,
+                          "The replica set name "
+                          "\"{str_escape_configdbConnectionString_getValue_getSetName}\" resolves "
+                          "as a host name, but none of the servers in the seed list do. "
+                          "Did you reverse the replica set name and the seed list in "
+                          "{str_escape_configdbConnectionString_getValue}?",
+                          "str_escape_configdbConnectionString_getValue_getSetName"_attr =
+                              str::escape(configdbConnectionString.getValue().getSetName()),
+                          "str_escape_configdbConnectionString_getValue"_attr =
+                              str::escape(configdbConnectionString.getValue().toString()));
         }
     }
 
@@ -230,8 +170,9 @@ Status storeMongosOptions(const moe::Environment& params) {
                          configdbConnectionString.getValue().getSetName()};
 
     if (mongosGlobalParams.configdbs.getServers().size() < 3) {
-        warning() << "Running a sharded cluster with fewer than 3 config servers should only be "
-                     "done for testing purposes and is not recommended for production.";
+        LOGV2_WARNING(24132,
+                      "Running a sharded cluster with fewer than 3 config servers should only be "
+                      "done for testing purposes and is not recommended for production.");
     }
 
     return Status::OK();

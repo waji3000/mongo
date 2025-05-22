@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,12 +29,17 @@
 
 #include "mongo/base/string_data.h"
 
+#include <boost/container_hash/hash.hpp>
+
 #include <ostream>
 
 namespace mongo {
-
 std::ostream& operator<<(std::ostream& stream, StringData value) {
-    return stream.write(value.rawData(), value.size());
+    return stream << toStdStringViewForInterop(value);
+}
+
+size_t hash_value(StringData sd) {
+    return boost::hash<std::string_view>{}(toStdStringViewForInterop(sd));
 }
 
 }  // namespace mongo

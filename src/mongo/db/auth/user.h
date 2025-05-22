@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,22 +29,159 @@
 
 #pragma once
 
+#include <algorithm>
+#include <boost/move/utility_core.hpp>
+#include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+#include <cstdint>
+#include <set>
 #include <string>
+#include <tuple>
+#include <utility>
 #include <vector>
 
-#include "mongo/base/disallow_copying.h"
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/crypto/sha1_block.h"
 #include "mongo/crypto/sha256_block.h"
+#include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/auth/resource_pattern.h"
 #include "mongo/db/auth/restriction_set.h"
 #include "mongo/db/auth/role_name.h"
+#include "mongo/db/auth/user_acquisition_stats.h"
 #include "mongo/db/auth/user_name.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/stdx/unordered_map.h"
 #include "mongo/stdx/unordered_set.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/base64.h"
+#include "mongo/util/read_through_cache.h"
+
 
 namespace mongo {
+
+/**
+ * Represents the properties required to request a UserHandle.
+ * It contains a UserRequestCacheKey which is hashable and can be
+ * used as a cache key.
+ */
+class UserRequest {
+public:
+    virtual ~UserRequest() = default;
+
+    class UserRequestCacheKey {
+    public:
+        UserRequestCacheKey(const UserName& userName, const std::vector<std::string>& hashElements)
+            : _hashElements(std::move(hashElements)), _userName(userName) {}
+
+        const UserName& getUserName() const {
+            return _userName;
+        }
+
+        template <typename H>
+        friend H AbslHashValue(H h, const UserRequestCacheKey& key) {
+            for (const auto& elem : key.getHashElements()) {
+                h = H::combine(std::move(h), elem);
+            }
+            return h;
+        }
+
+        bool operator==(const UserRequestCacheKey& key) const {
+            return getHashElements() == key.getHashElements();
+        }
+
+        bool operator<(const UserRequestCacheKey& key) const {
+            return getHashElements() < key.getHashElements();
+        }
+
+        bool operator>(const UserRequestCacheKey& k) const {
+            return k < *this;
+        }
+
+        bool operator>=(const UserRequestCacheKey& k) const {
+            return !(*this < k);
+        }
+
+        bool operator<=(const UserRequestCacheKey& k) const {
+            return !(k < *this);
+        }
+
+    private:
+        const std::vector<std::string>& getHashElements() const {
+            return _hashElements;
+        }
+
+        const std::vector<std::string> _hashElements;
+
+        // We store the userName here for userCacheInfo.
+        const UserName _userName;
+    };
+
+    enum class UserRequestType { General, X509, OIDC };
+
+    virtual const UserName& getUserName() const = 0;
+    virtual const boost::optional<std::set<RoleName>>& getRoles() const = 0;
+    virtual UserRequestType getType() const = 0;
+    virtual void setRoles(boost::optional<std::set<RoleName>> roles) = 0;
+    virtual std::unique_ptr<UserRequest> clone() const = 0;
+
+    /**
+     * Version of clone that clones the UserRequest by erasing the roles from
+     * the document and re-fetching the roles for OIDC / X509.
+     */
+    virtual StatusWith<std::unique_ptr<UserRequest>> cloneForReacquire() const = 0;
+    virtual UserRequestCacheKey generateUserRequestCacheKey() const = 0;
+
+    static std::vector<std::string> getUserNameAndRolesVector(
+        const UserName& userName, const boost::optional<std::set<RoleName>>& roles);
+};
+
+/**
+ * This is a version of the UserRequest that is used for all authentication types
+ * that are not X509 and OIDC.
+ */
+class UserRequestGeneral : public UserRequest {
+public:
+    UserRequestGeneral(UserName name, boost::optional<std::set<RoleName>> roles)
+        : name(std::move(name)), roles(std::move(roles)) {}
+
+    const UserName& getUserName() const final {
+        return name;
+    }
+
+    const boost::optional<std::set<RoleName>>& getRoles() const final {
+        return roles;
+    }
+
+    UserRequestType getType() const override {
+        return UserRequestType::General;
+    }
+
+    void setRoles(boost::optional<std::set<RoleName>> roles) final {
+        this->roles = std::move(roles);
+    }
+
+    std::unique_ptr<UserRequest> clone() const override {
+        return std::unique_ptr<UserRequest>(
+            std::make_unique<UserRequestGeneral>(getUserName(), getRoles()));
+    }
+
+    StatusWith<std::unique_ptr<UserRequest>> cloneForReacquire() const override {
+        return std::unique_ptr<UserRequest>(
+            std::make_unique<UserRequestGeneral>(getUserName(), boost::none));
+    }
+
+    UserRequestCacheKey generateUserRequestCacheKey() const override;
+
+protected:
+    // The name of the requested user
+    UserName name;
+    // Any authorization grants which should override and be used in favor of roles acquisition.
+    boost::optional<std::set<RoleName>> roles;
+};
 
 /**
  * Represents a MongoDB user.  Stores information about the user necessary for access control
@@ -62,9 +198,19 @@ namespace mongo {
  * user from the AuthorizationManager.
  */
 class User {
-    MONGO_DISALLOW_COPYING(User);
+    User(const User&) = delete;
+    User& operator=(const User&) = delete;
 
 public:
+    using UserId = std::vector<std::uint8_t>;
+    constexpr static auto kSHA1FieldName = "SCRAM-SHA-1"_sd;
+    constexpr static auto kSHA256FieldName = "SCRAM-SHA-256"_sd;
+    constexpr static auto kExternalFieldName = "external"_sd;
+    constexpr static auto kIterationCountFieldName = "iterationCount"_sd;
+    constexpr static auto kSaltFieldName = "salt"_sd;
+    constexpr static auto kServerKeyFieldName = "serverKey"_sd;
+    constexpr static auto kStoredKeyFieldName = "storedKey"_sd;
+
     template <typename HashBlock>
     struct SCRAMCredentials {
         SCRAMCredentials() : iterationCount(0), salt(""), serverKey(""), storedKey("") {}
@@ -83,7 +229,19 @@ public:
                 base64::validate(serverKey) && (storedKey.size() == kEncodedHashLength) &&
                 base64::validate(storedKey);
         }
+
+        bool empty() const {
+            return !iterationCount && salt.empty() && serverKey.empty() && storedKey.empty();
+        }
+
+        void toBSON(BSONObjBuilder* builder) const {
+            builder->append(kIterationCountFieldName, iterationCount);
+            builder->append(kSaltFieldName, salt);
+            builder->append(kStoredKeyFieldName, storedKey);
+            builder->append(kServerKeyFieldName, serverKey);
+        }
     };
+
     struct CredentialData {
         CredentialData() : scram_sha1(), scram_sha256(), isExternal(false) {}
 
@@ -99,17 +257,79 @@ public:
 
         template <typename HashBlock>
         const SCRAMCredentials<HashBlock>& scram() const;
+
+        void toBSON(BSONObjBuilder* builder) const {
+            if (scram_sha1.isValid()) {
+                BSONObjBuilder sha1ObjBuilder(builder->subobjStart(kSHA1FieldName));
+                scram_sha1.toBSON(&sha1ObjBuilder);
+                sha1ObjBuilder.doneFast();
+            }
+            if (scram_sha256.isValid()) {
+                BSONObjBuilder sha256ObjBuilder(builder->subobjStart(kSHA256FieldName));
+                scram_sha256.toBSON(&sha256ObjBuilder);
+                sha256ObjBuilder.doneFast();
+            }
+            if (isExternal) {
+                builder->append(kExternalFieldName, true);
+            }
+        }
+
+        std::vector<StringData> toMechanismsVector() const {
+            std::vector<StringData> mechanismsVec;
+            if (scram_sha1.isValid()) {
+                mechanismsVec.push_back(kSHA1FieldName);
+            }
+            if (scram_sha256.isValid()) {
+                mechanismsVec.push_back(kSHA256FieldName);
+            }
+            if (isExternal) {
+                mechanismsVec.push_back(kExternalFieldName);
+            }
+
+            // Valid CredentialData objects must have at least one mechanism.
+            invariant(mechanismsVec.size() > 0);
+
+            return mechanismsVec;
+        }
     };
 
-    typedef stdx::unordered_map<ResourcePattern, Privilege> ResourcePrivilegeMap;
+    using ResourcePrivilegeMap = stdx::unordered_map<ResourcePattern, Privilege>;
 
-    explicit User(const UserName& name);
+    explicit User(std::unique_ptr<UserRequest> request);
+    User(User&&) = default;
+    User& operator=(User&&) = default;
+
+    const UserId& getID() const {
+        return _id;
+    }
+
+    void setID(UserId id) {
+        _id = std::move(id);
+    }
+
+    const UserRequest* getUserRequest() const {
+        return _request.get();
+    }
 
     /**
      * Returns the user name for this user.
      */
     const UserName& getName() const {
-        return _name;
+        return _request->getUserName();
+    }
+
+    /**
+     * Checks if the user has been invalidated.
+     */
+    bool isInvalidated() const {
+        return _isInvalidated;
+    }
+
+    /**
+     * Invalidates the user.
+     */
+    void invalidate() {
+        _isInvalidated = true;
     }
 
     /**
@@ -118,7 +338,6 @@ public:
     const SHA256Block& getDigest() const {
         return _digest;
     }
-
 
     /**
      * Returns an iterator over the names of the user's direct roles
@@ -150,19 +369,12 @@ public:
     /**
      * Gets the set of actions this user is allowed to perform on the given resource.
      */
-    const ActionSet getActionsForResource(const ResourcePattern& resource) const;
+    ActionSet getActionsForResource(const ResourcePattern& resource) const;
 
     /**
      * Returns true if the user has is allowed to perform an action on the given resource.
      */
     bool hasActionsForResource(const ResourcePattern& resource) const;
-
-    /**
-     * Returns true if this copy of information about this user is still valid. If this returns
-     * false, this object should no longer be used and should be returned to the
-     * AuthorizationManager and a new User object for this user should be requested.
-     */
-    bool isValid() const;
 
     // Mutators below.  Mutation functions should *only* be called by the AuthorizationManager
 
@@ -215,23 +427,51 @@ public:
     /**
      * Gets any set authentication restrictions.
      */
-    const RestrictionDocuments& getRestrictions() const& noexcept {
+    const RestrictionDocuments& getRestrictions() const& {
         return _restrictions;
     }
-    void getRestrictions() && = delete;
 
-protected:
-    friend class AuthorizationManagerImpl;
     /**
-     * Marks this instance of the User object as invalid, most likely because information about
-     * the user has been updated and needs to be reloaded from the AuthorizationManager.
-     *
-     * This method should *only* be called by the AuthorizationManager.
+     * Replaces any existing authentication restrictions with "restrictions".
      */
-    void _invalidate();
+    void setIndirectRestrictions(RestrictionDocuments restrictions) &;
+
+    /**
+     * Gets any set authentication restrictions.
+     */
+    const RestrictionDocuments& getIndirectRestrictions() const& {
+        return _indirectRestrictions;
+    }
+
+    /**
+     * Process both direct and indirect authentication restrictions.
+     */
+    Status validateRestrictions(OperationContext* opCtx) const;
+
+    /**
+     * Generates a BSON representation of the User object with all the information needed for
+     * usersInfo.
+     */
+    void reportForUsersInfo(BSONObjBuilder* builder,
+                            bool showCredentials,
+                            bool showPrivileges,
+                            bool showAuthenticationRestrictions) const;
+
+    /**
+     * Returns true if the User object has at least one different direct or indirect role from the
+     * otherUser.
+     */
+    bool hasDifferentRoles(const User& otherUser) const;
 
 private:
-    UserName _name;
+    // Unique ID (often UUID) for this user. May be empty for legacy users.
+    UserId _id;
+
+    // The original UserRequest which resolved into this user
+    std::unique_ptr<UserRequest> _request;
+
+    // User was explicitly invalidated
+    bool _isInvalidated;
 
     // Digest of the full username
     SHA256Block _digest;
@@ -251,10 +491,15 @@ private:
     // Restrictions which must be met by a Client in order to authenticate as this user.
     RestrictionDocuments _restrictions;
 
-    // Indicates whether the user has been marked as invalid by the AuthorizationManager.
-    AtomicBool _isValid{true};
+    // Indirect restrictions inherited via roles.
+    RestrictionDocuments _indirectRestrictions;
 };
 
-using UserHandle = std::shared_ptr<User>;
+using UserCache = ReadThroughCache<UserRequest::UserRequestCacheKey,
+                                   User,
+                                   CacheNotCausallyConsistent,
+                                   std::shared_ptr<UserRequest>,
+                                   SharedUserAcquisitionStats>;
+using UserHandle = UserCache::ValueHandle;
 
 }  // namespace mongo

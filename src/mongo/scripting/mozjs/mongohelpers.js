@@ -32,10 +32,9 @@
 
 // The contents of exportToMongoHelpers will be copied into the MongoHelpers object and
 // this dictionary will be removed from the global scope.
-exportToMongoHelpers = {
+globalThis.exportToMongoHelpers = {
     // This function accepts an expression or function body and returns a function definition
     'functionExpressionParser': function functionExpressionParser(fnSrc) {
-
         // Ensure that a provided expression or function body is not terminated with a ';'.
         // This ensures we interpret the input as a single expression, rather than a sequence
         // of expressions, and can wrap it in parentheses.
@@ -52,7 +51,7 @@ exportToMongoHelpers = {
             } else if (e == 'SyntaxError: return not in function') {
                 return 'function() { ' + fnSrc + ' }';
             } else {
-                throw(e);
+                throw (e);
             }
         }
         // Input source is a series of expressions. we should prepend the last one with return
@@ -70,13 +69,18 @@ exportToMongoHelpers = {
                 if (prevExprEnd.line != loc.line) {
                     prevExprEnd = 0;
                 } else {
-                    prevExprEnd = prevExprEnd.column;
+                    // Starting in MozJS ESR128, the column numbers returned by the engine are
+                    // 1-indexed. To ensure we reference the correct substring when we perform
+                    // string manipulation below, we need to subtract 1.
+                    prevExprEnd = prevExprEnd.column - 1;
                 }
             }
 
             var lines = fnSrc.split('\n');
-            var col = loc.column;
+            // Adjust for 1-indexed column number by substracting 1.
+            var col = loc.column - 1;
             var fnSrc;
+            var tmpTree;
             var origLine = lines[loc.line - 1];
 
             // The parser has a weird behavior where sometimes if you have an expression like

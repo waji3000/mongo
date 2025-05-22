@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,39 +27,46 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kControl
 
 #include <boost/filesystem.hpp>
 #include <boost/none.hpp>
 #include <boost/optional.hpp>
+#include <cstdio>
 #include <fstream>
 #include <iostream>
-#include <malloc.h>
-#include <procfs.h>
-#include <stdio.h>
 #include <string>
-#include <sys/lgrp_user.h>
-#include <sys/mman.h>
-#include <sys/systeminfo.h>
-#include <sys/utsname.h>
-#include <unistd.h>
 #include <vector>
 
+#ifndef _WIN32
+#include <malloc.h>
+#include <procfs.h>
+#include <sys/lgrp_user.h>
+#include <sys/mman.h>
+#include <sys/socket.h>
+#include <sys/systeminfo.h>
+#include <sys/utsname.h>
+#endif
+
+#include "mongo/config.h"  // IWYU pragma: keep
+#include "mongo/logv2/log.h"
 #include "mongo/util/file.h"
-#include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
 #include "mongo/util/processinfo.h"
 #include "mongo/util/scopeguard.h"
-#include "mongo/util/stringutils.h"
+#include "mongo/util/str.h"
 
-using namespace std;
+#if defined(MONGO_CONFIG_HAVE_HEADER_UNISTD_H)
+#include <unistd.h>
+#endif
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
+
 
 namespace mongo {
 
 /**
  * Read the first line from a file; return empty string on failure
  */
-static string readLineFromFile(const char* fname) {
+static std::string readLineFromFile(const char* fname) {
     std::string fstr;
     std::ifstream f(fname);
     if (f.is_open()) {
@@ -72,16 +78,17 @@ static string readLineFromFile(const char* fname) {
 struct ProcPsinfo {
     ProcPsinfo() {
         FILE* f = fopen("/proc/self/psinfo", "r");
-        massert(16846,
-                mongoutils::str::stream() << "couldn't open \"/proc/self/psinfo\": "
-                                          << errnoWithDescription(),
-                f);
+        if (!f) {
+            auto ec = lastSystemError();
+            msgasserted(16846,
+                        str::stream()
+                            << "couldn't open \"/proc/self/psinfo\": " << errorMessage(ec));
+        }
         size_t num = fread(&psinfo, sizeof(psinfo), 1, f);
-        int err = errno;
+        auto ec = lastSystemError();
         fclose(f);
         massert(16847,
-                mongoutils::str::stream() << "couldn't read from \"/proc/self/psinfo\": "
-                                          << errnoWithDescription(err),
+                str::stream() << "couldn't read from \"/proc/self/psinfo\": " << errorMessage(ec),
                 num == 1);
     }
     psinfo_t psinfo;
@@ -90,16 +97,16 @@ struct ProcPsinfo {
 struct ProcUsage {
     ProcUsage() {
         FILE* f = fopen("/proc/self/usage", "r");
-        massert(16848,
-                mongoutils::str::stream() << "couldn't open \"/proc/self/usage\": "
-                                          << errnoWithDescription(),
-                f);
+        if (!f) {
+            auto ec = lastSystemError();
+            msgasserted(
+                16848, str::stream() << "couldn't open \"/proc/self/usage\": " << errorMessage(ec));
+        }
         size_t num = fread(&prusage, sizeof(prusage), 1, f);
-        int err = errno;
+        auto ec = lastSystemError();
         fclose(f);
         massert(16849,
-                mongoutils::str::stream() << "couldn't read from \"/proc/self/usage\": "
-                                          << errnoWithDescription(err),
+                str::stream() << "couldn't read from \"/proc/self/usage\": " << errorMessage(ec),
                 num == 1);
     }
     prusage_t prusage;
@@ -130,13 +137,36 @@ int ProcessInfo::getResidentSize() {
     return static_cast<int>(p.psinfo.pr_rssize / 1024);
 }
 
-double ProcessInfo::getSystemMemoryPressurePercentage() {
-    return 0.0;
-}
-
 void ProcessInfo::getExtraInfo(BSONObjBuilder& info) {
     ProcUsage p;
     info.appendNumber("page_faults", static_cast<long long>(p.prusage.pr_majf));
+}
+
+bool checkNumaEnabled() {
+    lgrp_cookie_t cookie = lgrp_init(LGRP_VIEW_OS);
+
+    if (cookie == LGRP_COOKIE_NONE) {
+        auto ec = lastSystemError();
+        LOGV2_WARNING(23362,
+                      "lgrp_init failed: {errnoWithDescription}",
+                      "errnoWithDescription"_attr = errorMessage(ec));
+        return false;
+    }
+
+    ON_BLOCK_EXIT([&] { lgrp_fini(cookie); });
+
+    int groups = lgrp_nlgrps(cookie);
+
+    if (groups == -1) {
+        auto ec = lastSystemError();
+        LOGV2_WARNING(23363,
+                      "lgrp_nlgrps failed: {errnoWithDescription}",
+                      "errnoWithDescription"_attr = errorMessage(ec));
+        return false;
+    }
+
+    // NUMA machines have more then 1 locality group
+    return groups > 1;
 }
 
 /**
@@ -145,23 +175,28 @@ void ProcessInfo::getExtraInfo(BSONObjBuilder& info) {
 void ProcessInfo::SystemInfo::collectSystemInfo() {
     struct utsname unameData;
     if (uname(&unameData) == -1) {
-        log() << "Unable to collect detailed system information: " << strerror(errno);
+        LOGV2(23356,
+              "Unable to collect detailed system information: {strerror_errno}",
+              "strerror_errno"_attr = strerror(errno));
     }
 
     char buf_64[32];
     char buf_native[32];
     if (sysinfo(SI_ARCHITECTURE_64, buf_64, sizeof(buf_64)) != -1 &&
         sysinfo(SI_ARCHITECTURE_NATIVE, buf_native, sizeof(buf_native)) != -1) {
-        addrSize = mongoutils::str::equals(buf_64, buf_native) ? 64 : 32;
+        addrSize = str::equals(buf_64, buf_native) ? 64 : 32;
     } else {
-        log() << "Unable to determine system architecture: " << strerror(errno);
+        LOGV2(23357,
+              "Unable to determine system architecture: {strerror_errno}",
+              "strerror_errno"_attr = strerror(errno));
     }
 
     osType = unameData.sysname;
-    osName = mongoutils::str::ltrim(readLineFromFile("/etc/release"));
+    osName = str::ltrim(readLineFromFile("/etc/release"));
     osVersion = unameData.version;
     pageSize = static_cast<unsigned long long>(sysconf(_SC_PAGESIZE));
     memSize = pageSize * static_cast<unsigned long long>(sysconf(_SC_PHYS_PAGES));
+    memLimit = memSize;
     numCores = static_cast<unsigned>(sysconf(_SC_NPROCESSORS_CONF));
     cpuArch = unameData.machine;
     hasNuma = checkNumaEnabled();
@@ -171,23 +206,34 @@ void ProcessInfo::SystemInfo::collectSystemInfo() {
     // 2. Illumos kernel releases (which is all non Oracle Solaris releases)
     preferMsyncOverFSync = false;
 
-    if (mongoutils::str::startsWith(osName, "Oracle Solaris")) {
+    // The proper way to set `defaultListenBacklog` is to use `libkstat` to
+    // look up the value of the [tcp_conn_req_max_q][1] tuning parameter.
+    // That would require users of `ProcessInfo` to link `libkstat`.
+    // Instead, use the compile-time constant `SOMAXCONN`.
+    // [1]: https://docs.oracle.com/cd/E19159-01/819-3681/abeir/index.html
+    defaultListenBacklog = SOMAXCONN;
+
+    if (str::startsWith(osName, "Oracle Solaris")) {
         std::vector<std::string> versionComponents;
-        splitStringDelim(osVersion, &versionComponents, '.');
+        str::splitStringDelim(osVersion, &versionComponents, '.');
 
         if (versionComponents.size() > 1) {
             unsigned majorInt, minorInt;
-            Status majorStatus = parseNumberFromString<unsigned>(versionComponents[0], &majorInt);
+            Status majorStatus = NumberParser{}(versionComponents[0], &majorInt);
 
-            Status minorStatus = parseNumberFromString<unsigned>(versionComponents[1], &minorInt);
+            Status minorStatus = NumberParser{}(versionComponents[1], &minorInt);
 
             if (!majorStatus.isOK() || !minorStatus.isOK()) {
-                warning() << "Could not parse OS version numbers from uname: " << osVersion;
+                LOGV2_WARNING(23360,
+                              "Could not parse OS version numbers from uname: {osVersion}",
+                              "osVersion"_attr = osVersion);
             } else if ((majorInt == 11 && minorInt >= 2) || majorInt > 11) {
                 preferMsyncOverFSync = true;
             }
         } else {
-            warning() << "Could not parse OS version string from uname: " << osVersion;
+            LOGV2_WARNING(23361,
+                          "Could not parse OS version string from uname: {osVersion}",
+                          "osVersion"_attr = osVersion);
         }
     }
 
@@ -199,52 +245,4 @@ void ProcessInfo::SystemInfo::collectSystemInfo() {
     _extraStats = bExtra.obj();
 }
 
-bool ProcessInfo::checkNumaEnabled() {
-    lgrp_cookie_t cookie = lgrp_init(LGRP_VIEW_OS);
-
-    if (cookie == LGRP_COOKIE_NONE) {
-        warning() << "lgrp_init failed: " << errnoWithDescription();
-        return false;
-    }
-
-    ON_BLOCK_EXIT(lgrp_fini, cookie);
-
-    int groups = lgrp_nlgrps(cookie);
-
-    if (groups == -1) {
-        warning() << "lgrp_nlgrps failed: " << errnoWithDescription();
-        return false;
-    }
-
-    // NUMA machines have more then 1 locality group
-    return groups > 1;
-}
-
-bool ProcessInfo::blockCheckSupported() {
-    return true;
-}
-
-bool ProcessInfo::blockInMemory(const void* start) {
-    char x = 0;
-    if (mincore(
-            static_cast<char*>(const_cast<void*>(alignToStartOfPage(start))), getPageSize(), &x)) {
-        log() << "mincore failed: " << errnoWithDescription();
-        return 1;
-    }
-    return x & 0x1;
-}
-
-bool ProcessInfo::pagesInMemory(const void* start, size_t numPages, std::vector<char>* out) {
-    out->resize(numPages);
-    if (mincore(static_cast<char*>(const_cast<void*>(alignToStartOfPage(start))),
-                numPages * getPageSize(),
-                &out->front())) {
-        log() << "mincore failed: " << errnoWithDescription();
-        return false;
-    }
-    for (size_t i = 0; i < numPages; ++i) {
-        (*out)[i] &= 0x1;
-    }
-    return true;
-}
-}
+}  // namespace mongo

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,30 +29,37 @@
 
 /** Unit tests for BSONElementHasher. */
 
-#include "mongo/platform/basic.h"
+#include <limits>
+#include <memory>
 
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/bsontypes.h"
+#include "mongo/bson/bsontypes_util.h"
+#include "mongo/bson/json.h"
+#include "mongo/bson/oid.h"
+#include "mongo/bson/timestamp.h"
 #include "mongo/db/hasher.h"
-#include "mongo/db/jsobj.h"
-#include "mongo/db/json.h"
-
 #include "mongo/unittest/unittest.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo {
 namespace {
 
 // Helper methods
-long long hashIt(const BSONObj& object, int seed) {
+long long hashIt(const BSONObj& object, HashSeed seed) {
     return BSONElementHasher::hash64(object.firstElement(), seed);
 }
 long long hashIt(const BSONObj& object) {
-    int seed = 0;
+    HashSeed seed = 0;
     return hashIt(object, seed);
 }
 
 // Test different oids hash to different things
 TEST(BSONElementHasher, DifferentOidsAreDifferentHashes) {
-    int seed = 0;
+    HashSeed seed = 0;
 
     long long int oidHash =
         BSONElementHasher::hash64(BSONObjBuilder().genOID().obj().firstElement(), seed);
@@ -97,18 +103,14 @@ TEST(BSONElementHasher, SeedMatters) {
 
 // Test strings hash to different things
 TEST(BSONElementHasher, IntAndStringHashesDiffer) {
-    ASSERT_NOT_EQUALS(hashIt(BSON("a" << 3)),
-                      hashIt(BSON("a"
-                                  << "3")));
+    ASSERT_NOT_EQUALS(hashIt(BSON("a" << 3)), hashIt(BSON("a" << "3")));
 }
 
 // Test regexps and strings hash to different things
 TEST(BSONElementHasher, RegexAndStringHashesDiffer) {
     BSONObjBuilder builder;
 
-    ASSERT_NOT_EQUALS(hashIt(BSON("a"
-                                  << "3")),
-                      hashIt(builder.appendRegex("a", "3").obj()));
+    ASSERT_NOT_EQUALS(hashIt(BSON("a" << "3")), hashIt(builder.appendRegex("a", "3").obj()));
 }
 
 // Test arrays and subobject hash to different things
@@ -125,7 +127,7 @@ TEST(BSONElementHasher, SubDocumentGroupingHashesDiffer) {
 
 // Testing codeWscope scope squashing
 TEST(BSONElementHasher, CodeWithScopeSquashesScopeIntsAndDoubles) {
-    int seed = 0;
+    HashSeed seed = 0;
 
     BSONObjBuilder b1;
     b1.appendCodeWScope("a", "print('this is some stupid code')", BSON("a" << 3));
@@ -156,7 +158,7 @@ TEST(BSONElementHasher, MinKeyMaxKeyHashesDiffer) {
 // Test squashing very large doubles and very small doubles
 TEST(BSONElementHasher, VeryLargeAndSmallDoubles) {
     long long maxInt = std::numeric_limits<long long>::max();
-    double smallerDouble = maxInt / 2;
+    double smallerDouble = static_cast<double>(maxInt) / 2;
     double biggerDouble = ((double)maxInt) * ((double)maxInt);
     ASSERT_NOT_EQUALS(hashIt(BSON("a" << maxInt)), hashIt(BSON("a" << smallerDouble)));
     ASSERT_EQUALS(hashIt(BSON("a" << maxInt)), hashIt(BSON("a" << biggerDouble)));
@@ -219,7 +221,8 @@ TEST(BSONElementHasher, HashIntOrLongOrDouble) {
     ASSERT_EQUALS(hashIt(o), 1143184177162245883LL);
 
     // Large/small double values.
-    ASSERT(std::numeric_limits<long long>::max() < std::numeric_limits<double>::max());
+    ASSERT(static_cast<double>(std::numeric_limits<long long>::max()) <
+           std::numeric_limits<double>::max());
     o = BSON("check" << std::numeric_limits<double>::max());
     ASSERT_EQUALS(hashIt(o), 921523596458303250LL);
     o = BSON("check" << std::numeric_limits<long long>::max());  // 9223372036854775807
@@ -257,24 +260,20 @@ TEST(BSONElementHasher, HashNull) {
 }
 
 TEST(BSONElementHasher, HashString) {
-    BSONObj o = BSON("check"
-                     << "abc");
+    BSONObj o = BSON("check" << "abc");
     ASSERT_EQUALS(hashIt(o), 8478485326885698097LL);
     o = BSON("check" << BSONSymbol("abc"));
     ASSERT_EQUALS(hashIt(o), 8478485326885698097LL);
 
-    o = BSON("check"
-             << "");
+    o = BSON("check" << "");
     ASSERT_EQUALS(hashIt(o), 2049396243249673340LL);
     o = BSON("check" << BSONSymbol(""));
     ASSERT_EQUALS(hashIt(o), 2049396243249673340LL);
 }
 
 TEST(BSONElementHasher, HashObject) {
-    BSONObj o = BSON("check" << BSON("a"
-                                     << "abc"
-                                     << "b"
-                                     << 123LL));
+    BSONObj o = BSON("check" << BSON("a" << "abc"
+                                         << "b" << 123LL));
     ASSERT_EQUALS(hashIt(o), 4771603801758380216LL);
 
     o = BSON("check" << BSONObj());
@@ -282,9 +281,8 @@ TEST(BSONElementHasher, HashObject) {
 }
 
 TEST(BSONElementHasher, HashArray) {
-    BSONObj o = BSON("check" << BSON_ARRAY("bar"
-                                           << "baz"
-                                           << "qux"));
+    BSONObj o = BSON("check" << BSON_ARRAY("bar" << "baz"
+                                                 << "qux"));
     ASSERT_EQUALS(hashIt(o), -2938911267422831539LL);
 
     o = BSON("check" << BSONArray());
@@ -359,6 +357,17 @@ TEST(BSONElementHasher, HashCode) {
 TEST(BSONElementHasher, HashCodeWScope) {
     BSONObj o = BSON("check" << BSONCodeWScope("func f() { return 1; }", BSON("c" << true)));
     ASSERT_EQUALS(hashIt(o), 501342939894575968LL);
+}
+
+TEST(BSONElementHasher, HashWithNonZeroSeed) {
+    HashSeed seed = 40513;
+
+    BSONObj o = BSON("check" << 42);
+    ASSERT_EQUALS(hashIt(o, seed), 4302929669663179197LL);
+
+    o = BSON("check" << BSON_ARRAY("sunflower" << "sesame"
+                                               << "mustard"));
+    ASSERT_EQUALS(hashIt(o, seed), -9222615859251096151LL);
 }
 
 }  // namespace

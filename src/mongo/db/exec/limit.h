@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -31,9 +30,13 @@
 #pragma once
 
 
+#include <memory>
+
 #include "mongo/db/exec/plan_stage.h"
-#include "mongo/db/jsobj.h"
-#include "mongo/db/record_id.h"
+#include "mongo/db/exec/plan_stats.h"
+#include "mongo/db/exec/working_set.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/query/stage_types.h"
 
 namespace mongo {
 
@@ -46,10 +49,13 @@ namespace mongo {
  */
 class LimitStage final : public PlanStage {
 public:
-    LimitStage(OperationContext* opCtx, long long limit, WorkingSet* ws, PlanStage* child);
-    ~LimitStage();
+    LimitStage(ExpressionContext* expCtx,
+               long long limit,
+               WorkingSet* ws,
+               std::unique_ptr<PlanStage> child);
+    ~LimitStage() override;
 
-    bool isEOF() final;
+    bool isEOF() const final;
     StageState doWork(WorkingSetID* out) final;
 
     StageType stageType() const final {
@@ -63,8 +69,6 @@ public:
     static const char* kStageType;
 
 private:
-    WorkingSet* _ws;
-
     // We only return this many results.
     long long _numToReturn;
 

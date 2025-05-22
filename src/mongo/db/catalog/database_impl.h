@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,133 +29,42 @@
 
 #pragma once
 
-#include "mongo/db/catalog/database.h"
-
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
 #include <memory>
-#include <string>
 
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
 #include "mongo/base/string_data.h"
 #include "mongo/bson/bsonobj.h"
+#include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/collection_options.h"
+#include "mongo/db/catalog/database.h"
+#include "mongo/db/catalog/virtual_collection_options.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/dbcommands_gen.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/storage/storage_options.h"
-#include "mongo/db/views/view.h"
-#include "mongo/db/views/view_catalog.h"
-#include "mongo/util/mongoutils/str.h"
-#include "mongo/util/string_map.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/query/collation/collator_interface.h"
+#include "mongo/db/repl/optime.h"
+#include "mongo/platform/atomic_word.h"
 
 namespace mongo {
 
-class Collection;
-class DatabaseCatalogEntry;
-class IndexCatalog;
-class OperationContext;
-class PseudoRandom;
-
-/**
- * Represents a logical database containing Collections.
- *
- * The semantics for a const Database are that you can mutate individual collections but not add or
- * remove them.
- */
-class DatabaseImpl : public Database::Impl {
+class DatabaseImpl final : public Database {
 public:
-    typedef StringMap<Collection*> CollectionMap;
-
-    /**
-     * Iterating over a Database yields Collection* pointers.
-     */
-    class iterator {
-    public:
-        using iterator_category = std::forward_iterator_tag;
-        using value_type = Collection*;
-        using pointer = const value_type*;
-        using reference = const value_type&;
-        using difference_type = ptrdiff_t;
-
-        iterator() = default;
-        iterator(CollectionMap::const_iterator it) : _it(it) {}
-
-        reference operator*() const {
-            return _it->second;
-        }
-
-        pointer operator->() const {
-            return &_it->second;
-        }
-
-        bool operator==(const iterator& other) {
-            return _it == other._it;
-        }
-
-        bool operator!=(const iterator& other) {
-            return _it != other._it;
-        }
-
-        iterator& operator++() {
-            ++_it;
-            return *this;
-        }
-
-        iterator operator++(int) {
-            auto oldPosition = *this;
-            ++_it;
-            return oldPosition;
-        }
-
-    private:
-        CollectionMap::const_iterator _it;
-    };
-
-    explicit DatabaseImpl(Database* this_,
-                          OperationContext* opCtx,
-                          StringData name,
-                          DatabaseCatalogEntry* dbEntry);
-
-    // must call close first
-    ~DatabaseImpl();
+    explicit DatabaseImpl(const DatabaseName& dbName);
 
     void init(OperationContext*) final;
 
-    iterator begin() const {
-        return iterator(_collections.begin());
-    }
-
-    iterator end() const {
-        return iterator(_collections.end());
-    }
-
-    // closes files and other cleanup see below.
-    void close(OperationContext* opCtx, const std::string& reason) final;
-
-    const std::string& name() const final {
+    const DatabaseName& name() const final {
         return _name;
     }
 
-    void clearTmpCollections(OperationContext* opCtx) final;
-
-    /**
-     * Sets a new profiling level for the database and returns the outcome.
-     *
-     * @param opCtx Operation context which to use for creating the profiling collection.
-     * @param newLevel New profiling level to use.
-     */
-    Status setProfilingLevel(OperationContext* opCtx, int newLevel) final;
-
-    int getProfilingLevel() const final {
-        return _profile;
-    }
-    const char* getProfilingNS() const final {
-        return _profileName.c_str();
-    }
-
-    void setDropPending(OperationContext* opCtx, bool dropPending) final;
-
-    bool isDropPending(OperationContext* opCtx) const final;
-
-    void getStats(OperationContext* opCtx, BSONObjBuilder* output, double scale = 1) final;
-
-    const DatabaseCatalogEntry* getDatabaseCatalogEntry() const final;
+    void getStats(OperationContext* opCtx,
+                  DBStats* output,
+                  bool includeFreeStorage,
+                  double scale = 1) const final;
 
     /**
      * dropCollection() will refuse to drop system collections. Use dropCollectionEvenIfSystem() if
@@ -164,152 +72,106 @@ public:
      *
      * If we are applying a 'drop' oplog entry on a secondary, 'dropOpTime' will contain the optime
      * of the oplog entry.
+     *
+     * When fromMigrate is set, the related oplog entry will be marked with a 'fromMigrate' field to
+     * reduce its visibility (e.g. in change streams).
+     *
+     * The caller should hold a DB X lock and ensure there are no index builds in progress on the
+     * collection.
      */
     Status dropCollection(OperationContext* opCtx,
-                          StringData fullns,
-                          repl::OpTime dropOpTime) final;
+                          NamespaceString nss,
+                          repl::OpTime dropOpTime,
+                          bool markFromMigrate) const final;
     Status dropCollectionEvenIfSystem(OperationContext* opCtx,
-                                      const NamespaceString& fullns,
-                                      repl::OpTime dropOpTime) final;
+                                      NamespaceString nss,
+                                      repl::OpTime dropOpTime,
+                                      bool markFromMigrate) const final;
 
-    Status dropView(OperationContext* opCtx, StringData fullns) final;
+    Status dropView(OperationContext* opCtx, NamespaceString viewName) const final;
+
+    Status userCreateNS(OperationContext* opCtx,
+                        const NamespaceString& nss,
+                        CollectionOptions collectionOptions,
+                        bool createDefaultIndexes,
+                        const BSONObj& idIndex,
+                        bool fromMigrate) const final;
+
+    Status userCreateVirtualNS(OperationContext* opCtx,
+                               const NamespaceString& fullns,
+                               CollectionOptions opts,
+                               const VirtualCollectionOptions& vopts) const final;
 
     Collection* createCollection(OperationContext* opCtx,
-                                 StringData ns,
+                                 const NamespaceString& nss,
                                  const CollectionOptions& options = CollectionOptions(),
                                  bool createDefaultIndexes = true,
-                                 const BSONObj& idIndex = BSONObj()) final;
+                                 const BSONObj& idIndex = BSONObj(),
+                                 bool fromMigrate = false) const final;
+
+    Collection* createVirtualCollection(OperationContext* opCtx,
+                                        const NamespaceString& nss,
+                                        const CollectionOptions& opts,
+                                        const VirtualCollectionOptions& vopts) const final;
+
+    StatusWith<std::unique_ptr<CollatorInterface>> validateCollator(
+        OperationContext* opCtx, CollectionOptions& opts) const final;
 
     Status createView(OperationContext* opCtx,
-                      StringData viewName,
-                      const CollectionOptions& options) final;
+                      const NamespaceString& viewName,
+                      const CollectionOptions& options) const final;
 
-    /**
-     * @param ns - this is fully qualified, which is maybe not ideal ???
-     */
-    Collection* getCollection(OperationContext* opCtx, StringData ns) const final;
-
-    Collection* getCollection(OperationContext* opCtx, const NamespaceString& ns) const;
-
-    /**
-     * Get the view catalog, which holds the definition for all views created on this database. You
-     * must be holding a database lock to use this accessor.
-     */
-    ViewCatalog* getViewCatalog() final {
-        return &_views;
-    }
-
-    Collection* getOrCreateCollection(OperationContext* opCtx, const NamespaceString& nss) final;
-
-    /**
-     * Renames the fully qualified namespace 'fromNS' to the fully qualified namespace 'toNS'.
-     * Illegal to call unless both 'fromNS' and 'toNS' are within this database. Returns an error if
-     * 'toNS' already exists or 'fromNS' does not exist.
-     */
     Status renameCollection(OperationContext* opCtx,
-                            StringData fromNS,
-                            StringData toNS,
-                            bool stayTemp) final;
+                            NamespaceString fromNss,
+                            NamespaceString toNss,
+                            bool stayTemp) const final;
 
-    /**
-     * Physically drops the specified opened database and removes it from the server's metadata. It
-     * doesn't notify the replication subsystem or do any other consistency checks, so it should
-     * not be used directly from user commands.
-     *
-     * Must be called with the specified database locked in X mode.
-     */
-    static void dropDatabase(OperationContext* opCtx, Database* db);
+    static Status validateDBName(const DatabaseName& dbName);
 
-    static Status validateDBName(StringData dbname);
-
-    const std::string& getSystemViewsName() const final {
+    const NamespaceString& getSystemViewsName() const final {
         return _viewsName;
     }
 
-    StatusWith<NamespaceString> makeUniqueCollectionNamespace(OperationContext* opCtx,
-                                                              StringData collectionNameModel) final;
-
-    void checkForIdIndexesAndDropPendingCollections(OperationContext* opCtx) final;
-
-    inline CollectionMap& collections() final {
-        return _collections;
-    }
-    inline const CollectionMap& collections() const final {
-        return _collections;
-    }
-
 private:
-    /**
-     * Gets or creates collection instance from existing metadata,
-     * Returns NULL if invalid
-     *
-     * Note: This does not add the collection to _collections map, that must be done
-     * by the caller, who takes onership of the Collection*
-     */
-    Collection* _getOrCreateCollectionInstance(OperationContext* opCtx, const NamespaceString& nss);
+    StatusWith<std::unique_ptr<CollatorInterface>> _validateCollator(OperationContext* opCtx,
+                                                                     CollectionOptions& opts) const;
+    Collection* _createCollection(
+        OperationContext* opCtx,
+        const NamespaceString& nss,
+        const CollectionOptions& opts = CollectionOptions(),
+        bool createDefaultIndexes = true,
+        const BSONObj& idIndex = BSONObj(),
+        bool fromMigrate = false,
+        const boost::optional<VirtualCollectionOptions>& vopts = boost::none) const;
 
     /**
-     * Throws if there is a reason 'ns' cannot be created as a user collection.
+     * Throws if there is a reason 'ns' cannot be created as a user collection. Namespace pattern
+     * matching checks should be added to userAllowedCreateNS().
      */
     void _checkCanCreateCollection(OperationContext* opCtx,
                                    const NamespaceString& nss,
-                                   const CollectionOptions& options);
+                                   const CollectionOptions& options) const;
 
     /**
-     * Deregisters and invalidates all cursors on collection 'fullns'.  Callers must specify
-     * 'reason' for why the cache is being cleared. If 'collectionGoingAway' is false,
-     * unpinned cursors will not be killed.
-     */
-    void _clearCollectionCache(OperationContext* opCtx,
-                               StringData fullns,
-                               const std::string& reason,
-                               bool collectionGoingAway);
-
-    /**
-     * Completes a collection drop by removing all the indexes and removing the collection itself
-     * from the storage engine.
+     * Completes a collection drop by removing the collection itself from the storage engine.
      *
      * This is called from dropCollectionEvenIfSystem() to drop the collection immediately on
      * unreplicated collection drops.
      */
     Status _finishDropCollection(OperationContext* opCtx,
-                                 const NamespaceString& fullns,
-                                 Collection* collection);
+                                 const NamespaceString& nss,
+                                 Collection* collection) const;
 
-    class AddCollectionChange;
-    class RemoveCollectionChange;
-    class RenameCollectionChange;
+    /**
+     * Removes all indexes for a collection.
+     */
+    void _dropCollectionIndexes(OperationContext* opCtx,
+                                const NamespaceString& nss,
+                                Collection* collection) const;
 
-    const std::string _name;  // "dbname"
+    const DatabaseName _name;  // "dbname"
 
-    DatabaseCatalogEntry* _dbEntry;  // not owned here
-
-    const std::string _profileName;  // "dbname.system.profile"
-    const std::string _viewsName;    // "dbname.system.views"
-
-    int _profile;  // 0=off.
-
-    // If '_dropPending' is true, this Database is in the midst of a two-phase drop. No new
-    // collections may be created in this Database.
-    // This variable may only be read/written while the database is locked in MODE_X.
-    bool _dropPending = false;
-
-    // Random number generator used to create unique collection namespaces suitable for temporary
-    // collections.
-    // Lazily created on first call to makeUniqueCollectionNamespace().
-    // This variable may only be read/written while the database is locked in MODE_X.
-    std::unique_ptr<PseudoRandom> _uniqueCollectionNamespacePseudoRandom;
-
-    CollectionMap _collections;
-
-    DurableViewCatalogImpl _durableViews;  // interface for system.views operations
-    ViewCatalog _views;                    // in-memory representation of _durableViews
-    Database* _this;                       // Pointer to wrapper, for external caller compatibility.
-
-    friend class Collection;
-    friend class IndexCatalog;
+    const NamespaceString _viewsName;  // "dbname.system.views"
 };
-
-void dropAllDatabasesExceptLocalImpl(OperationContext* opCtx);
 
 }  // namespace mongo

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,49 +27,49 @@
  *    it in the license file.
  */
 
+#include <cstdint>
 #include <limits>
-#include <ostream>
 #include <sstream>
 #include <string>
-#include <utility>
 
+#include <boost/cstdint.hpp>
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/db/repl/optime.h"
+#include "mongo/db/repl/optime_base_gen.h"
+#include "mongo/idl/idl_parser.h"
+#include "mongo/util/assert_util.h"
 
-namespace mongo {
-namespace repl {
-
-const char OpTime::kTimestampFieldName[] = "ts";
-const char OpTime::kTermFieldName[] = "t";
-const long long OpTime::kInitialTerm = 0;
+namespace mongo::repl {
 
 // static
 OpTime OpTime::max() {
-    return OpTime(Timestamp::max(), std::numeric_limits<decltype(OpTime::_term)>::max());
+    return OpTime(Timestamp::max(), std::numeric_limits<long long>::max());
 }
 
-void OpTime::append(BSONObjBuilder* builder, const std::string& subObjName) const {
-    BSONObjBuilder opTimeBuilder(builder->subobjStart(subObjName));
+void OpTime::append(StringData fieldName, BSONObjBuilder* builder) const {
+    BSONObjBuilder opTimeBuilder(builder->subobjStart(fieldName));
     opTimeBuilder.append(kTimestampFieldName, _timestamp);
-
     opTimeBuilder.append(kTermFieldName, _term);
     opTimeBuilder.doneFast();
 }
 
 StatusWith<OpTime> OpTime::parseFromOplogEntry(const BSONObj& obj) {
-    Timestamp ts;
-    Status status = bsonExtractTimestampField(obj, kTimestampFieldName, &ts);
-    if (!status.isOK())
-        return status;
-
-    // Default to -1 if the term is absent.
-    long long term;
-    status = bsonExtractIntegerFieldWithDefault(obj, kTermFieldName, kUninitializedTerm, &term);
-    if (!status.isOK())
-        return status;
-
-    return OpTime(ts, term);
+    try {
+        OpTimeBase base = OpTimeBase::parse(IDLParserContext("OpTimeBase"), obj);
+        long long term = base.getTerm().value_or(kUninitializedTerm);
+        return OpTime(base.getTimestamp(), term);
+    } catch (...) {
+        return exceptionToStatus();
+    }
 }
 
 BSONObj OpTime::toBSON() const {
@@ -85,6 +84,10 @@ OpTime OpTime::parse(const BSONObj& obj) {
     return uassertStatusOK(parseFromOplogEntry(obj));
 }
 
+OpTime OpTime::parse(const BSONElement& elem) {
+    return OpTime::parse(elem.Obj());
+}
+
 std::string OpTime::toString() const {
     return toBSON().toString();
 }
@@ -93,14 +96,16 @@ std::ostream& operator<<(std::ostream& out, const OpTime& opTime) {
     return out << opTime.toString();
 }
 
+std::ostream& operator<<(std::ostream& out, const OpTimeAndWallTime& opTime) {
+    return out << opTime.opTime.toString() << ", " << opTime.wallTime.toString();
+}
+
 void OpTime::appendAsQuery(BSONObjBuilder* builder) const {
     builder->append(kTimestampFieldName, _timestamp);
     if (_term == kUninitializedTerm) {
-        // pv0 oplogs don't actually have the term field so don't query for {t: -1}.
-        builder->append(kTermFieldName, BSON("$exists" << false));
-    } else {
-        builder->append(kTermFieldName, _term);
+        fassertFailedWithStatus(7356000, Status(ErrorCodes::BadValue, toString()));
     }
+    builder->append(kTermFieldName, _term);
 }
 
 BSONObj OpTime::asQuery() const {
@@ -109,10 +114,27 @@ BSONObj OpTime::asQuery() const {
     return builder.obj();
 }
 
-}  // namespace repl
+StatusWith<OpTimeAndWallTime> OpTimeAndWallTime::parseOpTimeAndWallTimeFromOplogEntry(
+    const BSONObj& obj) {
 
-BSONObjBuilder& operator<<(BSONObjBuilderValueStream& builder, const repl::OpTime& value) {
+    try {
+        auto base = OpTimeAndWallTimeBase::parse(IDLParserContext("OpTimeAndWallTimeBase"), obj);
+
+        auto opTime =
+            OpTime(base.getTimestamp(), base.getTerm().value_or(OpTime::kUninitializedTerm));
+
+        return OpTimeAndWallTime(opTime, base.getWall());
+    } catch (const DBException& ex) {
+        return ex.toStatus();
+    }
+}
+
+OpTimeAndWallTime OpTimeAndWallTime::parse(const BSONObj& obj) {
+    return uassertStatusOK(parseOpTimeAndWallTimeFromOplogEntry(obj));
+}
+
+BSONObjBuilder& operator<<(BSONObjBuilder::ValueStream& builder, const OpTime& value) {
     return builder << value.toBSON();
 }
 
-}  // namespace mongo
+}  // namespace mongo::repl

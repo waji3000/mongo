@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,26 +29,33 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <cstddef>
+#include <cstdint>
 #include <iosfwd>
 #include <string>
+#include <type_traits>
+#include <vector>
 
-#include "mongo/db/jsobj.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/rpc/metadata.h"
+#include "mongo/transport/transport_layer.h"
+#include "mongo/util/duration.h"
 #include "mongo/util/net/hostandport.h"
 #include "mongo/util/time_support.h"
+#include "mongo/util/uuid.h"
 
 namespace mongo {
 namespace executor {
 
-/**
- * Type of object describing a command to execute against a remote MongoDB node.
- */
 struct RemoteCommandRequest {
+
     // Indicates that there is no timeout for the request to complete
     static constexpr Milliseconds kNoTimeout{-1};
-
-    // Indicates that there is no expiration time by when the request needs to complete
-    static constexpr Date_t kNoExpirationDate{Date_t::max()};
 
     // Type to represent the internal id of this request
     typedef uint64_t RequestId;
@@ -57,40 +63,74 @@ struct RemoteCommandRequest {
     RemoteCommandRequest();
 
     RemoteCommandRequest(RequestId requestId,
-                         const HostAndPort& theTarget,
-                         const std::string& theDbName,
-                         const BSONObj& theCmdObj,
+                         const HostAndPort& hostAndPort,
+                         const DatabaseName& dbName,
+                         const BSONObj& cmdObj,
                          const BSONObj& metadataObj,
                          OperationContext* opCtx,
-                         Milliseconds timeoutMillis);
+                         Milliseconds timeoutMillis = kNoTimeout,
+                         bool fireAndForget = false,
+                         boost::optional<UUID> operationKey = boost::none);
 
-    RemoteCommandRequest(const HostAndPort& theTarget,
-                         const std::string& theDbName,
-                         const BSONObj& theCmdObj,
+    RemoteCommandRequest(const HostAndPort& target,
+                         const DatabaseName& dbName,
+                         const BSONObj& cmdObj,
                          const BSONObj& metadataObj,
                          OperationContext* opCtx,
-                         Milliseconds timeoutMillis = kNoTimeout);
+                         Milliseconds timeoutMillis = kNoTimeout,
+                         bool fireAndForget = false,
+                         boost::optional<UUID> operationKey = boost::none);
 
-    RemoteCommandRequest(const HostAndPort& theTarget,
-                         const std::string& theDbName,
-                         const BSONObj& theCmdObj,
+    RemoteCommandRequest(const HostAndPort& target,
+                         const DatabaseName& dbName,
+                         const BSONObj& cmdObj,
+                         const BSONObj& metadataObj,
                          OperationContext* opCtx,
-                         Milliseconds timeoutMillis = kNoTimeout)
+                         bool fireAndForget,
+                         boost::optional<UUID> operationKey = boost::none)
         : RemoteCommandRequest(
-              theTarget, theDbName, theCmdObj, rpc::makeEmptyMetadata(), opCtx, timeoutMillis) {}
+              target, dbName, cmdObj, metadataObj, opCtx, kNoTimeout, fireAndForget, operationKey) {
+    }
+
+
+    RemoteCommandRequest(const HostAndPort& target,
+                         const DatabaseName& dbName,
+                         const BSONObj& cmdObj,
+                         OperationContext* opCtx,
+                         Milliseconds timeoutMillis = kNoTimeout,
+                         bool fireAndForget = false,
+                         boost::optional<UUID> operationKey = boost::none)
+        : RemoteCommandRequest(target,
+                               dbName,
+                               cmdObj,
+                               rpc::makeEmptyMetadata(),
+                               opCtx,
+                               timeoutMillis,
+                               fireAndForget,
+                               operationKey) {}
+
+    /**
+     * Conversion function that performs the RemoteCommandRequest conversion into OpMsgRequest
+     */
+    explicit operator OpMsgRequest() const;
 
     std::string toString() const;
 
     bool operator==(const RemoteCommandRequest& rhs) const;
     bool operator!=(const RemoteCommandRequest& rhs) const;
 
+    friend std::ostream& operator<<(std::ostream& os, const RemoteCommandRequest& response) {
+        return (os << response.toString());
+    }
+
     // Internal id of this request. Not interpreted and used for tracing purposes only.
     RequestId id;
 
     HostAndPort target;
-    std::string dbname;
-    BSONObj metadata{rpc::makeEmptyMetadata()};
+
+    DatabaseName dbname;
     BSONObj cmdObj;
+    BSONObj metadata{rpc::makeEmptyMetadata()};
 
     // OperationContext is added to each request to allow OP_Command metadata attachment access to
     // the Client object. The OperationContext is only accessed on the thread that calls
@@ -102,12 +142,31 @@ struct RemoteCommandRequest {
     OperationContext* opCtx{nullptr};
 
     Milliseconds timeout = kNoTimeout;
+    boost::optional<ErrorCodes::Error> timeoutCode;
 
-    // Deadline by when the request must be completed
-    Date_t expirationDate = kNoExpirationDate;
+    bool fireAndForget = false;
+
+    boost::optional<UUID> operationKey;
+
+    // When false, the network interface will refrain from enforcing the 'timeout' for this request,
+    // but will still pass the timeout on as maxTimeMSOpOnly.
+    bool enforceLocalTimeout = true;
+
+    // Time when the request was scheduled.
+    boost::optional<Date_t> dateScheduled;
+
+    transport::ConnectSSLMode sslMode = transport::kGlobalSSLMode;
+
+private:
+    /**
+     * Sets 'timeout' to the min of the current 'timeout' value and the remaining time on the OpCtx.
+     * If the remaining time is less than the provided 'timeout', remembers the timeout error code
+     * from the opCtx to use later if the timeout is indeed triggered.  This is important so that
+     * timeouts that are a direct result of a user-provided maxTimeMS return MaxTimeMSExpired rather
+     * than NetworkInterfaceExceededTimeLimit.
+     */
+    void _updateTimeoutFromOpCtxDeadline(const OperationContext* opCtx);
 };
-
-std::ostream& operator<<(std::ostream& os, const RemoteCommandRequest& response);
 
 }  // namespace executor
 }  // namespace mongo

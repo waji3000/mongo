@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -29,9 +28,15 @@
  */
 
 #include "mongo/base/data_builder.h"
-#include "mongo/base/data_type_terminated.h"
 
-#include "mongo/platform/endian.h"
+#include <boost/cstdint.hpp>
+#include <boost/move/utility_core.hpp>
+#include <cstddef>
+#include <cstdint>
+
+#include "mongo/base/data_type_endian.h"
+#include "mongo/base/data_type_terminated.h"
+#include "mongo/base/string_data.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
@@ -68,11 +73,10 @@ TEST(DataBuilder, Basic) {
 
     ConstDataRangeCursor cdrc = db.getCursor();
 
-    ASSERT_EQUALS(static_cast<uint16_t>(1), cdrc.readAndAdvance<uint16_t>().getValue());
-    ASSERT_EQUALS(static_cast<uint32_t>(2),
-                  cdrc.readAndAdvance<LittleEndian<uint32_t>>().getValue());
-    ASSERT_EQUALS(static_cast<uint64_t>(3), cdrc.readAndAdvance<BigEndian<uint64_t>>().getValue());
-    ASSERT_EQUALS(false, cdrc.readAndAdvance<char>().isOK());
+    ASSERT_EQUALS(static_cast<uint16_t>(1), cdrc.readAndAdvance<uint16_t>());
+    ASSERT_EQUALS(static_cast<uint32_t>(2), cdrc.readAndAdvance<LittleEndian<uint32_t>>());
+    ASSERT_EQUALS(static_cast<uint64_t>(3), cdrc.readAndAdvance<BigEndian<uint64_t>>());
+    ASSERT_NOT_OK(cdrc.readAndAdvanceNoThrow<char>());
 }
 
 TEST(DataBuilder, ResizeDown) {
@@ -87,8 +91,8 @@ TEST(DataBuilder, ResizeDown) {
 
     ConstDataRangeCursor cdrc = db.getCursor();
 
-    ASSERT_EQUALS(static_cast<uint16_t>(1), cdrc.readAndAdvance<uint16_t>().getValue());
-    ASSERT_EQUALS(false, cdrc.readAndAdvance<char>().isOK());
+    ASSERT_EQUALS(static_cast<uint16_t>(1), cdrc.readAndAdvance<uint16_t>());
+    ASSERT_NOT_OK(cdrc.readAndAdvanceNoThrow<char>());
 }
 
 TEST(DataBuilder, ResizeUp) {
@@ -103,9 +107,9 @@ TEST(DataBuilder, ResizeUp) {
 
     ConstDataRangeCursor cdrc = db.getCursor();
 
-    ASSERT_EQUALS(static_cast<uint16_t>(1), cdrc.readAndAdvance<uint16_t>().getValue());
-    ASSERT_EQUALS(static_cast<uint64_t>(2), cdrc.readAndAdvance<uint64_t>().getValue());
-    ASSERT_EQUALS(false, cdrc.readAndAdvance<char>().isOK());
+    ASSERT_EQUALS(static_cast<uint16_t>(1), cdrc.readAndAdvance<uint16_t>());
+    ASSERT_EQUALS(static_cast<uint64_t>(2), cdrc.readAndAdvance<uint64_t>());
+    ASSERT_NOT_OK(cdrc.readAndAdvanceNoThrow<char>());
 }
 
 TEST(DataBuilder, Reserve) {
@@ -149,11 +153,11 @@ TEST(DataBuilder, Clear) {
     ASSERT_EQUALS(0u, db.size());
 
     ConstDataRangeCursor cdrc = db.getCursor();
-    ASSERT_EQUALS(false, cdrc.readAndAdvance<char>().isOK());
+    ASSERT_NOT_OK(cdrc.readAndAdvanceNoThrow<char>());
 }
 
 TEST(DataBuilder, Move) {
-    DataBuilder db(1);
+    DataBuilder db(42);
 
     ASSERT_EQUALS(true, db.writeAndAdvance<uint16_t>(1).isOK());
 
@@ -161,13 +165,13 @@ TEST(DataBuilder, Move) {
 
     ConstDataRangeCursor cdrc = db2.getCursor();
 
-    ASSERT_EQUALS(static_cast<uint16_t>(1), cdrc.readAndAdvance<uint16_t>().getValue());
-    ASSERT_EQUALS(2u, db2.capacity());
+    ASSERT_EQUALS(static_cast<uint16_t>(1), cdrc.readAndAdvance<uint16_t>());
+    ASSERT_EQUALS(42u, db2.capacity());
     ASSERT_EQUALS(2u, db2.size());
 
-    ASSERT_EQUALS(0u, db.capacity());
-    ASSERT_EQUALS(0u, db.size());
-    ASSERT(!db.getCursor().data());
+    ASSERT_EQUALS(0u, db.capacity());  // NOLINT(bugprone-use-after-move)
+    ASSERT_EQUALS(0u, db.size());      // NOLINT(bugprone-use-after-move)
+    ASSERT(!db.getCursor().data());    // NOLINT(bugprone-use-after-move)
 }
 
 TEST(DataBuilder, TerminatedStringDatas) {

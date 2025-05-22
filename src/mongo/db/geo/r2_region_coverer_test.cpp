@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,20 +27,36 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kGeo
 
+#include <cmath>
+#include <cstddef>
+// IWYU pragma: no_include "ext/alloc_traits.h"
+#include <algorithm>
 #include <chrono>
+#include <iterator>
+#include <limits>
+#include <map>
 #include <memory>
 #include <random>
 
-#include "mongo/db/geo/r2_region_coverer.h"
-
-#include "mongo/base/init.h"
+#include "mongo/base/init.h"  // IWYU pragma: keep
+#include "mongo/base/initializer.h"
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
 #include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/geo/geometry_container.h"
-#include "mongo/platform/random.h"
+#include "mongo/db/geo/r2_region_coverer.h"
+#include "mongo/db/geo/shapes.h"
+#include "mongo/logv2/log.h"
+#include "mongo/stdx/type_traits.h"
 #include "mongo/unittest/unittest.h"
-#include "mongo/util/log.h"
+#include "mongo/util/assert_util.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
+
 
 namespace {
 
@@ -59,8 +74,7 @@ MONGO_INITIALIZER(R2CellUnion_Test)(InitializerContext* context) {
         }
     }
     generator.seed(seed);
-    log() << "R2CellUnion Test - Random Number Generator Seed: " << seed;
-    return Status::OK();
+    LOGV2(20640, "R2CellUnion Test - Random Number Generator Seed: {seed}", "seed"_attr = seed);
 }
 
 // Returns an integral number in [lower, upper]
@@ -155,15 +169,15 @@ GeoHashConverter::Parameters getConverterParams() {
 class HashBoxRegion : public R2Region {
 public:
     HashBoxRegion(Box box) : _box(box) {}
-    Box getR2Bounds() const {
+    Box getR2Bounds() const override {
         return _box;
     }
 
-    bool fastContains(const Box& other) const {
+    bool fastContains(const Box& other) const override {
         return _box.contains(other);
     }
 
-    bool fastDisjoint(const Box& other) const {
+    bool fastDisjoint(const Box& other) const override {
         if (!_box.intersects(other))
             return true;
 
@@ -180,8 +194,10 @@ private:
 };
 
 TEST(R2RegionCoverer, RandomCells) {
-    GeoHashConverter converter(getConverterParams());
-    R2RegionCoverer coverer(&converter);
+    auto result = GeoHashConverter::createFromParams(getConverterParams());
+    ASSERT_OK(result.getStatus());
+
+    R2RegionCoverer coverer(std::move(result.getValue()));
     coverer.setMaxCells(1);
     // Test random cell ids at all levels.
     for (int i = 0; i < 10000; ++i) {
@@ -189,7 +205,7 @@ TEST(R2RegionCoverer, RandomCells) {
             random(std::numeric_limits<long long>::lowest(), std::numeric_limits<long long>::max()),
             random(0U, GeoHash::kMaxBits));
         vector<GeoHash> covering;
-        Box box = converter.unhashToBoxCovering(id);
+        Box box = coverer.getHashConverter().unhashToBoxCovering(id);
         // Since the unhashed box is expanded by the error 8Mu, we need to shrink it.
         box.fudge(-GeoHashConverter::kMachinePrecision * MAXBOUND * 20);
         HashBoxRegion region(box);
@@ -200,7 +216,7 @@ TEST(R2RegionCoverer, RandomCells) {
 }
 
 double randDouble(double lowerBound, double upperBound) {
-    verify(lowerBound <= upperBound);
+    MONGO_verify(lowerBound <= upperBound);
     const int NUMBITS = 53;
     // Random double in [0, 1)
     long long randLong =
@@ -227,8 +243,8 @@ void checkCellIdCovering(const GeoHashConverter& converter,
 
     // The covering doesn't contain this cell, so the region shouldn't contain this cell.
     if (region.fastContains(cell)) {
-        log() << "covering " << covering.toString();
-        log() << "cellId " << cellId;
+        LOGV2(20641, "covering {covering}", "covering"_attr = covering.toString());
+        LOGV2(20642, "cellId {cellId}", "cellId"_attr = cellId);
     }
     ASSERT_FALSE(region.fastContains(cell));
 
@@ -289,8 +305,10 @@ GeometryContainer* getRandomCircle(double radius) {
 
 // Test the covering for arbitrary random circle.
 TEST(R2RegionCoverer, RandomCircles) {
-    GeoHashConverter converter(getConverterParams());
-    R2RegionCoverer coverer(&converter);
+    auto result = GeoHashConverter::createFromParams(getConverterParams());
+    ASSERT_OK(result.getStatus());
+
+    R2RegionCoverer coverer(std::move(result.getValue()));
     coverer.setMaxCells(8);
 
     for (int i = 0; i < 1000; i++) {
@@ -306,14 +324,16 @@ TEST(R2RegionCoverer, RandomCircles) {
 
         vector<GeoHash> covering;
         coverer.getCovering(region, &covering);
-        checkCovering(converter, region, coverer, covering);
+        checkCovering(coverer.getHashConverter(), region, coverer, covering);
     }
 }
 
 // Test the covering for very small circles, since the above test doesn't cover finest cells.
 TEST(R2RegionCoverer, RandomTinyCircles) {
-    GeoHashConverter converter(getConverterParams());
-    R2RegionCoverer coverer(&converter);
+    auto result = GeoHashConverter::createFromParams(getConverterParams());
+    ASSERT_OK(result.getStatus());
+
+    R2RegionCoverer coverer(std::move(result.getValue()));
     coverer.setMaxCells(random(1, 20));  // [1, 20]
 
     for (int i = 0; i < 10000; i++) {
@@ -329,7 +349,7 @@ TEST(R2RegionCoverer, RandomTinyCircles) {
 
         vector<GeoHash> covering;
         coverer.getCovering(region, &covering);
-        checkCovering(converter, region, coverer, covering);
+        checkCovering(coverer.getHashConverter(), region, coverer, covering);
     }
 }
 
@@ -727,8 +747,12 @@ TEST(R2CellUnion, Normalize) {
             ASSERT_EQUALS(expected[i], cellUnion.cellIds()[i]);
         }
     }
-    log() << "Average Unnormalized Size: " << unnormalizedSum * 1.0 / kIters;
-    log() << "Average Normalized Size: " << normalizedSum * 1.0 / kIters;
+    LOGV2(20643,
+          "Average Unnormalized Size: {unnormalizedSum_1_0_kIters}",
+          "unnormalizedSum_1_0_kIters"_attr = unnormalizedSum * 1.0 / kIters);
+    LOGV2(20644,
+          "Average Normalized Size: {normalizedSum_1_0_kIters}",
+          "normalizedSum_1_0_kIters"_attr = normalizedSum * 1.0 / kIters);
 }
 
 void testContains(const R2CellUnion& cellUnion, GeoHash id, int num) {
@@ -776,7 +800,7 @@ TEST(R2CellUnion, Contains) {
         generateRandomCells(GeoHash(), false, &unnormalized, &normalized);
         R2CellUnion cellUnion;
         cellUnion.init(normalized);
-        for (auto cellId : normalized) {
+        for (const auto& cellId : normalized) {
             testContains(cellUnion, cellId, 100);
         }
     }
@@ -784,7 +808,7 @@ TEST(R2CellUnion, Contains) {
 
 // Naive implementation of intersects to test correctness
 bool intersects(const R2CellUnion& cellUnion, GeoHash cellId) {
-    for (auto unionCellId : cellUnion.cellIds()) {
+    for (const auto& unionCellId : cellUnion.cellIds()) {
         // Two cells will only intersect if one contains the other
         if (unionCellId.contains(cellId) || cellId.contains(unionCellId)) {
             return true;
@@ -818,7 +842,7 @@ TEST(R2CellUnion, Intersects) {
 
         // An R2CellUnion should intersect with every cell that contains a member of the union.
         // It should also intersect with cells it contains
-        for (auto cellId : randomUnion.cellIds()) {
+        for (const auto& cellId : randomUnion.cellIds()) {
             for (unsigned level = 0; level <= 32; ++level) {
                 ASSERT_TRUE(randomUnion.intersects(GeoHash(cellId.getHash(), level)));
             }
@@ -878,14 +902,14 @@ void testDifference(std::vector<GeoHash>& xCellIds, std::vector<GeoHash>& yCellI
     xUnionY.init(x.cellIds());
     xUnionY.add(y.cellIds());
 
-    for (auto cellId : xUnionY.cellIds()) {
+    for (const auto& cellId : xUnionY.cellIds()) {
         ASSERT_TRUE(xMinusYPlusY.contains(cellId));
         ASSERT_TRUE(yMinusXPlusX.contains(cellId));
     }
-    for (auto cellId : xMinusYPlusY.cellIds()) {
+    for (const auto& cellId : xMinusYPlusY.cellIds()) {
         ASSERT_TRUE(xUnionY.contains(cellId));
     }
-    for (auto cellId : yMinusXPlusX.cellIds()) {
+    for (const auto& cellId : yMinusXPlusX.cellIds()) {
         ASSERT_TRUE(xUnionY.contains(cellId));
     }
 }

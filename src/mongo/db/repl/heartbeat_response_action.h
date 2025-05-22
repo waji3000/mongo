@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -46,7 +45,14 @@ public:
     /**
      * Actions taken based on heartbeat responses
      */
-    enum Action { NoAction, Reconfig, StepDownSelf, PriorityTakeover, CatchupTakeover };
+    enum Action {
+        NoAction,
+        Reconfig,
+        StepDownSelf,
+        PriorityTakeover,
+        CatchupTakeover,
+        RetryReconfig
+    };
 
     /**
      * Makes a new action representing doing nothing.
@@ -71,6 +77,12 @@ public:
     static HeartbeatResponseAction makeCatchupTakeoverAction();
 
     /**
+     * Makes a new action telling the current node to attempt to find itself in its current replica
+     * set config again, in case the previous attempt's failure was due to a temporary DNS outage.
+     */
+    static HeartbeatResponseAction makeRetryReconfigAction();
+
+    /**
      * Makes a new action telling the current node to step down as primary.
      *
      * It is an error to call this with primaryIndex != the index of the current node.
@@ -89,9 +101,21 @@ public:
     void setNextHeartbeatStartDate(Date_t when);
 
     /**
-     * Sets whether or not the heartbeat response advanced the member's opTime.
+     * Sets whether or not the member's opTime has advanced or config has changed since the
+     * last heartbeat response.
      */
-    void setAdvancedOpTime(bool advanced);
+    void setAdvancedOpTimeOrUpdatedConfig(bool advancedOrUpdated);
+
+    /*
+     * Sets whether or not the member has transitioned from unelectable to electable since the last
+     * heartbeat response.
+     */
+    void setBecameElectable(bool becameElectable);
+
+    /*
+     * Sets whether or not the member has changed member state since the last heartbeat response.
+     */
+    void setChangedMemberState(bool changedMemberState);
 
     /**
      * Gets the action type of this action.
@@ -117,18 +141,42 @@ public:
     }
 
     /*
-     * Returns true if the heartbeat response resulting in our conception of the
-     * member's optime moving forward, so we need to recalculate lastCommittedOpTime.
+     * Returns true if the heartbeat response results in the conception of the
+     * member's optime moving forward or the member's config being newer.
      */
-    bool getAdvancedOpTime() const {
-        return _advancedOpTime;
+    bool getAdvancedOpTimeOrUpdatedConfig() const {
+        return _advancedOpTimeOrUpdatedConfig;
+    }
+
+    /*
+     * Returns true if the heartbeat response results in the member transitioning from unelectable
+     * to electable.
+     */
+    bool getBecameElectable() const {
+        return _becameElectable;
+    }
+
+    /*
+     * Returns true if the heartbeat response results in the member changing member state.
+     */
+    bool getChangedMemberState() const {
+        return _changedMemberState;
+    }
+
+    /*
+     * Returns true if the heartbeat results in any significant change in member data.
+     */
+    bool getChangedSignificantly() const {
+        return _changedMemberState || _advancedOpTimeOrUpdatedConfig || _becameElectable;
     }
 
 private:
     Action _action;
     int _primaryIndex;
     Date_t _nextHeartbeatStartDate;
-    bool _advancedOpTime = false;
+    bool _advancedOpTimeOrUpdatedConfig = false;
+    bool _becameElectable = false;
+    bool _changedMemberState = false;
 };
 
 }  // namespace repl

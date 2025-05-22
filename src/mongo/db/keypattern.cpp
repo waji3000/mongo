@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,21 +29,16 @@
 
 #include "mongo/db/keypattern.h"
 
+#include "mongo/base/error_codes.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/bson/util/builder.h"
 #include "mongo/db/index_names.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 
 KeyPattern::KeyPattern(const BSONObj& pattern) : _pattern(pattern) {}
-
-bool KeyPattern::isIdKeyPattern(const BSONObj& pattern) {
-    BSONObjIterator i(pattern);
-    BSONElement e = i.next();
-    // _id index must have form exactly {_id : 1} or {_id : -1}.
-    // Allows an index of form {_id : "hashed"} to exist but
-    // do not consider it to be the primary _id index
-    return (0 == strcmp(e.fieldName(), "_id")) && (e.numberInt() == 1 || e.numberInt() == -1) &&
-        i.next().eoo();
-}
 
 bool KeyPattern::isOrderedKeyPattern(const BSONObj& pattern) {
     return IndexNames::BTREE == IndexNames::findPluginName(pattern);
@@ -55,13 +49,17 @@ bool KeyPattern::isHashedKeyPattern(const BSONObj& pattern) {
 }
 
 StringBuilder& operator<<(StringBuilder& sb, const KeyPattern& keyPattern) {
+    return KeyPattern::addToStringBuilder(sb, keyPattern._pattern);
+}
+
+StringBuilder& KeyPattern::addToStringBuilder(StringBuilder& sb, const BSONObj& pattern) {
     // Rather than return BSONObj::toString() we construct a keyPattern string manually. This allows
     // us to avoid the cost of writing numeric direction to the str::stream which will then undergo
     // expensive number to string conversion.
     sb << "{ ";
 
     bool first = true;
-    for (auto&& elem : keyPattern._pattern) {
+    for (auto&& elem : pattern) {
         if (first) {
             first = false;
         } else {
@@ -90,22 +88,21 @@ BSONObj KeyPattern::extendRangeBound(const BSONObj& bound, bool makeUpperInclusi
     BSONObjIterator pat(_pattern);
 
     while (src.more()) {
-        massert(16649,
+        massert(ErrorCodes::KeyPatternShorterThanBound,
                 str::stream() << "keyPattern " << _pattern << " shorter than bound " << bound,
                 pat.more());
         BSONElement srcElt = src.next();
         BSONElement patElt = pat.next();
         massert(16634,
                 str::stream() << "field names of bound " << bound
-                              << " do not match those of keyPattern "
-                              << _pattern,
-                str::equals(srcElt.fieldName(), patElt.fieldName()));
+                              << " do not match those of keyPattern " << _pattern,
+                srcElt.fieldNameStringData() == patElt.fieldNameStringData());
         newBound.append(srcElt);
     }
     while (pat.more()) {
         BSONElement patElt = pat.next();
         // for non 1/-1 field values, like {a : "hashed"}, treat order as ascending
-        int order = patElt.isNumber() ? patElt.numberInt() : 1;
+        int order = patElt.isNumber() ? patElt.safeNumberInt() : 1;
         // flip the order semantics if this is an upper bound
         if (makeUpperInclusive)
             order *= -1;
@@ -125,6 +122,12 @@ BSONObj KeyPattern::globalMin() const {
 
 BSONObj KeyPattern::globalMax() const {
     return extendRangeBound(BSONObj(), true);
+}
+
+size_t KeyPattern::getApproximateSize() const {
+    auto size = sizeof(KeyPattern);
+    size += _pattern.isOwned() ? _pattern.objsize() : 0;
+    return size;
 }
 
 }  // namespace mongo

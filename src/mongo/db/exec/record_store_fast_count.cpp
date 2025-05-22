@@ -27,19 +27,20 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
 
 #include "mongo/db/exec/record_store_fast_count.h"
+#include "mongo/db/catalog/collection.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 
 const char* RecordStoreFastCountStage::kStageType = "RECORD_STORE_FAST_COUNT";
 
-RecordStoreFastCountStage::RecordStoreFastCountStage(OperationContext* opCtx,
-                                                     Collection* collection,
+RecordStoreFastCountStage::RecordStoreFastCountStage(ExpressionContext* expCtx,
+                                                     VariantCollectionPtrOrAcquisition collection,
                                                      long long skip,
                                                      long long limit)
-    : RequiresCollectionStage(kStageType, opCtx, collection), _skip(skip), _limit(limit) {
+    : RequiresCollectionStage(kStageType, expCtx, collection), _skip(skip), _limit(limit) {
     invariant(_skip >= 0);
     invariant(_limit >= 0);
 }
@@ -54,7 +55,7 @@ PlanStage::StageState RecordStoreFastCountStage::doWork(WorkingSetID* out) {
     // This stage never returns a working set member.
     *out = WorkingSet::INVALID_ID;
 
-    long long nCounted = collection()->numRecords(getOpCtx());
+    long long nCounted = collectionPtr()->numRecords(opCtx());
 
     if (_skip) {
         nCounted -= _skip;

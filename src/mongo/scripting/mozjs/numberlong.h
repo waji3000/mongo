@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,8 +29,14 @@
 
 #pragma once
 
+#include <cstdint>
+#include <js/CallArgs.h>
+#include <js/Class.h>
+#include <js/PropertySpec.h>
+#include <js/TypeDecls.h>
 #include <jsapi.h>
 
+#include "mongo/scripting/mozjs/base.h"
 #include "mongo/scripting/mozjs/wraptype.h"
 
 namespace mongo {
@@ -52,8 +57,10 @@ namespace mozjs {
  * floating point approximation.
  */
 struct NumberLongInfo : public BaseInfo {
+    enum Slots { Int64Slot, NumberLongInfoSlotCount };
+
     static void construct(JSContext* cx, JS::CallArgs args);
-    static void finalize(JSFreeOp* fop, JSObject* obj);
+    static void finalize(JS::GCContext* gcCtx, JSObject* obj);
 
     struct Functions {
         MONGO_DECLARE_JS_FUNCTION(toNumber);
@@ -64,12 +71,14 @@ struct NumberLongInfo : public BaseInfo {
         MONGO_DECLARE_JS_FUNCTION(floatApprox);
         MONGO_DECLARE_JS_FUNCTION(top);
         MONGO_DECLARE_JS_FUNCTION(bottom);
+        MONGO_DECLARE_JS_FUNCTION(exactValueString);
     };
 
     static const JSFunctionSpec methods[6];
 
     static const char* const className;
-    static const unsigned classFlags = JSCLASS_HAS_PRIVATE;
+    static const unsigned classFlags =
+        JSCLASS_HAS_RESERVED_SLOTS(NumberLongInfoSlotCount) | BaseInfo::finalizeFlag;
 
     static void postInstall(JSContext* cx, JS::HandleObject global, JS::HandleObject proto);
 

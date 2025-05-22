@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,7 +29,15 @@
 
 #pragma once
 
+#include <memory>
+
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/db/matcher/expression.h"
+#include "mongo/db/matcher/expression_text_base.h"
+#include "mongo/db/matcher/expression_where_base.h"
 #include "mongo/db/matcher/extensions_callback.h"
+#include "mongo/db/pipeline/expression_context.h"
 
 namespace mongo {
 
@@ -41,15 +48,12 @@ namespace mongo {
  */
 class ExtensionsCallbackNoop : public ExtensionsCallback {
 public:
-    /**
-     * Returns a TextNoOpMatchExpression, or an error Status if parsing fails.
-     */
-    StatusWithMatchExpression parseText(BSONElement text) const final;
+    std::unique_ptr<MatchExpression> createText(
+        TextMatchExpressionBase::TextParams text) const final;
 
-    /**
-     * Returns a WhereNoOpMatchExpression, or an error Status if parsing fails.
-     */
-    StatusWithMatchExpression parseWhere(BSONElement where) const final;
+    std::unique_ptr<MatchExpression> createWhere(
+        const boost::intrusive_ptr<ExpressionContext>& expCtx,
+        WhereMatchExpressionBase::WhereParams where) const final;
 
     bool hasNoopExtensions() const final {
         return true;

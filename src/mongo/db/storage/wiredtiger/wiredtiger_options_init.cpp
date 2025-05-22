@@ -1,6 +1,3 @@
-// wiredtiger_options_init.cpp
-
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,33 +27,31 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/util/options_parser/startup_option_init.h"
-
 #include <iostream>
+#include <vector>
 
+#include "mongo/base/initializer.h"
+#include "mongo/base/status.h"
+#include "mongo/config.h"  // IWYU pragma: keep
 #include "mongo/db/storage/wiredtiger/wiredtiger_global_options.h"
 #include "mongo/util/exit_code.h"
+#include "mongo/util/options_parser/startup_option_init.h"
 #include "mongo/util/options_parser/startup_options.h"
+
+#if defined(MONGO_CONFIG_HAVE_HEADER_UNISTD_H)
+#include <unistd.h>
+#endif
+
+namespace moe = mongo::optionenvironment;
 
 namespace mongo {
 
-MONGO_MODULE_STARTUP_OPTIONS_REGISTER(WiredTigerOptions)(InitializerContext* context) {
-    return wiredTigerGlobalOptions.add(&moe::startupOptions);
-}
-
-MONGO_STARTUP_OPTIONS_VALIDATE(WiredTigerOptions)(InitializerContext* context) {
-    return Status::OK();
-}
-
 MONGO_STARTUP_OPTIONS_STORE(WiredTigerOptions)(InitializerContext* context) {
-    Status ret = wiredTigerGlobalOptions.store(moe::startupOptionsParsed, context->args());
+    Status ret = wiredTigerGlobalOptions.store(moe::startupOptionsParsed);
     if (!ret.isOK()) {
         std::cerr << ret.toString() << std::endl;
         std::cerr << "try '" << context->args()[0] << " --help' for more information" << std::endl;
-        ::_exit(EXIT_BADOPTIONS);
+        ::_exit(static_cast<int>(ExitCode::badOptions));
     }
-    return Status::OK();
 }
-}
+}  // namespace mongo

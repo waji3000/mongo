@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,8 +29,16 @@
 
 #pragma once
 
-#include "mongo/db/jsobj.h"
-#include "mongo/platform/basic.h"
+#include <iosfwd>
+#include <memory>
+#include <string>
+#include <vector>
+
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/storage/key_string/key_string.h"
 
 namespace mongo {
 
@@ -68,9 +75,6 @@ public:
     /** Is the 'bit'-th most significant bit set?  (NOT the least significant) */
     static bool isBitSet(unsigned val, unsigned bit);
 
-    /** Return a GeoHash with one bit of precision lost. */
-    GeoHash up() const;
-
     bool hasPrefix(const GeoHash& other) const;
 
     std::string toString() const;
@@ -78,16 +82,6 @@ public:
 
     void setBit(unsigned pos, bool value);
     bool getBit(unsigned pos) const;
-
-    bool getBitX(unsigned pos) const;
-    bool getBitY(unsigned pos) const;
-
-    // XXX: what does this really do?
-    BSONObj wrap(const char* name = "") const;
-
-    // XXX what does this do
-    bool constrains() const;
-    bool canRefine() const;
 
     // XXX comment better
     bool atMinX() const;
@@ -104,21 +98,15 @@ public:
     bool operator==(const GeoHash& h) const;
     bool operator!=(const GeoHash& h) const;
     bool operator<(const GeoHash& h) const;
-    // Append the hash in s to our current hash.  We expect s to be '0' or '1' or '\0',
-    // though we also treat non-'1' values as '0'.
-    GeoHash& operator+=(const char* s);
-    GeoHash operator+(const char* s) const;
-    GeoHash operator+(const std::string& s) const;
 
     // Append the minimum range of the hash to the builder provided (inclusive)
     void appendHashMin(BSONObjBuilder* builder, const char* fieldName) const;
+    void appendHashMin(key_string::PooledBuilder* ks) const;
     // Append the maximum range of the hash to the builder provided (inclusive)
     void appendHashMax(BSONObjBuilder* builder, const char* fieldName) const;
 
     long long getHash() const;
     unsigned getBits() const;
-
-    GeoHash commonPrefix(const GeoHash& other) const;
 
     // If this is not a leaf cell, set children[0..3] to the four children of
     // this cell (in traversal order) and return true. Otherwise returns false.
@@ -137,10 +125,6 @@ public:
     // Requires: level < this->_bits, so that we can determine which vertex is
     // closest (in particular, level == kMaxBits is not allowed).
     void appendVertexNeighbors(unsigned level, std::vector<GeoHash>* output) const;
-
-    // public but only for the purpose of testing
-    void unhash_fast(unsigned* x, unsigned* y) const;
-    void unhash_slow(unsigned* x, unsigned* y) const;
 
 private:
     // Create a hash from the provided string.  Used by the std::string and char* cons.
@@ -166,6 +150,7 @@ private:
 class GeoHashConverter {
 public:
     static double const kMachinePrecision;  // = 1.1e-16
+    static double const kNumBuckets;        // = 4 * 1024 * 1024 * 1024
 
     struct Parameters {
         // How many bits to use for the hash?
@@ -177,14 +162,18 @@ public:
         double scaling;
     };
 
-    GeoHashConverter(const Parameters& params);
+    /**
+     * Factory method to return a new instance with status. Uses hashing parameters parsed from a
+     * BSONObj.
+     */
+    static StatusWith<std::unique_ptr<GeoHashConverter>> createFromDoc(const BSONObj& paramDoc);
 
     /**
-     * Returns hashing parameters parsed from a BSONObj
+     * Factory method to return a new instance with status.
      */
-    static Status parseParameters(const BSONObj& paramDoc, Parameters* params);
+    static StatusWith<std::unique_ptr<GeoHashConverter>> createFromParams(const Parameters& params);
 
-    static double calcUnhashToBoxError(const GeoHashConverter::Parameters& params);
+    static double calcUnhashToBoxError(const Parameters& params);
 
     /**
      * Return converter parameterss which can be used to
@@ -215,13 +204,12 @@ public:
     /**
      * Hashing functions.  Convert the following types to a GeoHash:
      * BSONElement
-     * BSONObj
+     * BSONObj, BSONObj
      * Point
      * double, double
      */
     GeoHash hash(const Point& p) const;
     GeoHash hash(const BSONElement& e) const;
-    GeoHash hash(const BSONObj& o) const;
     // src is printed out as debugging information.  I'm not sure if it's actually
     // somehow the 'source' of o?  Anyway, this is nasty, very nasty.  XXX
     GeoHash hash(const BSONObj& o, const BSONObj* src) const;
@@ -232,20 +220,16 @@ public:
      * double, double
      * Point
      * Box
-     * BSONObj
      */
     // XXX: these should have consistent naming
     Point unhashToPoint(const GeoHash& h) const;
     Point unhashToPoint(const BSONElement& e) const;
-    BSONObj unhashToBSONObj(const GeoHash& h) const;
     void unhash(const GeoHash& h, double* x, double* y) const;
 
     /**
      * Generates bounding box from geohash, expanded by the error bound
      */
     Box unhashToBoxCovering(const GeoHash& h) const;
-
-    double sizeOfDiag(const GeoHash& a) const;
 
     // Return the sizeEdge of a cell at a given level.
     double sizeEdge(unsigned level) const;
@@ -255,6 +239,8 @@ public:
     double convertToDoubleHashScale(double in) const;
 
 private:
+    GeoHashConverter(const Parameters& params);
+
     void init();
 
     // Convert from an unsigned in [0, (max-min)*scaling] to [min, max]

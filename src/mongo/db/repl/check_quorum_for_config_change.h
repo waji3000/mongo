@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,9 +29,15 @@
 
 #pragma once
 
+#include <utility>
+#include <vector>
+
 #include "mongo/base/status.h"
 #include "mongo/db/repl/scatter_gather_algorithm.h"
+#include "mongo/executor/remote_command_request.h"
+#include "mongo/executor/remote_command_response.h"
 #include "mongo/executor/task_executor.h"
+#include "mongo/util/net/hostandport.h"
 
 namespace mongo {
 namespace repl {
@@ -50,7 +55,8 @@ class ReplSetConfig;
  * result of the quorum check.
  */
 class QuorumChecker : public ScatterGatherAlgorithm {
-    MONGO_DISALLOW_COPYING(QuorumChecker);
+    QuorumChecker(const QuorumChecker&) = delete;
+    QuorumChecker& operator=(const QuorumChecker&) = delete;
 
 public:
     /**
@@ -60,13 +66,13 @@ public:
      * "rsConfig" must stay in scope until QuorumChecker's destructor completes.
      */
     QuorumChecker(const ReplSetConfig* rsConfig, int myIndex, long long term);
-    virtual ~QuorumChecker();
+    ~QuorumChecker() override;
 
-    virtual std::vector<executor::RemoteCommandRequest> getRequests() const;
-    virtual void processResponse(const executor::RemoteCommandRequest& request,
-                                 const executor::RemoteCommandResponse& response);
+    std::vector<executor::RemoteCommandRequest> getRequests() const override;
+    void processResponse(const executor::RemoteCommandRequest& request,
+                         const executor::RemoteCommandResponse& response) override;
 
-    virtual bool hasReceivedSufficientResponses() const;
+    bool hasReceivedSufficientResponses() const override;
 
     Status getFinalStatus() const {
         return _finalStatus;
@@ -134,7 +140,7 @@ private:
  */
 Status checkQuorumForInitiate(executor::TaskExecutor* executor,
                               const ReplSetConfig& rsConfig,
-                              const int myIndex,
+                              int myIndex,
                               long long term);
 
 /**
@@ -154,7 +160,7 @@ Status checkQuorumForInitiate(executor::TaskExecutor* executor,
  */
 Status checkQuorumForReconfig(executor::TaskExecutor* executor,
                               const ReplSetConfig& rsConfig,
-                              const int myIndex,
+                              int myIndex,
                               long long term);
 
 }  // namespace repl

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -37,7 +36,7 @@ namespace pal {
 const char* strcasestr(const char* haystack, const char* needle);
 }
 using mongo::pal::strcasestr;
-}
+}  // namespace mongo
 
 #else
 

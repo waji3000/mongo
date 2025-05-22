@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,213 +27,362 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/namespace_string.h"
 
-#include <ostream>
+#include <boost/optional.hpp>
 
-#include "mongo/base/parse_number.h"
-#include "mongo/util/mongoutils/str.h"
+// IWYU pragma: no_include "mongo/db/namespace_string_reserved.def.h"
 
 namespace mongo {
 namespace {
 
 constexpr auto listCollectionsCursorCol = "$cmd.listCollections"_sd;
-constexpr auto listIndexesCursorNSPrefix = "$cmd.listIndexes."_sd;
-constexpr auto collectionlessAggregateCursorCol = "$cmd.aggregate"_sd;
+constexpr auto bulkWriteCursorCol = "$cmd.bulkWrite"_sd;
+constexpr auto collectionlessShardsvrParticipantBlockCollection =
+    "$cmd.shardsvrParticipantBlock"_sd;
 constexpr auto dropPendingNSPrefix = "system.drop."_sd;
 
+constexpr auto fle2Prefix = "enxcol_."_sd;
+constexpr auto fle2EscSuffix = ".esc"_sd;
+constexpr auto fle2EcocSuffix = ".ecoc"_sd;
+constexpr auto fle2EcocCompactSuffix = ".ecoc.compact"_sd;
+
+// The following are namespaces in the form of config.xxx for which only one instance exist globally
+// within the cluster.
+static const absl::flat_hash_set<NamespaceString> globallyUniqueConfigDbCollections = {
+    NamespaceString::kConfigsvrCollectionsNamespace,
+    NamespaceString::kConfigsvrChunksNamespace,
+    NamespaceString::kConfigDatabasesNamespace,
+    NamespaceString::kConfigsvrShardsNamespace,
+    NamespaceString::kConfigsvrIndexCatalogNamespace,
+    NamespaceString::kConfigsvrPlacementHistoryNamespace,
+    NamespaceString::kConfigChangelogNamespace,
+    NamespaceString::kConfigsvrTagsNamespace,
+    NamespaceString::kConfigVersionNamespace,
+    NamespaceString::kConfigMongosNamespace,
+    NamespaceString::kLogicalSessionsNamespace};
+
 }  // namespace
-
-constexpr StringData NamespaceString::kAdminDb;
-constexpr StringData NamespaceString::kLocalDb;
-constexpr StringData NamespaceString::kConfigDb;
-constexpr StringData NamespaceString::kSystemDotViewsCollectionName;
-constexpr StringData NamespaceString::kOrphanCollectionPrefix;
-constexpr StringData NamespaceString::kOrphanCollectionDb;
-
-const NamespaceString NamespaceString::kServerConfigurationNamespace(NamespaceString::kAdminDb,
-                                                                     "system.version");
-const NamespaceString NamespaceString::kLogicalSessionsNamespace(NamespaceString::kConfigDb,
-                                                                 "system.sessions");
-const NamespaceString NamespaceString::kSessionTransactionsTableNamespace(
-    NamespaceString::kConfigDb, "transactions");
-const NamespaceString NamespaceString::kShardConfigCollectionsNamespace(NamespaceString::kConfigDb,
-                                                                        "cache.collections");
-const NamespaceString NamespaceString::kShardConfigDatabasesNamespace(NamespaceString::kConfigDb,
-                                                                      "cache.databases");
-const NamespaceString NamespaceString::kSystemKeysNamespace(NamespaceString::kAdminDb,
-                                                            "system.keys");
-const NamespaceString NamespaceString::kRsOplogNamespace(NamespaceString::kLocalDb, "oplog.rs");
 
 bool NamespaceString::isListCollectionsCursorNS() const {
     return coll() == listCollectionsCursorCol;
 }
 
-bool NamespaceString::isListIndexesCursorNS() const {
-    return coll().size() > listIndexesCursorNSPrefix.size() &&
-        coll().startsWith(listIndexesCursorNSPrefix);
+bool NamespaceString::isCollectionlessShardsvrParticipantBlockNS() const {
+    return coll() == collectionlessShardsvrParticipantBlockCollection;
 }
 
 bool NamespaceString::isCollectionlessAggregateNS() const {
-    return coll() == collectionlessAggregateCursorCol;
+    return coll() == kCollectionlessAggregateCollection;
 }
 
 bool NamespaceString::isLegalClientSystemNS() const {
-    if (db() == "admin") {
-        if (ns() == "admin.system.roles")
+    auto collectionName = coll();
+    if (isAdminDB()) {
+        if (collectionName == "system.roles")
             return true;
-        if (ns() == kServerConfigurationNamespace.ns())
+        if (collectionName == kServerConfigurationNamespace.coll())
             return true;
-        if (ns() == kSystemKeysNamespace.ns())
+        if (collectionName == kKeysCollectionNamespace.coll())
             return true;
-        if (ns() == "admin.system.new_users")
+        if (collectionName == "system.backup_users")
             return true;
-        if (ns() == "admin.system.backup_users")
+        if (collectionName == "system.new_users")
             return true;
-    } else if (db() == "config") {
-        if (ns() == "config.system.sessions")
+    } else if (isConfigDB()) {
+        if (collectionName == "system.sessions")
+            return true;
+        if (collectionName == kIndexBuildEntryNamespace.coll())
+            return true;
+        if (collectionName.find(".system.resharding.") != std::string::npos)
+            return true;
+        if (collectionName == kShardingDDLCoordinatorsNamespace.coll())
+            return true;
+        if (collectionName == kConfigsvrCoordinatorsNamespace.coll())
+            return true;
+    } else if (isLocalDB()) {
+        if (collectionName == kSystemReplSetNamespace.coll())
+            return true;
+        if (collectionName == kLocalHealthLogNamespace.coll())
+            return true;
+        if (collectionName == kConfigsvrRestoreNamespace.coll())
             return true;
     }
 
-    if (ns() == "local.system.replset")
+    if (collectionName == "system.users")
         return true;
+    if (collectionName == "system.js")
+        return true;
+    if (collectionName == kSystemDotViewsCollectionName)
+        return true;
+    if (isTemporaryReshardingCollection()) {
+        return true;
+    }
+    if (isTimeseriesBucketsCollection() &&
+        validCollectionName(collectionName.substr(kTimeseriesBucketsCollectionPrefix.size()))) {
+        return true;
+    }
+    if (isChangeStreamPreImagesCollection()) {
+        return true;
+    }
 
-    if (coll() == "system.users")
+    if (isChangeCollection()) {
         return true;
-    if (coll() == "system.js")
-        return true;
+    }
 
-    if (coll() == kSystemDotViewsCollectionName)
+    if (isSystemStatsCollection()) {
         return true;
+    }
 
     return false;
 }
 
-NamespaceString NamespaceString::makeListCollectionsNSS(StringData dbName) {
+/**
+ * Oplog entries on 'system.views' should also be processed one at a time. View catalog immediately
+ * reflects changes for each oplog entry so we can see inconsistent view catalog if multiple oplog
+ * entries on 'system.views' are being applied out of the original order.
+ *
+ * Process updates to 'admin.system.version' individually as well so the secondary's FCV when
+ * processing each operation matches the primary's when committing that operation.
+ *
+ * Oplog entries on 'config.shards' should be processed one at a time, otherwise the in-memory state
+ * that its kept on the TopologyTimeTicker might be wrong.
+ *
+ */
+bool NamespaceString::mustBeAppliedInOwnOplogBatch() const {
+    auto ns = this->ns();
+    return isSystemDotViews() || isServerConfigurationCollection() || isPrivilegeCollection() ||
+        ns == kDonorReshardingOperationsNamespace.ns() ||
+        ns == kForceOplogBatchBoundaryNamespace.ns() || ns == kConfigsvrShardsNamespace.ns();
+}
+
+NamespaceString NamespaceString::makeBulkWriteNSS(const boost::optional<TenantId>& tenantId) {
+    return NamespaceString(tenantId, DatabaseName::kAdmin.db(omitTenant), bulkWriteCursorCol);
+}
+
+NamespaceString NamespaceString::makeClusterParametersNSS(
+    const boost::optional<TenantId>& tenantId) {
+    return tenantId
+        ? NamespaceString(tenantId, DatabaseName::kConfig.db(omitTenant), "clusterParameters")
+        : kClusterParametersNamespace;
+}
+
+NamespaceString NamespaceString::makeSystemDotViewsNamespace(const DatabaseName& dbName) {
+    return NamespaceString(dbName, kSystemDotViewsCollectionName);
+}
+
+NamespaceString NamespaceString::makeSystemDotProfileNamespace(const DatabaseName& dbName) {
+    return NamespaceString(dbName, kSystemDotProfileCollectionName);
+}
+
+NamespaceString NamespaceString::makeListCollectionsNSS(const DatabaseName& dbName) {
     NamespaceString nss(dbName, listCollectionsCursorCol);
     dassert(nss.isValid());
     dassert(nss.isListCollectionsCursorNS());
     return nss;
 }
 
-NamespaceString NamespaceString::makeListIndexesNSS(StringData dbName, StringData collectionName) {
-    NamespaceString nss(dbName, str::stream() << listIndexesCursorNSPrefix << collectionName);
+NamespaceString NamespaceString::makeCollectionlessShardsvrParticipantBlockNSS(
+    const DatabaseName& dbName) {
+    NamespaceString nss(dbName, collectionlessShardsvrParticipantBlockCollection);
     dassert(nss.isValid());
-    dassert(nss.isListIndexesCursorNS());
+    dassert(nss.isCollectionlessShardsvrParticipantBlockNS());
     return nss;
 }
 
-NamespaceString NamespaceString::makeCollectionlessAggregateNSS(StringData dbname) {
-    NamespaceString nss(dbname, collectionlessAggregateCursorCol);
+NamespaceString NamespaceString::makeGlobalConfigCollection(StringData collName) {
+    return NamespaceString(DatabaseName::kConfig, collName);
+}
+
+NamespaceString NamespaceString::makeLocalCollection(StringData collName) {
+    return NamespaceString(DatabaseName::kLocal, collName);
+}
+
+NamespaceString NamespaceString::makeCollectionlessAggregateNSS(const DatabaseName& dbName) {
+    NamespaceString nss(dbName, kCollectionlessAggregateCollection);
     dassert(nss.isValid());
     dassert(nss.isCollectionlessAggregateNS());
     return nss;
 }
 
-NamespaceString NamespaceString::getTargetNSForListIndexes() const {
-    dassert(isListIndexesCursorNS());
-    return NamespaceString(db(), coll().substr(listIndexesCursorNSPrefix.size()));
+NamespaceString NamespaceString::makeChangeCollectionNSS(
+    const boost::optional<TenantId>& tenantId) {
+    return NamespaceString{tenantId, DatabaseName::kConfig.db(omitTenant), kChangeCollectionName};
+}
+
+NamespaceString NamespaceString::makePreImageCollectionNSS(
+    const boost::optional<TenantId>& tenantId) {
+    return NamespaceString{
+        tenantId, DatabaseName::kConfig.db(omitTenant), kPreImagesCollectionName};
+}
+
+NamespaceString NamespaceString::makeReshardingLocalOplogBufferNSS(
+    const UUID& existingUUID, const std::string& donorShardId) {
+    return NamespaceString(DatabaseName::kConfig,
+                           "localReshardingOplogBuffer." + existingUUID.toString() + "." +
+                               donorShardId);
+}
+
+NamespaceString NamespaceString::makeReshardingLocalConflictStashNSS(
+    const UUID& existingUUID, const std::string& donorShardId) {
+    return NamespaceString(DatabaseName::kConfig,
+                           "localReshardingConflictStash." + existingUUID.toString() + "." +
+                               donorShardId);
+}
+
+NamespaceString NamespaceString::makeTenantUsersCollection(
+    const boost::optional<TenantId>& tenantId) {
+    return NamespaceString(
+        tenantId, DatabaseName::kAdmin.db(omitTenant), NamespaceString::kSystemUsers);
+}
+
+NamespaceString NamespaceString::makeTenantRolesCollection(
+    const boost::optional<TenantId>& tenantId) {
+    return NamespaceString(
+        tenantId, DatabaseName::kAdmin.db(omitTenant), NamespaceString::kSystemRoles);
+}
+
+NamespaceString NamespaceString::makeCommandNamespace(const DatabaseName& dbName) {
+    return NamespaceString(dbName, "$cmd");
 }
 
 std::string NamespaceString::getSisterNS(StringData local) const {
-    verify(local.size() && local[0] != '.');
-    return db().toString() + "." + local.toString();
+    MONGO_verify(local.size() && local[0] != '.');
+    return db_deprecated().toString() + "." + local.toString();
 }
 
-boost::optional<NamespaceString> NamespaceString::getTargetNSForGloballyManagedNamespace() const {
-    // Globally managed namespaces are of the form '$cmd.commandName.<targetNs>' or simply
-    // '$cmd.commandName'.
-    dassert(isGloballyManagedNamespace());
-    const size_t indexOfNextDot = coll().find('.', 5);
-    if (indexOfNextDot == std::string::npos) {
-        return boost::none;
+void NamespaceString::serializeCollectionName(BSONObjBuilder* builder, StringData fieldName) const {
+    if (isCollectionlessAggregateNS()) {
+        builder->append(fieldName, 1);
+    } else {
+        builder->append(fieldName, coll());
     }
-    return NamespaceString{db(), coll().substr(indexOfNextDot + 1)};
 }
 
-bool NamespaceString::isDropPendingNamespace() const {
-    return coll().startsWith(dropPendingNSPrefix);
+bool NamespaceString::isNamespaceAlwaysUntracked() const {
+    // Local and admin never have sharded collections
+    if (isLocalDB() || isAdminDB())
+        return true;
+
+    // Config can only have the system.sessions as sharded
+    if (isConfigDB())
+        return *this != NamespaceString::kLogicalSessionsNamespace;
+
+    if (isSystem()) {
+        // Only some system collections (<DB>.system.<COLL>) can be sharded,
+        // all the others are always unsharded.
+        // This list does not contain 'config.system.sessions' because we already check it above
+        return !isTemporaryReshardingCollection() && !isTimeseriesBucketsCollection();
+    }
+
+    return false;
 }
 
-NamespaceString NamespaceString::makeDropPendingNamespace(const repl::OpTime& opTime) const {
-    StringBuilder ss;
-    ss << db() << "." << dropPendingNSPrefix;
-    ss << opTime.getSecs() << "i" << opTime.getTimestamp().getInc() << "t" << opTime.getTerm();
-    ss << "." << coll();
-    return NamespaceString(ss.stringData().substr(0, MaxNsCollectionLen));
+bool NamespaceString::isShardLocalNamespace() const {
+    if (isLocalDB() || isAdminDB()) {
+        return true;
+    }
+
+    if (isConfigDB()) {
+        return !globallyUniqueConfigDbCollections.contains(*this);
+    }
+
+    if (isSystem()) {
+        // Only some db.system.xxx collections are cluster global.
+        const bool isUniqueInstanceSystemCollection =
+            isTemporaryReshardingCollection() || isTimeseriesBucketsCollection();
+        return !isUniqueInstanceSystemCollection;
+    }
+
+    return false;
 }
 
-StatusWith<repl::OpTime> NamespaceString::getDropPendingNamespaceOpTime() const {
-    if (!isDropPendingNamespace()) {
-        return Status(ErrorCodes::BadValue,
-                      str::stream() << "Not a drop-pending namespace: " << _ns);
-    }
-
-    auto collectionName = coll();
-    auto opTimeBeginIndex = dropPendingNSPrefix.size();
-    auto opTimeEndIndex = collectionName.find('.', opTimeBeginIndex);
-    auto opTimeStr = std::string::npos == opTimeEndIndex
-        ? collectionName.substr(opTimeBeginIndex)
-        : collectionName.substr(opTimeBeginIndex, opTimeEndIndex - opTimeBeginIndex);
-
-    auto incrementSeparatorIndex = opTimeStr.find('i');
-    if (std::string::npos == incrementSeparatorIndex) {
-        return Status(ErrorCodes::FailedToParse,
-                      str::stream() << "Missing 'i' separator in drop-pending namespace: " << _ns);
-    }
-
-    auto termSeparatorIndex = opTimeStr.find('t', incrementSeparatorIndex);
-    if (std::string::npos == termSeparatorIndex) {
-        return Status(ErrorCodes::FailedToParse,
-                      str::stream() << "Missing 't' separator in drop-pending namespace: " << _ns);
-    }
-
-    long long seconds;
-    auto status = parseNumberFromString(opTimeStr.substr(0, incrementSeparatorIndex), &seconds);
-    if (!status.isOK()) {
-        return status.withContext(
-            str::stream() << "Invalid timestamp seconds in drop-pending namespace: " << _ns);
-    }
-
-    unsigned int increment;
-    status =
-        parseNumberFromString(opTimeStr.substr(incrementSeparatorIndex + 1,
-                                               termSeparatorIndex - (incrementSeparatorIndex + 1)),
-                              &increment);
-    if (!status.isOK()) {
-        return status.withContext(
-            str::stream() << "Invalid timestamp increment in drop-pending namespace: " << _ns);
-    }
-
-    long long term;
-    status = mongo::parseNumberFromString(opTimeStr.substr(termSeparatorIndex + 1), &term);
-    if (!status.isOK()) {
-        return status.withContext(str::stream() << "Invalid term in drop-pending namespace: "
-                                                << _ns);
-    }
-
-    return repl::OpTime(Timestamp(Seconds(seconds), increment), term);
+bool NamespaceString::isConfigDotCacheDotChunks() const {
+    return db_deprecated() == "config" && coll().starts_with("cache.chunks.");
 }
 
-Status NamespaceString::checkLengthForRename(
-    const std::string::size_type longestIndexNameLength) const {
-    auto longestAllowed =
-        std::min(std::string::size_type(NamespaceString::MaxNsCollectionLen),
-                 std::string::size_type(NamespaceString::MaxNsLen - 2U /*strlen(".$")*/ -
-                                        longestIndexNameLength));
-    if (size() > longestAllowed) {
-        StringBuilder sb;
-        sb << "collection name length of " << size() << " exceeds maximum length of "
-           << longestAllowed << ", allowing for index names";
-        return Status(ErrorCodes::InvalidLength, sb.str());
+bool NamespaceString::isReshardingLocalOplogBufferCollection() const {
+    return db_deprecated() == "config" && coll().starts_with(kReshardingLocalOplogBufferPrefix);
+}
+
+bool NamespaceString::isReshardingConflictStashCollection() const {
+    return db_deprecated() == "config" && coll().starts_with(kReshardingConflictStashPrefix);
+}
+
+bool NamespaceString::isTemporaryReshardingCollection() const {
+    return coll().starts_with(kTemporaryTimeseriesReshardingCollectionPrefix) ||
+        coll().starts_with(kTemporaryReshardingCollectionPrefix);
+}
+
+bool NamespaceString::isTimeseriesBucketsCollection() const {
+    return coll().starts_with(kTimeseriesBucketsCollectionPrefix);
+}
+
+bool NamespaceString::isChangeStreamPreImagesCollection() const {
+    return isConfigDB() && coll() == kPreImagesCollectionName;
+}
+
+bool NamespaceString::isChangeCollection() const {
+    return isConfigDB() && coll() == kChangeCollectionName;
+}
+
+bool NamespaceString::isConfigImagesCollection() const {
+    return ns() == kConfigImagesNamespace.ns();
+}
+
+bool NamespaceString::isConfigTransactionsCollection() const {
+    return ns() == kSessionTransactionsTableNamespace.ns();
+}
+
+bool NamespaceString::isFLE2StateCollection() const {
+    return coll().starts_with(fle2Prefix) &&
+        (coll().ends_with(fle2EscSuffix) || coll().ends_with(fle2EcocSuffix) ||
+         coll().ends_with(fle2EcocCompactSuffix));
+}
+
+bool NamespaceString::isFLE2StateCollection(StringData coll) {
+    return coll.starts_with(fle2Prefix) &&
+        (coll.ends_with(fle2EscSuffix) || coll.ends_with(fle2EcocSuffix));
+}
+
+bool NamespaceString::isOplogOrChangeCollection() const {
+    return isOplog() || isChangeCollection();
+}
+
+bool NamespaceString::isSystemStatsCollection() const {
+    return coll().starts_with(kStatisticsCollectionPrefix);
+}
+
+bool NamespaceString::isOutTmpBucketsCollection() const {
+    return isTimeseriesBucketsCollection() &&
+        getTimeseriesViewNamespace().coll().starts_with(kOutTmpCollectionPrefix);
+}
+
+NamespaceString NamespaceString::makeTimeseriesBucketsNamespace() const {
+    return {dbName(), kTimeseriesBucketsCollectionPrefix.toString() + coll()};
+}
+
+NamespaceString NamespaceString::getTimeseriesViewNamespace() const {
+    invariant(isTimeseriesBucketsCollection(), ns());
+    return {dbName(), coll().substr(kTimeseriesBucketsCollectionPrefix.size())};
+}
+
+bool NamespaceString::isImplicitlyReplicated() const {
+    if (db_deprecated() == DatabaseName::kConfig.db(omitTenant)) {
+        if (isChangeStreamPreImagesCollection() || isConfigImagesCollection() ||
+            isChangeCollection()) {
+            // Implicitly replicated namespaces are replicated, although they only replicate a
+            // subset of writes.
+            invariant(isReplicated());
+            return true;
+        }
     }
-    return Status::OK();
+
+    return false;
 }
 
 bool NamespaceString::isReplicated() const {
-    if (isLocal()) {
+    if (isLocalDB()) {
         return false;
     }
 
@@ -252,19 +400,28 @@ bool NamespaceString::isReplicated() const {
     return true;
 }
 
-std::string NamespaceStringOrUUID::toString() const {
-    if (_nss)
-        return _nss->toString();
-    else
-        return _uuid->toString();
+std::string NamespaceStringOrUUID::toStringForErrorMsg() const {
+    if (isNamespaceString()) {
+        return nss().toStringForErrorMsg();
+    }
+
+    return uuid().toString();
 }
 
-std::ostream& operator<<(std::ostream& stream, const NamespaceString& nss) {
-    return stream << nss.toString();
+std::string toStringForLogging(const NamespaceStringOrUUID& nssOrUUID) {
+    if (nssOrUUID.isNamespaceString()) {
+        return toStringForLogging(nssOrUUID.nss());
+    }
+
+    return nssOrUUID.uuid().toString();
 }
 
-std::ostream& operator<<(std::ostream& stream, const NamespaceStringOrUUID& nsOrUUID) {
-    return stream << nsOrUUID.toString();
+void NamespaceStringOrUUID::serialize(BSONObjBuilder* builder, StringData fieldName) const {
+    if (const NamespaceString* nss = get_if<NamespaceString>(&_nssOrUUID)) {
+        builder->append(fieldName, nss->coll());
+    } else {
+        get<1>(get<UUIDWithDbName>(_nssOrUUID)).appendToBuilder(builder, fieldName);
+    }
 }
 
 }  // namespace mongo

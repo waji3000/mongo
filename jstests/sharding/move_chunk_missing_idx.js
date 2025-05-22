@@ -3,12 +3,16 @@
  * have the index and is not empty.
  */
 
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+
+// This test runs dropIndex on one of the shards.
+TestData.skipCheckingIndexesConsistentAcrossCluster = true;
+
 var st = new ShardingTest({shards: 2});
 
 var testDB = st.s.getDB('test');
 
-testDB.adminCommand({enableSharding: 'test'});
-st.ensurePrimaryShard(testDB.toString(), st.shard1.shardName);
+testDB.adminCommand({enableSharding: 'test', primaryShard: st.shard1.shardName});
 testDB.adminCommand({shardCollection: 'test.user', key: {x: 1}});
 
 // Test procedure:
@@ -16,7 +20,7 @@ testDB.adminCommand({shardCollection: 'test.user', key: {x: 1}});
 // 2. Split chunk into 3 parts.
 // 3. Move 1 chunk to 2nd shard - should have no issues
 
-testDB.user.ensureIndex({a: 1, b: 1});
+testDB.user.createIndex({a: 1, b: 1});
 
 testDB.adminCommand({split: 'test.user', middle: {x: 0}});
 testDB.adminCommand({split: 'test.user', middle: {x: 10}});

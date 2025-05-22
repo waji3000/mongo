@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,34 +27,59 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <boost/smart_ptr.hpp>
+#include <memory>
+#include <type_traits>
+#include <utility>
 
-#include "mongo/util/future.h"
+#include <boost/move/utility_core.hpp>
 
-#include "mongo/stdx/thread.h"
-#include "mongo/unittest/death_test.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
 #include "mongo/unittest/unittest.h"
-
+#include "mongo/util/assert_util.h"
+#include "mongo/util/future.h"
+#include "mongo/util/future_impl.h"
 #include "mongo/util/future_test_utils.h"
 
 namespace mongo {
 namespace {
 
-TEST(Promise, Success_setFrom) {
-    FUTURE_SUCCESS_TEST([] { return 1; },
-                        [](Future<int>&& fut) {
-                            auto pf = makePromiseFuture<int>();
-                            pf.promise.setFrom(std::move(fut));
-                            ASSERT_EQ(std::move(pf.future).get(), 1);
-                        });
+static_assert(!canSetFrom<Promise<int>, int>, "Use Promise<T>::emplaceValue(...) instead");
+static_assert(!canSetFrom<Promise<int>, Status>, "Use Promise<T>::setError(...) instead");
+static_assert(canSetFrom<Promise<int>, StatusWith<int>>);
+static_assert(canSetFrom<Promise<int>, Future<int>>);
+
+TEST(Promise, Success_setFrom_future) {
+    FUTURE_SUCCESS_TEST<kNoExecutorFuture_needsPromiseSetFrom>(
+        [] { return 1; },
+        [](/*Future<int>*/ auto&& fut) {
+            auto pf = makePromiseFuture<int>();
+            pf.promise.setFrom(std::move(fut));
+            ASSERT_EQ(std::move(pf.future).get(), 1);
+        });
 }
 
-TEST(Promise, Fail_setFrom) {
-    FUTURE_FAIL_TEST<int>([](Future<int>&& fut) {
+TEST(Promise, Success_setFrom_statusWith) {
+    auto pf = makePromiseFuture<int>();
+    pf.promise.setFrom(StatusWith<int>(3));
+    ASSERT_EQ(std::move(pf.future).getNoThrow(), 3);
+}
+
+TEST(Promise, Fail_setFrom_future) {
+    FUTURE_FAIL_TEST<int, kNoExecutorFuture_needsPromiseSetFrom>([](/*Future<int>*/ auto&& fut) {
         auto pf = makePromiseFuture<int>();
         pf.promise.setFrom(std::move(fut));
         ASSERT_THROWS_failStatus(std::move(pf.future).get());
     });
+}
+
+TEST(Promise, Fail_setFrom_statusWith_error) {
+    auto pf = makePromiseFuture<int>();
+    pf.promise.setFrom(StatusWith<int>(failStatus()));
+    ASSERT_THROWS_failStatus(std::move(pf.future).get());
 }
 
 TEST(Promise, Success_setWith_value) {
@@ -86,16 +110,17 @@ TEST(Promise, Fail_setWith_StatusWith) {
 }
 
 TEST(Promise, Success_setWith_Future) {
-    FUTURE_SUCCESS_TEST([] { return 1; },
-                        [](Future<int>&& fut) {
-                            auto pf = makePromiseFuture<int>();
-                            pf.promise.setWith([&] { return std::move(fut); });
-                            ASSERT_EQ(std::move(pf.future).get(), 1);
-                        });
+    FUTURE_SUCCESS_TEST<kNoExecutorFuture_needsPromiseSetFrom>(
+        [] { return 1; },
+        [](/*Future<int>*/ auto&& fut) {
+            auto pf = makePromiseFuture<int>();
+            pf.promise.setWith([&] { return std::move(fut); });
+            ASSERT_EQ(std::move(pf.future).get(), 1);
+        });
 }
 
 TEST(Promise, Fail_setWith_Future) {
-    FUTURE_FAIL_TEST<int>([](Future<int>&& fut) {
+    FUTURE_FAIL_TEST<int, kNoExecutorFuture_needsPromiseSetFrom>([](/*Future<int>*/ auto&& fut) {
         auto pf = makePromiseFuture<int>();
         pf.promise.setWith([&] { return std::move(fut); });
         ASSERT_THROWS_failStatus(std::move(pf.future).get());

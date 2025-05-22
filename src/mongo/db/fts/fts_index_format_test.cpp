@@ -1,6 +1,3 @@
-// fts_index_format_test.cpp
-
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,19 +27,32 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
 
-#include "mongo/platform/basic.h"
-
+#include <fmt/format.h>
+#include <memory>
 #include <set>
 
+// IWYU pragma: no_include "boost/container/detail/flat_tree.hpp"
+#include <boost/container/flat_set.hpp>
+#include <boost/container/vector.hpp>
+#include <boost/move/utility_core.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsontypes.h"
 #include "mongo/bson/json.h"
-#include "mongo/bson/simple_bsonobj_comparator.h"
+#include "mongo/bson/util/builder.h"
 #include "mongo/db/fts/fts_index_format.h"
 #include "mongo/db/fts/fts_spec.h"
 #include "mongo/unittest/unittest.h"
-#include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
+
 
 namespace mongo {
 
@@ -52,40 +62,42 @@ using std::string;
 using unittest::assertGet;
 
 TEST(FTSIndexFormat, Simple1) {
-    FTSSpec spec(assertGet(FTSSpec::fixSpec(BSON("key" << BSON("data"
-                                                               << "text")))));
-    BSONObjSet keys = SimpleBSONObjComparator::kInstance.makeBSONObjSet();
-    FTSIndexFormat::getKeys(spec,
-                            BSON("data"
-                                 << "cat sat"),
-                            &keys);
+    FTSSpec spec(assertGet(FTSSpec::fixSpec(BSON("key" << BSON("data" << "text")))));
+    SharedBufferFragmentBuilder allocator(BufBuilder::kDefaultInitSizeBytes);
+    KeyStringSet keys;
+    FTSIndexFormat::getKeys(allocator,
+                            spec,
+                            BSON("data" << "cat sat"),
+                            &keys,
+                            key_string::Version::kLatestVersion,
+                            Ordering::make(BSONObj()));
 
     ASSERT_EQUALS(2U, keys.size());
-    for (BSONObjSet::const_iterator i = keys.begin(); i != keys.end(); ++i) {
-        BSONObj key = *i;
+    for (auto& keyString : keys) {
+        auto key = key_string::toBson(keyString, Ordering::make(BSONObj()));
         ASSERT_EQUALS(2, key.nFields());
         ASSERT_EQUALS(String, key.firstElement().type());
     }
 }
 
 TEST(FTSIndexFormat, ExtraBack1) {
-    FTSSpec spec(assertGet(FTSSpec::fixSpec(BSON("key" << BSON("data"
-                                                               << "text"
-                                                               << "x"
-                                                               << 1)))));
-    BSONObjSet keys = SimpleBSONObjComparator::kInstance.makeBSONObjSet();
-    FTSIndexFormat::getKeys(spec,
-                            BSON("data"
-                                 << "cat"
-                                 << "x"
-                                 << 5),
-                            &keys);
+    FTSSpec spec(assertGet(FTSSpec::fixSpec(BSON("key" << BSON("data" << "text"
+                                                                      << "x" << 1)))));
+    SharedBufferFragmentBuilder allocator(BufBuilder::kDefaultInitSizeBytes);
+    KeyStringSet keys;
+    FTSIndexFormat::getKeys(allocator,
+                            spec,
+                            BSON("data" << "cat"
+                                        << "x" << 5),
+                            &keys,
+                            key_string::Version::kLatestVersion,
+                            Ordering::make(BSONObj()));
 
     ASSERT_EQUALS(1U, keys.size());
-    BSONObj key = *(keys.begin());
+    auto key = key_string::toBson(*keys.begin(), Ordering::make(BSONObj()));
     ASSERT_EQUALS(3, key.nFields());
     BSONObjIterator i(key);
-    ASSERT_EQUALS(StringData("cat"), i.next().valuestr());
+    ASSERT_EQUALS(StringData("cat"), i.next().valueStringDataSafe());
     ASSERT(i.next().numberDouble() > 0);
     ASSERT_EQUALS(5, i.next().numberInt());
 }
@@ -93,39 +105,44 @@ TEST(FTSIndexFormat, ExtraBack1) {
 TEST(FTSIndexFormat, ExtraFront1) {
     FTSSpec spec(assertGet(FTSSpec::fixSpec(BSON("key" << BSON("x" << 1 << "data"
                                                                    << "text")))));
-    BSONObjSet keys = SimpleBSONObjComparator::kInstance.makeBSONObjSet();
-    FTSIndexFormat::getKeys(spec,
-                            BSON("data"
-                                 << "cat"
-                                 << "x"
-                                 << 5),
-                            &keys);
+    SharedBufferFragmentBuilder allocator(BufBuilder::kDefaultInitSizeBytes);
+    KeyStringSet keys;
+    FTSIndexFormat::getKeys(allocator,
+                            spec,
+                            BSON("data" << "cat"
+                                        << "x" << 5),
+                            &keys,
+                            key_string::Version::kLatestVersion,
+                            Ordering::make(BSONObj()));
 
     ASSERT_EQUALS(1U, keys.size());
-    BSONObj key = *(keys.begin());
+    auto key = key_string::toBson(*keys.begin(), Ordering::make(BSONObj()));
     ASSERT_EQUALS(3, key.nFields());
     BSONObjIterator i(key);
     ASSERT_EQUALS(5, i.next().numberInt());
-    ASSERT_EQUALS(StringData("cat"), i.next().valuestr());
+    ASSERT_EQUALS(StringData("cat"), i.next().valueStringDataSafe());
     ASSERT(i.next().numberDouble() > 0);
 }
 
 TEST(FTSIndexFormat, StopWords1) {
-    FTSSpec spec(assertGet(FTSSpec::fixSpec(BSON("key" << BSON("data"
-                                                               << "text")))));
-
-    BSONObjSet keys1 = SimpleBSONObjComparator::kInstance.makeBSONObjSet();
-    FTSIndexFormat::getKeys(spec,
-                            BSON("data"
-                                 << "computer"),
-                            &keys1);
+    FTSSpec spec(assertGet(FTSSpec::fixSpec(BSON("key" << BSON("data" << "text")))));
+    SharedBufferFragmentBuilder allocator(BufBuilder::kDefaultInitSizeBytes);
+    KeyStringSet keys1;
+    FTSIndexFormat::getKeys(allocator,
+                            spec,
+                            BSON("data" << "computer"),
+                            &keys1,
+                            key_string::Version::kLatestVersion,
+                            Ordering::make(BSONObj()));
     ASSERT_EQUALS(1U, keys1.size());
 
-    BSONObjSet keys2 = SimpleBSONObjComparator::kInstance.makeBSONObjSet();
-    FTSIndexFormat::getKeys(spec,
-                            BSON("data"
-                                 << "any computer"),
-                            &keys2);
+    KeyStringSet keys2;
+    FTSIndexFormat::getKeys(allocator,
+                            spec,
+                            BSON("data" << "any computer"),
+                            &keys2,
+                            key_string::Version::kLatestVersion,
+                            Ordering::make(BSONObj()));
     ASSERT_EQUALS(1U, keys2.size());
 }
 
@@ -133,16 +150,16 @@ TEST(FTSIndexFormat, StopWords1) {
  * Helper function to compare keys returned in getKeys() result
  * with expected values.
  */
-void assertEqualsIndexKeys(std::set<std::string>& expectedKeys, const BSONObjSet& keys) {
+void assertEqualsIndexKeys(std::set<std::string>& expectedKeys, const KeyStringSet& keys) {
     ASSERT_EQUALS(expectedKeys.size(), keys.size());
-    for (BSONObjSet::const_iterator i = keys.begin(); i != keys.end(); ++i) {
-        BSONObj key = *i;
+    for (auto& keyString : keys) {
+        auto key = key_string::toBson(keyString, Ordering::make(BSONObj()));
         ASSERT_EQUALS(2, key.nFields());
         ASSERT_EQUALS(String, key.firstElement().type());
         string s = key.firstElement().String();
         std::set<string>::const_iterator j = expectedKeys.find(s);
         if (j == expectedKeys.end()) {
-            mongoutils::str::stream ss;
+            str::stream ss;
             ss << "unexpected key " << s << " in FTSIndexFormat::getKeys result. "
                << "expected keys:";
             for (std::set<string>::const_iterator k = expectedKeys.begin(); k != expectedKeys.end();
@@ -159,18 +176,22 @@ void assertEqualsIndexKeys(std::set<std::string>& expectedKeys, const BSONObjSet
  * Terms that are too long are not truncated in version 1.
  */
 TEST(FTSIndexFormat, LongWordsTextIndexVersion1) {
-    FTSSpec spec(assertGet(FTSSpec::fixSpec(BSON("key" << BSON("data"
-                                                               << "text")
-                                                       << "textIndexVersion"
-                                                       << 1))));
-    BSONObjSet keys = SimpleBSONObjComparator::kInstance.makeBSONObjSet();
+    FTSSpec spec(assertGet(
+        FTSSpec::fixSpec(BSON("key" << BSON("data" << "text") << "textIndexVersion" << 1))));
+    SharedBufferFragmentBuilder allocator(BufBuilder::kDefaultInitSizeBytes);
+    KeyStringSet keys;
     string longPrefix(1024U, 'a');
     // "aaa...aaacat"
     string longWordCat = longPrefix + "cat";
     // "aaa...aaasat"
     string longWordSat = longPrefix + "sat";
-    string text = mongoutils::str::stream() << longWordCat << " " << longWordSat;
-    FTSIndexFormat::getKeys(spec, BSON("data" << text), &keys);
+    string text = str::stream() << longWordCat << " " << longWordSat;
+    FTSIndexFormat::getKeys(allocator,
+                            spec,
+                            BSON("data" << text),
+                            &keys,
+                            key_string::Version::kLatestVersion,
+                            Ordering::make(BSONObj()));
 
     // Hard-coded expected computed keys for future-proofing.
     std::set<string> expectedKeys;
@@ -189,11 +210,10 @@ TEST(FTSIndexFormat, LongWordsTextIndexVersion1) {
  * characters of the term to form the index key.
  */
 TEST(FTSIndexFormat, LongWordTextIndexVersion2) {
-    FTSSpec spec(assertGet(FTSSpec::fixSpec(BSON("key" << BSON("data"
-                                                               << "text")
-                                                       << "textIndexVersion"
-                                                       << 2))));
-    BSONObjSet keys = SimpleBSONObjComparator::kInstance.makeBSONObjSet();
+    FTSSpec spec(assertGet(
+        FTSSpec::fixSpec(BSON("key" << BSON("data" << "text") << "textIndexVersion" << 2))));
+    SharedBufferFragmentBuilder allocator(BufBuilder::kDefaultInitSizeBytes);
+    KeyStringSet keys;
     string longPrefix(1024U, 'a');
     // "aaa...aaacat"
     string longWordCat = longPrefix + "cat";
@@ -201,9 +221,13 @@ TEST(FTSIndexFormat, LongWordTextIndexVersion2) {
     string longWordSat = longPrefix + "sat";
     // "aaa...aaamongodbfts"
     string longWordMongoDBFts = longPrefix + "mongodbfts";
-    string text = mongoutils::str::stream() << longWordCat << " " << longWordSat << " "
-                                            << longWordMongoDBFts;
-    FTSIndexFormat::getKeys(spec, BSON("data" << text), &keys);
+    string text = str::stream() << longWordCat << " " << longWordSat << " " << longWordMongoDBFts;
+    FTSIndexFormat::getKeys(allocator,
+                            spec,
+                            BSON("data" << text),
+                            &keys,
+                            key_string::Version::kLatestVersion,
+                            Ordering::make(BSONObj()));
 
     // Hard-coded expected computed keys for future-proofing.
     std::set<string> expectedKeys;
@@ -224,18 +248,22 @@ TEST(FTSIndexFormat, LongWordTextIndexVersion2) {
  * characters of the term to form the index key.
  */
 TEST(FTSIndexFormat, LongWordTextIndexVersion3) {
-    FTSSpec spec(assertGet(FTSSpec::fixSpec(BSON("key" << BSON("data"
-                                                               << "text")
-                                                       << "textIndexVersion"
-                                                       << 3))));
-    BSONObjSet keys = SimpleBSONObjComparator::kInstance.makeBSONObjSet();
+    FTSSpec spec(assertGet(
+        FTSSpec::fixSpec(BSON("key" << BSON("data" << "text") << "textIndexVersion" << 3))));
+    SharedBufferFragmentBuilder allocator(BufBuilder::kDefaultInitSizeBytes);
+    KeyStringSet keys;
     string longPrefix(1024U, 'a');
     // "aaa...aaacat"
     string longWordCat = longPrefix + "cat";
     // "aaa...aaasat"
     string longWordSat = longPrefix + "sat";
-    string text = mongoutils::str::stream() << longWordCat << " " << longWordSat;
-    FTSIndexFormat::getKeys(spec, BSON("data" << text), &keys);
+    string text = str::stream() << longWordCat << " " << longWordSat;
+    FTSIndexFormat::getKeys(allocator,
+                            spec,
+                            BSON("data" << text),
+                            &keys,
+                            key_string::Version::kLatestVersion,
+                            Ordering::make(BSONObj()));
 
     // Hard-coded expected computed keys for future-proofing.
     std::set<string> expectedKeys;
@@ -256,9 +284,15 @@ TEST(FTSIndexFormat, LongWordTextIndexVersion3) {
 TEST(FTSIndexFormat, GetKeysWithLeadingEmptyArrayThrows) {
     BSONObj keyPattern = fromjson("{'a.b': 1, data: 'text'}");
     FTSSpec spec(assertGet(FTSSpec::fixSpec(BSON("key" << keyPattern << "textIndexVersion" << 3))));
-    BSONObjSet keys = SimpleBSONObjComparator::kInstance.makeBSONObjSet();
+    SharedBufferFragmentBuilder allocator(BufBuilder::kDefaultInitSizeBytes);
+    KeyStringSet keys;
     BSONObj objToIndex = fromjson("{a: {b: []}, data: 'foo'}");
-    ASSERT_THROWS_CODE(FTSIndexFormat::getKeys(spec, objToIndex, &keys),
+    ASSERT_THROWS_CODE(FTSIndexFormat::getKeys(allocator,
+                                               spec,
+                                               objToIndex,
+                                               &keys,
+                                               key_string::Version::kLatestVersion,
+                                               Ordering::make(BSONObj())),
                        AssertionException,
                        ErrorCodes::CannotBuildIndexKeys);
 }
@@ -266,9 +300,15 @@ TEST(FTSIndexFormat, GetKeysWithLeadingEmptyArrayThrows) {
 TEST(FTSIndexFormat, GetKeysWithTrailingEmptyArrayThrows) {
     BSONObj keyPattern = fromjson("{data: 'text', 'a.b': 1}");
     FTSSpec spec(assertGet(FTSSpec::fixSpec(BSON("key" << keyPattern << "textIndexVersion" << 3))));
-    BSONObjSet keys = SimpleBSONObjComparator::kInstance.makeBSONObjSet();
+    SharedBufferFragmentBuilder allocator(BufBuilder::kDefaultInitSizeBytes);
+    KeyStringSet keys;
     BSONObj objToIndex = fromjson("{a: {b: []}, data: 'foo'}");
-    ASSERT_THROWS_CODE(FTSIndexFormat::getKeys(spec, objToIndex, &keys),
+    ASSERT_THROWS_CODE(FTSIndexFormat::getKeys(allocator,
+                                               spec,
+                                               objToIndex,
+                                               &keys,
+                                               key_string::Version::kLatestVersion,
+                                               Ordering::make(BSONObj())),
                        AssertionException,
                        ErrorCodes::CannotBuildIndexKeys);
 }
@@ -276,9 +316,15 @@ TEST(FTSIndexFormat, GetKeysWithTrailingEmptyArrayThrows) {
 TEST(FTSIndexFormat, GetKeysWithLeadingSingleElementArrayThrows) {
     BSONObj keyPattern = fromjson("{'a.b': 1, data: 'text'}");
     FTSSpec spec(assertGet(FTSSpec::fixSpec(BSON("key" << keyPattern << "textIndexVersion" << 3))));
-    BSONObjSet keys = SimpleBSONObjComparator::kInstance.makeBSONObjSet();
+    SharedBufferFragmentBuilder allocator(BufBuilder::kDefaultInitSizeBytes);
+    KeyStringSet keys;
     BSONObj objToIndex = fromjson("{a: [{b: 9}], data: 'foo'}");
-    ASSERT_THROWS_CODE(FTSIndexFormat::getKeys(spec, objToIndex, &keys),
+    ASSERT_THROWS_CODE(FTSIndexFormat::getKeys(allocator,
+                                               spec,
+                                               objToIndex,
+                                               &keys,
+                                               key_string::Version::kLatestVersion,
+                                               Ordering::make(BSONObj())),
                        AssertionException,
                        ErrorCodes::CannotBuildIndexKeys);
 }
@@ -286,9 +332,15 @@ TEST(FTSIndexFormat, GetKeysWithLeadingSingleElementArrayThrows) {
 TEST(FTSIndexFormat, GetKeysWithTrailingSingleElementArrayThrows) {
     BSONObj keyPattern = fromjson("{data: 'text', 'a.b': 1}");
     FTSSpec spec(assertGet(FTSSpec::fixSpec(BSON("key" << keyPattern << "textIndexVersion" << 3))));
-    BSONObjSet keys = SimpleBSONObjComparator::kInstance.makeBSONObjSet();
+    SharedBufferFragmentBuilder allocator(BufBuilder::kDefaultInitSizeBytes);
+    KeyStringSet keys;
     BSONObj objToIndex = fromjson("{a: [{b: 9}], data: 'foo'}");
-    ASSERT_THROWS_CODE(FTSIndexFormat::getKeys(spec, objToIndex, &keys),
+    ASSERT_THROWS_CODE(FTSIndexFormat::getKeys(allocator,
+                                               spec,
+                                               objToIndex,
+                                               &keys,
+                                               key_string::Version::kLatestVersion,
+                                               Ordering::make(BSONObj())),
                        AssertionException,
                        ErrorCodes::CannotBuildIndexKeys);
 }
@@ -296,9 +348,15 @@ TEST(FTSIndexFormat, GetKeysWithTrailingSingleElementArrayThrows) {
 TEST(FTSIndexFormat, GetKeysWithMultiElementArrayThrows) {
     BSONObj keyPattern = fromjson("{'a.b': 1, 'a.c': 'text'}");
     FTSSpec spec(assertGet(FTSSpec::fixSpec(BSON("key" << keyPattern << "textIndexVersion" << 3))));
-    BSONObjSet keys = SimpleBSONObjComparator::kInstance.makeBSONObjSet();
+    SharedBufferFragmentBuilder allocator(BufBuilder::kDefaultInitSizeBytes);
+    KeyStringSet keys;
     BSONObj objToIndex = fromjson("{a: [{b: 9, c: 'foo'}, {b: 10, c: 'bar'}]}");
-    ASSERT_THROWS_CODE(FTSIndexFormat::getKeys(spec, objToIndex, &keys),
+    ASSERT_THROWS_CODE(FTSIndexFormat::getKeys(allocator,
+                                               spec,
+                                               objToIndex,
+                                               &keys,
+                                               key_string::Version::kLatestVersion,
+                                               Ordering::make(BSONObj())),
                        AssertionException,
                        ErrorCodes::CannotBuildIndexKeys);
 }
@@ -306,13 +364,19 @@ TEST(FTSIndexFormat, GetKeysWithMultiElementArrayThrows) {
 TEST(FTSIndexFormat, GetKeysWithPositionalPathAllowed) {
     BSONObj keyPattern = fromjson("{'a.0': 1, 'a.b': 'text'}");
     FTSSpec spec(assertGet(FTSSpec::fixSpec(BSON("key" << keyPattern << "textIndexVersion" << 3))));
-    BSONObjSet keys = SimpleBSONObjComparator::kInstance.makeBSONObjSet();
+    SharedBufferFragmentBuilder allocator(BufBuilder::kDefaultInitSizeBytes);
+    KeyStringSet keys;
     BSONObj objToIndex = fromjson("{a: [{b: 'foo'}, {b: 'bar'}]}");
-    FTSIndexFormat::getKeys(spec, objToIndex, &keys);
+    FTSIndexFormat::getKeys(allocator,
+                            spec,
+                            objToIndex,
+                            &keys,
+                            key_string::Version::kLatestVersion,
+                            Ordering::make(BSONObj()));
     ASSERT_EQ(2U, keys.size());
 
     {
-        BSONObj key = *(keys.begin());
+        auto key = key_string::toBson(*keys.begin(), Ordering::make(BSONObj()));
         ASSERT_EQ(3, key.nFields());
         BSONObjIterator it{key};
         ASSERT_BSONELT_EQ(it.next(), fromjson("{'': {b: 'foo'}}").firstElement());
@@ -320,7 +384,8 @@ TEST(FTSIndexFormat, GetKeysWithPositionalPathAllowed) {
     }
 
     {
-        BSONObj key = *(++keys.begin());
+        auto next = ++keys.begin();
+        auto key = key_string::toBson(*next, Ordering::make(BSONObj()));
         ASSERT_EQ(3, key.nFields());
         BSONObjIterator it{key};
         ASSERT_BSONELT_EQ(it.next(), fromjson("{'': {b: 'foo'}}").firstElement());

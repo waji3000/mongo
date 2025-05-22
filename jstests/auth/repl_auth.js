@@ -4,6 +4,8 @@
  * @tags: [requires_replication]
  */
 
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+
 var NUM_NODES = 3;
 var rsTest = new ReplSetTest({nodes: NUM_NODES});
 rsTest.startSet({oplogSize: 10, keyFile: 'jstests/libs/key1'});
@@ -34,11 +36,11 @@ var barDB1 = replConn1.getDB('bar');
 fooDB0.auth('foo', 'foopwd');
 barDB1.auth('bar', 'barpwd');
 
-assert.writeOK(fooDB0.user.insert({x: 1}, {writeConcern: {w: NUM_NODES}}));
+assert.commandWorked(fooDB0.user.insert({x: 1}, {writeConcern: {w: NUM_NODES}}));
 assert.writeError(barDB0.user.insert({x: 1}, {writeConcern: {w: NUM_NODES}}));
 
 assert.writeError(fooDB1.user.insert({x: 2}, {writeConcern: {w: NUM_NODES}}));
-assert.writeOK(barDB1.user.insert({x: 2}, {writeConcern: {w: NUM_NODES}}));
+assert.commandWorked(barDB1.user.insert({x: 2}, {writeConcern: {w: NUM_NODES}}));
 
 // Make sure replica set connection in the shell is ready.
 _awaitRSHostViaRSMonitor(rsTest.getPrimary().name, {ok: true, ismaster: true}, rsTest.name);

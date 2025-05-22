@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -41,13 +40,13 @@ namespace unittest {
  */
 class EnsureFCV {
 public:
-    using Version = ServerGlobalParams::FeatureCompatibility::Version;
+    using Version = multiversion::FeatureCompatibilityVersion;
     EnsureFCV(Version version)
-        : _origVersion(serverGlobalParams.featureCompatibility.getVersion()) {
-        serverGlobalParams.featureCompatibility.setVersion(version);
+        : _origVersion(serverGlobalParams.featureCompatibility.acquireFCVSnapshot().getVersion()) {
+        serverGlobalParams.mutableFCV.setVersion(version);
     }
     ~EnsureFCV() {
-        serverGlobalParams.featureCompatibility.setVersion(_origVersion);
+        serverGlobalParams.mutableFCV.setVersion(_origVersion);
     }
 
 private:

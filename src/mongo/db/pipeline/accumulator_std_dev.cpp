@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,27 +27,45 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <cmath>
 
-#include "mongo/db/pipeline/accumulator.h"
+#include <boost/smart_ptr/intrusive_ptr.hpp>
 
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/pipeline/accumulation_statement.h"
-#include "mongo/db/pipeline/document.h"
+#include "mongo/db/pipeline/accumulator.h"
+#include "mongo/db/pipeline/accumulator_helpers.h"
 #include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/expression_context.h"
-#include "mongo/db/pipeline/value.h"
+#include "mongo/db/pipeline/window_function/window_function_expression.h"
+#include "mongo/db/pipeline/window_function/window_function_stddev.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
-using boost::intrusive_ptr;
 
-REGISTER_ACCUMULATOR(stdDevPop, AccumulatorStdDevPop::create);
-REGISTER_ACCUMULATOR(stdDevSamp, AccumulatorStdDevSamp::create);
-REGISTER_EXPRESSION(stdDevPop, ExpressionFromAccumulator<AccumulatorStdDevPop>::parse);
-REGISTER_EXPRESSION(stdDevSamp, ExpressionFromAccumulator<AccumulatorStdDevSamp>::parse);
-
-const char* AccumulatorStdDev::getOpName() const {
-    return (_isSamp ? "$stdDevSamp" : "$stdDevPop");
+template <>
+Value ExpressionFromAccumulator<AccumulatorStdDevPop>::evaluate(const Document& root,
+                                                                Variables* variables) const {
+    return evaluateAccumulator(*this, root, variables);
 }
+
+template <>
+Value ExpressionFromAccumulator<AccumulatorStdDevSamp>::evaluate(const Document& root,
+                                                                 Variables* variables) const {
+    return evaluateAccumulator(*this, root, variables);
+}
+
+REGISTER_ACCUMULATOR(stdDevPop, genericParseSingleExpressionAccumulator<AccumulatorStdDevPop>);
+REGISTER_ACCUMULATOR(stdDevSamp, genericParseSingleExpressionAccumulator<AccumulatorStdDevSamp>);
+REGISTER_STABLE_EXPRESSION(stdDevPop, ExpressionFromAccumulator<AccumulatorStdDevPop>::parse);
+REGISTER_STABLE_EXPRESSION(stdDevSamp, ExpressionFromAccumulator<AccumulatorStdDevSamp>::parse);
+REGISTER_STABLE_REMOVABLE_WINDOW_FUNCTION(stdDevPop, AccumulatorStdDevPop, WindowFunctionStdDevPop);
+REGISTER_STABLE_REMOVABLE_WINDOW_FUNCTION(stdDevSamp,
+                                          AccumulatorStdDevSamp,
+                                          WindowFunctionStdDevSamp);
 
 void AccumulatorStdDev::processInternal(const Value& input, bool merging) {
     if (!merging) {
@@ -59,14 +76,16 @@ void AccumulatorStdDev::processInternal(const Value& input, bool merging) {
         const double val = input.getDouble();
 
         // This is an implementation of the following algorithm:
-        // http://en.wikipedia.org/wiki/Algorithms_for_calculating_variance#Online_algorithm
+        // https://en.wikipedia.org/wiki/Algorithms_for_calculating_variance#Welford's_online_algorithm
         _count += 1;
         const double delta = val - _mean;
-        _mean += delta / _count;
-        _m2 += delta * (val - _mean);
+        if (delta != 0.0) {
+            _mean += delta / _count;
+            _m2 += delta * (val - _mean);
+        }
     } else {
         // This is what getValue(true) produced below.
-        verify(input.getType() == Object);
+        assertMergingInputType(input, Object);
         const double m2 = input["m2"].getDouble();
         const double mean = input["mean"].getDouble();
         const long long count = input["count"].getLong();
@@ -79,8 +98,13 @@ void AccumulatorStdDev::processInternal(const Value& input, bool merging) {
         const double delta = mean - _mean;
         const long long newCount = count + _count;
 
-        _mean = ((_count * _mean) + (count * mean)) / newCount;
-        _m2 += m2 + (delta * delta * (double(_count) * count / newCount));
+        if (delta != 0.0) {
+            // Avoid potential numerical stability issues.
+            _mean = ((_count * _mean) + (count * mean)) / newCount;
+            _m2 += delta * delta * (double(_count) * count / newCount);
+        }
+        _m2 += m2;
+
         _count = newCount;
     }
 }
@@ -97,21 +121,10 @@ Value AccumulatorStdDev::getValue(bool toBeMerged) {
     }
 }
 
-intrusive_ptr<Accumulator> AccumulatorStdDevSamp::create(
-    const boost::intrusive_ptr<ExpressionContext>& expCtx) {
-    return new AccumulatorStdDevSamp(expCtx);
-}
-
-intrusive_ptr<Accumulator> AccumulatorStdDevPop::create(
-    const boost::intrusive_ptr<ExpressionContext>& expCtx) {
-    return new AccumulatorStdDevPop(expCtx);
-}
-
-AccumulatorStdDev::AccumulatorStdDev(const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                                     bool isSamp)
-    : Accumulator(expCtx), _isSamp(isSamp), _count(0), _mean(0), _m2(0) {
-    // This is a fixed size Accumulator so we never need to update this
-    _memUsageBytes = sizeof(*this);
+AccumulatorStdDev::AccumulatorStdDev(ExpressionContext* const expCtx, bool isSamp)
+    : AccumulatorState(expCtx), _isSamp(isSamp), _count(0), _mean(0), _m2(0) {
+    // This is a fixed size AccumulatorState so we never need to update this
+    _memUsageTracker.set(sizeof(*this));
 }
 
 void AccumulatorStdDev::reset() {
@@ -119,4 +132,4 @@ void AccumulatorStdDev::reset() {
     _mean = 0;
     _m2 = 0;
 }
-}
+}  // namespace mongo

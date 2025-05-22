@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,34 +27,63 @@
  *    it in the license file.
  */
 
-#include "mongo/db/storage/write_unit_of_work.h"
+
+#include <ostream>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+
+#include "mongo/db/op_observer/op_observer.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/storage/recovery_unit.h"
+#include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/db/transaction_resources.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 
-WriteUnitOfWork::WriteUnitOfWork(OperationContext* opCtx)
-    : _opCtx(opCtx), _toplevel(opCtx->_ruState == RecoveryUnitState::kNotInUnitOfWork) {
-    uassert(ErrorCodes::IllegalOperation,
-            "Cannot execute a write operation in read-only mode",
-            !storageGlobalParams.readOnly);
-    _opCtx->lockState()->beginWriteUnitOfWork();
+WriteUnitOfWork::WriteUnitOfWork(OperationContext* opCtx, OplogEntryGroupType groupOplogEntries)
+    : _opCtx(opCtx),
+      _toplevel(opCtx->_ruState == RecoveryUnitState::kNotInUnitOfWork),
+      _groupOplogEntries(groupOplogEntries) {  // Grouping oplog entries doesn't support WUOW
+                                               // nesting (e.g. multi-doc transactions).
+    invariant(_toplevel || !_isGroupingOplogEntries());
+
+    if (_isGroupingOplogEntries()) {
+        const auto opObserver = _opCtx->getServiceContext()->getOpObserver();
+        invariant(opObserver);
+        opObserver->onBatchedWriteStart(_opCtx);
+    }
+
+    shard_role_details::getLocker(_opCtx)->beginWriteUnitOfWork();
     if (_toplevel) {
-        _opCtx->recoveryUnit()->beginUnitOfWork(_opCtx);
+        shard_role_details::getRecoveryUnit(_opCtx)->beginUnitOfWork(_opCtx->readOnly());
         _opCtx->_ruState = RecoveryUnitState::kActiveUnitOfWork;
     }
+
+    // Make sure we don't silently proceed after a previous WriteUnitOfWork under the same parent
+    // WriteUnitOfWork fails.
+    invariant(_opCtx->_ruState != RecoveryUnitState::kFailedUnitOfWork);
 }
 
 WriteUnitOfWork::~WriteUnitOfWork() {
-    dassert(!storageGlobalParams.readOnly);
     if (!_released && !_committed) {
         invariant(_opCtx->_ruState != RecoveryUnitState::kNotInUnitOfWork);
         if (_toplevel) {
-            _opCtx->recoveryUnit()->abortUnitOfWork();
+            // Abort unit of work and execute rollback handlers
+            shard_role_details::getRecoveryUnit(_opCtx)->abortUnitOfWork();
             _opCtx->_ruState = RecoveryUnitState::kNotInUnitOfWork;
         } else {
             _opCtx->_ruState = RecoveryUnitState::kFailedUnitOfWork;
         }
-        _opCtx->lockState()->endWriteUnitOfWork();
+        shard_role_details::getLocker(_opCtx)->endWriteUnitOfWork();
+    }
+
+    if (_isGroupingOplogEntries()) {
+        const auto opObserver = _opCtx->getServiceContext()->getOpObserver();
+        invariant(opObserver);
+        opObserver->onBatchedWriteAbort(_opCtx);
     }
 }
 
@@ -86,7 +114,7 @@ void WriteUnitOfWork::prepare() {
     invariant(_toplevel);
     invariant(_opCtx->_ruState == RecoveryUnitState::kActiveUnitOfWork);
 
-    _opCtx->recoveryUnit()->prepareUnitOfWork();
+    shard_role_details::getRecoveryUnit(_opCtx)->prepareUnitOfWork();
     _prepared = true;
 }
 
@@ -94,11 +122,17 @@ void WriteUnitOfWork::commit() {
     invariant(!_committed);
     invariant(!_released);
     invariant(_opCtx->_ruState == RecoveryUnitState::kActiveUnitOfWork);
+
+    if (_isGroupingOplogEntries()) {
+        const auto opObserver = _opCtx->getServiceContext()->getOpObserver();
+        invariant(opObserver);
+        opObserver->onBatchedWriteCommit(_opCtx, _groupOplogEntries);
+    }
     if (_toplevel) {
-        _opCtx->recoveryUnit()->commitUnitOfWork();
+        shard_role_details::getRecoveryUnit(_opCtx)->commitUnitOfWork();
         _opCtx->_ruState = RecoveryUnitState::kNotInUnitOfWork;
     }
-    _opCtx->lockState()->endWriteUnitOfWork();
+    shard_role_details::getLocker(_opCtx)->endWriteUnitOfWork();
     _committed = true;
 }
 

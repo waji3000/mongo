@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -32,38 +31,61 @@
  * This file tests db/exec/fetch.cpp.  Fetch goes to disk so we cannot test outside of a dbtest.
  */
 
-#include "mongo/platform/basic.h"
+#include <cstddef>
+#include <memory>
+#include <set>
+#include <string>
+#include <utility>
+#include <vector>
 
-#include "mongo/client/dbclient_cursor.h"
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/client.h"
+#include "mongo/db/concurrency/d_concurrency.h"
+#include "mongo/db/concurrency/lock_manager_defs.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
+#include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/exec/fetch.h"
 #include "mongo/db/exec/plan_stage.h"
 #include "mongo/db/exec/queued_data_stage.h"
-#include "mongo/db/json.h"
+#include "mongo/db/exec/working_set.h"
+#include "mongo/db/matcher/expression.h"
 #include "mongo/db/matcher/expression_parser.h"
-#include "mongo/dbtests/dbtests.h"
-#include "mongo/stdx/memory.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/record_id.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/storage/record_store.h"
+#include "mongo/db/storage/snapshot.h"
+#include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/dbtests/dbtests.h"  // IWYU pragma: keep
+#include "mongo/unittest/unittest.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/intrusive_counter.h"
 
+namespace mongo {
 namespace QueryStageFetch {
-
-using std::set;
-using std::shared_ptr;
-using std::unique_ptr;
-using stdx::make_unique;
 
 class QueryStageFetchBase {
 public:
     QueryStageFetchBase() : _client(&_opCtx) {}
 
     virtual ~QueryStageFetchBase() {
-        _client.dropCollection(ns());
+        _client.dropCollection(nss());
     }
 
-    void getRecordIds(set<RecordId>* out, Collection* coll) {
+    void getRecordIds(std::set<RecordId>* out, const CollectionPtr& coll) {
         auto cursor = coll->getCursor(&_opCtx);
         while (auto record = cursor->next()) {
             out->insert(record->id);
@@ -71,21 +93,27 @@ public:
     }
 
     void insert(const BSONObj& obj) {
-        _client.insert(ns(), obj);
+        _client.insert(nss(), obj);
     }
 
     void remove(const BSONObj& obj) {
-        _client.remove(ns(), obj);
+        _client.remove(nss(), obj);
     }
 
     static const char* ns() {
         return "unittests.QueryStageFetch";
+    }
+    static NamespaceString nss() {
+        return NamespaceString::createNamespaceString_forTest(ns());
     }
 
 protected:
     const ServiceContext::UniqueOperationContext _opCtxPtr = cc().makeOperationContext();
     OperationContext& _opCtx = *_opCtxPtr;
     DBDirectClient _client;
+
+    boost::intrusive_ptr<ExpressionContext> _expCtx =
+        ExpressionContextBuilder{}.opCtx(&_opCtx).ns(nss()).build();
 };
 
 
@@ -97,10 +125,14 @@ public:
     void run() {
         dbtests::WriteContextForTests ctx(&_opCtx, ns());
         Database* db = ctx.db();
-        Collection* coll = db->getCollection(&_opCtx, ns());
+        // TODO(SERVER-103409): Investigate usage validity of CollectionPtr::CollectionPtr_UNSAFE
+        CollectionPtr coll = CollectionPtr::CollectionPtr_UNSAFE(
+            CollectionCatalog::get(&_opCtx)->lookupCollectionByNamespace(&_opCtx, nss()));
         if (!coll) {
             WriteUnitOfWork wuow(&_opCtx);
-            coll = db->createCollection(&_opCtx, ns());
+            // TODO(SERVER-103409): Investigate usage validity of
+            // CollectionPtr::CollectionPtr_UNSAFE
+            coll = CollectionPtr::CollectionPtr_UNSAFE(db->createCollection(&_opCtx, nss()));
             wuow.commit();
         }
 
@@ -108,19 +140,20 @@ public:
 
         // Add an object to the DB.
         insert(BSON("foo" << 5));
-        set<RecordId> recordIds;
+        std::set<RecordId> recordIds;
         getRecordIds(&recordIds, coll);
         ASSERT_EQUALS(size_t(1), recordIds.size());
 
         // Create a mock stage that returns the WSM.
-        auto mockStage = make_unique<QueuedDataStage>(&_opCtx, &ws);
+        auto mockStage = std::make_unique<QueuedDataStage>(_expCtx.get(), &ws);
 
         // Mock data.
         {
             WorkingSetID id = ws.allocate();
             WorkingSetMember* mockMember = ws.get(id);
             mockMember->recordId = *recordIds.begin();
-            mockMember->obj = coll->docFor(&_opCtx, mockMember->recordId);
+            auto snapshotBson = coll->docFor(&_opCtx, mockMember->recordId);
+            mockMember->doc = {snapshotBson.snapshotId(), Document{snapshotBson.value()}};
             ws.transitionToRecordIdAndObj(id);
             // Points into our DB.
             mockStage->pushBack(id);
@@ -129,14 +162,14 @@ public:
             WorkingSetID id = ws.allocate();
             WorkingSetMember* mockMember = ws.get(id);
             mockMember->recordId = RecordId();
-            mockMember->obj = Snapshotted<BSONObj>(SnapshotId(), BSON("foo" << 6));
+            mockMember->doc = {SnapshotId(), Document{BSON("foo" << 6)}};
             mockMember->transitionToOwnedObj();
-            ASSERT_TRUE(mockMember->obj.value().isOwned());
+            ASSERT_TRUE(mockMember->doc.value().isOwned());
             mockStage->pushBack(id);
         }
 
-        unique_ptr<FetchStage> fetchStage(
-            new FetchStage(&_opCtx, &ws, mockStage.release(), NULL, coll));
+        auto fetchStage =
+            std::make_unique<FetchStage>(_expCtx.get(), &ws, std::move(mockStage), nullptr, &coll);
 
         WorkingSetID id = WorkingSet::INVALID_ID;
         PlanStage::StageState state;
@@ -159,13 +192,17 @@ public:
 class FetchStageFilter : public QueryStageFetchBase {
 public:
     void run() {
-        Lock::DBLock lk(&_opCtx, nsToDatabaseSubstring(ns()), MODE_X);
-        OldClientContext ctx(&_opCtx, ns());
+        Lock::DBLock lk(&_opCtx, nss().dbName(), MODE_X);
+        OldClientContext ctx(&_opCtx, nss());
         Database* db = ctx.db();
-        Collection* coll = db->getCollection(&_opCtx, ns());
+        // TODO(SERVER-103409): Investigate usage validity of CollectionPtr::CollectionPtr_UNSAFE
+        CollectionPtr coll = CollectionPtr::CollectionPtr_UNSAFE(
+            CollectionCatalog::get(&_opCtx)->lookupCollectionByNamespace(&_opCtx, nss()));
         if (!coll) {
             WriteUnitOfWork wuow(&_opCtx);
-            coll = db->createCollection(&_opCtx, ns());
+            // TODO(SERVER-103409): Investigate usage validity of
+            // CollectionPtr::CollectionPtr_UNSAFE
+            coll = CollectionPtr::CollectionPtr_UNSAFE(db->createCollection(&_opCtx, nss()));
             wuow.commit();
         }
 
@@ -173,12 +210,12 @@ public:
 
         // Add an object to the DB.
         insert(BSON("foo" << 5));
-        set<RecordId> recordIds;
+        std::set<RecordId> recordIds;
         getRecordIds(&recordIds, coll);
         ASSERT_EQUALS(size_t(1), recordIds.size());
 
         // Create a mock stage that returns the WSM.
-        auto mockStage = make_unique<QueuedDataStage>(&_opCtx, &ws);
+        auto mockStage = std::make_unique<QueuedDataStage>(_expCtx.get(), &ws);
 
         // Mock data.
         {
@@ -195,17 +232,14 @@ public:
 
         // Make the filter.
         BSONObj filterObj = BSON("foo" << 6);
-        const CollatorInterface* collator = nullptr;
-        const boost::intrusive_ptr<ExpressionContext> expCtx(
-            new ExpressionContext(&_opCtx, collator));
         StatusWithMatchExpression statusWithMatcher =
-            MatchExpressionParser::parse(filterObj, expCtx);
-        verify(statusWithMatcher.isOK());
-        unique_ptr<MatchExpression> filterExpr = std::move(statusWithMatcher.getValue());
+            MatchExpressionParser::parse(filterObj, _expCtx);
+        MONGO_verify(statusWithMatcher.isOK());
+        std::unique_ptr<MatchExpression> filterExpr = std::move(statusWithMatcher.getValue());
 
         // Matcher requires that foo==6 but we only have data with foo==5.
-        unique_ptr<FetchStage> fetchStage(
-            new FetchStage(&_opCtx, &ws, mockStage.release(), filterExpr.get(), coll));
+        auto fetchStage = std::make_unique<FetchStage>(
+            _expCtx.get(), &ws, std::move(mockStage), filterExpr.get(), &coll);
 
         // First call should return a fetch request as it's not in memory.
         WorkingSetID id = WorkingSet::INVALID_ID;
@@ -221,16 +255,17 @@ public:
     }
 };
 
-class All : public Suite {
+class All : public unittest::OldStyleSuiteSpecification {
 public:
-    All() : Suite("query_stage_fetch") {}
+    All() : OldStyleSuiteSpecification("query_stage_fetch") {}
 
-    void setupTests() {
+    void setupTests() override {
         add<FetchStageAlreadyFetched>();
         add<FetchStageFilter>();
     }
 };
 
-SuiteInstance<All> queryStageFetchAll;
+unittest::OldStyleSuiteInitializer<All> queryStageFetchAll;
 
 }  // namespace QueryStageFetch
+}  // namespace mongo

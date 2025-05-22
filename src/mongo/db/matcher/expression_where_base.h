@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,7 +29,19 @@
 
 #pragma once
 
+#include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+#include <cstddef>
+#include <memory>
+#include <string>
+#include <vector>
+
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/util/builder_fwd.h"
 #include "mongo/db/matcher/expression.h"
+#include "mongo/db/query/query_shape/serialization_options.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 
@@ -41,7 +52,6 @@ class WhereMatchExpressionBase : public MatchExpression {
 public:
     struct WhereParams {
         std::string code;
-        BSONObj scope;  // Owned.
     };
 
     explicit WhereMatchExpressionBase(WhereParams params);
@@ -51,20 +61,23 @@ public:
     }
 
     MatchExpression* getChild(size_t i) const final {
-        MONGO_UNREACHABLE;
+        MONGO_UNREACHABLE_TASSERT(6400211);
     }
 
-    std::vector<MatchExpression*>* getChildVector() final {
+    void resetChild(size_t, MatchExpression*) override {
+        MONGO_UNREACHABLE;
+    };
+
+
+    std::vector<std::unique_ptr<MatchExpression>>* getChildVector() final {
         return nullptr;
     }
 
-    bool matchesSingleElement(const BSONElement& e, MatchDetails* details = nullptr) const final {
-        return false;
-    }
+    void debugString(StringBuilder& debug, int indentationLevel = 0) const final;
 
-    void debugString(StringBuilder& debug, int level = 0) const final;
-
-    void serialize(BSONObjBuilder* out) const final;
+    void serialize(BSONObjBuilder* out,
+                   const SerializationOptions& opts = {},
+                   bool includePath = true) const final;
 
     bool equivalent(const MatchExpression* other) const final;
 
@@ -72,22 +85,28 @@ public:
         return MatchCategory::kOther;
     }
 
-protected:
+    void setInputParamId(boost::optional<InputParamId> paramId) {
+        _inputParamId = paramId;
+    }
+
+    boost::optional<InputParamId> getInputParamId() const {
+        return _inputParamId;
+    }
+
     const std::string& getCode() const {
         return _code;
     }
 
-    const BSONObj& getScope() const {
-        return _scope;
-    }
-
 private:
     ExpressionOptimizerFunc getOptimizer() const final {
-        return [](std::unique_ptr<MatchExpression> expression) { return expression; };
+        return [](std::unique_ptr<MatchExpression> expression) {
+            return expression;
+        };
     }
 
     const std::string _code;
-    const BSONObj _scope;  // Owned.
+
+    boost::optional<InputParamId> _inputParamId;
 };
 
 }  // namespace mongo

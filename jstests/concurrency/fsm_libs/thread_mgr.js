@@ -1,15 +1,13 @@
-'use strict';
-
-load('jstests/libs/parallelTester.js');                 // for ScopedThread and CountDownLatch
-load('jstests/concurrency/fsm_libs/worker_thread.js');  // for workerThread
+import {workerThread} from "jstests/concurrency/fsm_libs/worker_thread.js";
+import {Thread} from "jstests/libs/parallelTester.js";
 
 /**
  * Helper for spawning and joining worker threads.
  */
 
-var ThreadManager = function(clusterOptions, executionMode = {composed: false}) {
+export const ThreadManager = function(clusterOptions) {
     if (!(this instanceof ThreadManager)) {
-        return new ThreadManager(clusterOptions, executionMode);
+        return new ThreadManager(clusterOptions);
     }
 
     function makeThread(workloads, args, options) {
@@ -21,18 +19,13 @@ var ThreadManager = function(clusterOptions, executionMode = {composed: false}) 
                 return threadFn(workloads, args, options);
             } finally {
                 if (typeof db !== 'undefined') {
-                    db = null;
+                    globalThis.db = undefined;
                     gc();
                 }
             }
         };
 
-        if (executionMode.composed) {
-            return new ScopedThread(
-                guardedThreadFn, workerThread.composed, workloads, args, options);
-        }
-
-        return new ScopedThread(guardedThreadFn, workerThread.fsm, workloads, args, options);
+        return new Thread(guardedThreadFn, workerThread.fsm, workloads, args, options);
     }
 
     var latch;
@@ -63,21 +56,29 @@ var ThreadManager = function(clusterOptions, executionMode = {composed: false}) 
         }
 
         var requestedNumThreads = computeNumThreads();
+        var perLoadThreads = {};
+        var factor = 1;
         if (requestedNumThreads > maxAllowedThreads) {
             // Scale down the requested '$config.threadCount' values to make
             // them sum to less than 'maxAllowedThreads'
-            var factor = maxAllowedThreads / requestedNumThreads;
+            factor = maxAllowedThreads / requestedNumThreads;
             workloads.forEach(function(workload) {
                 var config = context[workload].config;
                 var threadCount = config.threadCount;
                 threadCount = Math.floor(factor * threadCount);
                 threadCount = Math.max(1, threadCount);  // ensure workload is executed
                 config.threadCount = threadCount;
+                perLoadThreads[workload] = threadCount;
             });
         }
 
         numThreads = computeNumThreads();
-        assert.lte(numThreads, maxAllowedThreads);
+        assert.lte(numThreads, maxAllowedThreads, tojson({
+                       'requestedNumThreads': requestedNumThreads,
+                       'maxAllowedThreads': maxAllowedThreads,
+                       'factor': factor,
+                       'perLoadThreads': perLoadThreads
+                   }));
         latch = new CountDownLatch(numThreads);
         errorLatch = new CountDownLatch(numThreads);
 
@@ -102,13 +103,11 @@ var ThreadManager = function(clusterOptions, executionMode = {composed: false}) 
             var config = _context[workload].config;
             workloadData[workload] = config.data;
             var workloads = [workload];  // worker thread only needs to load 'workload'
-            if (executionMode.composed) {
-                workloads = _workloads;  // worker thread needs to load all workloads
-            }
 
             for (var i = 0; i < config.threadCount; ++i) {
                 var args = {
                     tid: tid++,
+                    tenantId: options.tenantId,
                     data: workloadData,
                     host: cluster.getHost(),
                     secondaryHost: cluster.getSecondaryHost(),
@@ -119,9 +118,9 @@ var ThreadManager = function(clusterOptions, executionMode = {composed: false}) 
                     cluster: cluster.getSerializedCluster(),
                     clusterOptions: clusterOptions,
                     seed: Random.randInt(1e13),  // contains range of Date.getTime()
-                    globalAssertLevel: globalAssertLevel,
                     errorLatch: errorLatch,
-                    sessionOptions: options.sessionOptions
+                    sessionOptions: options.sessionOptions,
+                    numThreads: numThreads,
                 };
 
                 var t = makeThread(workloads, args, options);
@@ -197,22 +196,13 @@ var ThreadManager = function(clusterOptions, executionMode = {composed: false}) 
  * workload and a composition of them, respectively.
  */
 
-workerThread.fsm = function(workloads, args, options) {
-    load('jstests/concurrency/fsm_libs/worker_thread.js');  // for workerThread.main
-    load('jstests/concurrency/fsm_libs/fsm.js');            // for fsm.run
+workerThread.fsm = async function(workloads, args, options) {
+    const {workerThread} = await import("jstests/concurrency/fsm_libs/worker_thread.js");
+    const {fsm} = await import("jstests/concurrency/fsm_libs/fsm.js");
 
-    return workerThread.main(workloads, args, function(configs) {
+    return workerThread.main(workloads, args, async function(configs) {
         var workloads = Object.keys(configs);
         assert.eq(1, workloads.length);
-        fsm.run(configs[workloads[0]]);
-    });
-};
-
-workerThread.composed = function(workloads, args, options) {
-    load('jstests/concurrency/fsm_libs/worker_thread.js');  // for workerThread.main
-    load('jstests/concurrency/fsm_libs/composer.js');       // for composer.run
-
-    return workerThread.main(workloads, args, function(configs) {
-        composer.run(workloads, configs, options);
+        await fsm.run(configs[workloads[0]]);
     });
 };

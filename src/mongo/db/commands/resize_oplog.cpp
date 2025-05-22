@@ -27,22 +27,39 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
-
-#include "mongo/platform/basic.h"
-
 #include <string>
 
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/auth/resource_pattern.h"
 #include "mongo/db/catalog/collection.h"
-#include "mongo/db/catalog/collection_catalog_entry.h"
-#include "mongo/db/catalog/database_holder.h"
+#include "mongo/db/catalog/collection_options.h"
+#include "mongo/db/catalog_raii.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/db_raii.h"
-#include "mongo/db/jsobj.h"
+#include "mongo/db/commands/resize_oplog_gen.h"
+#include "mongo/db/concurrency/exception_util.h"
+#include "mongo/db/concurrency/lock_manager_defs.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/util/log.h"
-#include "mongo/util/scopeguard.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/storage/storage_options.h"
+#include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/idl/idl_parser.h"
+#include "mongo/logv2/log.h"
+#include "mongo/platform/atomic_word.h"
+#include "mongo/util/assert_util.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
+
 
 namespace mongo {
 namespace {
@@ -59,69 +76,62 @@ public:
         return true;
     }
 
-    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+    bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
 
     std::string help() const override {
-        return "resize oplog size in MB";
+        return "Resize oplog using size (in MBs) and optionally, retention (in terms of hours)";
     }
 
-    Status checkAuthForCommand(Client* client,
-                               const std::string& dbname,
-                               const BSONObj& cmdObj) const final {
-        AuthorizationSession* authzSession = AuthorizationSession::get(client);
-        if (authzSession->isAuthorizedForActionsOnResource(ResourcePattern::forClusterResource(),
-                                                           ActionType::replSetResizeOplog)) {
+    Status checkAuthForOperation(OperationContext* opCtx,
+                                 const DatabaseName& dbName,
+                                 const BSONObj&) const final {
+        AuthorizationSession* authzSession = AuthorizationSession::get(opCtx->getClient());
+        if (authzSession->isAuthorizedForActionsOnResource(
+                ResourcePattern::forClusterResource(dbName.tenantId()),
+                ActionType::replSetResizeOplog)) {
             return Status::OK();
         }
         return Status(ErrorCodes::Unauthorized, "Unauthorized");
     }
 
     bool run(OperationContext* opCtx,
-             const std::string& dbname,
+             const DatabaseName&,
              const BSONObj& jsobj,
-             BSONObjBuilder& result) {
-        const NamespaceString nss("local", "oplog.rs");
-        Lock::GlobalWrite global(opCtx);
-        Database* database = DatabaseHolder::getDatabaseHolder().get(opCtx, nss.db());
-        if (!database) {
-            uasserted(ErrorCodes::NamespaceNotFound, "database local does not exist");
-        }
-        Collection* coll = database->getCollection(opCtx, nss);
-        if (!coll) {
-            uasserted(ErrorCodes::NamespaceNotFound, "oplog does not exist");
-        }
-        if (!coll->isCapped()) {
-            uasserted(ErrorCodes::IllegalOperation, "oplog isn't capped");
-        }
-        if (!jsobj["size"].isNumber()) {
-            uasserted(ErrorCodes::InvalidOptions, "invalid size field, size should be a number");
-        }
+             BSONObjBuilder& result) override {
+        AutoGetCollection coll(opCtx, NamespaceString::kRsOplogNamespace, MODE_X);
+        uassert(ErrorCodes::NamespaceNotFound, "oplog does not exist", coll);
+        uassert(ErrorCodes::IllegalOperation, "oplog isn't capped", coll->isCapped());
 
-        long long sizeMb = jsobj["size"].numberLong();
-        if (sizeMb < 990L) {
-            uasserted(ErrorCodes::InvalidOptions, "oplog size should be 990MB at least");
-        }
+        auto params =
+            ReplSetResizeOplogRequest::parse(IDLParserContext("replSetResizeOplog"), jsobj);
 
-        const long long kMB = 1024 * 1024;
-        const long long kPB = kMB * 1024 * 1024 * 1024;
-        if (sizeMb > kPB / kMB) {
-            uasserted(ErrorCodes::InvalidOptions, "oplog size in MB cannot exceed maximum of 1PB");
-        }
-        long long size = sizeMb * kMB;
+        return writeConflictRetry(opCtx, "replSetResizeOplog", coll->ns(), [&] {
+            WriteUnitOfWork wunit(opCtx);
 
-        WriteUnitOfWork wunit(opCtx);
-        Status status = coll->getRecordStore()->updateCappedSize(opCtx, size);
-        uassertStatusOK(status);
-        CollectionCatalogEntry* entry = coll->getCatalogEntry();
-        entry->updateCappedSize(opCtx, size);
-        wunit.commit();
-        LOG(0) << "replSetResizeOplog success, currentSize:" << size;
-        return true;
+            CollectionWriter writer{opCtx, coll};
+
+            if (auto sizeMB = params.getSize()) {
+                const long long sizeBytes = *sizeMB * 1024 * 1024;
+                uassertStatusOK(writer.getWritableCollection(opCtx)->updateCappedSize(
+                    opCtx, sizeBytes, /*newCappedMax=*/boost::none));
+            }
+
+            if (auto minRetentionHoursOpt = params.getMinRetentionHours()) {
+                storageGlobalParams.oplogMinRetentionHours.store(*minRetentionHoursOpt);
+            }
+            wunit.commit();
+
+            LOGV2(20497,
+                  "replSetResizeOplog success",
+                  "size"_attr = coll->getCollectionOptions().cappedSize,
+                  "minRetentionHours"_attr = storageGlobalParams.oplogMinRetentionHours.load());
+            return true;
+        });
     }
-
-} cmdReplSetResizeOplog;
+};
+MONGO_REGISTER_COMMAND(CmdReplSetResizeOplog).forShard();
 
 }  // namespace
 }  // namespace mongo

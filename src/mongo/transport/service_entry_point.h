@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,63 +29,33 @@
 
 #pragma once
 
-#include "mongo/base/disallow_copying.h"
-#include "mongo/bson/bsonobjbuilder.h"
-#include "mongo/db/dbmessage.h"
-#include "mongo/transport/session.h"
+#include "mongo/logv2/log_severity.h"
+#include "mongo/logv2/log_severity_suppressor.h"
+#include "mongo/rpc/message.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/future.h"
 
 namespace mongo {
+class OperationContext;
+struct DbResponse;
 
 /**
  * This is the entrypoint from the transport layer into mongod or mongos.
- *
- * The ServiceEntryPoint accepts new Sessions from the TransportLayer, and is
- * responsible for running these Sessions in a get-Message, run-Message,
- * reply-with-Message loop.  It may not do this on the TransportLayer’s thread.
  */
 class ServiceEntryPoint {
-    MONGO_DISALLOW_COPYING(ServiceEntryPoint);
+private:
+    ServiceEntryPoint(const ServiceEntryPoint&) = delete;
+    ServiceEntryPoint& operator=(const ServiceEntryPoint&) = delete;
+
+protected:
+    ServiceEntryPoint() = default;
 
 public:
     virtual ~ServiceEntryPoint() = default;
 
     /**
-     * Begin running a new Session. This method returns immediately.
-     */
-    virtual void startSession(transport::SessionHandle session) = 0;
-
-    /**
-     * End all sessions that do not match the mask in tags.
-     */
-    virtual void endAllSessions(transport::Session::TagMask tags) = 0;
-
-    /**
-     * Starts the service entry point
-     */
-    virtual Status start() = 0;
-
-    /**
-    * Shuts down the service entry point.
-    */
-    virtual bool shutdown(Milliseconds timeout) = 0;
-
-    /**
-     * Append high-level stats to a BSONObjBuilder for serverStatus
-     */
-    virtual void appendStats(BSONObjBuilder* bob) const = 0;
-
-    /**
-    * Returns the number of sessions currently open.
-    */
-    virtual size_t numOpenSessions() const = 0;
-
-    /**
      * Processes a request and fills out a DbResponse.
      */
-    virtual DbResponse handleRequest(OperationContext* opCtx, const Message& request) = 0;
-
-protected:
-    ServiceEntryPoint() = default;
+    virtual Future<DbResponse> handleRequest(OperationContext* opCtx, const Message& request) = 0;
 };
-
 }  // namespace mongo

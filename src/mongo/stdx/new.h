@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,18 +29,23 @@
 
 #pragma once
 
-#include "mongo/config.h"
-
 #include <cstddef>
+#include <cstdint>
 #include <new>
+
+#include "mongo/config.h"
+#include "mongo/platform/compiler.h"
 
 namespace mongo {
 namespace stdx {
 
-#if __cplusplus < 201703L || !defined(__cpp_lib_hardware_interference_size)
+// libc++ 8.0 and later define __cpp_lib_hardware_interference_size but don't actually implement it
+#if __cplusplus < 201703L || \
+    !(defined(__cpp_lib_hardware_interference_size) && !defined(_LIBCPP_VERSION))
 
 #if defined(MONGO_CONFIG_MAX_EXTENDED_ALIGNMENT)
-static_assert(MONGO_CONFIG_MAX_EXTENDED_ALIGNMENT >= sizeof(uint64_t), "Bad extended alignment");
+static_assert(MONGO_CONFIG_MAX_EXTENDED_ALIGNMENT >= sizeof(std::uint64_t),
+              "Bad extended alignment");
 constexpr std::size_t hardware_destructive_interference_size = MONGO_CONFIG_MAX_EXTENDED_ALIGNMENT;
 #else
 constexpr std::size_t hardware_destructive_interference_size = alignof(std::max_align_t);
@@ -54,7 +58,16 @@ constexpr auto hardware_constructive_interference_size = hardware_destructive_in
 using std::hardware_constructive_interference_size;
 using std::hardware_destructive_interference_size;
 
-#endif
+#endif  // hardware_interference_size
+
+#if __cpp_lib_launder >= 201606
+using std::launder;
+#else
+template <typename T>
+[[nodiscard]] constexpr T* launder(T* p) noexcept {
+    return p;
+}
+#endif  // launder
 
 }  // namespace stdx
 }  // namespace mongo

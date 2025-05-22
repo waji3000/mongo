@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,51 +27,75 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include <benchmark/benchmark.h>
+#include <cstdint>
+#include <limits>
+#include <string>
 
+#include "mongo/base/string_data.h"
 #include "mongo/util/decimal_counter.h"
 #include "mongo/util/itoa.h"
 
 namespace mongo {
+namespace {
+auto nonzeroStart = std::numeric_limits<uint32_t>::max() / 2;
+}  // namespace
 
 void BM_decimalCounterPreInc(benchmark::State& state) {
-    DecimalCounter<uint32_t> count;
+    uint64_t items = 0;
     for (auto _ : state) {
-        benchmark::ClobberMemory();
-        benchmark::DoNotOptimize(StringData(++count));
+        DecimalCounter<uint32_t> count(state.range(1));
+        for (int i = state.range(0); i--;) {
+            benchmark::ClobberMemory();
+            benchmark::DoNotOptimize(StringData(++count));
+        }
+        items += state.range(0);
     }
+    state.SetItemsProcessed(items);
 }
 
 void BM_decimalCounterPostInc(benchmark::State& state) {
-    DecimalCounter<uint32_t> count;
+    uint64_t items = 0;
     for (auto _ : state) {
-        benchmark::ClobberMemory();
-        benchmark::DoNotOptimize(StringData(count++));
+        DecimalCounter<uint32_t> count(state.range(1));
+        for (int i = state.range(0); i--;) {
+            benchmark::ClobberMemory();
+            benchmark::DoNotOptimize(StringData(count++));
+        }
+        items += state.range(0);
     }
+    state.SetItemsProcessed(items);
 }
 
 void BM_ItoACounter(benchmark::State& state) {
-    uint32_t count = 0;
+    uint64_t items = 0;
     for (auto _ : state) {
-        benchmark::ClobberMemory();
-        benchmark::DoNotOptimize(StringData(ItoA(++count)));
+        uint32_t count = state.range(1);
+        for (int i = state.range(0); i--;) {
+            benchmark::ClobberMemory();
+            benchmark::DoNotOptimize(StringData(ItoA(++count)));
+        }
+        items += state.range(0);
     }
+    state.SetItemsProcessed(items);
 }
 
-void BM_to_stringCounter(benchmark::State& state) {
-    uint32_t count = 0;
-    std::string str;
+void BM_ToStringCounter(benchmark::State& state) {
+    uint64_t items = 0;
     for (auto _ : state) {
-        benchmark::ClobberMemory();
-        benchmark::DoNotOptimize(std::to_string(++count));
+        uint32_t count = state.range(1);
+        for (int i = state.range(0); i--;) {
+            benchmark::ClobberMemory();
+            benchmark::DoNotOptimize(std::to_string(++count));
+        }
+        items += state.range(0);
     }
+    state.SetItemsProcessed(items);
 }
 
-BENCHMARK(BM_decimalCounterPreInc);
-BENCHMARK(BM_decimalCounterPostInc);
-BENCHMARK(BM_ItoACounter);
-BENCHMARK(BM_to_stringCounter);
+BENCHMARK(BM_decimalCounterPreInc)->Args({10000, 0})->Args({{10, nonzeroStart}});
+BENCHMARK(BM_decimalCounterPostInc)->Args({10000, 0})->Args({{10, nonzeroStart}});
+BENCHMARK(BM_ItoACounter)->Args({10000, 0})->Args({{10, nonzeroStart}});
+BENCHMARK(BM_ToStringCounter)->Args({10000, 0})->Args({{10, nonzeroStart}});
 
 }  // namespace mongo

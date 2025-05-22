@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Public Domain 2014-2018 MongoDB, Inc.
+# Public Domain 2014-present MongoDB, Inc.
 # Public Domain 2008-2014 WiredTiger, Inc.
 #
 # This is free and unencumbered software released into the public domain.
@@ -32,7 +32,7 @@ from wiredtiger import *
 from workgen import *
 
 context = Context()
-conn = wiredtiger_open("WT_TEST", "create,cache_size=500MB")
+conn = context.wiredtiger_open("create,cache_size=500MB")
 s = conn.open_session()
 tname = "file:test.wt"
 s.create(tname, 'key_format=S,value_format=S')
@@ -44,7 +44,8 @@ op = Operation(Operation.OP_INSERT, table)
 thread = Thread(op * 500000)
 pop_workload = Workload(context, thread)
 print('populate:')
-pop_workload.run(conn)
+ret = pop_workload.run(conn)
+assert ret == 0, ret
 
 op = Operation(Operation.OP_SEARCH, table)
 op._config = 'reopen'
@@ -53,4 +54,5 @@ workload = Workload(context, t * 8)
 workload.options.run_time = 120
 workload.options.report_interval = 5
 print('read workload:')
-workload.run(conn)
+ret = workload.run(conn)
+assert ret == 0, ret

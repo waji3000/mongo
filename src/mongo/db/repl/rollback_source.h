@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,9 +29,8 @@
 
 #pragma once
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/status_with.h"
-#include "mongo/db/jsobj.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/util/net/hostandport.h"
 #include "mongo/util/uuid.h"
 
@@ -49,7 +47,8 @@ class OplogInterface;
  * Interface for rollback-related operations on the sync source.
  */
 class RollbackSource {
-    MONGO_DISALLOW_COPYING(RollbackSource);
+    RollbackSource(const RollbackSource&) = delete;
+    RollbackSource& operator=(const RollbackSource&) = delete;
 
 public:
     RollbackSource() = default;
@@ -86,20 +85,14 @@ public:
      * Fetch a single document from the sync source using the UUID. Returns the namespace matching
      * the UUID on the sync source as well.
      */
-    virtual std::pair<BSONObj, NamespaceString> findOneByUUID(const std::string& db,
+    virtual std::pair<BSONObj, NamespaceString> findOneByUUID(const DatabaseName& db,
                                                               UUID uuid,
                                                               const BSONObj& filter) const = 0;
 
     /**
-     * Clones a single collection from the sync source.
-     */
-    virtual void copyCollectionFromRemote(OperationContext* opCtx,
-                                          const NamespaceString& nss) const = 0;
-
-    /**
      * Finds and returns collection info using the UUID.
      */
-    virtual StatusWith<BSONObj> getCollectionInfoByUUID(const std::string& db,
+    virtual StatusWith<BSONObj> getCollectionInfoByUUID(const DatabaseName& dbName,
                                                         const UUID& uuid) const = 0;
 
     /**

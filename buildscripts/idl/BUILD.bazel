@@ -1,0 +1,20 @@
+filegroup(
+    name = "idlc",
+    srcs = [
+        "__init__.py",
+        "idlc.py",
+    ] + glob(["**/idl/*.py"]),
+    visibility = ["//visibility:public"],
+)
+
+py_library(
+    name = "idl",
+    srcs = [
+        "gen_all_feature_flag_list.py",
+        "idlc.py",
+        "lib.py",
+    ] + glob(["idl/**/*.py"]),
+    visibility = ["//visibility:public"],
+    deps = [
+    ],
+)

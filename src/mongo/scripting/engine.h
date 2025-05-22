@@ -1,6 +1,3 @@
-// engine.h
-
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -32,9 +29,28 @@
 
 #pragma once
 
-#include "mongo/db/jsobj.h"
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <cstdint>
+#include <functional>
+#include <map>
+#include <memory>
+#include <set>
+#include <string>
+#include <utility>
+
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes_util.h"
+#include "mongo/bson/oid.h"
+#include "mongo/bson/timestamp.h"
 #include "mongo/db/service_context.h"
 #include "mongo/platform/atomic_word.h"
+#include "mongo/platform/decimal128.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo {
 typedef unsigned long long ScriptingFunction;
@@ -49,8 +65,18 @@ struct JSFile {
     const StringData source;
 };
 
+struct JSRegEx {
+    std::string pattern;
+    std::string flags;
+
+    JSRegEx() = default;
+    JSRegEx(std::string pattern, std::string flags)
+        : pattern(std::move(pattern)), flags(std::move(flags)) {}
+};
+
 class Scope {
-    MONGO_DISALLOW_COPYING(Scope);
+    Scope(const Scope&) = delete;
+    Scope& operator=(const Scope&) = delete;
 
 public:
     Scope();
@@ -67,7 +93,7 @@ public:
     }
 
     virtual void externalSetup() = 0;
-    virtual void setLocalDB(const std::string& localDBName) {
+    virtual void setLocalDB(const DatabaseName& localDBName) {
         _localDBName = localDBName;
     }
 
@@ -76,10 +102,14 @@ public:
     virtual bool getBoolean(const char* field) = 0;
     virtual double getNumber(const char* field) = 0;
     virtual int getNumberInt(const char* field) = 0;
-
     virtual long long getNumberLongLong(const char* field) = 0;
-
     virtual Decimal128 getNumberDecimal(const char* field) = 0;
+    virtual OID getOID(const char* field) = 0;
+    // Note: The resulting BSONBinData is only valid within the scope of the 'withBinData' callback.
+    virtual void getBinData(const char* field,
+                            std::function<void(const BSONBinData&)> withBinData) = 0;
+    virtual Timestamp getTimestamp(const char* field) = 0;
+    virtual JSRegEx getRegEx(const char* field) = 0;
 
     virtual void setElement(const char* field, const BSONElement& e, const BSONObj& parent) = 0;
     virtual void setNumber(const char* field, double val) = 0;
@@ -95,6 +125,8 @@ public:
     virtual void rename(const char* from, const char* to) = 0;
 
     virtual std::string getError() = 0;
+
+    virtual std::string getBaseURL() const = 0;
 
     virtual bool hasOutOfMemoryException() = 0;
 
@@ -142,7 +174,7 @@ public:
         uasserted(9005, std::string("invoke failed: ") + getError());
     }
 
-    virtual void injectNative(const char* field, NativeFunction func, void* data = 0) = 0;
+    virtual void injectNative(const char* field, NativeFunction func, void* data = nullptr) = 0;
 
     virtual bool exec(StringData code,
                       const std::string& name,
@@ -165,6 +197,7 @@ public:
                           int timeoutMs = 0);
 
     void execCoreFiles();
+    void execPrelude();
 
     virtual void loadStored(OperationContext* opCtx, bool ignoreNotConnected = false);
 
@@ -176,14 +209,9 @@ public:
 
     static void validateObjectIdString(const std::string& str);
 
-    /** increments the number of times a scope was used */
-    void incTimesUsed() {
-        ++_numTimesUsed;
-    }
-
-    /** gets the number of times a scope was used */
-    int getTimesUsed() const {
-        return _numTimesUsed;
+    /** gets the time at which the scope was created */
+    Date_t getCreateTime() const {
+        return _createTime;
     }
 
     /** return true if last invoke() return'd native code */
@@ -191,61 +219,45 @@ public:
         return _lastRetIsNativeCode;
     }
 
-    class NoDBAccess {
-        Scope* _s;
-
-    public:
-        NoDBAccess(Scope* s) : _s(s) {}
-        ~NoDBAccess() {
-            _s->rename("____db____", "db");
-        }
-    };
-    NoDBAccess disableDBAccess(const char* why) {
-        rename("db", "____db____");
-        return NoDBAccess(this);
-    }
-
 protected:
     friend class PooledScope;
 
-    /**
-     * RecoveryUnit::Change subclass used to commit work for
-     * Scope::storedFuncMod logOp listener.
-     */
-    class StoredFuncModLogOpHandler;
-
     virtual ScriptingFunction _createFunction(const char* code) = 0;
 
-    std::string _localDBName;
+    DatabaseName _localDBName;
     int64_t _loadedVersion;
     std::set<std::string> _storedNames;
-    static AtomicInt64 _lastVersion;
+    static AtomicWord<long long> _lastVersion;
     FunctionCacheMap _cachedFunctions;
-    int _numTimesUsed;
+    Date_t _createTime;
     bool _lastRetIsNativeCode;  // v8 only: set to true if eval'd script returns a native func
 };
 
+enum class ExecutionEnvironment { Server, TestRunner };
+
 class ScriptEngine : public KillOpListenerInterface {
-    MONGO_DISALLOW_COPYING(ScriptEngine);
+    ScriptEngine(const ScriptEngine&) = delete;
+    ScriptEngine& operator=(const ScriptEngine&) = delete;
 
 public:
     ScriptEngine();
-    virtual ~ScriptEngine();
+    ~ScriptEngine() override = default;
 
     virtual Scope* newScope() {
         return createScope();
     }
 
-    virtual Scope* newScopeForCurrentThread() {
-        return createScopeForCurrentThread();
+    virtual Scope* newScopeForCurrentThread(boost::optional<int> jsHeapLimitMB) {
+        return createScopeForCurrentThread(jsHeapLimitMB);
+    }
+
+    Scope* newScopeForCurrentThread() {
+        return newScopeForCurrentThread(boost::none);
     }
 
     virtual void runTest() = 0;
 
     virtual bool utf8Ok() const = 0;
-
-    virtual void enableJIT(bool value) = 0;
-    virtual bool isJITEnabled() const = 0;
 
     virtual void enableJavaScriptProtection(bool value) = 0;
     virtual bool isJavaScriptProtectionEnabled() const = 0;
@@ -253,7 +265,13 @@ public:
     virtual int getJSHeapLimitMB() const = 0;
     virtual void setJSHeapLimitMB(int limit) = 0;
 
-    static void setup();
+    virtual std::string getLoadPath() const = 0;
+    virtual void setLoadPath(const std::string& loadPath) = 0;
+
+    /**
+     * Calls the constructor for the Global ScriptEngine.
+     */
+    static void setup(ExecutionEnvironment environment);
     static void dropScopeCache();
 
     /** gets a scope from the pool or a new one if pool is empty
@@ -263,34 +281,38 @@ public:
      * @return the scope
      */
     std::unique_ptr<Scope> getPooledScope(OperationContext* opCtx,
-                                          const std::string& db,
+                                          const DatabaseName& db,
                                           const std::string& scopeType);
 
+    using ScopeCallback = void (*)(Scope&);
+    ScopeCallback getScopeInitCallback() {
+        return _scopeInitCallback;
+    };
     void setScopeInitCallback(void (*func)(Scope&)) {
         _scopeInitCallback = func;
     }
-    static void setConnectCallback(void (*func)(DBClientBase&)) {
+    static void setConnectCallback(void (*func)(DBClientBase&, StringData)) {
         _connectCallback = func;
     }
-    static void runConnectCallback(DBClientBase& c) {
+    static void runConnectCallback(DBClientBase& c, StringData uri) {
         if (_connectCallback)
-            _connectCallback(c);
+            _connectCallback(c, uri);
     }
 
     // engine implementation may either respond to interrupt events or
     // poll for interrupts.  the interrupt functions must not wait indefinitely on a lock.
-    virtual void interrupt(unsigned opId) {}
-    virtual void interruptAll() {}
+    void interrupt(ClientLock&, OperationContext*) override {}
+    void interruptAll(ServiceContextLock&) override {}
 
     static std::string getInterpreterVersionString();
 
 protected:
     virtual Scope* createScope() = 0;
-    virtual Scope* createScopeForCurrentThread() = 0;
+    virtual Scope* createScopeForCurrentThread(boost::optional<int> jsHeapLimitMB) = 0;
     void (*_scopeInitCallback)(Scope&);
 
 private:
-    static void (*_connectCallback)(DBClientBase&);
+    static void (*_connectCallback)(DBClientBase&, StringData);
 };
 
 void installGlobalUtils(Scope& scope);
@@ -299,4 +321,5 @@ const char* jsSkipWhiteSpace(const char* raw);
 
 ScriptEngine* getGlobalScriptEngine();
 void setGlobalScriptEngine(ScriptEngine* impl);
-}
+
+}  // namespace mongo

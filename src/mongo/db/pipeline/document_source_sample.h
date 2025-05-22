@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,46 +29,78 @@
 
 #pragma once
 
+#include <set>
+
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/pipeline/dependencies.h"
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/document_source_sort.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/pipeline.h"
+#include "mongo/db/pipeline/stage_constraints.h"
+#include "mongo/db/pipeline/variables.h"
+#include "mongo/db/query/query_shape/serialization_options.h"
+#include "mongo/util/intrusive_counter.h"
 
 namespace mongo {
 
-class DocumentSourceSample final : public DocumentSource, public NeedsMergerDocumentSource {
+class DocumentSourceSample final : public DocumentSource {
 public:
     static constexpr StringData kStageName = "$sample"_sd;
 
-    GetNextResult getNext() final;
     const char* getSourceName() const final {
-        return kStageName.rawData();
+        return kStageName.data();
     }
-    Value serialize(boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final;
+
+    static const Id& id;
+
+    Id getId() const override {
+        return id;
+    }
+
+    Value serialize(const SerializationOptions& opts = SerializationOptions{}) const final;
 
     StageConstraints constraints(Pipeline::SplitState pipeState) const final {
-        return {StreamType::kBlocking,
-                PositionRequirement::kNone,
-                HostTypeRequirement::kNone,
-                DiskUseRequirement::kWritesTmpData,
-                FacetRequirement::kAllowed,
-                TransactionRequirement::kAllowed};
+        StageConstraints constraints{StreamType::kBlocking,
+                                     PositionRequirement::kNone,
+                                     HostTypeRequirement::kNone,
+                                     DiskUseRequirement::kWritesTmpData,
+                                     FacetRequirement::kAllowed,
+                                     TransactionRequirement::kAllowed,
+                                     LookupRequirement::kAllowed,
+                                     UnionRequirement::kAllowed};
+        constraints.noFieldModifications = true;
+        return constraints;
     }
 
     DepsTracker::State getDependencies(DepsTracker* deps) const final {
+        deps->needRandomGenerator = true;
         return DepsTracker::State::SEE_NEXT;
     }
 
-    boost::intrusive_ptr<DocumentSource> getShardSource() final;
-    MergingLogic mergingLogic() final;
+    boost::optional<DistributedPlanLogic> distributedPlanLogic() final;
 
     long long getSampleSize() const {
         return _size;
     }
 
+    void addVariableRefs(std::set<Variables::Id>* refs) const final {}
+
     static boost::intrusive_ptr<DocumentSource> createFromBson(
         BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& expCtx);
 
+    static boost::intrusive_ptr<DocumentSource> create(
+        const boost::intrusive_ptr<ExpressionContext>& expCtx, long long size);
+
 private:
     explicit DocumentSourceSample(const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
+
+    GetNextResult doGetNext() final;
 
     long long _size;
 

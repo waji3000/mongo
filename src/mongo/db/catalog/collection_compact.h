@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,18 +29,23 @@
 
 #pragma once
 
+#include <cstdint>
+
 #include "mongo/base/status_with.h"
 #include "mongo/db/catalog/collection.h"
-#include "mongo/db/storage/record_store.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/storage/compact_options.h"
 
 namespace mongo {
 
 /**
-  * Compacts collection.
-  * See record_store.h for CompactStats and CompactOptions definitions.
-  */
-StatusWith<CompactStats> compactCollection(OperationContext* opCtx,
-                                           Collection* collection,
-                                           const CompactOptions* options);
+ * Compacts collection.
+ *
+ * Returns the number of bytes of stable storage and index size that were freed. If the total
+ * size decreased, the return value is positive. Otherwise, the return value is negative.
+ */
+StatusWith<int64_t> compactCollection(OperationContext* opCtx,
+                                      const CompactOptions& options,
+                                      const CollectionPtr& collection);
 
 }  // namespace mongo

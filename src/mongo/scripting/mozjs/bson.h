@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,9 +29,13 @@
 
 #pragma once
 
+#include <js/Class.h>
+#include <js/PropertySpec.h>
+#include <js/TypeDecls.h>
 #include <tuple>
 
-#include "mongo/db/jsobj.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/scripting/mozjs/base.h"
 #include "mongo/scripting/mozjs/wraptype.h"
 
 namespace mongo {
@@ -49,33 +52,39 @@ namespace mozjs {
  * ::make() from C++.
  */
 struct BSONInfo : public BaseInfo {
+    enum Slots { BSONHolderSlot, BSONInfoSlotCount };
+
     static void delProperty(JSContext* cx,
                             JS::HandleObject obj,
                             JS::HandleId id,
                             JS::ObjectOpResult& result);
     static void enumerate(JSContext* cx,
                           JS::HandleObject obj,
-                          JS::AutoIdVector& properties,
+                          JS::MutableHandleIdVector properties,
                           bool enumerableOnly);
-    static void finalize(JSFreeOp* fop, JSObject* obj);
+    static void finalize(JS::GCContext* gcCtx, JSObject* obj);
     static void resolve(JSContext* cx, JS::HandleObject obj, JS::HandleId id, bool* resolvedp);
     static void setProperty(JSContext* cx,
                             JS::HandleObject obj,
                             JS::HandleId id,
-                            JS::MutableHandleValue vp,
+                            JS::HandleValue v,
+                            JS::HandleValue receiver,
                             JS::ObjectOpResult& result);
 
     static const char* const className;
-    static const unsigned classFlags = JSCLASS_HAS_PRIVATE;
+    static const unsigned classFlags =
+        JSCLASS_HAS_RESERVED_SLOTS(BSONInfoSlotCount) | BaseInfo::finalizeFlag;
     static const InstallType installType = InstallType::Private;
     static void postInstall(JSContext* cx, JS::HandleObject global, JS::HandleObject proto);
 
     struct Functions {
         MONGO_DECLARE_JS_FUNCTION(bsonWoCompare);
+        MONGO_DECLARE_JS_FUNCTION(bsonUnorderedFieldsCompare);
         MONGO_DECLARE_JS_FUNCTION(bsonBinaryEqual);
+        MONGO_DECLARE_JS_FUNCTION(bsonObjToArray);
     };
 
-    static const JSFunctionSpec freeFunctions[3];
+    static const JSFunctionSpec freeFunctions[5];
 
     static std::tuple<BSONObj*, bool> originalBSON(JSContext* cx, JS::HandleObject obj);
     static void make(

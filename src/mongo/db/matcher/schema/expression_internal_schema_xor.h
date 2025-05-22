@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,7 +29,21 @@
 
 #pragma once
 
+#include <cstddef>
+#include <memory>
+#include <utility>
+#include <vector>
+
+#include "mongo/base/clonable_ptr.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/util/builder_fwd.h"
+#include "mongo/db/matcher/expression.h"
 #include "mongo/db/matcher/expression_tree.h"
+#include "mongo/db/matcher/expression_visitor.h"
+#include "mongo/db/query/query_shape/serialization_options.h"
+#include "mongo/db/query/util/make_data_structure.h"
 
 namespace mongo {
 
@@ -42,25 +55,41 @@ class InternalSchemaXorMatchExpression final : public ListOfMatchExpression {
 public:
     static constexpr StringData kName = "$_internalSchemaXor"_sd;
 
-    InternalSchemaXorMatchExpression() : ListOfMatchExpression(INTERNAL_SCHEMA_XOR) {}
+    InternalSchemaXorMatchExpression(clonable_ptr<ErrorAnnotation> annotation = nullptr)
+        : ListOfMatchExpression(INTERNAL_SCHEMA_XOR, std::move(annotation), {}) {}
+    InternalSchemaXorMatchExpression(std::vector<std::unique_ptr<MatchExpression>> expressions,
+                                     clonable_ptr<ErrorAnnotation> annotation = nullptr)
+        : ListOfMatchExpression(
+              INTERNAL_SCHEMA_XOR, std::move(annotation), std::move(expressions)) {}
+    InternalSchemaXorMatchExpression(std::unique_ptr<MatchExpression> expression,
+                                     clonable_ptr<ErrorAnnotation> annotation = nullptr)
+        : ListOfMatchExpression(
+              INTERNAL_SCHEMA_XOR, std::move(annotation), makeVector(std::move(expression))) {}
 
-    bool matches(const MatchableDocument* doc, MatchDetails* details = nullptr) const final;
-
-    bool matchesSingleElement(const BSONElement&, MatchDetails* details = nullptr) const final;
-
-    virtual std::unique_ptr<MatchExpression> shallowClone() const {
-        auto xorCopy = stdx::make_unique<InternalSchemaXorMatchExpression>();
+    std::unique_ptr<MatchExpression> clone() const override {
+        auto xorCopy = std::make_unique<InternalSchemaXorMatchExpression>(_errorAnnotation);
+        xorCopy->reserve(numChildren());
         for (size_t i = 0; i < numChildren(); ++i) {
-            xorCopy->add(getChild(i)->shallowClone().release());
+            xorCopy->add(getChild(i)->clone());
         }
         if (getTag()) {
             xorCopy->setTag(getTag()->clone());
         }
-        return std::move(xorCopy);
+        return xorCopy;
     }
 
-    void debugString(StringBuilder& debug, int level = 0) const final;
+    void debugString(StringBuilder& debug, int indentationLevel = 0) const final;
 
-    void serialize(BSONObjBuilder* out) const final;
+    void serialize(BSONObjBuilder* out,
+                   const SerializationOptions& opts = {},
+                   bool includePath = true) const final;
+
+    void acceptVisitor(MatchExpressionMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(MatchExpressionConstVisitor* visitor) const final {
+        visitor->visit(this);
+    }
 };
 }  // namespace mongo

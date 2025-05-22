@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,17 +27,18 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include <map>
-#include <set>
+#include <ostream>
+#include <string>
+#include <type_traits>
 #include <utility>
 
+#include <absl/container/node_hash_map.h>
+
+#include "mongo/base/string_data.h"
 #include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/simple_bsonobj_comparator.h"
-#include "mongo/stdx/unordered_map.h"
-#include "mongo/stdx/unordered_set.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
@@ -84,14 +84,6 @@ TEST(SimpleBSONObjContainerTest, UnorderedSetIsDefaultConstructible) {
     assertInsertSucceeds(uset, BSON("y" << 1));
     assertInsertFails(uset, BSON("x" << 1));
     ASSERT_EQ(uset.size(), 2UL);
-}
-
-TEST(SimpleBSONObjContainerTest, UnorderedMultiSetIsDefaultConstructible) {
-    SimpleBSONObjUnorderedMultiset umultiset;
-    umultiset.insert(BSON("x" << 1));
-    umultiset.insert(BSON("x" << 1));
-    umultiset.insert(BSON("y" << 1));
-    ASSERT_EQ(umultiset.size(), 3UL);
 }
 
 /**
@@ -141,12 +133,5 @@ TEST(SimpleBSONObjContainerTest, UnorderedMapIsDefaultConstructible) {
     ASSERT_EQ(umap.size(), 2UL);
 }
 
-TEST(SimpleBSONObjContainerTest, UnorderedMultiMapIsDefaultConstructible) {
-    SimpleBSONObjUnorderedMultiMap<std::string> umultimap;
-    umultimap.insert(std::make_pair(BSON("_id" << 0), "anica"));
-    umultimap.insert(std::make_pair(BSON("_id" << 0), "raj"));
-    umultimap.insert(std::make_pair(BSON("_id" << 1), "ian"));
-    ASSERT_EQ(umultimap.size(), 3UL);
-}
 }  // namespace
 }  // namespace mongo

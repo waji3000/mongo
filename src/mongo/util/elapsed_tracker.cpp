@@ -1,6 +1,3 @@
-// @file elapsed_tracker.cpp
-
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,10 +27,7 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include "mongo/util/elapsed_tracker.h"
-
 #include "mongo/util/clock_source.h"
 
 namespace mongo {
@@ -48,7 +42,7 @@ ElapsedTracker::ElapsedTracker(ClockSource* cs,
       _last(cs->now()) {}
 
 bool ElapsedTracker::intervalHasElapsed() {
-    if (++_pings >= _hitsBetweenMarks) {
+    if (_hitsBetweenMarks >= 0 && ++_pings >= _hitsBetweenMarks) {
         _pings = 0;
         _last = _clock->now();
         return true;

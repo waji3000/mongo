@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,9 +29,11 @@
 
 #include "mongo/base/data_view.h"
 
+#include <cstdint>
 #include <cstring>
 
 #include "mongo/base/data_type_endian.h"
+#include "mongo/base/string_data.h"
 #include "mongo/platform/endian.h"
 #include "mongo/unittest/unittest.h"
 

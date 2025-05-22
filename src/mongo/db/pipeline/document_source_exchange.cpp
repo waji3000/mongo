@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,42 +27,102 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
 
-#include "mongo/platform/basic.h"
-
+#include <boost/cstdint.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+// IWYU pragma: no_include "cxxabi.h"
 #include <algorithm>
+#include <compare>
 #include <iterator>
+#include <mutex>
 #include <set>
+#include <utility>
 
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
 #include "mongo/db/hasher.h"
 #include "mongo/db/pipeline/document_source_exchange.h"
-#include "mongo/db/storage/key_string.h"
-#include "mongo/util/log.h"
+#include "mongo/db/storage/key_string/key_string.h"
+#include "mongo/logv2/log.h"
+#include "mongo/platform/compiler.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/str.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
+
 
 namespace mongo {
 
 MONGO_FAIL_POINT_DEFINE(exchangeFailLoadNextBatch);
 
+ALLOCATE_DOCUMENT_SOURCE_ID(exchange, DocumentSourceExchange::id)
+
+class MutexAndResourceLock {
+    OperationContext* _opCtx;
+    ResourceYielder* _resourceYielder;
+    stdx::unique_lock<stdx::mutex> _lock;
+
+public:
+    // Must be constructed with the mutex held. 'yielder' may be null if there are no resources
+    // which need to be yielded while waiting.
+    MutexAndResourceLock(OperationContext* opCtx,
+                         stdx::unique_lock<stdx::mutex> m,
+                         ResourceYielder* yielder)
+        : _opCtx(opCtx), _resourceYielder(yielder), _lock(std::move(m)) {
+        invariant(_lock.owns_lock());
+    }
+
+    void lock() {
+        // Acquire the operation-wide resources, then the mutex.
+        if (_resourceYielder) {
+            _resourceYielder->unyield(_opCtx);
+        }
+        _lock.lock();
+    }
+    void unlock() {
+        _lock.unlock();
+        if (_resourceYielder) {
+            _resourceYielder->yield(_opCtx);
+        }
+    }
+
+    /**
+     * Releases ownership of the lock to the caller. May only be called when the mutex is held
+     * (after a call to unlock(), for example).
+     */
+    stdx::unique_lock<stdx::mutex> releaseLockOwnership() {
+        invariant(_lock.owns_lock());
+        return std::move(_lock);
+    }
+};
+
 constexpr size_t Exchange::kMaxBufferSize;
 constexpr size_t Exchange::kMaxNumberConsumers;
 
 const char* DocumentSourceExchange::getSourceName() const {
-    return "$_internalExchange";
+    return kStageName.data();
 }
 
-Value DocumentSourceExchange::serialize(boost::optional<ExplainOptions::Verbosity> explain) const {
-    return Value(DOC(getSourceName() << _exchange->getSpec().toBSON()));
+Value DocumentSourceExchange::serialize(const SerializationOptions& opts) const {
+    return Value(DOC(getSourceName() << _exchange->getSpec().toBSON(opts)));
 }
 
 DocumentSourceExchange::DocumentSourceExchange(
     const boost::intrusive_ptr<ExpressionContext>& expCtx,
     const boost::intrusive_ptr<Exchange> exchange,
-    size_t consumerId)
-    : DocumentSource(expCtx), _exchange(exchange), _consumerId(consumerId) {}
+    size_t consumerId,
+    std::unique_ptr<ResourceYielder> yielder)
+    : DocumentSource(kStageName, expCtx),
+      _exchange(exchange),
+      _consumerId(consumerId),
+      _resourceYielder(std::move(yielder)) {}
 
-DocumentSource::GetNextResult DocumentSourceExchange::getNext() {
-    return _exchange->getNext(pExpCtx->opCtx, _consumerId);
+DocumentSource::GetNextResult DocumentSourceExchange::doGetNext() {
+    return _exchange->getNext(pExpCtx->getOperationContext(), _consumerId, _resourceYielder.get());
 }
 
 Exchange::Exchange(ExchangeSpec spec, std::unique_ptr<Pipeline, PipelineDeleter> pipeline)
@@ -81,9 +140,7 @@ Exchange::Exchange(ExchangeSpec spec, std::unique_ptr<Pipeline, PipelineDeleter>
 
     uassert(50951,
             str::stream() << "Specified exchange buffer size (" << _maxBufferSize
-                          << ") exceeds the maximum allowable amount ("
-                          << kMaxBufferSize
-                          << ").",
+                          << ") exceeds the maximum allowable amount (" << kMaxBufferSize << ").",
             _maxBufferSize <= kMaxBufferSize);
 
     for (int idx = 0; idx < _spec.getConsumers(); ++idx) {
@@ -115,44 +172,34 @@ std::vector<std::string> Exchange::extractBoundaries(
     }
 
     for (auto& b : *obj) {
-        // Build the key.
-        BSONObjBuilder kb;
-        for (auto elem : b) {
-            kb << "" << elem;
-        }
-
-        KeyString key{KeyString::Version::V1, kb.obj(), ordering};
-        std::string keyStr{key.getBuffer(), key.getSize()};
-
-        ret.emplace_back(std::move(keyStr));
+        key_string::Builder key{key_string::Version::V1, b, ordering};
+        ret.emplace_back(key.getView().begin(), key.getView().end());
     }
 
-    uassert(50960, str::stream() << "Exchange range boundaries are not valid", ret.size() > 1);
+    uassert(50960, "Exchange range boundaries are not valid", ret.size() > 1);
 
     for (size_t idx = 1; idx < ret.size(); ++idx) {
         uassert(50893,
-                str::stream() << "Exchange range boundaries are not in ascending order.",
+                "Exchange range boundaries are not in ascending order.",
                 ret[idx - 1] < ret[idx]);
     }
 
     BSONObjBuilder kbMin;
     BSONObjBuilder kbMax;
     for (int i = 0; i < obj->front().nFields(); ++i) {
-        kbMin << "" << MINKEY;
-        kbMax << "" << MAXKEY;
+        kbMin.appendMinKey("");
+        kbMax.appendMaxKey("");
     }
 
-    KeyString minKey{KeyString::Version::V1, kbMin.obj(), ordering};
-    KeyString maxKey{KeyString::Version::V1, kbMax.obj(), ordering};
-    StringData minKeyStr{minKey.getBuffer(), minKey.getSize()};
-    StringData maxKeyStr{maxKey.getBuffer(), maxKey.getSize()};
+    key_string::Builder minKey{key_string::Version::V1, kbMin.obj(), ordering};
+    key_string::Builder maxKey{key_string::Version::V1, kbMax.obj(), ordering};
 
     uassert(50958,
-            str::stream() << "Exchange lower bound must be the minkey.",
-            ret.front() == minKeyStr);
+            "Exchange lower bound must be the minkey.",
+            key_string::compare(ret.front(), minKey.getView()) == 0);
     uassert(50959,
-            str::stream() << "Exchange upper bound must be the maxkey.",
-            ret.back() == maxKeyStr);
+            "Exchange upper bound must be the maxkey.",
+            key_string::compare(ret.back(), maxKey.getView()) == 0);
 
     return ret;
 }
@@ -162,8 +209,7 @@ std::vector<size_t> Exchange::extractConsumerIds(
 
     uassert(50950,
             str::stream() << "Specified number of exchange consumers (" << nConsumers
-                          << ") exceeds the maximum allowable amount ("
-                          << kMaxNumberConsumers
+                          << ") exceeds the maximum allowable amount (" << kMaxNumberConsumers
                           << ").",
             nConsumers <= kMaxNumberConsumers);
 
@@ -224,7 +270,7 @@ Ordering Exchange::extractOrdering(const BSONObj& keyPattern) {
 std::vector<FieldPath> Exchange::extractKeyPaths(const BSONObj& keyPattern) {
     std::vector<FieldPath> paths;
     for (auto& elem : keyPattern) {
-        paths.emplace_back(FieldPath{elem.fieldNameStringData()});
+        paths.emplace_back(elem.fieldNameStringData());
     }
     return paths;
 }
@@ -236,11 +282,16 @@ void Exchange::unblockLoading(size_t consumerId) {
         _haveBufferSpace.notify_all();
     }
 }
-DocumentSource::GetNextResult Exchange::getNext(OperationContext* opCtx, size_t consumerId) {
+DocumentSource::GetNextResult Exchange::getNext(OperationContext* opCtx,
+                                                size_t consumerId,
+                                                ResourceYielder* resourceYielder) {
     // Grab a lock.
     stdx::unique_lock<stdx::mutex> lk(_mutex);
 
     for (;;) {
+        // Guard against some of the trickiness we do with moving the lock to/from the
+        // MutexAndResourceLock.
+        invariant(lk.owns_lock());
         // Execute only in case we have not encountered an error.
         if (!_errorInLoadNextBatch.isOK()) {
             uasserted(ErrorCodes::ExchangePassthrough,
@@ -257,7 +308,8 @@ DocumentSource::GetNextResult Exchange::getNext(OperationContext* opCtx, size_t 
 
         // There is not any document so try to load more from the source.
         if (_loadingThreadId == kInvalidThreadId) {
-            LOG(3) << "A consumer " << consumerId << " begins loading";
+            LOGV2_DEBUG(
+                20896, 3, "A consumer {consumerId} begins loading", "consumerId"_attr = consumerId);
 
             try {
                 // This consumer won the race and will fill the buffers.
@@ -270,8 +322,8 @@ DocumentSource::GetNextResult Exchange::getNext(OperationContext* opCtx, size_t 
                 // The return value is an index of a full consumer buffer.
                 size_t fullConsumerId = loadNextBatch();
 
-                if (MONGO_FAIL_POINT(exchangeFailLoadNextBatch)) {
-                    log() << "exchangeFailLoadNextBatch fail point enabled.";
+                if (MONGO_unlikely(exchangeFailLoadNextBatch.shouldFail())) {
+                    LOGV2(20897, "exchangeFailLoadNextBatch fail point enabled.");
                     uasserted(ErrorCodes::FailPointEnabled,
                               "Asserting on loading the next batch due to failpoint.");
                 }
@@ -296,22 +348,28 @@ DocumentSource::GetNextResult Exchange::getNext(OperationContext* opCtx, size_t 
         } else {
             // Some other consumer is already loading the buffers. There is nothing else we can do
             // but wait.
-            _haveBufferSpace.wait(lk);
+            MutexAndResourceLock mutexAndResourceLock(opCtx, std::move(lk), resourceYielder);
+            _haveBufferSpace.wait(mutexAndResourceLock);
+            lk = mutexAndResourceLock.releaseLockOwnership();
         }
     }
 }
 
 size_t Exchange::loadNextBatch() {
-    auto input = _pipeline->getSources().back()->getNext();
+    auto input = _pipeline->getNextResult();
 
-    for (; input.isAdvanced(); input = _pipeline->getSources().back()->getNext()) {
+    for (; input.isAdvanced(); input = _pipeline->getNextResult()) {
         // We have a document and we will deliver it to a consumer(s) based on the policy.
         switch (_policy) {
             case ExchangePolicyEnum::kBroadcast: {
                 bool full = false;
                 // The document is sent to all consumers.
                 for (auto& c : _consumers) {
-                    full = c->appendDocument(input, _maxBufferSize);
+                    // By default the Document is shallow copied. However, the broadcasted document
+                    // can be used by multiple threads (consumers) and the Document is not thread
+                    // safe. Hence we have to clone the Document.
+                    auto copy = DocumentSource::GetNextResult(input.getDocument().clone());
+                    full = c->appendDocument(copy, _maxBufferSize);
                 }
 
                 if (full)
@@ -342,7 +400,7 @@ size_t Exchange::loadNextBatch() {
 
     // We have reached the end so send EOS to all consumers.
     for (auto& c : _consumers) {
-        c->appendDocument(input, _maxBufferSize);
+        [[maybe_unused]] auto full = c->appendDocument(input, _maxBufferSize);
     }
 
     return kInvalidThreadId;
@@ -352,7 +410,7 @@ size_t Exchange::getTargetConsumer(const Document& input) {
     // Build the key.
     BSONObjBuilder kb;
     size_t counter = 0;
-    for (auto elem : _keyPattern) {
+    for (const auto& elem : _keyPattern) {
         auto value = input.getNestedField(_keyPaths[counter]);
 
         // By definition we send documents with missing fields to the consumer 0.
@@ -361,16 +419,17 @@ size_t Exchange::getTargetConsumer(const Document& input) {
         }
 
         if (elem.type() == BSONType::String && elem.str() == "hashed") {
-            kb << "" << BSONElementHasher::hash64(BSON("" << value).firstElement(),
-                                                  BSONElementHasher::DEFAULT_HASH_SEED);
+            kb << ""
+               << BSONElementHasher::hash64(BSON("" << value).firstElement(),
+                                            BSONElementHasher::DEFAULT_HASH_SEED);
         } else {
             kb << "" << value;
         }
         ++counter;
     }
 
-    KeyString key{KeyString::Version::V1, kb.obj(), _ordering};
-    std::string keyStr{key.getBuffer(), key.getSize()};
+    key_string::Builder key{key_string::Version::V1, kb.obj(), _ordering};
+    StringData keyStr{key.getView().data(), key.getView().size()};
 
     // Binary search for the consumer id.
     auto it = std::upper_bound(_boundaries.begin(), _boundaries.end(), keyStr);

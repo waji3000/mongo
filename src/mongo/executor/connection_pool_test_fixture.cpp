@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,11 +27,19 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include "mongo/executor/connection_pool_test_fixture.h"
 
-#include "mongo/stdx/memory.h"
+#include <boost/move/utility_core.hpp>
+#include <functional>
+#include <memory>
+#include <type_traits>
+#include <utility>
+
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/util/assert_util.h"
+
 
 namespace mongo {
 namespace executor {
@@ -45,17 +52,18 @@ TimerImpl::~TimerImpl() {
 }
 
 void TimerImpl::setTimeout(Milliseconds timeout, TimeoutCallback cb) {
-    _timers.erase(this);
-
     _cb = std::move(cb);
+    invariant(timeout >= Milliseconds(0));
     _expiration = _global->now() + timeout;
 
     _timers.emplace(this);
 }
 
 void TimerImpl::cancelTimeout() {
+    TimeoutCallback cb;
+    _cb.swap(cb);
+
     _timers.erase(this);
-    _cb = TimeoutCallback{};
 }
 
 void TimerImpl::clear() {
@@ -65,14 +73,21 @@ void TimerImpl::clear() {
     }
 }
 
-void TimerImpl::fireIfNecessary() {
-    auto now = PoolImpl().now();
+Date_t TimerImpl::now() {
+    return _global->now();
+}
 
+void TimerImpl::fireIfNecessary() {
     auto timers = _timers;
 
     for (auto&& x : timers) {
-        if (_timers.count(x) && (x->_expiration <= now)) {
-            x->_cb();
+        if (_timers.count(x) && (x->_expiration <= x->now())) {
+            auto execCB = [cb = std::move(x->_cb)](auto&&) mutable {
+                std::move(cb)();
+            };
+            auto global = x->_global;
+            _timers.erase(x);
+            global->_executor->schedule(std::move(execCB));
         }
     }
 }
@@ -80,26 +95,14 @@ void TimerImpl::fireIfNecessary() {
 std::set<TimerImpl*> TimerImpl::_timers;
 
 ConnectionImpl::ConnectionImpl(const HostAndPort& hostAndPort, size_t generation, PoolImpl* global)
-    : _hostAndPort(hostAndPort),
+    : ConnectionInterface(generation),
+      _hostAndPort(hostAndPort),
       _timer(global),
       _global(global),
-      _id(_idCounter++),
-      _generation(generation) {}
+      _id(_idCounter++) {}
 
-void ConnectionImpl::indicateUsed() {
-    _lastUsed = _global->now();
-}
-
-void ConnectionImpl::indicateSuccess() {
-    _status = Status::OK();
-}
-
-void ConnectionImpl::indicateFailure(Status status) {
-    _status = std::move(status);
-}
-
-void ConnectionImpl::resetToUnknown() {
-    _status = ConnectionPool::kConnectionStateUnknown;
+Date_t ConnectionImpl::now() {
+    return _timer.now();
 }
 
 size_t ConnectionImpl::id() const {
@@ -121,18 +124,24 @@ void ConnectionImpl::clear() {
     _pushRefreshQueue.clear();
 }
 
-void ConnectionImpl::pushSetup(PushSetupCallback status) {
-    _pushSetupQueue.push_back(status);
+void ConnectionImpl::processSetup() {
+    auto connPtr = _setupQueue.front();
+    auto callback = std::move(_pushSetupQueue.front());
+    _setupQueue.pop_front();
+    _pushSetupQueue.pop_front();
 
-    if (_setupQueue.size()) {
-        auto connPtr = _setupQueue.front();
-        auto callback = _pushSetupQueue.front();
-        _setupQueue.pop_front();
-        _pushSetupQueue.pop_front();
-
-        auto cb = connPtr->_setupCallback;
+    connPtr->_global->_executor->schedule([connPtr, callback = std::move(callback)](auto&&) {
+        auto cb = std::move(connPtr->_setupCallback);
         connPtr->indicateUsed();
         cb(connPtr, callback());
+    });
+}
+
+void ConnectionImpl::pushSetup(PushSetupCallback status) {
+    _pushSetupQueue.push_back(std::move(status));
+
+    if (_setupQueue.size()) {
+        processSetup();
     }
 }
 
@@ -144,19 +153,25 @@ size_t ConnectionImpl::setupQueueDepth() {
     return _setupQueue.size();
 }
 
-void ConnectionImpl::pushRefresh(PushRefreshCallback status) {
-    _pushRefreshQueue.push_back(status);
+void ConnectionImpl::processRefresh() {
+    auto connPtr = _refreshQueue.front();
+    auto callback = std::move(_pushRefreshQueue.front());
 
-    if (_refreshQueue.size()) {
-        auto connPtr = _refreshQueue.front();
-        auto callback = _pushRefreshQueue.front();
+    _refreshQueue.pop_front();
+    _pushRefreshQueue.pop_front();
 
-        _refreshQueue.pop_front();
-        _pushRefreshQueue.pop_front();
-
-        auto cb = connPtr->_refreshCallback;
+    connPtr->_global->_executor->schedule([connPtr, callback = std::move(callback)](auto&&) {
+        auto cb = std::move(connPtr->_refreshCallback);
         connPtr->indicateUsed();
         cb(connPtr, callback());
+    });
+}
+
+void ConnectionImpl::pushRefresh(PushRefreshCallback status) {
+    _pushRefreshQueue.push_back(std::move(status));
+
+    if (_refreshQueue.size()) {
+        processRefresh();
     }
 }
 
@@ -168,40 +183,26 @@ size_t ConnectionImpl::refreshQueueDepth() {
     return _refreshQueue.size();
 }
 
-Date_t ConnectionImpl::getLastUsed() const {
-    return _lastUsed;
-}
-
-const Status& ConnectionImpl::getStatus() const {
-    return _status;
-}
-
 void ConnectionImpl::setTimeout(Milliseconds timeout, TimeoutCallback cb) {
-    _timer.setTimeout(timeout, cb);
+    _timer.setTimeout(timeout, std::move(cb));
 }
 
 void ConnectionImpl::cancelTimeout() {
     _timer.cancelTimeout();
 }
 
-void ConnectionImpl::setup(Milliseconds timeout, SetupCallback cb) {
+void ConnectionImpl::setup(Milliseconds timeout, SetupCallback cb, std::string) {
     _setupCallback = std::move(cb);
 
     _timer.setTimeout(timeout, [this] {
-        _setupCallback(this, Status(ErrorCodes::NetworkInterfaceExceededTimeLimit, "timeout"));
+        auto setupCb = std::move(_setupCallback);
+        setupCb(this, Status(ErrorCodes::HostUnreachable, "timeout"));
     });
 
     _setupQueue.push_back(this);
 
     if (_pushSetupQueue.size()) {
-        auto connPtr = _setupQueue.front();
-        auto callback = _pushSetupQueue.front();
-        _setupQueue.pop_front();
-        _pushSetupQueue.pop_front();
-
-        auto refreshCb = connPtr->_setupCallback;
-        connPtr->indicateUsed();
-        refreshCb(connPtr, callback());
+        processSetup();
     }
 }
 
@@ -209,26 +210,15 @@ void ConnectionImpl::refresh(Milliseconds timeout, RefreshCallback cb) {
     _refreshCallback = std::move(cb);
 
     _timer.setTimeout(timeout, [this] {
-        _refreshCallback(this, Status(ErrorCodes::NetworkInterfaceExceededTimeLimit, "timeout"));
+        auto refreshCb = std::move(_refreshCallback);
+        refreshCb(this, Status(ErrorCodes::HostUnreachable, "timeout"));
     });
 
     _refreshQueue.push_back(this);
 
     if (_pushRefreshQueue.size()) {
-        auto connPtr = _refreshQueue.front();
-        auto callback = _pushRefreshQueue.front();
-
-        _refreshQueue.pop_front();
-        _pushRefreshQueue.pop_front();
-
-        auto refreshCb = connPtr->_refreshCallback;
-        connPtr->indicateUsed();
-        refreshCb(connPtr, callback());
+        processRefresh();
     }
-}
-
-size_t ConnectionImpl::getGeneration() const {
-    return _generation;
 }
 
 std::deque<ConnectionImpl::PushSetupCallback> ConnectionImpl::_pushSetupQueue;
@@ -238,12 +228,16 @@ std::deque<ConnectionImpl*> ConnectionImpl::_refreshQueue;
 size_t ConnectionImpl::_idCounter = 1;
 
 std::shared_ptr<ConnectionPool::ConnectionInterface> PoolImpl::makeConnection(
-    const HostAndPort& hostAndPort, size_t generation) {
+    const HostAndPort& hostAndPort, transport::ConnectSSLMode sslMode, size_t generation) {
     return std::make_shared<ConnectionImpl>(hostAndPort, generation, this);
 }
 
 std::shared_ptr<ConnectionPool::TimerInterface> PoolImpl::makeTimer() {
-    return stdx::make_unique<TimerImpl>(this);
+    return std::make_unique<TimerImpl>(this);
+}
+
+const std::shared_ptr<OutOfLineExecutor>& PoolImpl::getExecutor() {
+    return _executor;
 }
 
 Date_t PoolImpl::now() {
@@ -251,11 +245,17 @@ Date_t PoolImpl::now() {
 }
 
 void PoolImpl::setNow(Date_t now) {
+    if (_now) {
+        // If we're not initializing the virtual clock, advance the fast clock source as well.
+        Milliseconds diff = now - *_now;
+        _fastClockSource.advance(diff);
+    }
     _now = now;
     TimerImpl::fireIfNecessary();
 }
 
 boost::optional<Date_t> PoolImpl::_now;
+ClockSourceMock PoolImpl::_fastClockSource;
 
 }  // namespace connection_pool_test_details
 }  // namespace executor

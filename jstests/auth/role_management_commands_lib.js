@@ -2,9 +2,7 @@
  * This tests that all the different commands for role manipulation all work properly for all valid
  * forms of input.
  */
-function runAllRoleManagementCommandsTests(conn, writeConcern) {
-    'use strict';
-
+export function runAllRoleManagementCommandsTests(conn, writeConcern) {
     var hasAuthzError = function(result) {
         assert(result instanceof WriteCommandError);
         assert.eq(ErrorCodes.Unauthorized, result.code);
@@ -75,7 +73,7 @@ function runAllRoleManagementCommandsTests(conn, writeConcern) {
         assert.throws(function() {
             db.foo.findOne();
         });
-        assert.writeOK(db.foo.insert({a: 1}));
+        assert.commandWorked(db.foo.insert({a: 1}));
         hasAuthzError(db.foo.update({}, {$inc: {a: 1}}, false, true));
         assert.commandFailedWithCode(db.adminCommand('connPoolSync'), ErrorCodes.Unauthorized);
 
@@ -84,7 +82,7 @@ function runAllRoleManagementCommandsTests(conn, writeConcern) {
             db.foo.findOne();
         });
         assert.eq(1, db.foo.count());
-        assert.writeOK(db.foo.insert({a: 1}));
+        assert.commandWorked(db.foo.insert({a: 1}));
         assert.eq(2, db.foo.count());
         hasAuthzError(db.foo.update({}, {$inc: {a: 1}}, false, true));
         assert.eq(1, db.foo.findOne().a);
@@ -108,7 +106,7 @@ function runAllRoleManagementCommandsTests(conn, writeConcern) {
         assert.throws(function() {
             db.foo.findOne();
         });
-        assert.writeOK(db.foo.insert({a: 1}));
+        assert.commandWorked(db.foo.insert({a: 1}));
         hasAuthzError(db.foo.update({}, {$inc: {a: 1}}, false, true));
         assert.commandFailedWithCode(db.adminCommand('connPoolSync'), ErrorCodes.Unauthorized);
 
@@ -120,7 +118,7 @@ function runAllRoleManagementCommandsTests(conn, writeConcern) {
             db.foo.findOne();
         });
         assert.eq(3, db.foo.count());
-        assert.writeOK(db.foo.insert({a: 1}));
+        assert.commandWorked(db.foo.insert({a: 1}));
         assert.eq(4, db.foo.count());
         hasAuthzError(db.foo.update({}, {$inc: {a: 1}}, false, true));
         assert.eq(1, db.foo.findOne().a);
@@ -164,7 +162,7 @@ function runAllRoleManagementCommandsTests(conn, writeConcern) {
             db.foo.findOne();
         });
         assert.eq(4, db.foo.count());
-        assert.writeOK(db.foo.insert({a: 1}));
+        assert.commandWorked(db.foo.insert({a: 1}));
         assert.eq(5, db.foo.count());
         hasAuthzError(db.foo.update({}, {$inc: {a: 1}}, false, true));
         assert.eq(1, db.foo.findOne().a);
@@ -194,8 +192,8 @@ function runAllRoleManagementCommandsTests(conn, writeConcern) {
         adminUserAdmin.grantPrivilegesToRole(
             'adminRole',
             [
-              {resource: {cluster: true}, actions: ['serverStatus']},
-              {resource: {db: "", collection: ""}, actions: ['find']}
+                {resource: {cluster: true}, actions: ['serverStatus']},
+                {resource: {db: "", collection: ""}, actions: ['find']}
             ],
             writeConcern);
         assert.doesNotThrow(function() {
@@ -212,16 +210,16 @@ function runAllRoleManagementCommandsTests(conn, writeConcern) {
         testUserAdmin.grantPrivilegesToRole(
             'testRole2',
             [
-              {resource: {db: 'test', collection: ''}, actions: ['insert', 'update']},
-              {resource: {db: 'test', collection: 'foo'}, actions: ['find']}
+                {resource: {db: 'test', collection: ''}, actions: ['insert', 'update']},
+                {resource: {db: 'test', collection: 'foo'}, actions: ['find']}
             ],
             writeConcern);
         assert.doesNotThrow(function() {
             db.foo.findOne();
         });
-        assert.writeOK(db.foo.insert({a: 1}));
+        assert.commandWorked(db.foo.insert({a: 1}));
         assert.eq(6, db.foo.count());
-        assert.writeOK(db.foo.update({}, {$inc: {a: 1}}, false, true));
+        assert.commandWorked(db.foo.update({}, {$inc: {a: 1}}, false, true));
         assert.eq(2, db.foo.findOne().a);
         assert.commandFailedWithCode(db.adminCommand('connPoolSync'), ErrorCodes.Unauthorized);
         assert.commandFailedWithCode(db.adminCommand('serverStatus'), ErrorCodes.Unauthorized);
@@ -237,7 +235,7 @@ function runAllRoleManagementCommandsTests(conn, writeConcern) {
         assert.doesNotThrow(function() {
             db.foo.findOne();
         });
-        assert.writeOK(db.foo.insert({a: 1}));
+        assert.commandWorked(db.foo.insert({a: 1}));
         assert.eq(7, db.foo.count());
         hasAuthzError(db.foo.update({}, {$inc: {a: 1}}, false, true));
         assert.eq(2, db.foo.findOne().a);
@@ -309,7 +307,7 @@ function runAllRoleManagementCommandsTests(conn, writeConcern) {
         assert.doesNotThrow(function() {
             db.foo.findOne();
         });
-        assert.writeOK(db.foo.insert({a: 1}));
+        assert.commandWorked(db.foo.insert({a: 1}));
         assert.eq(8, db.foo.count());
 
         testUserAdmin.dropRole('testRole2', writeConcern);

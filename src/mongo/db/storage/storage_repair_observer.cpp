@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,34 +27,31 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
 
 #include "mongo/db/storage/storage_repair_observer.h"
 
-#include <cerrno>
-#include <cstring>
-
-#ifdef __linux__
-#include <fcntl.h>
-#include <sys/stat.h>
-#include <sys/types.h>
-#endif
-
+#include <algorithm>
+#include <boost/filesystem/fstream.hpp>
 #include <boost/filesystem/path.hpp>
+#include <ostream>
+#include <utility>
 
-#include "mongo/db/dbhelpers.h"
+#include <boost/filesystem/operations.hpp>
+// IWYU pragma: no_include "boost/system/detail/error_code.hpp"
+
 #include "mongo/db/operation_context.h"
-#include "mongo/db/repl/repl_set_config.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/storage_file_util.h"
-#include "mongo/db/storage/storage_options.h"
-#include "mongo/util/file.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/decorable.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
+
 
 namespace mongo {
 
 namespace {
-static const NamespaceString kConfigNss("local.system.replset");
 static const std::string kRepairIncompleteFileName = "_repair_incomplete";
 
 const auto getRepairObserver =
@@ -64,8 +60,6 @@ const auto getRepairObserver =
 }  // namespace
 
 StorageRepairObserver::StorageRepairObserver(const std::string& dbpath) {
-    invariant(!storageGlobalParams.readOnly);
-
     using boost::filesystem::path;
     _repairIncompleteFilePath = path(dbpath) / path(kRepairIncompleteFileName);
 
@@ -89,31 +83,47 @@ void StorageRepairObserver::onRepairStarted() {
     _repairState = RepairState::kIncomplete;
 }
 
-void StorageRepairObserver::onModification(const std::string& description) {
+void StorageRepairObserver::benignModification(const std::string& description) {
     invariant(_repairState == RepairState::kIncomplete);
-    _modifications.emplace_back(description);
+    _modifications.emplace_back(Modification::benign(description));
 }
 
-void StorageRepairObserver::onRepairDone(OperationContext* opCtx) {
+void StorageRepairObserver::invalidatingModification(const std::string& description) {
+    invariant(_repairState == RepairState::kIncomplete);
+    _modifications.emplace_back(Modification::invalidating(description));
+}
+
+void StorageRepairObserver::onRepairDone(OperationContext* opCtx,
+                                         const InvalidateReplConfigCallback& cb) {
     invariant(_repairState == RepairState::kIncomplete);
 
     // This ordering is important. The incomplete file should only be removed once the
     // replica set configuration has been invalidated successfully.
-    if (!_modifications.empty()) {
-        _invalidateReplConfigIfNeeded(opCtx);
+    if (isDataInvalidated()) {
+        invariant(opCtx && cb);
+        cb();
     }
     _removeRepairIncompleteFile();
 
     _repairState = RepairState::kDone;
 }
 
+bool StorageRepairObserver::isDataInvalidated() const {
+    invariant(_repairState == RepairState::kIncomplete || _repairState == RepairState::kDone);
+    return std::any_of(_modifications.begin(), _modifications.end(), [](Modification mod) -> bool {
+        return mod.isInvalidating();
+    });
+}
+
 void StorageRepairObserver::_touchRepairIncompleteFile() {
     boost::filesystem::ofstream fileStream(_repairIncompleteFilePath);
     fileStream << "This file indicates that a repair operation is in progress or incomplete.";
     if (fileStream.fail()) {
-        severe() << "Failed to write to file " << _repairIncompleteFilePath.string() << ": "
-                 << errnoWithDescription();
-        fassertFailedNoTrace(50920);
+        auto ec = lastSystemError();
+        LOGV2_FATAL_NOTRACE(50920,
+                            "Failed to write to file",
+                            "file"_attr = _repairIncompleteFilePath.generic_string(),
+                            "error"_attr = errorMessage(ec));
     }
     fileStream.close();
 
@@ -126,30 +136,12 @@ void StorageRepairObserver::_removeRepairIncompleteFile() {
     boost::filesystem::remove(_repairIncompleteFilePath, ec);
 
     if (ec) {
-        severe() << "Failed to remove file " << _repairIncompleteFilePath.string() << ": "
-                 << ec.message();
-        fassertFailedNoTrace(50921);
+        LOGV2_FATAL_NOTRACE(50921,
+                            "Failed to remove file",
+                            "file"_attr = _repairIncompleteFilePath.generic_string(),
+                            "error"_attr = ec.message());
     }
     fassertNoTrace(50927, fsyncParentDirectory(_repairIncompleteFilePath));
-}
-
-void StorageRepairObserver::_invalidateReplConfigIfNeeded(OperationContext* opCtx) {
-    // If the config doesn't exist, don't invalidate anything. If this node were originally part of
-    // a replica set but lost its config due to a repair, it would automatically perform a resync.
-    // If this node is a standalone, this would lead to a confusing error message if it were
-    // added to a replica set later on.
-    BSONObj config;
-    if (!Helpers::getSingleton(opCtx, kConfigNss.ns().c_str(), config)) {
-        return;
-    }
-    if (config.hasField(repl::ReplSetConfig::kRepairedFieldName)) {
-        return;
-    }
-    BSONObjBuilder configBuilder(config);
-    configBuilder.append(repl::ReplSetConfig::kRepairedFieldName, true);
-    Helpers::putSingleton(opCtx, kConfigNss.ns().c_str(), configBuilder.obj());
-
-    opCtx->recoveryUnit()->waitUntilDurable();
 }
 
 }  // namespace mongo

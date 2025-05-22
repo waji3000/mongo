@@ -1,15 +1,13 @@
 /**
  * A class representing a directed graph.
  */
-function Graph() {
-    'use strict';
-
+export function Graph() {
     if (!(this instanceof Graph)) {
         return new Graph();
     }
 
     const nodes = new Set();
-    const adjList = new Map();
+    const adjList = new BSONAwareMap();
 
     this.addEdge = function addEdge(fromNode, toNode) {
         nodes.add(fromNode);
@@ -46,7 +44,7 @@ function Graph() {
      *   - http://www.cs.cornell.edu/courses/cs2112/2012sp/lectures/lec24/lec24-12sp.html
      */
     this.findCycle = function findCycle() {
-        const state = new Map();
+        const state = new BSONAwareMap();
         for (let node of nodes) {
             state.put(node, State.kNotYetVisited);
         }
@@ -86,7 +84,7 @@ function Graph() {
                     // A cycle has been detected during the recursive call to doDepthFirstSearch().
                     // Unless we've already closed the loop, the (node, otherNode) edge must be part
                     // of it. Note that we use friendlyEqual() to match the definition of sameness
-                    // as the mongo shell's Map type.
+                    // as the mongo shell's BSONAwareMap type.
                     if (!friendlyEqual(result[0], result[result.length - 1])) {
                         result.unshift(node);
                     }

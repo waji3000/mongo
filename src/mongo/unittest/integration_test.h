@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,10 +29,9 @@
 
 #pragma once
 
+#include "mongo/client/connection_string.h"
+
 namespace mongo {
-
-class ConnectionString;
-
 namespace unittest {
 
 /**
@@ -41,6 +39,11 @@ namespace unittest {
  * against.
  */
 ConnectionString getFixtureConnectionString();
+
+/**
+ * Determines if the integration test is configured to use gRPC.
+ */
+bool shouldUseGRPCEgress();
 
 }  // namespace unittest
 }  // namespace mongo

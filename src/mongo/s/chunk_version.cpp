@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,112 +27,55 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include "mongo/s/chunk_version.h"
 
-#include "mongo/util/mongoutils/str.h"
+
+#include "mongo/idl/idl_parser.h"
+#include "mongo/s/chunk_version_gen.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
-constexpr StringData ChunkVersion::kShardVersionField;
+constexpr StringData ChunkVersion::kChunkVersionField;
 
-StatusWith<ChunkVersion> ChunkVersion::parseWithField(const BSONObj& obj, StringData field) {
-    BSONElement versionElem = obj[field];
-    if (versionElem.eoo())
-        return {ErrorCodes::NoSuchKey,
-                str::stream() << "Expected field " << field << " not found."};
-
-    if (versionElem.type() != Array)
-        return {ErrorCodes::TypeMismatch,
-                str::stream() << "Invalid type " << versionElem.type()
-                              << " for shardVersion element. Expected an array"};
-
-    return fromBSON(versionElem.Obj());
-}
-
-StatusWith<ChunkVersion> ChunkVersion::fromBSON(const BSONObj& obj) {
-    BSONObjIterator it(obj);
-    if (!it.more())
-        return {ErrorCodes::BadValue, "Unexpected empty version array"};
-
-    ChunkVersion version;
-
-    // Expect the timestamp
-    {
-        BSONElement tsPart = it.next();
-        if (tsPart.type() != bsonTimestamp)
-            return {ErrorCodes::TypeMismatch,
-                    str::stream() << "Invalid type " << tsPart.type()
-                                  << " for version timestamp part."};
-
-        version._combined = tsPart.timestamp().asULL();
+bool CollectionGeneration::isSameCollection(const CollectionGeneration& other) const {
+    if (_timestamp == other._timestamp) {
+        tassert(664720,
+                str::stream() << "Collections have matching timestamps " << _timestamp
+                              << ", but different epochs " << _epoch << " vs " << other._epoch,
+                _epoch == other._epoch);
+        return true;
     }
 
-    // Expect the epoch OID
-    {
-        BSONElement epochPart = it.next();
-        if (epochPart.type() != jstOID)
-            return {ErrorCodes::TypeMismatch,
-                    str::stream() << "Invalid type " << epochPart.type()
-                                  << " for version epoch part."};
-
-        version._epoch = epochPart.OID();
-    }
-
-    return version;
+    tassert(664721,
+            str::stream() << "Collections have different timestamps " << _timestamp << " vs "
+                          << other._timestamp << ", but matching epochs " << _epoch,
+            _epoch != other._epoch);
+    return false;
 }
 
-StatusWith<ChunkVersion> ChunkVersion::parseLegacyWithField(const BSONObj& obj, StringData field) {
-    // Expect the timestamp
-    auto versionElem = obj[field];
-    if (versionElem.eoo())
-        return {ErrorCodes::NoSuchKey,
-                str::stream() << "Expected field " << field << " not found."};
-
-    ChunkVersion version;
-
-    if (versionElem.type() == bsonTimestamp || versionElem.type() == Date) {
-        version._combined = versionElem._numberLong();
-    } else {
-        return {ErrorCodes::TypeMismatch,
-                str::stream() << "Invalid type " << versionElem.type()
-                              << " for version timestamp part."};
-    }
-
-    // Expect the optional epoch OID
-    const auto epochField = field + "Epoch";
-    auto epochElem = obj[epochField];
-    if (epochElem.type() == jstOID) {
-        version._epoch = epochElem.OID();
-    } else if (!epochElem.eoo()) {
-        return {ErrorCodes::TypeMismatch,
-                str::stream() << "Invalid type " << epochElem.type() << " for version epoch part."};
-    }
-
-    return version;
+std::string CollectionGeneration::toString() const {
+    return str::stream() << _epoch << "|" << _timestamp;
 }
 
-void ChunkVersion::appendWithField(BSONObjBuilder* out, StringData field) const {
-    BSONArrayBuilder arr(out->subarrayStart(field));
-    arr.appendTimestamp(_combined);
-    arr.append(_epoch);
+ChunkVersion ChunkVersion::parse(const BSONElement& element) {
+    auto parsedVersion =
+        ChunkVersion60Format::parse(IDLParserContext("ChunkVersion"), element.Obj());
+    auto version = parsedVersion.getVersion();
+    return ChunkVersion({parsedVersion.getEpoch(), parsedVersion.getTimestamp()},
+                        {version.getSecs(), version.getInc()});
 }
 
-void ChunkVersion::appendLegacyWithField(BSONObjBuilder* out, StringData field) const {
-    out->appendTimestamp(field, _combined);
-    out->append(field + "Epoch", _epoch);
-}
-
-BSONObj ChunkVersion::toBSON() const {
-    BSONArrayBuilder b;
-    b.appendTimestamp(_combined);
-    b.append(_epoch);
-    return b.arr();
+void ChunkVersion::serialize(StringData field, BSONObjBuilder* builder) const {
+    ChunkVersion60Format version;
+    version.setGeneration({_epoch, _timestamp});
+    version.setPlacement(Timestamp(majorVersion(), minorVersion()));
+    builder->append(field, version.toBSON());
 }
 
 std::string ChunkVersion::toString() const {
-    return str::stream() << majorVersion() << "|" << minorVersion() << "||" << _epoch;
+    return str::stream() << majorVersion() << "|" << minorVersion() << "||" << _epoch << "||"
+                         << _timestamp.toString();
 }
 
 }  // namespace mongo

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,45 +27,34 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <boost/smart_ptr/intrusive_ptr.hpp>
 
-#include "mongo/db/pipeline/accumulator.h"
-
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/pipeline/accumulation_statement.h"
-#include "mongo/db/pipeline/value.h"
+#include "mongo/db/pipeline/accumulator.h"
+#include "mongo/db/pipeline/expression_context.h"
 
 namespace mongo {
 
-using boost::intrusive_ptr;
-
-REGISTER_ACCUMULATOR(last, AccumulatorLast::create);
-
-const char* AccumulatorLast::getOpName() const {
-    return "$last";
-}
+REGISTER_ACCUMULATOR(last, genericParseSingleExpressionAccumulator<AccumulatorLast>);
 
 void AccumulatorLast::processInternal(const Value& input, bool merging) {
     /* always remember the last value seen */
     _last = input;
-    _memUsageBytes = sizeof(*this) + _last.getApproximateSize() - sizeof(Value);
+    _memUsageTracker.set(sizeof(*this) + _last.getApproximateSize() - sizeof(Value));
 }
 
 Value AccumulatorLast::getValue(bool toBeMerged) {
     return _last;
 }
 
-AccumulatorLast::AccumulatorLast(const boost::intrusive_ptr<ExpressionContext>& expCtx)
-    : Accumulator(expCtx) {
-    _memUsageBytes = sizeof(*this);
+AccumulatorLast::AccumulatorLast(ExpressionContext* const expCtx) : AccumulatorState(expCtx) {
+    _memUsageTracker.set(sizeof(*this));
 }
 
 void AccumulatorLast::reset() {
-    _memUsageBytes = sizeof(*this);
+    _memUsageTracker.set(sizeof(*this));
     _last = Value();
 }
 
-intrusive_ptr<Accumulator> AccumulatorLast::create(
-    const boost::intrusive_ptr<ExpressionContext>& expCtx) {
-    return new AccumulatorLast(expCtx);
-}
-}
+}  // namespace mongo

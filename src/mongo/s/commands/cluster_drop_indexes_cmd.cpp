@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,20 +27,54 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#include <set>
+#include <string>
 
-#include "mongo/platform/basic.h"
-
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/client/read_preference.h"
+#include "mongo/db/auth/action_type.h"
+#include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/drop_indexes_gen.h"
+#include "mongo/db/generic_argument_util.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/query/explain_verbosity_gen.h"
+#include "mongo/db/service_context.h"
+#include "mongo/executor/remote_command_response.h"
+#include "mongo/idl/idl_parser.h"
+#include "mongo/logv2/log.h"
+#include "mongo/s/async_requests_sender.h"
+#include "mongo/s/catalog_cache.h"
+#include "mongo/s/client/shard.h"
 #include "mongo/s/cluster_commands_helpers.h"
-#include "mongo/util/log.h"
+#include "mongo/s/grid.h"
+#include "mongo/s/request_types/sharded_ddl_commands_gen.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/database_name_util.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 namespace mongo {
 namespace {
 
-class DropIndexesCmd : public ErrmsgCommandDeprecated {
+constexpr auto kRawFieldName = "raw"_sd;
+
+class DropIndexesCmd : public BasicCommandWithRequestParser<DropIndexesCmd> {
 public:
-    DropIndexesCmd() : ErrmsgCommandDeprecated("dropIndexes", "deleteIndexes") {}
+    using Request = DropIndexes;
+    using Reply = DropIndexesReply;
+
+    const std::set<std::string>& apiVersions() const override {
+        return kApiVersions1;
+    }
 
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kNever;
@@ -51,47 +84,87 @@ public:
         return false;
     }
 
-    void addRequiredPrivileges(const std::string& dbname,
-                               const BSONObj& cmdObj,
-                               std::vector<Privilege>* out) const override {
-        ActionSet actions;
-        actions.addAction(ActionType::dropIndex);
-        out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
+    bool supportsRawData() const override {
+        return true;
+    }
+
+    Status checkAuthForOperation(OperationContext* opCtx,
+                                 const DatabaseName& dbName,
+                                 const BSONObj& cmdObj) const override {
+        auto* as = AuthorizationSession::get(opCtx->getClient());
+        if (!as->isAuthorizedForActionsOnResource(parseResourcePattern(dbName, cmdObj),
+                                                  ActionType::dropIndex)) {
+            return {ErrorCodes::Unauthorized, "unauthorized"};
+        }
+
+        return Status::OK();
+    }
+
+    void validateResult(const BSONObj& resultObj) final {
+        auto ctx = IDLParserContext("DropIndexesReply");
+        if (!checkIsErrorStatus(resultObj, ctx)) {
+            Reply::parse(ctx, resultObj.removeField(kRawFieldName));
+            if (resultObj.hasField(kRawFieldName)) {
+                const auto& rawData = resultObj[kRawFieldName];
+                if (ctx.checkAndAssertType(rawData, Object)) {
+                    for (const auto& element : rawData.Obj()) {
+                        const auto& shardReply = element.Obj();
+                        if (!checkIsErrorStatus(shardReply, ctx)) {
+                            Reply::parse(ctx, shardReply);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     bool supportsWriteConcern(const BSONObj& cmd) const override {
         return true;
     }
 
-    bool errmsgRun(OperationContext* opCtx,
-                   const std::string& dbName,
-                   const BSONObj& cmdObj,
-                   std::string& errmsg,
-                   BSONObjBuilder& output) override {
-        const NamespaceString nss(CommandHelpers::parseNsCollectionRequired(dbName, cmdObj));
-        LOG(1) << "dropIndexes: " << nss << " cmd:" << redact(cmdObj);
+    bool runWithRequestParser(OperationContext* opCtx,
+                              const DatabaseName& dbName,
+                              const BSONObj& cmdObj,
+                              const RequestParser& requestParser,
+                              BSONObjBuilder& output) final {
+        auto nss = requestParser.request().getNamespace();
 
-        // If the collection is sharded, we target all shards rather than just shards that own
-        // chunks for the collection, because some shard may have previously owned chunks but no
-        // longer does (and so, may have the index). However, we ignore NamespaceNotFound errors
-        // from individual shards, because some shards may have never owned chunks for the
-        // collection. We additionally ignore IndexNotFound errors, because the index may not have
-        // been built on a shard if the earlier createIndexes command coincided with the shard
-        // receiving its first chunk for the collection (see SERVER-31715).
-        auto shardResponses = scatterGatherOnlyVersionIfUnsharded(
+        uassert(ErrorCodes::IllegalOperation,
+                "Cannot drop indexes in 'config' database in sharded cluster",
+                nss.dbName() != DatabaseName::kConfig);
+
+        uassert(ErrorCodes::IllegalOperation,
+                "Cannot drop indexes in 'admin' database in sharded cluster",
+                nss.dbName() != DatabaseName::kAdmin);
+
+        LOGV2_DEBUG(22751, 1, "CMD: dropIndexes", logAttrs(nss), "command"_attr = redact(cmdObj));
+
+        ShardsvrDropIndexes shardsvrDropIndexCmd(nss);
+        shardsvrDropIndexCmd.setDropIndexesRequest(requestParser.request().getDropIndexesRequest());
+        generic_argument_util::setMajorityWriteConcern(shardsvrDropIndexCmd,
+                                                       &opCtx->getWriteConcern());
+
+        const CachedDatabaseInfo dbInfo =
+            uassertStatusOK(Grid::get(opCtx)->catalogCache()->getDatabase(opCtx, dbName));
+
+        auto cmdResponse = executeCommandAgainstDatabasePrimaryOnlyAttachingDbVersion(
             opCtx,
-            nss,
-            CommandHelpers::filterCommandRequestForPassthrough(cmdObj),
-            ReadPreferenceSetting::get(opCtx),
+            dbName,
+            dbInfo,
+            shardsvrDropIndexCmd.toBSON(),
+            ReadPreferenceSetting(ReadPreference::PrimaryOnly),
             Shard::RetryPolicy::kNotIdempotent);
-        return appendRawResponses(opCtx,
-                                  &errmsg,
-                                  &output,
-                                  std::move(shardResponses),
-                                  {ErrorCodes::NamespaceNotFound, ErrorCodes::IndexNotFound});
+
+        const auto remoteResponse = uassertStatusOK(cmdResponse.swResponse);
+        CommandHelpers::filterCommandReplyForPassthrough(remoteResponse.data, &output);
+        return true;
     }
 
-} dropIndexesCmd;
+    const AuthorizationContract* getAuthorizationContract() const final {
+        return &::mongo::DropIndexes::kAuthorizationContract;
+    }
+};
+MONGO_REGISTER_COMMAND(DropIndexesCmd).forRouter();
 
 }  // namespace
 }  // namespace mongo

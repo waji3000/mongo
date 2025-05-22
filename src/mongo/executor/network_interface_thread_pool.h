@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,12 +29,16 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
 #include <cstdint>
+#include <mutex>
 #include <vector>
 
 #include "mongo/stdx/condition_variable.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/util/concurrency/thread_pool_interface.h"
+#include "mongo/util/hierarchical_acquisition.h"
+#include "mongo/util/out_of_line_executor.h"
 
 namespace mongo {
 namespace executor {
@@ -58,11 +61,12 @@ public:
     void startup() override;
     void shutdown() override;
     void join() override;
-    Status schedule(Task task) override;
+    void schedule(Task task) override;
 
 private:
-    void consumeTasks(stdx::unique_lock<stdx::mutex> lk);
-    void dtorImpl();
+    void _consumeTasks(stdx::unique_lock<stdx::mutex> lk);
+    void _consumeTasksInline(stdx::unique_lock<stdx::mutex> lk);
+    void _dtorImpl();
 
     NetworkInterface* const _net;
 
@@ -73,8 +77,13 @@ private:
     bool _started = false;
     bool _inShutdown = false;
     bool _joining = false;
-    bool _registeredAlarm = false;
-    bool _consumingTasks = false;
+
+    enum class ConsumeState {
+        kNeutral = 0,
+        kScheduled,
+        kConsuming,
+    };
+    ConsumeState _consumeState = ConsumeState::kNeutral;
 };
 
 }  // namespace executor

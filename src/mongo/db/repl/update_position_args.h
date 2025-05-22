@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -32,8 +31,10 @@
 
 #include <vector>
 
-#include "mongo/db/jsobj.h"
+#include "mongo/base/status.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/db/repl/optime.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo {
 
@@ -49,18 +50,30 @@ public:
     static const char kCommandFieldName[];
     static const char kUpdateArrayFieldName[];
     static const char kAppliedOpTimeFieldName[];
+    static const char kAppliedWallTimeFieldName[];
+    static const char kWrittenOpTimeFieldName[];
+    static const char kWrittenWallTimeFieldName[];
     static const char kDurableOpTimeFieldName[];
+    static const char kDurableWallTimeFieldName[];
     static const char kMemberIdFieldName[];
     static const char kConfigVersionFieldName[];
 
     struct UpdateInfo {
         UpdateInfo(const OpTime& applied,
+                   const Date_t& appliedWall,
+                   const OpTime& written,
+                   const Date_t& writtenWall,
                    const OpTime& durable,
+                   const Date_t& durableWall,
                    long long aCfgver,
                    long long aMemberId);
 
         OpTime appliedOpTime;
+        Date_t appliedWallTime;
+        OpTime writtenOpTime;
+        Date_t writtenWallTime;
         OpTime durableOpTime;
+        Date_t durableWallTime;
         long long cfgver;
         long long memberId;
     };

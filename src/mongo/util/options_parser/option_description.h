@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,10 +29,14 @@
 
 #pragma once
 
+#include <functional>
+#include <memory>
+#include <string>
 #include <vector>
 
 #include "mongo/base/status.h"
 #include "mongo/util/options_parser/constraints.h"
+#include "mongo/util/options_parser/environment.h"
 #include "mongo/util/options_parser/value.h"
 
 namespace mongo {
@@ -77,14 +80,18 @@ enum OptionSources {
  * OptionSection instance and passed to an OptionsParser.
  */
 class OptionDescription {
-public:
+private:
+    friend class OptionSection;
+
+    OptionDescription() = delete;
     OptionDescription(const std::string& dottedName,
                       const std::string& singleName,
-                      const OptionType type,
+                      OptionType type,
                       const std::string& description,
                       const std::vector<std::string>& deprecatedDottedNames = {},
                       const std::vector<std::string>& deprecatedSingleNames = {});
 
+public:
     /*
      * The following functions are part of the chaining interface for option registration.  See
      * comments below for what each of these attributes mean, and the OptionSection class for
@@ -102,6 +109,12 @@ public:
      * Make this option hidden so it does not appear in command line help
      */
     OptionDescription& hidden();
+
+    /*
+     * Mark this option as sensitive so that attempts by a client to read this setting
+     * will only return a placeholder value rather than the real setting.
+     */
+    OptionDescription& redact();
 
     /*
      * Add a default value for this option if it is not specified
@@ -168,11 +181,6 @@ public:
      */
 
     /**
-     * Specifies the range allowed for this option.  Only allowed for options with numeric type.
-     */
-    OptionDescription& validRange(long min, long max);
-
-    /**
      * Specifies that this option is incompatible with another option.  The std::string provided
      * must be the dottedName, which is the name used to access the option in the result
      * Environment.
@@ -186,14 +194,7 @@ public:
      * provided must be the dottedName, which is the name used to access the option in the
      * result Environment.
      */
-    OptionDescription& requires(const std::string& otherDottedName);
-
-    /**
-     * Specifies that this option is required to match the given format, specified as a regular
-     * expression.  The displayFormat argument is what gets printed to the user in the case
-     * where this constraint is not satisfied.  This is only allowed on std::string options.
-     */
-    OptionDescription& format(const std::string& regexFormat, const std::string& displayFormat);
+    OptionDescription& requiresOption(const std::string& otherDottedName);
 
     /**
      * Specifies that this option should be canonicalized immediately after initial parse.
@@ -217,6 +218,7 @@ public:
                                // (required by boost)
     std::string _description;  // Description of option printed in help output
     bool _isVisible;           // Visible in help output
+    bool _redact = false;      // Value should not be exposed to inquiry
     Value _default;            // Value if option is not specified
     Value _implicit;           // Value if option is specified with no argument
     bool _isComposing;         // Aggregate values from different sources instead of overriding

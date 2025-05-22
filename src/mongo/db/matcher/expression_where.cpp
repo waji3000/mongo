@@ -1,6 +1,3 @@
-// expression_where.cpp
-
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,81 +27,41 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <memory>
+#include <string>
 
-#include "mongo/db/matcher/expression_where.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
 
-#include "mongo/base/init.h"
-#include "mongo/db/auth/authorization_session.h"
-#include "mongo/db/client.h"
-#include "mongo/db/jsobj.h"
+#include "mongo/base/init.h"  // IWYU pragma: keep
 #include "mongo/db/matcher/expression.h"
-#include "mongo/db/matcher/expression_parser.h"
-#include "mongo/db/namespace_string.h"
-#include "mongo/scripting/engine.h"
-#include "mongo/stdx/memory.h"
+#include "mongo/db/matcher/expression_where.h"
 
 
 namespace mongo {
 
 using std::unique_ptr;
-using std::string;
-using std::stringstream;
-using stdx::make_unique;
 
 WhereMatchExpression::WhereMatchExpression(OperationContext* opCtx,
                                            WhereParams params,
-                                           StringData dbName)
-    : WhereMatchExpressionBase(std::move(params)), _dbName(dbName.toString()), _opCtx(opCtx) {
-    invariant(_opCtx != NULL);
+                                           const DatabaseName& dbName)
+    : WhereMatchExpressionBase(std::move(params)),
+      _opCtx(opCtx),
+      _jsFunction(std::make_unique<JsFunction>(_opCtx, getCode(), dbName)) {}
 
-    uassert(
-        ErrorCodes::BadValue, "no globalScriptEngine in $where parsing", getGlobalScriptEngine());
+unique_ptr<MatchExpression> WhereMatchExpression::clone() const {
+    validateState();
 
-    uassert(ErrorCodes::BadValue, "ns for $where cannot be empty", dbName.size() != 0);
-
-    const string userToken =
-        AuthorizationSession::get(Client::getCurrent())->getAuthenticatedUserNamesToken();
-
-    _scope = getGlobalScriptEngine()->getPooledScope(_opCtx, _dbName, "where" + userToken);
-    _func = _scope->createFunction(getCode().c_str());
-
-    uassert(ErrorCodes::BadValue, "$where compile error", _func);
-}
-
-bool WhereMatchExpression::matches(const MatchableDocument* doc, MatchDetails* details) const {
-    uassert(28692, "$where compile error", _func);
-    BSONObj obj = doc->toBSON();
-
-    if (!getScope().isEmpty()) {
-        _scope->init(&getScope());
-    }
-
-    _scope->advanceGeneration();
-    _scope->setObject("obj", const_cast<BSONObj&>(obj));
-    _scope->setBoolean("fullObject", true);  // this is a hack b/c fullObject used to be relevant
-
-    int err = _scope->invoke(_func, 0, &obj, 1000 * 60, false);
-    if (err == -3) {  // INVOKE_ERROR
-        stringstream ss;
-        ss << "error on invocation of $where function:\n" << _scope->getError();
-        uassert(16812, ss.str(), false);
-    } else if (err != 0) {  // ! INVOKE_SUCCESS
-        uassert(16813, "unknown error in invocation of $where function", false);
-    }
-
-    return _scope->getBoolean("__returnValue") != 0;
-}
-
-unique_ptr<MatchExpression> WhereMatchExpression::shallowClone() const {
     WhereParams params;
     params.code = getCode();
-    params.scope = getScope();
     unique_ptr<WhereMatchExpression> e =
-        make_unique<WhereMatchExpression>(_opCtx, std::move(params), _dbName);
+        std::make_unique<WhereMatchExpression>(_opCtx, std::move(params), _jsFunction->getDbName());
     if (getTag()) {
         e->setTag(getTag()->clone());
     }
-    return std::move(e);
+    if (getInputParamId()) {
+        e->setInputParamId(*getInputParamId());
+    }
+    return e;
 }
-}
+}  // namespace mongo

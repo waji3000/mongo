@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Public Domain 2014-2018 MongoDB, Inc.
+# Public Domain 2014-present MongoDB, Inc.
 # Public Domain 2008-2014 WiredTiger, Inc.
 #
 # This is free and unencumbered software released into the public domain.
@@ -33,90 +33,81 @@
 from suite_subprocess import suite_subprocess
 import wiredtiger, wttest
 
-def timestamp_str(t):
-    return '%x' % t
-
+@wttest.skip_for_hook("tiered", "Fails with tiered storage")
 class test_prepare02(wttest.WiredTigerTestCase, suite_subprocess):
-    def test_prepare_session_operations(self):
-        self.session.create("table:mytable", "key_format=S,value_format=S")
-        cursor = self.session.open_cursor("table:mytable", None)
 
-        # Test the session methods that are forbidden after the transaction is
-        # prepared.
+    def test_prepare_session_operations(self):
+        msg = "/not permitted in a prepared transaction/"
+        msgRunning = "/not permitted in a running transaction/"
+
+        # Test the session methods forbidden after the transaction is prepared.
+        self.session.create("table:mytable", "key_format=S,value_format=S")
         self.session.begin_transaction()
+        cursor = self.session.open_cursor("table:mytable", None)
+        cursor["key"] = "value"
         self.session.prepare_transaction("prepare_timestamp=2a")
-        msg = "/ not permitted in a/"
-        #
-        # The operations listed below are not supported in the prepared state.
-        #
-        # The operations are listed in the same order as they are declared in
-        # the session structure. Any function missing below is allowed in the
-        # prepared state.
-        #
+
+        # The operations are listed in the same order as they are declared in the session structure.
+        # WT_SESSION.close permitted.
+        # WT_SESSION.reconfigure permitted.
+        self.session.reconfigure()
+        # WT_SESSION.reconfigure with "isolation" - not permitted.
         self.assertRaisesWithMessage(wiredtiger.WiredTigerError,
-            lambda:self.session.reconfigure(), msg)
+            lambda:self.session.reconfigure("isolation=snapshot"), msgRunning)
+        # WT_SESSION.strerror permitted, but currently broken in the Python API (WT-5399).
         self.assertRaisesWithMessage(wiredtiger.WiredTigerError,
             lambda: self.session.open_cursor("table:mytable", None), msg)
         self.assertRaisesWithMessage(wiredtiger.WiredTigerError,
-            lambda: self.session.alter("table:mytable",
-                "access_pattern_hint=random"), msg)
+            lambda: self.session.alter("table:mytable", "access_pattern_hint=random"), msg)
         self.assertRaisesWithMessage(wiredtiger.WiredTigerError,
-            lambda: self.session.create("table:mytable1",
-                "key_format=S,value_format=S"), msg)
+            lambda: self.session.create("table:mytable1", "key_format=S,value_format=S"), msg)
+        # WT_SESSION.import permitted, not supported in the Python API.
         self.assertRaisesWithMessage(wiredtiger.WiredTigerError,
             lambda: self.session.compact("table:mytable"), msg)
         self.assertRaisesWithMessage(wiredtiger.WiredTigerError,
             lambda: self.session.drop("table:mytable", None), msg)
         self.assertRaisesWithMessage(wiredtiger.WiredTigerError,
-            lambda: self.session.join(cursor, cursor,
-                "compare=gt,count=10"), msg)
-        self.assertRaisesWithMessage(wiredtiger.WiredTigerError,
             lambda: self.session.log_flush("sync=on"), msg)
-        self.assertRaisesWithMessage(wiredtiger.WiredTigerError,
-            lambda: self.session.log_printf("Printing to log file"), msg)
-        self.assertRaisesWithMessage(wiredtiger.WiredTigerError,
-            lambda: self.session.rebalance("table:mytable", None), msg)
-        self.assertRaisesWithMessage(wiredtiger.WiredTigerError,
-            lambda: self.session.rename("table:mytable", "table:mynewtable",
-                None), msg)
         self.assertRaisesWithMessage(wiredtiger.WiredTigerError,
             lambda:self.session.reset(), msg)
         self.assertRaisesWithMessage(wiredtiger.WiredTigerError,
             lambda: self.session.salvage("table:mytable", None), msg)
         self.assertRaisesWithMessage(wiredtiger.WiredTigerError,
-            lambda: self.session.truncate("table:mytable",
-                None, None, None), msg)
-        self.assertRaisesWithMessage(wiredtiger.WiredTigerError,
-            lambda: self.session.upgrade("table:mytable", None), msg)
+            lambda: self.session.truncate("table:mytable", None, None, None), msg)
         self.assertRaisesWithMessage(wiredtiger.WiredTigerError,
             lambda: self.session.verify("table:mytable", None), msg)
         self.assertRaisesWithMessage(wiredtiger.WiredTigerError,
             lambda:self.session.begin_transaction(), msg)
+        # WT_SESSION.commit_transaction permitted, tested below.
         self.assertRaisesWithMessage(wiredtiger.WiredTigerError,
             lambda:self.session.prepare_transaction("prepare_timestamp=2a"), msg)
-        self.assertRaisesWithMessage(wiredtiger.WiredTigerError,
-            lambda: self.session.timestamp_transaction(
-                "read_timestamp=2a"), msg)
+        # WT_SESSION.rollback_transaction permitted, tested below.
+        self.session.timestamp_transaction("commit_timestamp=2b")
+        self.assertTimestampsEqual(self.session.query_timestamp('get=prepare'), '2a')
         self.assertRaisesWithMessage(wiredtiger.WiredTigerError,
             lambda:self.session.checkpoint(), msg)
-        self.assertRaisesWithMessage(wiredtiger.WiredTigerError,
-            lambda: self.session.snapshot("name=test"), msg)
-        self.assertRaisesWithMessage(wiredtiger.WiredTigerError,
-            lambda:self.session.transaction_sync(), msg)
-        self.session.rollback_transaction()
+        self.session.breakpoint()
+
+        # Commit the transaction. Test that no "not permitted in a prepared transaction" error has
+        # set a transaction error flag, that is, we should still be able to commit successfully.
+        self.session.timestamp_transaction("commit_timestamp=2b")
+        self.session.timestamp_transaction("durable_timestamp=2b")
+        self.session.commit_transaction('commit_timestamp=2a')
 
         # Commit after prepare is permitted.
         self.session.begin_transaction()
         c1 = self.session.open_cursor("table:mytable", None)
         self.session.prepare_transaction("prepare_timestamp=2a")
-        self.session.commit_transaction("commit_timestamp=2b")
+        self.session.timestamp_transaction("commit_timestamp=2b")
+        self.session.timestamp_transaction("durable_timestamp=2b")
+        self.session.commit_transaction()
 
-        # Setting commit timestamp via timestamp_transaction after
-        # prepare is also permitted.
+        # Setting commit timestamp via timestamp_transaction after prepare is also permitted.
         self.session.begin_transaction()
         c1 = self.session.open_cursor("table:mytable", None)
         self.session.prepare_transaction("prepare_timestamp=2a")
         self.session.timestamp_transaction("commit_timestamp=2b")
+        self.session.timestamp_transaction("durable_timestamp=2b")
         self.session.commit_transaction()
 
         # Rollback after prepare is permitted.
@@ -128,6 +119,3 @@ class test_prepare02(wttest.WiredTigerTestCase, suite_subprocess):
         self.session.begin_transaction()
         self.session.prepare_transaction("prepare_timestamp=2a")
         self.session.close()
-
-if __name__ == '__main__':
-    wttest.run()

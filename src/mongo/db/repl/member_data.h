@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,9 +29,15 @@
 
 #pragma once
 
+#include <string>
+
 #include "mongo/bson/timestamp.h"
+#include "mongo/db/repl/member_id.h"
 #include "mongo/db/repl/member_state.h"
+#include "mongo/db/repl/optime.h"
+#include "mongo/db/repl/repl_set_config.h"
 #include "mongo/db/repl/repl_set_heartbeat_response.h"
+#include "mongo/util/net/hostandport.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
@@ -44,6 +49,31 @@ namespace repl {
  **/
 class MemberData {
 public:
+    class HeartbeatChanges {
+    public:
+        HeartbeatChanges(bool opTimeAdvanced, bool configChanged, bool memberStateChanged)
+            : _opTimeAdvanced(opTimeAdvanced),
+              _configChanged(configChanged),
+              _memberStateChanged(memberStateChanged) {}
+
+        bool getOpTimeAdvanced() const {
+            return _opTimeAdvanced;
+        }
+
+        bool getConfigChanged() const {
+            return _configChanged;
+        }
+
+        bool getMemberStateChanged() const {
+            return _memberStateChanged;
+        }
+
+    private:
+        const bool _opTimeAdvanced;
+        const bool _configChanged;
+        const bool _memberStateChanged;
+    };
+
     MemberData();
 
     MemberState getState() const {
@@ -73,14 +103,23 @@ public:
     OpTime getHeartbeatAppliedOpTime() const {
         return _lastResponse.getAppliedOpTime();
     }
+    OpTime getHeartbeatWrittenOpTime() const {
+        return _lastResponse.getWrittenOpTime();
+    }
     OpTime getHeartbeatDurableOpTime() const {
         return _lastResponse.hasDurableOpTime() ? _lastResponse.getDurableOpTime() : OpTime();
     }
-    OpTime getHeartbeatLastOpCommitted() const {
-        return _lastOpCommitted;
-    }
     int getConfigVersion() const {
-        return _lastResponse.getConfigVersion();
+        return _configVersion;
+    }
+    long long getConfigTerm() const {
+        return _configTerm;
+    }
+    /**
+     * Gets the ReplSetConfig (version, term) pair from the last heartbeatResponse.
+     */
+    ConfigVersionAndTerm getConfigVersionAndTerm() const {
+        return ConfigVersionAndTerm(_configVersion, _configTerm);
     }
     bool hasAuthIssue() const {
         return _authIssue;
@@ -98,10 +137,9 @@ public:
     bool up() const {
         return _health > 0;
     }
-    // Was this member up for the last hearbeeat
-    // (or we haven't received the first heartbeat yet)
-    bool maybeUp() const {
-        return _health != 0;
+
+    OpTime getLastWrittenOpTime() const {
+        return _lastWrittenOpTime;
     }
 
     OpTime getLastAppliedOpTime() const {
@@ -110,6 +148,18 @@ public:
 
     OpTime getLastDurableOpTime() const {
         return _lastDurableOpTime;
+    }
+
+    Date_t getLastWrittenWallTime() const {
+        return _lastWrittenWallTime;
+    }
+
+    Date_t getLastAppliedWallTime() const {
+        return _lastAppliedWallTime;
+    }
+
+    Date_t getLastDurableWallTime() const {
+        return _lastDurableWallTime;
     }
 
     // When was the last time this data was updated via any means?
@@ -126,7 +176,7 @@ public:
         return _configIndex;
     }
 
-    int getMemberId() const {
+    MemberId getMemberId() const {
         return _memberId;
     }
 
@@ -138,12 +188,19 @@ public:
         return _hostAndPort;
     }
 
-    /**
-     * Sets values in this object from the results of a successful heartbeat command.
-     * 'lastOpCommitted' should be extracted from the heartbeat metadata.
-     * Returns whether or not the optimes advanced as a result of this heartbeat response.
+    /*
+     * Returns true if the last heartbeat data explicilty stated that the node is not electable.
      */
-    bool setUpValues(Date_t now, ReplSetHeartbeatResponse&& hbResponse, OpTime lastOpCommitted);
+    bool isUnelectable() const {
+        return _lastResponse.hasIsElectable() && !_lastResponse.isElectable();
+    }
+
+    /**
+     * Sets values in this object from the results of a successful heartbeat command.  Returns a
+     * value indicating whether the lastApplied/lastDurable values advanced, we've received a newer
+     * config, and/or the member state changed since the last heartbeat response.
+     */
+    HeartbeatChanges setUpValues(Date_t now, ReplSetHeartbeatResponse&& hbResponse);
 
     /**
      * Sets values in this object from the results of a erroring/failed heartbeat command.
@@ -170,29 +227,48 @@ public:
     }
 
     /**
-     * Sets the last applied op time (not the heartbeat applied op time) and updates the
-     * lastUpdate time.
+     * Performs setLastWrittenOpTime and also sets the wall clock time corresponding to the last
+     * written opTime. Should only be used on the current node.
      */
-    void setLastAppliedOpTime(OpTime opTime, Date_t now);
+    void setLastWrittenOpTimeAndWallTime(OpTimeAndWallTime opTime, Date_t now);
 
     /**
-     * Sets the last durable op time (not the heartbeat durable op time)
+     * Performs setLastAppliedOpTime and also sets the wall clock time corresponding to the last
+     * applied opTime. Should only be used on the current node.
      */
-    void setLastDurableOpTime(OpTime opTime, Date_t now);
+    void setLastAppliedOpTimeAndWallTime(OpTimeAndWallTime opTime, Date_t now);
+
+    /**
+     * Performs setLastDurableOpTime and also sets the wall clock time corresponding to the last
+     * durable opTime. Should only be used on the current node.
+     */
+    void setLastDurableOpTimeAndWallTime(OpTimeAndWallTime opTime, Date_t now);
+
+    /**
+     * Sets the lastWritten op time iff the new optime is later than the current optime, and updates
+     * the lastUpdate time.  Returns true if the optime was advanced.
+     * Performs advanceLastWrittenOpTime and also sets the wall clock time corresponding to the last
+     * written opTime. Should only be used on the current node.
+     */
+    bool advanceLastWrittenOpTimeAndWallTime(OpTimeAndWallTime opTime, Date_t now);
 
     /**
      * Sets the last applied op time (not the heartbeat applied op time) iff the new optime is
      * later than the current optime, and updates the lastUpdate time.  Returns true if the
      * optime was advanced.
+     * Performs advanceLastAppliedOpTime and also sets the wall clock time corresponding to the last
+     * applied opTime. Should only be used on the current node.
      */
-    bool advanceLastAppliedOpTime(OpTime opTime, Date_t now);
+    bool advanceLastAppliedOpTimeAndWallTime(OpTimeAndWallTime opTime, Date_t now);
 
     /**
      * Sets the last durable op time (not the heartbeat applied op time) iff the new optime is
      * later than the current optime, and updates the lastUpdate time.  Returns true if the
      * optime was advanced.
+     * Performs advanceLastDurableOpTime and also sets the wall clock time corresponding to the last
+     * durable opTime. Should only be used on the current node.
      */
-    bool advanceLastDurableOpTime(OpTime opTime, Date_t now);
+    bool advanceLastDurableOpTimeAndWallTime(OpTimeAndWallTime opTime, Date_t now);
 
     /*
      * Indicates that this data is stale, based on _lastUpdateTime.
@@ -221,11 +297,20 @@ public:
         _hostAndPort = hostAndPort;
     }
 
-    void setMemberId(int memberId) {
+    void setMemberId(MemberId memberId) {
         _memberId = memberId;
     }
 
+    void setConfigVersion(int version) {
+        _configVersion = version;
+    }
+
+    void setConfigTerm(long long term) {
+        _configTerm = term;
+    }
+
 private:
+    bool _checkAndSetLastDurableOpTime(OpTime opTime, Date_t now);
     // -1 = not checked yet, 0 = member is down/unreachable, 1 = member is up
     int _health;
 
@@ -256,16 +341,23 @@ private:
     // on the primary, but not the secondaries.
     bool _lastUpdateStale = false;
 
-    // Last known OpTime that the replica has applied and journaled to.
+    // Last known OpTime that the replica has written oplog entry into memory.
+    OpTime _lastWrittenOpTime;
+    Date_t _lastWrittenWallTime = Date_t();
+
+    // Last known OpTime that the replica has journaled to.
     OpTime _lastDurableOpTime;
+    Date_t _lastDurableWallTime = Date_t();
 
     // Last known OpTime that the replica has applied, whether journaled or unjournaled.
     OpTime _lastAppliedOpTime;
+    Date_t _lastAppliedWallTime = Date_t();
 
-    // OpTime of the most recently committed op of which the node was aware, extracted from the
-    // heartbeat metadata. Note that only arbiters should update their knowledge of the commit point
-    // from heartbeat data.
-    OpTime _lastOpCommitted;
+    // Last known configVersion.
+    int _configVersion = -1;
+
+    // Last known configTerm.
+    long long _configTerm = OpTime::kUninitializedTerm;
 
     // TODO(russotto): Since memberData is kept in config order, _configIndex
     // and _isSelf may not be necessary.
@@ -277,7 +369,7 @@ private:
 
     // This member's member ID.  memberId and hostAndPort duplicate information in the
     // set's ReplSetConfig.
-    int _memberId = -1;
+    MemberId _memberId;
 
     // Client address of this member.
     HostAndPort _hostAndPort;

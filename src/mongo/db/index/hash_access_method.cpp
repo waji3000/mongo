@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,37 +29,58 @@
 
 #include "mongo/db/index/hash_access_method.h"
 
+#include <utility>
+
+#include <boost/optional/optional.hpp>
+
 #include "mongo/db/catalog/index_catalog_entry.h"
-#include "mongo/db/hasher.h"
 #include "mongo/db/index/expression_keys_private.h"
 #include "mongo/db/index/expression_params.h"
+#include "mongo/db/index/index_descriptor.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 
-HashAccessMethod::HashAccessMethod(IndexCatalogEntry* btreeState, SortedDataInterface* btree)
-    : AbstractIndexAccessMethod(btreeState, btree) {
+HashAccessMethod::HashAccessMethod(IndexCatalogEntry* btreeState,
+                                   std::unique_ptr<SortedDataInterface> btree)
+    : SortedDataIndexAccessMethod(btreeState, std::move(btree)) {
     const IndexDescriptor* descriptor = btreeState->descriptor();
-
-    // We can change these if the single-field limitation is lifted later.
-    uassert(16763,
-            "Currently only single field hashed index supported.",
-            1 == descriptor->getNumFields());
 
     uassert(16764,
             "Currently hashed indexes cannot guarantee uniqueness. Use a regular index.",
             !descriptor->unique());
-
-    ExpressionParams::parseHashParams(descriptor->infoObj(), &_seed, &_hashVersion, &_hashedField);
+    ExpressionParams::parseHashParams(descriptor->infoObj(), &_hashVersion, &_keyPattern);
 
     _collator = btreeState->getCollator();
 }
 
-void HashAccessMethod::doGetKeys(const BSONObj& obj,
-                                 BSONObjSet* keys,
-                                 BSONObjSet* multikeyMetadataKeys,
-                                 MultikeyPaths* multikeyPaths) const {
-    ExpressionKeysPrivate::getHashKeys(
-        obj, _hashedField, _seed, _hashVersion, _descriptor->isSparse(), _collator, keys);
+void HashAccessMethod::validateDocument(const CollectionPtr& collection,
+                                        const BSONObj& obj,
+                                        const BSONObj& keyPattern) const {
+    ExpressionKeysPrivate::validateDocumentCommon(collection, obj, keyPattern);
+}
+
+void HashAccessMethod::doGetKeys(OperationContext* opCtx,
+                                 const CollectionPtr& collection,
+                                 const IndexCatalogEntry* entry,
+                                 SharedBufferFragmentBuilder& pooledBufferBuilder,
+                                 const BSONObj& obj,
+                                 GetKeysContext context,
+                                 KeyStringSet* keys,
+                                 KeyStringSet* multikeyMetadataKeys,
+                                 MultikeyPaths* multikeyPaths,
+                                 const boost::optional<RecordId>& id) const {
+    ExpressionKeysPrivate::getHashKeys(pooledBufferBuilder,
+                                       obj,
+                                       _keyPattern,
+                                       _hashVersion,
+                                       entry->descriptor()->isSparse(),
+                                       _collator,
+                                       keys,
+                                       getSortedDataInterface()->getKeyStringVersion(),
+                                       getSortedDataInterface()->getOrdering(),
+                                       (context == GetKeysContext::kRemovingKeys),
+                                       id);
 }
 
 }  // namespace mongo

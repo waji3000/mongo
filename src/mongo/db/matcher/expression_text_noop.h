@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,8 +29,13 @@
 
 #pragma once
 
+#include <memory>
+
+#include "mongo/db/fts/fts_query.h"
 #include "mongo/db/fts/fts_query_noop.h"
+#include "mongo/db/matcher/expression.h"
 #include "mongo/db/matcher/expression_text_base.h"
+#include "mongo/db/matcher/expression_visitor.h"
 
 namespace mongo {
 
@@ -43,11 +47,15 @@ public:
         return _ftsQuery;
     }
 
-    bool matchesSingleElement(const BSONElement& e, MatchDetails* details = nullptr) const final {
-        MONGO_UNREACHABLE;
+    std::unique_ptr<MatchExpression> clone() const final;
+
+    void acceptVisitor(MatchExpressionMutableVisitor* visitor) final {
+        visitor->visit(this);
     }
 
-    std::unique_ptr<MatchExpression> shallowClone() const final;
+    void acceptVisitor(MatchExpressionConstVisitor* visitor) const final {
+        visitor->visit(this);
+    }
 
 private:
     fts::FTSQueryNoop _ftsQuery;

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,12 +27,10 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kFTDC
-
-#include "mongo/platform/basic.h"
 
 #include "mongo/db/ftdc/ftdc_system_stats.h"
 
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -42,9 +39,11 @@
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/ftdc/collector.h"
 #include "mongo/db/ftdc/controller.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/perfctr_collect.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kFTDC
+
 
 namespace mongo {
 
@@ -145,13 +144,15 @@ void installSystemMetricsCollector(FTDCController* controller) {
 
     auto swCollector = createCollector();
     if (!swCollector.getStatus().isOK()) {
-        warning() << "Failed to initialize Performance Counters for FTDC: "
-                  << swCollector.getStatus();
+        LOGV2_WARNING(23718,
+                      "Failed to initialize Performance Counters for FTDC",
+                      "error"_attr = swCollector.getStatus());
         return;
     }
 
     controller->addPeriodicCollector(
-        stdx::make_unique<WindowsSystemMetricsCollector>(std::move(swCollector.getValue())));
+        std::make_unique<WindowsSystemMetricsCollector>(std::move(swCollector.getValue())),
+        ClusterRole::None);
 }
 
 }  // namespace mongo

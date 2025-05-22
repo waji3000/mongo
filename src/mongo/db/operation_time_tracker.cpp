@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,10 +27,14 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <mutex>
+#include <utility>
+
 
 #include "mongo/db/operation_time_tracker.h"
 #include "mongo/stdx/mutex.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/decorable.h"
 
 namespace mongo {
 namespace {
@@ -43,7 +46,7 @@ struct OperationTimeTrackerHolder {
 
 const OperationContext::Decoration<OperationTimeTrackerHolder> OperationTimeTrackerHolder::get =
     OperationContext::declareDecoration<OperationTimeTrackerHolder>();
-}
+}  // namespace
 
 std::shared_ptr<OperationTimeTracker> OperationTimeTracker::get(OperationContext* opCtx) {
     auto timeTrackerHolder = OperationTimeTrackerHolder::get(opCtx);

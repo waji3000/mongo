@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -32,7 +31,6 @@
 
 #include <string>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/status.h"
 #include "mongo/base/string_data.h"
 #include "mongo/client/sasl_client_conversation.h"
@@ -42,7 +40,8 @@ namespace mongo {
  *  Client side authentication session for SASL PLAIN.
  */
 class SaslPLAINClientConversation : public SaslClientConversation {
-    MONGO_DISALLOW_COPYING(SaslPLAINClientConversation);
+    SaslPLAINClientConversation(const SaslPLAINClientConversation&) = delete;
+    SaslPLAINClientConversation& operator=(const SaslPLAINClientConversation&) = delete;
 
 public:
     /**
@@ -51,9 +50,9 @@ public:
      **/
     explicit SaslPLAINClientConversation(SaslClientSession* saslClientSession);
 
-    virtual ~SaslPLAINClientConversation();
+    ~SaslPLAINClientConversation() override;
 
-    virtual StatusWith<bool> step(StringData inputData, std::string* outputData);
+    StatusWith<bool> step(StringData inputData, std::string* outputData) override;
 };
 
 }  // namespace mongo

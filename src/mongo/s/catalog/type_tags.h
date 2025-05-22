@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,11 +29,17 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
 #include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
 #include <string>
 
-#include "mongo/db/jsobj.h"
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bson_field.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/s/catalog/type_chunk.h"
 
 namespace mongo {
 
@@ -60,6 +65,8 @@ public:
     static const BSONField<BSONObj> min;
     static const BSONField<BSONObj> max;
 
+    TagsType() = default;
+    TagsType(NamespaceString nss, std::string tag, ChunkRange range);
 
     /**
      * Constructs a new DatabaseType object from BSON. Validates that all required fields are
@@ -93,15 +100,16 @@ public:
     }
     void setTag(const std::string& tag);
 
+    void setRange(const ChunkRange& range);
+    const ChunkRange& getRange() const {
+        return _range.get();
+    }
     const BSONObj& getMinKey() const {
-        return _minKey.get();
+        return getRange().getMin();
     }
-    void setMinKey(const BSONObj& minKey);
-
     const BSONObj& getMaxKey() const {
-        return _maxKey.get();
+        return getRange().getMax();
     }
-    void setMaxKey(const BSONObj& maxKey);
 
 private:
     // Required namespace to which this tag belongs
@@ -110,11 +118,8 @@ private:
     // Required tag name
     boost::optional<std::string> _tag;
 
-    // Required first key of the tag (inclusive)
-    boost::optional<BSONObj> _minKey;
-
-    // Required last key of the tag (not-inclusive)
-    boost::optional<BSONObj> _maxKey;
+    // Required range
+    boost::optional<ChunkRange> _range;
 };
 
 }  // namespace mongo

@@ -4,60 +4,52 @@
  *
  * @tags: [requires_persistence, requires_majority_read_concern]
  */
-(function() {
-    "use strict";
-    // For supportsMajorityReadConcern().
-    load("jstests/multiVersion/libs/causal_consistency_helpers.js");
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
-    if (!supportsMajorityReadConcern()) {
-        jsTestLog("Skipping test since storage engine doesn't support majority read concern.");
-        return;
+const rst = new ReplSetTest({nodes: 1});
+rst.startSet();
+const localDB = rst.nodes[0].getDB('local');
+assert.commandWorked(localDB.test.insert({_id: 0}));
+assert.commandWorked(localDB.runCommand({
+    hello: 1,
+    "$clusterTime": {
+        "clusterTime": Timestamp(1, 1),
+        "signature": {"hash": BinData(0, "AAAAAAAAAAAAAAAAAAAAAAAAAAA="), "keyId": NumberLong(0)}
     }
+}));
+jsTestLog("Local readConcern on local database should work.");
+const res = assert.commandWorked(localDB.runCommand(
+    {find: "test", filter: {}, maxTimeMS: 60000, readConcern: {level: "local"}}));
+assert.eq([{_id: 0}], res.cursor.firstBatch);
 
-    const rst = new ReplSetTest({nodes: 1});
-    rst.startSet();
-    const localDB = rst.nodes[0].getDB('local');
-    assert.commandWorked(localDB.test.insert({_id: 0}));
-    assert.commandWorked(localDB.runCommand({
-        isMaster: 1,
-        "$clusterTime": {
-            "clusterTime": Timestamp(1, 1),
-            "signature":
-                {"hash": BinData(0, "AAAAAAAAAAAAAAAAAAAAAAAAAAA="), "keyId": NumberLong(0)}
-        }
-    }));
-    jsTestLog("Local readConcern on local database should work.");
-    const res = assert.commandWorked(localDB.runCommand(
-        {find: "test", filter: {}, maxTimeMS: 60000, readConcern: {level: "local"}}));
-    assert.eq([{_id: 0}], res.cursor.firstBatch);
+jsTestLog("Majority readConcern should fail with NotPrimaryNoSecondaryOk or NotYetInitialized.");
+assert.commandFailedWithCode(
+    localDB.runCommand(
+        {find: "test", filter: {}, maxTimeMS: 60000, readConcern: {level: "majority"}}),
+    // Fails with NotPrimaryNoSecondaryOk as of SERVER-53813.
+    [ErrorCodes.NotPrimaryNoSecondaryOk, ErrorCodes.NotYetInitialized]);
 
-    jsTestLog("Majority readConcern should fail with NotYetInitialized.");
-    assert.commandFailedWithCode(
-        localDB.runCommand(
-            {find: "test", filter: {}, maxTimeMS: 60000, readConcern: {level: "majority"}}),
-        ErrorCodes.NotYetInitialized);
+// Nodes don't process $clusterTime metadata when in an unreadable state, so this read will fail
+// because the logical clock's latest value is less than the given afterClusterTime timestamp.
+jsTestLog("afterClusterTime readConcern should fail with NotPrimaryOrSecondary.");
+assert.commandFailedWithCode(localDB.runCommand({
+    find: "test",
+    filter: {},
+    maxTimeMS: 60000,
+    readConcern: {afterClusterTime: Timestamp(1, 1)}
+}),
+                             ErrorCodes.NotPrimaryOrSecondary);
 
-    jsTestLog("afterClusterTime readConcern should fail with NotYetInitialized.");
-    assert.commandFailedWithCode(localDB.runCommand({
-        find: "test",
-        filter: {},
-        maxTimeMS: 60000,
-        readConcern: {afterClusterTime: Timestamp(1, 1)}
-    }),
-                                 ErrorCodes.NotYetInitialized);
-
-    jsTestLog("oplog query should fail with NotYetInitialized.");
-    assert.commandFailedWithCode(localDB.runCommand({
-        find: "oplog.rs",
-        filter: {ts: {$gte: Timestamp(1520004466, 2)}},
-        tailable: true,
-        oplogReplay: true,
-        awaitData: true,
-        maxTimeMS: 60000,
-        batchSize: 13981010,
-        term: 1,
-        readConcern: {afterClusterTime: Timestamp(1, 1)}
-    }),
-                                 ErrorCodes.NotYetInitialized);
-    rst.stopSet();
-}());
+jsTestLog("oplog query should fail with NotYetInitialized.");
+assert.commandFailedWithCode(localDB.runCommand({
+    find: "oplog.rs",
+    filter: {ts: {$gte: Timestamp(1520004466, 2)}},
+    tailable: true,
+    awaitData: true,
+    maxTimeMS: 60000,
+    batchSize: 13981010,
+    term: 1,
+    readConcern: {afterClusterTime: Timestamp(1, 1)}
+}),
+                             ErrorCodes.NotPrimaryOrSecondary);
+rst.stopSet();

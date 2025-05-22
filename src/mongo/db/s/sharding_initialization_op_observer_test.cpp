@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,25 +27,32 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <string>
 
-#include "mongo/client/remote_command_targeter_mock.h"
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/oid.h"
+#include "mongo/client/connection_string.h"
 #include "mongo/db/catalog_raii.h"
-#include "mongo/db/concurrency/d_concurrency.h"
+#include "mongo/db/cluster_role.h"
+#include "mongo/db/collection_crud/collection_write_path.h"
+#include "mongo/db/concurrency/lock_manager_defs.h"
 #include "mongo/db/dbdirectclient.h"
-#include "mongo/db/op_observer_impl.h"
-#include "mongo/db/op_observer_registry.h"
-#include "mongo/db/repl/replication_coordinator_mock.h"
-#include "mongo/db/s/config_server_op_observer.h"
-#include "mongo/db/s/shard_server_catalog_cache_loader.h"
-#include "mongo/db/s/shard_server_op_observer.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/repl/oplog.h"
 #include "mongo/db/s/sharding_initialization_mongod.h"
+#include "mongo/db/s/sharding_mongod_test_fixture.h"
 #include "mongo/db/s/type_shard_identity.h"
 #include "mongo/db/server_options.h"
-#include "mongo/s/catalog/dist_lock_manager_mock.h"
-#include "mongo/s/client/shard_registry.h"
-#include "mongo/s/config_server_catalog_cache_loader.h"
-#include "mongo/s/shard_server_test_fixture.h"
+#include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/rpc/get_status_from_command_result.h"
+#include "mongo/s/sharding_state.h"
+#include "mongo/unittest/unittest.h"
 
 namespace mongo {
 namespace {
@@ -55,29 +61,21 @@ const std::string kShardName("TestShard");
 
 /**
  * This test suite validates that when the default OpObserver chain is set up (which happens to
- * include the ShardServerOpObserver), writes to the 'admin.system.version' collection (and the
+ * include the ShardingMongodOpObserver), writes to the 'admin.system.version' collection (and the
  * shardIdentity document specifically) will invoke the sharding initialization code.
  */
-class ShardingInitializationOpObserverTest : public ShardServerTestFixture {
-public:
+class ShardingInitializationOpObserverTest : public ShardingMongoDTestFixture {
+protected:
     void setUp() override {
-        ShardServerTestFixture::setUp();
+        ShardingMongoDTestFixture::setUp();
 
         // NOTE: this assumes that globalInit will always be called on the same thread as the main
         // test thread
         ShardingInitializationMongoD::get(operationContext())
-            ->setGlobalInitMethodForTest([this](OperationContext* opCtx,
-                                                const ShardIdentity& shardIdentity,
-                                                StringData distLockProcessId) {
-                _initCallCount++;
-                return Status::OK();
-            });
-    }
-
-    void tearDown() override {
-        ShardingState::get(getServiceContext())->clearForTests();
-
-        ShardServerTestFixture::tearDown();
+            ->setGlobalInitMethodForTest(
+                [this](OperationContext* opCtx, const ShardIdentity& shardIdentity) {
+                    _initCallCount++;
+                });
     }
 
     int getInitCallCount() const {
@@ -85,41 +83,48 @@ public:
     }
 
 private:
+    service_context_test::ShardRoleOverride _shardRole;
+
     int _initCallCount = 0;
 };
 
 TEST_F(ShardingInitializationOpObserverTest, GlobalInitGetsCalledAfterWriteCommits) {
     ShardIdentityType shardIdentity;
     shardIdentity.setConfigsvrConnectionString(
-        ConnectionString(ConnectionString::SET, "a:1,b:2", "config"));
+        ConnectionString(ConnectionString::ConnectionType::kReplicaSet, "a:1,b:2", "config"));
     shardIdentity.setShardName(kShardName);
     shardIdentity.setClusterId(OID::gen());
 
     DBDirectClient client(operationContext());
-    client.insert("admin.system.version", shardIdentity.toShardIdentityDocument());
+    client.insert(NamespaceString::createNamespaceString_forTest("admin.system.version"),
+                  shardIdentity.toShardIdentityDocument());
     ASSERT_EQ(1, getInitCallCount());
 }
 
 TEST_F(ShardingInitializationOpObserverTest, GlobalInitDoesntGetCalledIfWriteAborts) {
     ShardIdentityType shardIdentity;
     shardIdentity.setConfigsvrConnectionString(
-        ConnectionString(ConnectionString::SET, "a:1,b:2", "config"));
+        ConnectionString(ConnectionString::ConnectionType::kReplicaSet, "a:1,b:2", "config"));
     shardIdentity.setShardName(kShardName);
     shardIdentity.setClusterId(OID::gen());
 
     // This part of the test ensures that the collection exists for the AutoGetCollection below to
     // find and also validates that the initializer does not get called for non-sharding documents
     DBDirectClient client(operationContext());
-    client.insert("admin.system.version", BSON("_id" << 1));
+    client.insert(NamespaceString::createNamespaceString_forTest("admin.system.version"),
+                  BSON("_id" << 1));
     ASSERT_EQ(0, getInitCallCount());
 
     {
         AutoGetCollection autoColl(
-            operationContext(), NamespaceString("admin.system.version"), MODE_IX);
+            operationContext(),
+            NamespaceString::createNamespaceString_forTest("admin.system.version"),
+            MODE_IX);
 
         WriteUnitOfWork wuow(operationContext());
         InsertStatement stmt(shardIdentity.toShardIdentityDocument());
-        ASSERT_OK(autoColl.getCollection()->insertDocument(operationContext(), stmt, nullptr));
+        ASSERT_OK(
+            collection_internal::insertDocument(operationContext(), *autoColl, stmt, nullptr));
         ASSERT_EQ(0, getInitCallCount());
     }
 
@@ -129,21 +134,26 @@ TEST_F(ShardingInitializationOpObserverTest, GlobalInitDoesntGetCalledIfWriteAbo
 TEST_F(ShardingInitializationOpObserverTest, GlobalInitDoesntGetsCalledIfNSIsNotForShardIdentity) {
     ShardIdentityType shardIdentity;
     shardIdentity.setConfigsvrConnectionString(
-        ConnectionString(ConnectionString::SET, "a:1,b:2", "config"));
+        ConnectionString(ConnectionString::ConnectionType::kReplicaSet, "a:1,b:2", "config"));
     shardIdentity.setShardName(kShardName);
     shardIdentity.setClusterId(OID::gen());
 
     DBDirectClient client(operationContext());
-    client.insert("admin.user", shardIdentity.toShardIdentityDocument());
+    client.insert(NamespaceString::createNamespaceString_forTest("admin.user"),
+                  shardIdentity.toShardIdentityDocument());
     ASSERT_EQ(0, getInitCallCount());
 }
 
 TEST_F(ShardingInitializationOpObserverTest, OnInsertOpThrowWithIncompleteShardIdentityDocument) {
     DBDirectClient client(operationContext());
-    client.insert("admin.system.version",
-                  BSON("_id" << ShardIdentityType::IdName << ShardIdentity::kShardNameFieldName
-                             << kShardName));
-    ASSERT(!client.getLastError().empty());
+
+    auto response = client.insertAcknowledged(
+        NamespaceString::createNamespaceString_forTest("admin.system.version"),
+        {BSON("_id" << ShardIdentityType::IdName << ShardIdentity::kShardNameFieldName
+                    << kShardName)});
+
+    ASSERT_NOT_OK(getStatusFromWriteCommandReply(response));
+    ASSERT_EQ(0, response["n"].Int());
 }
 
 }  // namespace

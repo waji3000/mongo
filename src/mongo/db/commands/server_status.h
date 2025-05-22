@@ -1,6 +1,3 @@
-// server_status.h
-
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -32,21 +29,56 @@
 
 #pragma once
 
+#include <map>
+#include <string>
+
+#include "mongo/base/status.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/jsobj.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/stats/counters.h"
 #include "mongo/platform/atomic_word.h"
-#include <string>
 
 namespace mongo {
 
+/**
+ * ServerStatusSections act as customizable extension points into the
+ * output of the serverStatus command. The BSONObj returned by generateSection
+ * is appended to the serverStatus response under the name of the section.
+ *
+ * Use ServerStatusSectionBuilder below to build your ServerStatusSection and register it with the
+ * command. Make sure to perform the registration before the server can run commands.
+ */
 class ServerStatusSection {
 public:
-    ServerStatusSection(const std::string& sectionName);
-    virtual ~ServerStatusSection() {}
+    ServerStatusSection(std::string sectionName, ClusterRole role)
+        : _sectionName(std::move(sectionName)), _role(role) {}
+    virtual ~ServerStatusSection() = default;
 
     const std::string& getSectionName() const {
         return _sectionName;
+    }
+
+    ClusterRole getClusterRole() const {
+        return _role;
+    }
+
+    /**
+     * True if the section is relevant to `serviceRole`. `serviceRole` must be one of _exactly_
+     * ClusterRole::ShardServer or ClusterRole::RouterServer, and it holds the ClusterRole that some
+     * Service is associated with. A ServerStatusSection is relevant to a service if the section's
+     * _role has any overlap with the `serviceRole` for the service.
+     */
+    bool relevantTo(const ClusterRole& serviceRole) const {
+        constexpr static std::array allRoles{ClusterRole::ShardServer, ClusterRole::RouterServer};
+        // TODO SERVER-87512 - Once all roles are tagged, remove the exception for
+        // ClusterRole::None. Sections not tagged with a role are relevant to all services.
+        return std::any_of(allRoles.begin(),
+                           allRoles.end(),
+                           [&](auto&& r) { return _role.has(r) && serviceRole.has(r); }) ||
+            _role.hasExclusively(ClusterRole::None);
     }
 
     /**
@@ -68,10 +100,12 @@ public:
     virtual bool includeByDefault() const = 0;
 
     /**
-     * Adds the privileges that are required to view this section
+     * Perform authorization checks required to show this status section.
      * TODO: Remove this empty default implementation and implement for every section.
      */
-    virtual void addRequiredPrivileges(std::vector<Privilege>* out){};
+    virtual Status checkAuthForOperation(OperationContext* opCtx) const {
+        return Status::OK();
+    }
 
     /**
      * actually generate the result
@@ -108,19 +142,126 @@ public:
 
 private:
     const std::string _sectionName;
+    const ClusterRole _role;
 };
+
+/**
+ * Class the keeps a map of all registered status sections
+ */
+class ServerStatusSectionRegistry {
+public:
+    enum class RoleTag { shard, router, shardAndRouter };
+    using KeyType = std::pair<std::string, RoleTag>;
+    using SectionMap = std::map<KeyType, std::unique_ptr<ServerStatusSection>>;
+
+    /** Get the singleton ServerStatusSectionRegistry for the process. */
+    static ServerStatusSectionRegistry* instance();
+
+    /**
+     * Add a status section to the map. Called by ServerStatusSection constructor
+     */
+    void addSection(std::unique_ptr<ServerStatusSection> section);
+
+    SectionMap::const_iterator begin();
+
+    SectionMap::const_iterator end();
+
+private:
+    RoleTag getTagForRole(ClusterRole);
+
+    Atomic<bool> _runCalled{false};
+    SectionMap _sections;
+};
+
+/**
+ * Builder that can be used to construct ServerStatusSections and register them with the global
+ * registry used by the serverStatus command.
+ *
+ * Builds an instance of the section which is owned and stored by the registry, and returns
+ * a reference to the built section. To use create a variable at namespace scope to store
+ * the reference:
+ *
+ * auto& myInstance = *ServerStatusSectionBuilder<MySectionType>("mySectionName");
+ *
+ * ServerStatusSections can be associated with a cluster-role in the registry, so that
+ * mongod running with an embedded-router mode can correctly track shard vs. router metrics.
+ *
+ * If your section takes custom constructor args, you can use `bind` to forward them.
+ * Your section must then override the base-class constructor, and pass it the sectionName
+ * and ClusterRole.
+ *
+ * operator* must be invoked/the build must be exected before the server can run commands, to ensure
+ * all sections are registered before serverStatus can be run.
+ */
+template <typename Section>
+class ServerStatusSectionBuilder {
+public:
+    explicit ServerStatusSectionBuilder(std::string name) : _name(std::move(name)) {}
+
+    /** Executes the builder; returns a reference to the built + registered section. */
+    Section& operator*() && {
+        // Every section must be for eitehr the shard service, router service, or both:
+        // invariant(_roles.has(ClusterRole::RouterServer) || _roles.has(ClusterRole::ShardServer));
+        std::unique_ptr<Section> section;
+        if (_construct) {
+            section = _construct();
+        } else {
+            if constexpr (std::is_constructible_v<Section, std::string, ClusterRole>) {
+                section = std::make_unique<Section>(_name, _roles);
+            } else {
+                invariant(false, "No suitable constructor");
+            }
+        }
+        auto& ref = *section;
+        ServerStatusSectionRegistry::instance()->addSection(std::move(section));
+        return ref;
+    }
+
+    /** Used to associate the section with the router-role. */
+    ServerStatusSectionBuilder forRouter() && {
+        _roles += ClusterRole::RouterServer;
+        return std::move(*this);
+    }
+
+    /** Used to associate the section with the shard-role. */
+    ServerStatusSectionBuilder forShard() && {
+        _roles += ClusterRole::ShardServer;
+        return std::move(*this);
+    }
+
+    template <typename... Args>
+    ServerStatusSectionBuilder bind(Args... args) && {
+        _construct = [name = _name, roles = _roles, args...] {
+            return std::make_unique<Section>(name, roles, args...);
+        };
+        return std::move(*this);
+    }
+
+private:
+    /** Name of the section we are building. */
+    std::string _name;
+    /** Must be 'shard', 'router', or 'shard+router' when *this runs. */
+    ClusterRole _roles{ClusterRole::None};
+    /** Used to construct sections that take custom arguments. */
+    std::function<std::unique_ptr<Section>()> _construct;
+};
+
 
 class OpCounterServerStatusSection : public ServerStatusSection {
 public:
-    OpCounterServerStatusSection(const std::string& sectionName, OpCounters* counters);
-    virtual bool includeByDefault() const {
+    OpCounterServerStatusSection(const std::string& sectionName,
+                                 ClusterRole role,
+                                 OpCounters* counters);
+
+    bool includeByDefault() const override {
         return true;
     }
 
-    virtual BSONObj generateSection(OperationContext* opCtx,
-                                    const BSONElement& configElement) const;
+    BSONObj generateSection(OperationContext* opCtx,
+                            const BSONElement& configElement) const override;
 
 private:
     const OpCounters* _counters;
 };
-}
+
+}  // namespace mongo

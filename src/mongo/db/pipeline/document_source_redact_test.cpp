@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,7 +27,9 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <memory>
+
+#include <boost/smart_ptr/intrusive_ptr.hpp>
 
 #include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobj.h"
@@ -47,8 +48,7 @@ namespace {
 using DocumentSourceRedactTest = AggregationContextFixture;
 
 TEST_F(DocumentSourceRedactTest, ShouldCopyRedactSafePartOfMatchBeforeItself) {
-    BSONObj redactSpec = BSON("$redact"
-                              << "$$PRUNE");
+    BSONObj redactSpec = BSON("$redact" << "$$PRUNE");
     auto redact = DocumentSourceRedact::createFromBson(redactSpec.firstElement(), getExpCtx());
     auto match = DocumentSourceMatch::create(BSON("a" << 1), getExpCtx());
 
@@ -63,13 +63,14 @@ TEST_F(DocumentSourceRedactTest, ShouldCopyRedactSafePartOfMatchBeforeItself) {
 }
 
 TEST_F(DocumentSourceRedactTest, ShouldPropagatePauses) {
-    auto redactSpec = BSON("$redact"
-                           << "$$KEEP");
+    auto redactSpec = BSON("$redact" << "$$KEEP");
     auto redact = DocumentSourceRedact::createFromBson(redactSpec.firstElement(), getExpCtx());
-    auto mock = DocumentSourceMock::create({Document{{"_id", 0}},
-                                            DocumentSource::GetNextResult::makePauseExecution(),
-                                            Document{{"_id", 1}},
-                                            DocumentSource::GetNextResult::makePauseExecution()});
+    auto mock =
+        DocumentSourceMock::createForTest({Document{{"_id", 0}},
+                                           DocumentSource::GetNextResult::makePauseExecution(),
+                                           Document{{"_id", 1}},
+                                           DocumentSource::GetNextResult::makePauseExecution()},
+                                          getExpCtx());
     redact->setSource(mock.get());
 
     // The $redact is keeping everything, so we should see everything from the mock, then EOF.

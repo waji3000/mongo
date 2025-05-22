@@ -1,7 +1,6 @@
-load("jstests/readonly/lib/read_only_test.js");
+import {runReadOnlyTest} from "jstests/readonly/lib/read_only_test.js";
 
 runReadOnlyTest(function() {
-    'use strict';
     return {
         name: 'get_more',
         count: 3000,
@@ -16,7 +15,7 @@ runReadOnlyTest(function() {
                     var idx = i * bulkSize + j;
                     bulk.insert({x: idx, y: idx + 1});
                 }
-                assert.writeOK(bulk.execute());
+                assert.commandWorked(bulk.execute());
             }
             assert.eq(writableCollection.count(), this.count);
         },

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -31,17 +30,23 @@
 #pragma once
 
 #include <list>
+#include <memory>
 #include <queue>
 #include <vector>
 
+#include "mongo/bson/bsonobj.h"
 #include "mongo/db/exec/plan_stage.h"
+#include "mongo/db/exec/plan_stats.h"
+#include "mongo/db/exec/recordid_deduplicator.h"
 #include "mongo/db/exec/working_set.h"
-#include "mongo/db/jsobj.h"
-#include "mongo/db/record_id.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/query/collation/collator_interface.h"
+#include "mongo/db/query/stage_types.h"
 
 namespace mongo {
 
 class CollatorInterface;
+
 // External params for the merge sort stage.  Declared below.
 class MergeSortStageParams;
 
@@ -58,18 +63,18 @@ class MergeSortStageParams;
  */
 class MergeSortStage final : public PlanStage {
 public:
-    MergeSortStage(OperationContext* opCtx, const MergeSortStageParams& params, WorkingSet* ws);
+    MergeSortStage(ExpressionContext* expCtx, const MergeSortStageParams& params, WorkingSet* ws);
 
-    void addChild(PlanStage* child);
+    void addChild(std::unique_ptr<PlanStage> child);
 
-    bool isEOF() final;
+    bool isEOF() const final;
     StageState doWork(WorkingSetID* out) final;
 
     StageType stageType() const final {
         return STAGE_SORT_MERGE;
     }
 
-    std::unique_ptr<PlanStageStats> getStats();
+    std::unique_ptr<PlanStageStats> getStats() override;
 
     const SpecificStats* getSpecificStats() const final;
 
@@ -77,7 +82,7 @@ public:
 
 private:
     struct StageWithValue {
-        StageWithValue() : id(WorkingSet::INVALID_ID), stage(NULL) {}
+        StageWithValue() : id(WorkingSet::INVALID_ID), stage(nullptr) {}
         WorkingSetID id;
         PlanStage* stage;
     };
@@ -98,6 +103,9 @@ private:
         bool operator()(const MergingRef& lhs, const MergingRef& rhs);
 
     private:
+        // Encodes sort key part 'keyPart' according to the collation of the query.
+        BSONObj encodeKeyPartWithCollation(const BSONElement& keyPart);
+
         WorkingSet* _ws;
         BSONObj _pattern;
         const CollatorInterface* _collator;
@@ -109,15 +117,11 @@ private:
     // The pattern that we're sorting by.
     BSONObj _pattern;
 
-    // Null if this merge sort stage orders strings according to simple binary compare. If non-null,
-    // represents the collator used to compare strings.
-    const CollatorInterface* _collator;
-
     // Are we deduplicating on RecordId?
     const bool _dedup;
 
     // Which RecordIds have we seen?
-    stdx::unordered_set<RecordId, RecordId::Hasher> _seen;
+    RecordIdDeduplicator _recordIdDeduplicator;
 
     // In order to pick the next smallest value, we need each child work(...) until it produces
     // a result.  This is the queue of children that haven't given us a result yet.
@@ -136,7 +140,7 @@ private:
 // Parameters that must be provided to a MergeSortStage
 class MergeSortStageParams {
 public:
-    MergeSortStageParams() : collator(NULL), dedup(true) {}
+    MergeSortStageParams() : collator(nullptr), dedup(true) {}
 
     // How we're sorting.
     BSONObj pattern;

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,12 +27,23 @@
  *    it in the license file.
  */
 
-#include "mongo/bson/bsontypes.h"
+#include <absl/container/flat_hash_map.h>
+#include <boost/none.hpp>
+#include <fmt/format.h>
+#include <ostream>
+#include <utility>
 
-#include "mongo/config.h"
-#include "mongo/db/jsobj.h"
+#include <boost/optional/optional.hpp>
+
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/config.h"  // IWYU pragma: keep
+#include "mongo/util/string_map.h"
 
 namespace mongo {
+namespace {
+bool localTimeZoneForDate = false;
+}
 
 const char kMaxKeyData[] = {7, 0, 0, 0, static_cast<char>(MaxKey), 0, 0};
 const BSONObj kMaxBSONKey(kMaxKeyData);
@@ -94,35 +104,51 @@ const char* typeName(BSONType type) {
     }
 }
 
-const StringMap<BSONType> kTypeAliasMap = {
-    {typeName(BSONType::NumberDouble), BSONType::NumberDouble},
-    {typeName(BSONType::String), BSONType::String},
-    {typeName(BSONType::Object), BSONType::Object},
-    {typeName(BSONType::Array), BSONType::Array},
-    {typeName(BSONType::BinData), BSONType::BinData},
-    {typeName(BSONType::Undefined), BSONType::Undefined},
-    {typeName(BSONType::jstOID), BSONType::jstOID},
-    {typeName(BSONType::Bool), BSONType::Bool},
-    {typeName(BSONType::Date), BSONType::Date},
-    {typeName(BSONType::jstNULL), BSONType::jstNULL},
-    {typeName(BSONType::RegEx), BSONType::RegEx},
-    {typeName(BSONType::DBRef), BSONType::DBRef},
-    {typeName(BSONType::Code), BSONType::Code},
-    {typeName(BSONType::Symbol), BSONType::Symbol},
-    {typeName(BSONType::CodeWScope), BSONType::CodeWScope},
-    {typeName(BSONType::NumberInt), BSONType::NumberInt},
-    {typeName(BSONType::bsonTimestamp), BSONType::bsonTimestamp},
-    {typeName(BSONType::NumberLong), BSONType::NumberLong},
-    {typeName(BSONType::NumberDecimal), BSONType::NumberDecimal},
-    {typeName(BSONType::MaxKey), BSONType::MaxKey},
-    {typeName(BSONType::MinKey), BSONType::MinKey}};
+boost::optional<BSONType> findBSONTypeAlias(StringData key) {
+    // intentionally leaked
+    static const auto& typeAliasMap =
+        *new StringMap<BSONType>{{typeName(BSONType::NumberDouble), BSONType::NumberDouble},
+                                 {typeName(BSONType::String), BSONType::String},
+                                 {typeName(BSONType::Object), BSONType::Object},
+                                 {typeName(BSONType::Array), BSONType::Array},
+                                 {typeName(BSONType::BinData), BSONType::BinData},
+                                 {typeName(BSONType::Undefined), BSONType::Undefined},
+                                 {typeName(BSONType::jstOID), BSONType::jstOID},
+                                 {typeName(BSONType::Bool), BSONType::Bool},
+                                 {typeName(BSONType::Date), BSONType::Date},
+                                 {typeName(BSONType::jstNULL), BSONType::jstNULL},
+                                 {typeName(BSONType::RegEx), BSONType::RegEx},
+                                 {typeName(BSONType::DBRef), BSONType::DBRef},
+                                 {typeName(BSONType::Code), BSONType::Code},
+                                 {typeName(BSONType::Symbol), BSONType::Symbol},
+                                 {typeName(BSONType::CodeWScope), BSONType::CodeWScope},
+                                 {typeName(BSONType::NumberInt), BSONType::NumberInt},
+                                 {typeName(BSONType::bsonTimestamp), BSONType::bsonTimestamp},
+                                 {typeName(BSONType::NumberLong), BSONType::NumberLong},
+                                 {typeName(BSONType::NumberDecimal), BSONType::NumberDecimal},
+                                 {typeName(BSONType::MaxKey), BSONType::MaxKey},
+                                 {typeName(BSONType::MinKey), BSONType::MinKey}};
+
+    auto it = typeAliasMap.find(key);
+    if (it == typeAliasMap.end())
+        return boost::none;
+    return it->second;
+}
 
 BSONType typeFromName(StringData name) {
-    auto typeIt = kTypeAliasMap.find(name);
-    uassert(ErrorCodes::BadValue,
-            str::stream() << "Unknown type name: " << name,
-            typeIt != kTypeAliasMap.end());
-    return typeIt->second;
+    auto typeAlias = findBSONTypeAlias(name);
+    uassert(ErrorCodes::BadValue, fmt::format("Unknown type name: {}", name), typeAlias);
+    return *typeAlias;
+}
+
+Status isValidBSONTypeName(StringData typeName) {
+    try {
+        typeFromName(typeName);
+    } catch (const ExceptionFor<ErrorCodes::BadValue>& ex) {
+        return ex.toStatus();
+    }
+
+    return Status::OK();
 }
 
 std::ostream& operator<<(std::ostream& stream, BSONType type) {
@@ -173,11 +199,45 @@ const char* typeName(BinDataType type) {
             return "UUID";
         case MD5Type:
             return "MD5";
+        case Encrypt:
+            return "encrypt";
+        case Column:
+            return "column";
+        case Sensitive:
+            return "sensitive";
+        case Vector:
+            return "vector";
         case bdtCustom:
             return "Custom";
         default:
             return "invalid";
     }
+}
+
+bool isValidBinDataType(int type) {
+    switch (type) {
+        case BinDataGeneral:
+        case Function:
+        case ByteArrayDeprecated:
+        case bdtUUID:
+        case newUUID:
+        case MD5Type:
+        case Encrypt:
+        case Column:
+        case bdtCustom:
+        case Sensitive:
+        case Vector:
+            return true;
+        default:
+            return false;
+    }
+}
+
+void setDateFormatIsLocalTimezone(bool localTimeZone) {
+    localTimeZoneForDate = localTimeZone;
+}
+bool dateFormatIsLocalTimezone() {
+    return localTimeZoneForDate;
 }
 
 }  // namespace mongo

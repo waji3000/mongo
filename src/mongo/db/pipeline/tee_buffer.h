@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -32,11 +31,16 @@
 
 #include <algorithm>
 #include <boost/intrusive_ptr.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+#include <cstddef>
+#include <memory>
 #include <vector>
 
-#include "mongo/db/pipeline/document.h"
+#include "mongo/db/exec/agg/stage.h"
+#include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/pipeline/document_source.h"
-#include "mongo/db/query/query_knobs.h"
+#include "mongo/db/query/query_knobs_gen.h"
+#include "mongo/platform/atomic_word.h"
 #include "mongo/util/intrusive_counter.h"
 
 namespace mongo {
@@ -56,7 +60,7 @@ public:
     static boost::intrusive_ptr<TeeBuffer> create(
         size_t nConsumers, int bufferSizeBytes = internalQueryFacetBufferSizeBytes.load());
 
-    void setSource(DocumentSource* source) {
+    void setSource(exec::agg::Stage* source) {
         _source = source;
     }
 
@@ -94,7 +98,7 @@ private:
      */
     void loadNextBatch();
 
-    DocumentSource* _source = nullptr;
+    exec::agg::Stage* _source = nullptr;
 
     const size_t _bufferSizeBytes;
     std::vector<DocumentSource::GetNextResult> _buffer;

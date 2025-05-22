@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,30 +29,48 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
 #include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
 #include <string>
 
 #include "mongo/base/status.h"
-#include "mongo/db/json.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/timestamp.h"
 #include "mongo/db/logical_time.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/read_write_concern_provenance.h"
 #include "mongo/db/repl/optime.h"
+#include "mongo/db/repl/read_concern_gen.h"
 #include "mongo/db/repl/read_concern_level.h"
-#include "mongo/util/time_support.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
-
-class BSONObj;
-class OperationContext;
-
 namespace repl {
 
 class ReadConcernArgs {
 public:
-    static const std::string kReadConcernFieldName;
-    static const std::string kAfterOpTimeFieldName;
-    static const std::string kAfterClusterTimeFieldName;
-    static const std::string kAtClusterTimeFieldName;
-    static const std::string kLevelFieldName;
+    static constexpr StringData kReadConcernFieldName = "readConcern"_sd;
+    static constexpr StringData kAfterOpTimeFieldName = ReadConcernIdl::kAfterOpTimeFieldName;
+    static constexpr StringData kAfterClusterTimeFieldName =
+        ReadConcernIdl::kAfterClusterTimeFieldName;
+    static constexpr StringData kAtClusterTimeFieldName = ReadConcernIdl::kAtClusterTimeFieldName;
+    static constexpr StringData kLevelFieldName = ReadConcernIdl::kLevelFieldName;
+    static constexpr StringData kAllowTransactionTableSnapshot =
+        ReadConcernIdl::kAllowTransactionTableSnapshotFieldName;
+    static constexpr StringData kWaitLastStableRecoveryTimestamp =
+        ReadConcernIdl::kWaitLastStableRecoveryTimestampFieldName;
+
+    static const ReadConcernArgs kImplicitDefault;
+    static const ReadConcernArgs kLocal;
+    static const ReadConcernArgs kMajority;
+    static const ReadConcernArgs kAvailable;
+    static const ReadConcernArgs kLinearizable;
+    static const ReadConcernArgs kSnapshot;
 
     /**
      * Represents the internal mechanism an operation uses to satisfy 'majority' read concern.
@@ -78,8 +95,26 @@ public:
 
     ReadConcernArgs(boost::optional<OpTime> opTime, boost::optional<ReadConcernLevel> level);
 
-    ReadConcernArgs(boost::optional<LogicalTime> clusterTime,
+    ReadConcernArgs(boost::optional<LogicalTime> afterClusterTime,
                     boost::optional<ReadConcernLevel> level);
+
+    static ReadConcernArgs snapshot(
+        LogicalTime atClusterTime,
+        boost::optional<bool> allowTransactionTableSnapshot = boost::none) {
+        auto rc = ReadConcernArgs::kSnapshot;
+        rc.setArgsAtClusterTimeForSnapshot(atClusterTime.asTimestamp());
+        if (allowTransactionTableSnapshot) {
+            rc._allowTransactionTableSnapshot = *allowTransactionTableSnapshot;
+        }
+        return rc;
+    }
+
+    static ReadConcernArgs snapshot(Timestamp atClusterTime) {
+        auto rc = ReadConcernArgs::kSnapshot;
+        rc.setArgsAtClusterTimeForSnapshot(atClusterTime);
+        return rc;
+    }
+
     /**
      * Format:
      * {
@@ -105,10 +140,18 @@ public:
     Status initialize(const BSONElement& readConcernElem);
 
     /**
-     * Upconverts the readConcern level to 'snapshot', or returns a non-ok status if this
-     * readConcern cannot be upconverted.
+     * Initializes the object by parsing the actual readConcern sub-object.
      */
-    Status upconvertReadConcernLevelToSnapshot();
+    Status parse(const BSONObj& readConcernObj);
+
+    /**
+     * Initializes the object by parsing the IDL representation of the actual readConcern
+     * sub-object.
+     */
+    Status parse(ReadConcernIdl inner);
+
+    static ReadConcernArgs fromBSONThrows(const BSONObj& readConcernObj);
+    static ReadConcernArgs fromIDLThrows(ReadConcernIdl readConcern);
 
     /**
      * Sets the mechanism we should use to satisfy 'majority' reads.
@@ -125,42 +168,132 @@ public:
     MajorityReadMechanism getMajorityReadMechanism() const;
 
     /**
-     * Appends level and afterOpTime.
+     * Returns whether the read concern is speculative 'majority'.
+     */
+    bool isSpeculativeMajority() const;
+
+    /**
+     * Appends level, afterOpTime, and any other sub-fields in a 'readConcern' sub-object.
      */
     void appendInfo(BSONObjBuilder* builder) const;
 
     /**
-     * Returns true if any of clusterTime,  opTime or level arguments are set.
+     * Returns true if any of clusterTime, opTime or level arguments are set. Does not differentiate
+     * between an unspecified read concern and an empty one (i.e. an empty BSON object).
      */
     bool isEmpty() const;
 
     /**
-     *  Returns default kLocalReadConcern if _level is not set.
+     * Returns true if this ReadConcernArgs represents a read concern that was actually specified.
+     * If the RC was specified as an empty BSON object this will still be true (unlike isEmpty()).
+     * False represents an absent or missing read concern, ie. one which wasn't present at all.
      */
-    ReadConcernLevel getLevel() const;
+    bool isSpecified() const {
+        return _specified;
+    }
 
     /**
-     *  Returns readConcernLevel before upconverting, or same as getLevel() if not upconverted.
+     * Returns true if this ReadConcernArgs represents an implicit default read concern.
      */
-    ReadConcernLevel getOriginalLevel() const;
+    bool isImplicitDefault() const;
+
+    /**
+     *  Returns default kLocalReadConcern if _level is not set.
+     */
+    ReadConcernLevel getLevel() const {
+        return _level.value_or(ReadConcernLevel::kLocalReadConcern);
+    }
 
     /**
      * Checks whether _level is explicitly set.
      */
-    bool hasLevel() const;
+    bool hasLevel() const {
+        return _level.has_value();
+    }
 
     /**
      * Returns the opTime. Deprecated: will be replaced with getArgsAfterClusterTime.
      */
-    boost::optional<OpTime> getArgsOpTime() const;
+    boost::optional<OpTime> getArgsOpTime() const {
+        return _opTime;
+    }
 
-    boost::optional<LogicalTime> getArgsAfterClusterTime() const;
+    boost::optional<LogicalTime> getArgsAfterClusterTime() const {
+        return _afterClusterTime;
+    }
 
-    boost::optional<LogicalTime> getArgsAtClusterTime() const;
+    boost::optional<LogicalTime> getArgsAtClusterTime() const {
+        return _atClusterTime;
+    }
+
+    /**
+     * Returns a BSON object of the form:
+     *
+     * { readConcern: { level: "...",
+     *                  afterClusterTime: Timestamp(...) } }
+     */
     BSONObj toBSON() const;
+
+    /**
+     * Returns a BSON object of the form:
+     *
+     * { level: "...",
+     *   afterClusterTime: Timestamp(...) }
+     */
+    BSONObj toBSONInner() const;
     std::string toString() const;
 
+    /**
+     * Returns the IDL-struct representation of this object's inner BSON serialized form.
+     */
+    ReadConcernIdl toReadConcernIdl() const;
+
+    ReadWriteConcernProvenance& getProvenance() {
+        return _provenance;
+    }
+    const ReadWriteConcernProvenance& getProvenance() const {
+        return _provenance;
+    }
+
+    /**
+     * Set atClusterTime, clear afterClusterTime. The BSON representation becomes
+     * {level: "snapshot", atClusterTime: <ts>}.
+     */
+    void setArgsAtClusterTimeForSnapshot(Timestamp ts) {
+        invariant(_level && _level == ReadConcernLevel::kSnapshotReadConcern);
+        // Only overwrite a server-selected atClusterTime, not user-supplied.
+        invariant(_atClusterTime.is_initialized() == _atClusterTimeSelected);
+        _afterClusterTime = boost::none;
+        _atClusterTime = LogicalTime(ts);
+        _atClusterTimeSelected = true;
+    }
+
+    /**
+     * Return whether an atClusterTime has been selected by the server for a snapshot read. This
+     * function returns false if the atClusterTime was specified by the client.
+     */
+    bool wasAtClusterTimeSelected() const {
+        return _atClusterTimeSelected;
+    }
+
+    bool allowTransactionTableSnapshot() const {
+        return _allowTransactionTableSnapshot;
+    }
+
+    bool waitLastStableRecoveryTimestamp() const {
+        return _waitLastStableRecoveryTimestamp;
+    }
+
+    void setWaitLastStableRecoveryTimestamp(bool wait) {
+        _waitLastStableRecoveryTimestamp = wait;
+    }
+
 private:
+    /**
+     * Appends level, afterOpTime, and the other "inner" fields of the read concern args.
+     */
+    void _appendInfoInner(BSONObjBuilder* builder) const;
+
     /**
      *  Read data after the OpTime of an operation on this replica set. Deprecated.
      *  The only user is for read-after-optime calls using the config server optime.
@@ -177,15 +310,24 @@ private:
     boost::optional<ReadConcernLevel> _level;
 
     /**
-     * If the read concern was upconverted, the original read concern level.
-     */
-    boost::optional<ReadConcernLevel> _originalLevel;
-
-    /**
      * The mechanism to use for satisfying 'majority' reads. Only meaningful if the read concern
      * level is 'majority'.
      */
     MajorityReadMechanism _majorityReadMechanism{MajorityReadMechanism::kMajoritySnapshot};
+
+    /**
+     * True indicates that a read concern has been specified (even if it might be empty), as
+     * opposed to being absent or missing.
+     */
+    bool _specified;
+
+    ReadWriteConcernProvenance _provenance;
+
+    bool _atClusterTimeSelected = false;
+
+    bool _allowTransactionTableSnapshot = false;
+
+    bool _waitLastStableRecoveryTimestamp = false;
 };
 
 }  // namespace repl

@@ -1,7 +1,11 @@
 /*
  * Test that replSetInitiate and replSetReconfig prohibit zero-vote arbiters,
  * SERVER-13627.
+ *
+ * @tags: [multiversion_incompatible]
  */
+
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 var NewReplicaSetConfigurationIncompatible = 103;
 var InvalidReplicaSetConfig = 93;
@@ -26,7 +30,7 @@ TestData.skipCheckDBHashes = true;
     jsTestLog('Add arbiter with zero votes:');
     var response = admin.runCommand({replSetReconfig: conf});
     assert.commandFailed(response);
-    assert.eq(response.code, NewReplicaSetConfigurationIncompatible);
+    assert.eq(response.code, InvalidReplicaSetConfig);
     assert(/.*arbiter must vote.*/i.test(response.errmsg));
 
     replTest.stopSet();
@@ -37,7 +41,7 @@ TestData.skipCheckDBHashes = true;
  */
 (function reconfigArbiterZeroVotes() {
     var replTest = new ReplSetTest({nodes: 4});
-    replTest.startSet();
+    replTest.startSet({setParameter: {allowMultipleArbiters: true}});
     var config = replTest.getReplSetConfig();
     config.members[2].arbiterOnly = true;
     config.members[3].arbiterOnly = true;
@@ -52,7 +56,7 @@ TestData.skipCheckDBHashes = true;
     var response = admin.runCommand({replSetReconfig: conf});
     printjson(response);
     assert.commandFailed(response);
-    assert.eq(response.code, NewReplicaSetConfigurationIncompatible);
+    assert.eq(response.code, InvalidReplicaSetConfig);
     assert(/.*arbiter must vote.*/i.test(response.errmsg));
 
     replTest.stopSet();
@@ -99,7 +103,7 @@ TestData.skipCheckDBHashes = true;
     jsTestLog('Add arbiter with zero votes:');
     var response = admin.runCommand({replSetReconfig: conf});
     assert.commandFailed(response);
-    assert.eq(response.code, NewReplicaSetConfigurationIncompatible);
+    assert.eq(response.code, InvalidReplicaSetConfig);
     assert(/.*arbiter must vote.*/i.test(response.errmsg));
 
     replTest.stopSet();

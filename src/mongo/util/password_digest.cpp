@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,9 +27,8 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include "mongo/util/password_digest.h"
+#include "mongo/util/md5.h"
 
 namespace mongo {
 
@@ -38,10 +36,10 @@ std::string createPasswordDigest(StringData username, StringData clearTextPasswo
     md5digest d;
     {
         md5_state_t st;
-        md5_init(&st);
-        md5_append(&st, (const md5_byte_t*)username.rawData(), username.size());
+        md5_init_state(&st);
+        md5_append(&st, (const md5_byte_t*)username.data(), username.size());
         md5_append(&st, (const md5_byte_t*)":mongo:", 7);
-        md5_append(&st, (const md5_byte_t*)clearTextPassword.rawData(), clearTextPassword.size());
+        md5_append(&st, (const md5_byte_t*)clearTextPassword.data(), clearTextPassword.size());
         md5_finish(&st, d);
     }
     return digestToString(d);

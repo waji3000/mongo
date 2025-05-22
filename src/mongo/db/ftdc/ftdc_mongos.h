@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,12 +29,23 @@
 
 #pragma once
 
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/ftdc/controller.h"
+#include "mongo/db/operation_context.h"
+
 namespace mongo {
+
+/**
+ * To be called from `startMongoDFTDC`.
+ */
+void registerRouterCollectors(FTDCController* controller);
 
 /**
  * Start Full Time Data Capture
  */
-void startMongoSFTDC();
+void startMongoSFTDC(ServiceContext* serviceContext);
 
 /**
  * Stop Full Time Data Capture

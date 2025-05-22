@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Public Domain 2014-2018 MongoDB, Inc.
+# Public Domain 2014-present MongoDB, Inc.
 # Public Domain 2008-2014 WiredTiger, Inc.
 #
 # This is free and unencumbered software released into the public domain.
@@ -26,7 +26,7 @@
 # ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
 # OTHER DEALINGS IN THE SOFTWARE.
 
-# Usage: python test_conf_dump.py <optional-wtperf-config>
+# Usage: python test_conf_dump.py -d wtperf_directory [-c optional_wtperf_config]
 #
 # This script tests if the config file dumped in the test directory corresponds
 # correctly to the wtperf config file used. Command line options to wtperf are
@@ -46,13 +46,19 @@
 # fails if the value for the option is not replaced/appended in the correct
 # order of precedence as stated above.
 
-import os, re, subprocess, sys
+import os, re, subprocess
+import argparse
 
 OP_FILE = "WT_TEST/CONFIG.wtperf"
 TMP_CONF = "__tmp.wtperf"
 WTPERF_BIN = "./wtperf"
-WTPERF_DIR = "../../build_posix/bench/wtperf/"
 
+ap = argparse.ArgumentParser('Validates a WiredTiger test config files matches the wtperf config file being used')
+ap.add_argument('-d', '--wtperf_dir', type=str, required=True, help="Specify the wtperf binary directory")
+ap.add_argument('-c', '--config', help="Optional wtperf config file")
+args = ap.parse_args()
+
+WTPERF_DIR = args.wtperf_dir
 CONF_NOT_PROVIDED = -2
 
 # Generate a wtperf conf file to use
@@ -97,9 +103,9 @@ def execute_wtperf(conf_file, option_C = "", option_T = "", option_o = ""):
         option_o_cmd_str = option_o.replace('"', '\\"')
         cmd += " -o " + option_o_cmd_str
 
-    print "Running: ", cmd
+    print("Running:  " + cmd)
     subprocess.check_call(cmd, shell=True)
-    print "=========================\n"
+    print("=========================\n")
 
 # Build a dictionary of config key and it's value from the given config file.
 # Optionally take -C, -T and -o and overwrite/append values as per correct
@@ -209,7 +215,7 @@ def run_test(conf_file, option_C = "", option_T = "", option_o = ""):
 
         # Check if we see this config key in the dumped file
         if not key in key_val_dict_op:
-            print "Key '", key, "' not found in dumped file ", OP_FILE
+            print("Key '" + key + "' not found in dumped file " + OP_FILE)
             match = match_itr = False
             continue
 
@@ -235,7 +241,7 @@ def run_test(conf_file, option_C = "", option_T = "", option_o = ""):
             if ((conn_config_from_file and file_loc == -1) or
                 (conn_config_from_opt_o and option_o_loc == -1) or
                 (option_C and option_C_loc == -1)):
-                print "Part of conn_config missing in dumped file ", OP_FILE
+                print("Part of conn_config missing in dumped file " + OP_FILE)
                 match_itr = False
 
             # Check if the values got appended in the correct order
@@ -244,7 +250,7 @@ def run_test(conf_file, option_C = "", option_T = "", option_o = ""):
                      option_o_loc < file_loc) or
                     (option_C_loc != CONF_NOT_PROVIDED and
                      (option_C_loc < file_loc or option_C_loc < option_o_loc))):
-                    print "Detected incorrect config append order:"
+                    print("Detected incorrect config append order:")
                     match_itr = False
 
         # Check if values from all sources of table_config are presented in the
@@ -270,7 +276,7 @@ def run_test(conf_file, option_C = "", option_T = "", option_o = ""):
             if ((table_config_from_file and file_loc == -1) or
                 (table_config_from_opt_o and option_o_loc == -1) or
                 (option_T and option_T_loc == -1)):
-                print "Part of table_config missing in dumped file ", OP_FILE
+                print("Part of table_config missing in dumped file " + OP_FILE)
                 match_itr = False
 
             # Check if the values got appended in the correct order
@@ -279,18 +285,18 @@ def run_test(conf_file, option_C = "", option_T = "", option_o = ""):
                      option_o_loc < file_loc) or
                     (option_T_loc != CONF_NOT_PROVIDED and
                      (option_T_loc < file_loc or option_T_loc < option_o_loc))):
-                    print "Detected incorrect config append order:"
+                    print("Detected incorrect config append order:")
                     match_itr = False
 
         if (key != 'table_config' and key != 'conn_config' and
             key_val_dict_ip[key] != key_val_dict_op[key]):
-            print "Config mismatch between:"
+            print("Config mismatch between:")
             match_itr = False
 
         if match_itr is False:
-            print "Input Config:", key, '=', key_val_dict_ip[key]
-            print "Dumped Config:", key, '=', key_val_dict_op[key]
-            print "\n"
+            print("Input Config:" + key + '=' + key_val_dict_ip[key])
+            print("Dumped Config:" + key + '=' + key_val_dict_op[key])
+            print("\n")
 
         match = match and match_itr
 
@@ -299,8 +305,8 @@ def run_test(conf_file, option_C = "", option_T = "", option_o = ""):
 # ----------------- Execute Test --------------
 # If a wtperf conf file is provided use it, else generate a temp conf file
 os.chdir(WTPERF_DIR)
-if len(sys.argv) == 2:
-    conf_file = sys.argv[1]
+if args.config:
+    conf_file = args.config
 else:
     conf_file = TMP_CONF
     generate_conf_file(conf_file)
@@ -310,7 +316,7 @@ if not run_test(conf_file):
     exit(-1)
 
 # Run a test with -C, -T, -o provided
-option_o = "verbose=2,conn_config=\"session_max=135\",table_config=\"type=lsm\",sample_interval=2,run_time=0,sample_rate=2,readonly=false"
+option_o = "verbose=2,conn_config=\"session_max=135\",sample_interval=2,run_time=0,sample_rate=2,readonly=false"
 option_C = "\"cache_size=10GB,session_max=115\""
 option_T = "\"allocation_size=8k,split_pct=92\""
 if not run_test(conf_file, option_C, option_T, option_o):
@@ -318,7 +324,7 @@ if not run_test(conf_file, option_C, option_T, option_o):
 
 # Cleanup generated temp files
 subprocess.check_call("rm -rf WT_TEST/", shell=True)
-if len(sys.argv) == 1 and conf_file == TMP_CONF:
+if not args.config and conf_file == TMP_CONF:
     subprocess.check_call("rm " + TMP_CONF, shell=True)
 
-print "All tests succeeded"
+print("All tests succeeded")

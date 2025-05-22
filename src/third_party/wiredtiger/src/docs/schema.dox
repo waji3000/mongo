@@ -1,4 +1,4 @@
-/*! @m_page{{c,java},schema,Schema, Columns, Column Groups, Indices and Projections}
+/*! @page schema Schema, Columns, Column Groups, Indices and Projections
 
 While many tables have simple key/value pairs for records, WiredTiger
 also supports more complex data patterns.
@@ -66,24 +66,23 @@ struct module to describe the types of columns in a table:
   http://docs.python.org/library/struct
 
 <table>
-@hrow{Format, C Type, Java type, Python type, Notes}
-@row{\c x, N/A, N/A, N/A, pad byte\, no associated value}
-@row{\c b, \c int8_t, \c byte, \c int, signed byte}
-@row{\c B, \c uint8_t, \c byte, \c int, unsigned byte}
-@row{\c h, \c int16_t, \c short, \c int, signed 16-bit}
-@row{\c H, \c uint16_t, \c short, \c int, unsigned 16-bit}
-@row{\c i, \c int32_t, \c int, \c int, signed 32-bit}
-@row{\c I, \c uint32_t, \c int, \c int, unsigned 32-bit}
-@row{\c l, \c int32_t, \c int, \c int, signed 32-bit}
-@row{\c L, \c uint32_t, \c int, \c int, unsigned 32-bit}
-@row{\c q, \c int64_t, \c long, \c int, signed 64-bit}
-@row{\c Q, \c uint64_t, \c long, \c int, unsigned 64-bit}
-@row{\c r, \c uint64_t, \c long, \c int, record number}
-@row{\c s, \c char[], \c String, \c str, fixed-length string}
-@row{\c S, \c char[], \c String, \c str, NUL-terminated string}
-@row{\c t, \c uint8_t, \c byte, \c int, fixed-length bit field}
-@row{\c u, <code>WT_ITEM *</code>, <code>byte[]</code>, \c str,
-	raw byte array}
+@hrow{Format, C Type, Python type, Notes}
+@row{\c x, N/A, N/A, pad byte\, no associated value}
+@row{\c b, \c int8_t, \c int, signed byte}
+@row{\c B, \c uint8_t, \c int, unsigned byte}
+@row{\c h, \c int16_t, \c int, signed 16-bit}
+@row{\c H, \c uint16_t, \c int, unsigned 16-bit}
+@row{\c i, \c int32_t, \c int, signed 32-bit}
+@row{\c I, \c uint32_t, \c int, unsigned 32-bit}
+@row{\c l, \c int32_t, \c int, signed 32-bit}
+@row{\c L, \c uint32_t, \c int, unsigned 32-bit}
+@row{\c q, \c int64_t, \c int, signed 64-bit}
+@row{\c Q, \c uint64_t, \c int, unsigned 64-bit}
+@row{\c r, \c uint64_t, \c int, record number}
+@row{\c s, \c char[], \c str, fixed-length string}
+@row{\c S, \c char[], \c str, NUL-terminated string}
+@row{\c t, \c uint8_t, \c int, fixed-length bit field}
+@row{\c u, <code>WT_ITEM *</code>, \c bytes, raw byte array}
 </table>
 
 The \c 'r' type is used for record number keys in column stores.  It is
@@ -98,32 +97,29 @@ NUL character. When preceded by a size, that indicates the maximum number of
 bytes the string can store. In a string with characters less than the
 specified size, the remaining bytes are NUL padded. If the supplied string
 is longer than the specified size, it will be stored without a trailing NUL.
-@m_if{java}
-Because of this, the associated Java String may not contain the NUL character.
-@m_endif
 
 The \c 't' type is used for fixed-length bit field values.  If
 it is preceded by a size, that indicates the number of bits to store,
 between 1 and 8.  That number of low-order bits will be stored in the
 table.  The default is a size of 1 bit: that is, a boolean.
-@m_if{c}
 C applications must always use a \c uint8_t type (or equivalently,
 <code>unsigned char</code>) for calls to WT_CURSOR::set_value, and a
 pointer to the same for calls to WT_CURSOR::get_value.
-@m_endif
-If a bit field
-value is combined with other types in a packing format, it is equivalent to
-\c 'B', and a full byte is used to store it.
 
-When referenced by a record number (that is, a key format of
+If a bit field value is combined with other types in a packing format,
+it is equivalent to \c 'B', and a full byte is used to store it.
+However, when standing alone in a table or column group, and
+referenced by a record number (that is, a key format of
 <code>'r'</code>), the \c 't' type will be stored in a fixed-length
-column-store, and will not have an out-of-band value to indicate the record
-does not exist.  In this case, a 0 byte value is used to indicate the
-record does not exist.  This means removing a record with WT_CURSOR::remove
-is equivalent to storing a value of 0 in the record with WT_CURSOR::update
-(and storing a value of 0 in the record will cause cursor scans to skip the
-record).  Additionally, creating a record past the end of an object implies
-the creation of any missing intermediate records, with byte values of 0.
+column store.  This is an optimized on-disk format for efficient
+storage of small items. (See @subpage_single file_formats_formats for
+further information.) It has an important operational restriction:
+there is no separate out-of-band value to indicate that deleted
+records do not exist. Instead, deleted values read back as zero. This
+means removing a record with WT_CURSOR::remove is equivalent to
+storing a value of 0 in the record with WT_CURSOR::update.
+Additionally, creating a record past the end of an object implicitly
+also creates any missing intermediate records, all with values of 0.
 
 The \c 'u' type is for raw byte arrays: if it appears at the end of a
 format string (including in the default \c "u" format for untyped tables),
@@ -140,11 +136,7 @@ natural integer ordering under the default collator.
 See @subpage packing for details of WiredTiger's packing format.
 
 WiredTiger can also be extended with custom collators by implementing the
-@m_if{c}
 WT_COLLATOR interface.
-@m_else
-WT_COLLATOR interface (C only).
-@m_endif
 
 @section schema_key_and_value_formats Key and value formats
 
@@ -166,15 +158,9 @@ follows:
 @section schema_cursor_formats Cursor formats
 
 Cursors for a table have the same key format as the table itself.
-@m_if{c}
 The key columns of a cursor are set with WT_CURSOR::set_key and accessed with
 WT_CURSOR::get_key.  WT_CURSOR::set_key is analogous to \c printf,
 and takes a list of value
-@m_else
-The key columns of a cursor are set with the \c Cursor.putKey* methods
-and accessed with the \c Cursor.getKey* methods.  \c Cursor.putKey* methods
-must be called
-@m_endif
 in the order the key columns are configured in \c
 key_format.
 
@@ -194,30 +180,18 @@ the key_format was \c "SiH", would be done as follows:
 @snippet ex_all.c Set the cursor's composite key
 
 The key's values are accessed with
-@m_if{c}
 WT_CURSOR::get_key, which is analogous
 to \c scanf, and takes a list of pointers to values in the same order:
-@m_else
-successive calls to \c Cursor.getKey* methods:
-@m_endif
 
 @snippet ex_all.c Get the cursor's string key
 @snippet ex_all.c Get the cursor's record number key
 @snippet ex_all.c Get the cursor's composite key
 
-Cursors for a table have the same value format as the table, unless a
-projection is configured with WT_SESSION::open_cursor.  See
-@ref cursor_projections for more information.
+Cursors for a table have the same value format as the table.
 
-@m_if{c}
 WT_CURSOR::set_value is used to set value columns, and
 WT_CURSOR::get_value is used to get value columns, in the same way as
 described for WT_CURSOR::set_key and WT_CURSOR::get_key.
-@m_else
-\c The Cursor.putValue* methods are used to set value columns, and
-\c Cursor.getValue* are used to get value columns, in the same way as
-described for \c Cursor.putKey* and \c Cursor.getKey*.
-@m_endif
 
 @section schema_columns Columns
 
@@ -287,6 +261,21 @@ group.  Because column groups always have the same key as the table, key
 columns for column groups are retrieved using WT_CURSOR::get_key, not
 WT_CURSOR::get_value.
 
+Another example of using column groups is in @ex_ref{ex_col_store.c}:
+
+@snippet ex_col_store.c col-store decl
+@snippet ex_col_store.c col-store create columns
+
+In this example the hour and day columns are grouped together in one
+columns group and the temperature column stored in another. This allows
+a cursor to be opened on a either of these column groups instead of the
+entire table.
+
+@snippet ex_col_store.c col-store temperature
+
+An operation can then be completed on the values of this column without
+having to bring the other columns into memory.
+
 @section schema_indices Indices
 
 Columns are also used to create and configure indices on tables.
@@ -307,11 +296,7 @@ Cursors are opened on indices by passing the index's URI to the
 WT_SESSION::open_cursor method.
 
 Index cursors use the specified index key columns for
-@m_if{c}
 WT_CURSOR::get_key and WT_CURSOR::set_key.
-@m_else
-\c Cursor.getKey* and \c Cursor.putKey* calls.
-@m_endif
 For example, we can retrieve information from
 the \c country index as follows:
 
@@ -323,11 +308,7 @@ to the WT_SESSION::create call:
 @snippet ex_schema.c Create an index with a composite key
 
 To retrieve information from a composite index requires a more complicated
-@m_if{c}
 WT_CURSOR::set_key call,
-@m_else
-set of \c Cursor.putKey* calls,
-@m_endif
 but is otherwise the same:
 
 @snippet ex_schema.c Search in a composite index
@@ -347,60 +328,19 @@ An example of using an immutable index is:
 
 @snippet ex_schema.c Create an immutable index
 
-@section schema_index_projections Index cursor projections
-
-By default, index cursors return all of the table's value columns from
-@m_if{c}
-WT_CURSOR::get_value.
-@m_else
-\c Cursor.getValue* calls.
-@m_endif
-The application can specify that a subset of the
-usual columns should be returned in calls to
-@m_if{c}
-WT_CURSOR::get_value
-@m_else
-\c Cursor.getValue
-@m_endif
-by appending a list of columns to the \c uri parameter of the
-WT_SESSION::open_cursor call.  This is called a \em projection, see
-@ref cursor_projections for more details.
-
-In the case of index cursors, a projection can be used to avoid lookups
-in column groups that do not hold columns relevant to the operation.
-
-The following example will return just the table's primary key (a record
-number, in this case) from the index:
-
-@snippet ex_schema.c Return the table's record number key using an index
-
-Here is an example of a projection that returns a subset of columns from
-the index:
-
-@snippet ex_schema.c Return a subset of the value columns from an index
-
-For performance reasons, it may be desirable to include all columns for
-a performance-critical operation in an index, so that it is possible to
-perform index-only lookups where no column group from the table is
-accessed.  In this case, all of the "hot" columns should be included in the
-index (always list the "real" index key columns first, so they will
-determine the sort order).  Then, open a cursor on the index that doesn't
-return any value columns, and no column group will be accessed.
-
-@snippet ex_schema.c Access only the index
-
-Index cursors for column-store objects may not be created using the
-record number as the index key (there is no use for a secondary index
-on a column-store where the index key is the record number).
-
 @section schema_examples Code samples
 
 The code included above was taken from the complete example program
 @ex_ref{ex_schema.c}.
 
-Here is another example program, @ex_ref{ex_call_center.c}.
+Here are other example programs, @ex_ref{ex_call_center.c},
 
 @snippet ex_call_center.c call-center decl
 @snippet ex_call_center.c call-center work
+
+and @ex_ref{ex_col_store.c}.
+
+@snippet ex_col_store.c col-store decl
+@snippet ex_col_store.c col-store main
 
  */

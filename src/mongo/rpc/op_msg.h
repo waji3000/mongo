@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -31,21 +30,51 @@
 #pragma once
 
 #include <algorithm>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+#include <cstddef>
+#include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "mongo/base/string_data.h"
-#include "mongo/db/jsobj.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/bson/util/builder.h"
+#include "mongo/db/auth/validated_tenancy_scope_factory.h"
+#include "mongo/db/tenant_id.h"
+#include "mongo/platform/atomic_word.h"
 #include "mongo/rpc/message.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/database_name_util.h"
+#include "mongo/util/serialization_context.h"
+#include "mongo/util/shared_buffer.h"
 
 namespace mongo {
 
+/**
+ * OpMsg packets are made up of the following sequence of possible fields.
+ *
+ * ----------------------------
+ * uint32_t           flags;     // One or more of the flags fields defined below
+ *                               // Bits 0-15 MUST be supported by the receiving peer
+ *                               // Bits 16-31 are OPTIONAL and may be ignored
+ * DocumentSequence[] docs;      // Zero or more name/BSON pairs describing the message
+ * optional<uint32_t> checksum;  // CRC-32C checksum for the preceeding data.
+ * ----------------------------
+ */
 struct OpMsg {
     struct DocumentSequence {
         std::string name;
         std::vector<BSONObj> objs;
     };
 
+    // Flags
     static constexpr uint32_t kChecksumPresent = 1 << 0;
     static constexpr uint32_t kMoreToCome = 1 << 1;
     static constexpr uint32_t kExhaustSupported = 1 << 16;
@@ -75,20 +104,57 @@ struct OpMsg {
     }
 
     /**
+     * Removes a flag from the list of set flags in message.
+     * Only legal on an otherwise valid OP_MSG message.
+     */
+    static void clearFlag(Message* message, uint32_t flag) {
+        replaceFlags(message, flags(*message) & ~flag);
+    }
+
+    /**
+     * Retrieves the checksum stored at the end of the message.
+     */
+    static uint32_t getChecksum(const Message& message);
+
+    /**
+     * Add a checksum at the end of the message. Call this after setting size, requestId, and
+     * responseTo. The checksumPresent flag must *not* already be set.
+     */
+    static void appendChecksum(Message* message);
+
+    /**
+     * If the checksum is present, unsets the checksumPresent flag and shrinks message by 4 bytes.
+     */
+    static void removeChecksum(Message* message) {
+        if (!isFlagSet(*message, kChecksumPresent)) {
+            return;
+        }
+
+        clearFlag(message, kChecksumPresent);
+        message->header().setLen(message->size() - 4);
+    }
+
+    /**
      * Parses and returns an OpMsg containing unowned BSON.
      */
-    static OpMsg parse(const Message& message);
+    static OpMsg parse(const Message& message, Client* client = nullptr);
 
     /**
      * Parses and returns an OpMsg containing owned BSON.
      */
-    static OpMsg parseOwned(const Message& message) {
-        auto msg = parse(message);
+    static OpMsg parseOwned(const Message& message, Client* client = nullptr) {
+        auto msg = parse(message, client);
         msg.shareOwnershipWith(message.sharedBuffer());
         return msg;
     }
 
     Message serialize() const;
+
+    /**
+     * Like serialize() but doesn't enforce max BSON size limits. This is almost never what you
+     * want. Prefer serialize() unless there's a good reason to skip the size check.
+     */
+    Message serializeWithoutSizeChecking() const;
 
     /**
      * Makes all BSONObjs in this object share ownership with buffer.
@@ -109,6 +175,15 @@ struct OpMsg {
 
     BSONObj body;
     std::vector<DocumentSequence> sequences;
+
+    boost::optional<auth::ValidatedTenancyScope> validatedTenancyScope = boost::none;
+
+    boost::optional<TenantId> getValidatedTenantId() const {
+        if (!validatedTenancyScope) {
+            return boost::none;
+        }
+        return validatedTenancyScope->tenantId();
+    }
 };
 
 /**
@@ -120,32 +195,32 @@ struct OpMsgRequest : public OpMsg {
     OpMsgRequest() = default;
     explicit OpMsgRequest(OpMsg&& generic) : OpMsg(std::move(generic)) {}
 
-    static OpMsgRequest parse(const Message& message) {
-        return OpMsgRequest(OpMsg::parse(message));
+    static OpMsgRequest parse(const Message& message, Client* client = nullptr) {
+        return OpMsgRequest(OpMsg::parse(message, client));
     }
 
-    static OpMsgRequest fromDBAndBody(StringData db,
-                                      BSONObj body,
-                                      const BSONObj& extraFields = {}) {
-        OpMsgRequest request;
-        request.body = ([&] {
-            BSONObjBuilder bodyBuilder(std::move(body));
-            bodyBuilder.appendElements(extraFields);
-            bodyBuilder.append("$db", db);
-            return bodyBuilder.obj();
-        }());
-        return request;
+    static OpMsgRequest parseOwned(const Message& message, Client* client = nullptr) {
+        return OpMsgRequest(OpMsg::parseOwned(message, client));
     }
 
-    StringData getDatabase() const {
-        if (auto elem = body["$db"])
-            return elem.checkAndGetStringData();
-        uasserted(40571, "OP_MSG requests require a $db argument");
+    /**
+     * Gets the "$db" field of the command request if specified.
+     * If the field is omitted, an empty string is returned.
+     *
+     * No validation of the value is performed. This method should only be used for logging or
+     * error messages, particularly in contexts where the command request has not been parsed yet.
+     */
+    StringData readDatabaseForLogging() const {
+        return body["$db"].valueStringDataSafe();
     }
+
+    DatabaseName parseDbName() const;
 
     StringData getCommandName() const {
         return body.firstElementFieldName();
     }
+
+    SerializationContext getSerializationContext() const;
 
     // DO NOT ADD MEMBERS!  Since this type is essentially a strong typedef (see the class comment),
     // it should not hold more data than an OpMsg. It should be freely interconvertible with OpMsg
@@ -161,7 +236,8 @@ struct OpMsgRequest : public OpMsg {
  * sent.
  */
 class OpMsgBuilder {
-    MONGO_DISALLOW_COPYING(OpMsgBuilder);
+    OpMsgBuilder(const OpMsgBuilder&) = delete;
+    OpMsgBuilder& operator=(const OpMsgBuilder&) = delete;
 
 public:
     OpMsgBuilder() {
@@ -197,11 +273,21 @@ public:
         resumeBody().appendElements(body);
     }
 
+    void setSecurityToken(StringData token);
+
     /**
      * Finish building and return a Message ready to give to the networking layer for transmission.
      * It is illegal to call any methods on this object after calling this.
+     * Can throw BSONObjectTooLarge if the internal buffer has grown too large to be converted
+     * to a Message within the BSON size limit.
      */
     Message finish();
+
+    /**
+     * Like finish() but doesn't enforce max BSON size limits. This is almost never what you want.
+     * Prefer finish() unless there's a good reason to skip the size check.
+     */
+    Message finishWithoutSizeChecking();
 
     /**
      * Reset this object to its initial empty state. All previously appended data is lost.
@@ -221,7 +307,7 @@ public:
      * the server handles them. Is false by default, although the check only happens in debug
      * builds.
      */
-    static AtomicBool disableDupeFieldCheck_forTest;
+    static AtomicWord<bool> disableDupeFieldCheck_forTest;
 
     /**
      * Similar to finish, any calls on this object after are illegal.
@@ -283,7 +369,8 @@ private:
  * docSeq.done(); // Or just let it go out of scope.
  */
 class OpMsgBuilder::DocSequenceBuilder {
-    MONGO_DISALLOW_COPYING(DocSequenceBuilder);
+    DocSequenceBuilder(const DocSequenceBuilder&) = delete;
+    DocSequenceBuilder& operator=(const DocSequenceBuilder&) = delete;
 
 public:
     DocSequenceBuilder(DocSequenceBuilder&& other)
@@ -335,6 +422,20 @@ private:
     BufBuilder* _buf;
     OpMsgBuilder* const _msgBuilder;
     const int _sizeOffset;
+};
+
+/**
+ * Builds an OpMsgRequest object.
+ */
+struct OpMsgRequestBuilder {
+public:
+    /**
+     * Creates an OpMsgRequest object and directly sets a validated tenancy scope on it.
+     */
+    static OpMsgRequest create(boost::optional<auth::ValidatedTenancyScope> validatedTenancyScope,
+                               const DatabaseName& dbName,
+                               BSONObj body,
+                               const BSONObj& extraFields = {});
 };
 
 }  // namespace mongo

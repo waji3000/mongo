@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,39 +27,38 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/pipeline/document_source_geo_near_cursor.h"
-
-#include <boost/intrusive_ptr.hpp>
-#include <boost/optional.hpp>
-#include <list>
 #include <memory>
+#include <utility>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
 
 #include "mongo/base/string_data.h"
-#include "mongo/bson/bsonelement.h"
-#include "mongo/bson/bsonobj.h"
-#include "mongo/bson/simple_bsonobj_comparator.h"
-#include "mongo/db/catalog/collection.h"
-#include "mongo/db/pipeline/document.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/document_metadata_fields.h"
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/pipeline/document_source_cursor.h"
-#include "mongo/db/pipeline/document_source_sort.h"
+#include "mongo/db/pipeline/document_source_geo_near_cursor.h"
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/field_path.h"
 #include "mongo/db/query/plan_executor.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
-constexpr const char* DocumentSourceGeoNearCursor::kStageName;
 
 boost::intrusive_ptr<DocumentSourceGeoNearCursor> DocumentSourceGeoNearCursor::create(
-    Collection* collection,
+    const MultipleCollectionAccessor& collections,
     std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> exec,
+    const boost::intrusive_ptr<DocumentSourceCursor::CatalogResourceHandle>& catalogResourceHandle,
     const boost::intrusive_ptr<ExpressionContext>& expCtx,
-    FieldPath distanceField,
+    boost::optional<FieldPath> distanceField,
     boost::optional<FieldPath> locationField,
     double distanceMultiplier) {
-    return {new DocumentSourceGeoNearCursor(collection,
+    return {new DocumentSourceGeoNearCursor(collections,
                                             std::move(exec),
+                                            catalogResourceHandle,
                                             expCtx,
                                             std::move(distanceField),
                                             std::move(locationField),
@@ -68,52 +66,56 @@ boost::intrusive_ptr<DocumentSourceGeoNearCursor> DocumentSourceGeoNearCursor::c
 }
 
 DocumentSourceGeoNearCursor::DocumentSourceGeoNearCursor(
-    Collection* collection,
+    const MultipleCollectionAccessor& collections,
     std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> exec,
+    const boost::intrusive_ptr<DocumentSourceCursor::CatalogResourceHandle>& catalogResourceHandle,
     const boost::intrusive_ptr<ExpressionContext>& expCtx,
-    FieldPath distanceField,
+    boost::optional<FieldPath> distanceField,
     boost::optional<FieldPath> locationField,
     double distanceMultiplier)
-    : DocumentSourceCursor(collection, std::move(exec), expCtx),
+    : DocumentSourceCursor(collections,
+                           std::move(exec),
+                           catalogResourceHandle,
+                           expCtx,
+                           DocumentSourceCursor::CursorType::kRegular),
       _distanceField(std::move(distanceField)),
       _locationField(std::move(locationField)),
       _distanceMultiplier(distanceMultiplier) {
-    invariant(_distanceMultiplier >= 0);
+    tassert(9911901, "", _distanceMultiplier >= 0);
 }
 
 const char* DocumentSourceGeoNearCursor::getSourceName() const {
-    return kStageName;
+    return DocumentSourceGeoNearCursor::kStageName.data();
 }
 
-BSONObjSet DocumentSourceGeoNearCursor::getOutputSorts() {
-    return SimpleBSONObjComparator::kInstance.makeBSONObjSet(
-        {BSON(_distanceField.fullPath() << 1)});
-}
-
-Document DocumentSourceGeoNearCursor::transformBSONObjToDocument(const BSONObj& obj) const {
-    MutableDocument output(Document::fromBsonWithMetaData(obj));
+Document DocumentSourceGeoNearCursor::transformDoc(Document&& objInput) const {
+    MutableDocument output(std::move(objInput));
 
     // Scale the distance by the requested factor.
-    invariant(output.peek().hasGeoNearDistance(),
-              str::stream()
-                  << "Query returned a document that is unexpectedly missing the geoNear distance: "
-                  << obj.jsonString());
-    const auto distance = output.peek().getGeoNearDistance() * _distanceMultiplier;
-
-    output.setNestedField(_distanceField, Value(distance));
-    if (_locationField) {
-        invariant(
-            output.peek().hasGeoNearPoint(),
+    tassert(9911902,
             str::stream()
-                << "Query returned a document that is unexpectedly missing the geoNear point: "
-                << obj.jsonString());
-        output.setNestedField(*_locationField, output.peek().getGeoNearPoint());
+                << "Query returned a document that is unexpectedly missing the geoNear distance: "
+                << output.peek().toString(),
+            output.peek().metadata().hasGeoNearDistance());
+    const auto distance = output.peek().metadata().getGeoNearDistance() * _distanceMultiplier;
+
+    if (_distanceField) {
+        output.setNestedField(*_distanceField, Value(distance));
+    }
+    if (_locationField) {
+        tassert(9911903,
+                str::stream()
+                    << "Query returned a document that is unexpectedly missing the geoNear point: "
+                    << output.peek().toString(),
+                output.peek().metadata().hasGeoNearPoint());
+        output.setNestedField(*_locationField, output.peek().metadata().getGeoNearPoint());
     }
 
-    // In a cluster, $geoNear will be merged via $sort, so add the sort key.
-    if (pExpCtx->needsMerge) {
-        output.setSortKeyMetaField(BSON("" << distance));
-    }
+    // Always set the sort key. Sometimes it will be needed in a sharded cluster to perform a merge
+    // sort. Other times it will be needed by $rankFusion. It is not expensive, so just make it
+    // unconditionally available.
+    const bool isSingleElementKey = true;
+    output.metadata().setSortKey(Value(distance), isSingleElementKey);
 
     return output.freeze();
 }

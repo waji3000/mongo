@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,25 +27,47 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
 
-#include "mongo/platform/basic.h"
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <js/Array.h>
+#include <js/CallArgs.h>
+#include <js/Object.h>
+#include <js/RootingAPI.h>
+#include <js/ValueArray.h>
+#include <jsapi.h>
+#include <jsfriendapi.h>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <utility>
 
-#include "mongo/scripting/mozjs/jsthread.h"
+#include <js/PropertyAndElement.h>
+#include <js/PropertySpec.h>
+#include <js/TypeDecls.h>
 
-#include "vm/PosixNSPR.h"
-#include <cstdio>
-
-#include "mongo/db/jsobj.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/client.h"
+#include "mongo/logv2/log.h"
+#include "mongo/scripting/engine.h"
+#include "mongo/scripting/mozjs/engine.h"
+#include "mongo/scripting/mozjs/exception.h"
 #include "mongo/scripting/mozjs/implscope.h"
+#include "mongo/scripting/mozjs/internedstring.h"
+#include "mongo/scripting/mozjs/jsthread.h"
+#include "mongo/scripting/mozjs/objectwrapper.h"
 #include "mongo/scripting/mozjs/valuereader.h"
-#include "mongo/scripting/mozjs/valuewriter.h"
-#include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/stdx/thread.h"
-#include "mongo/util/log.h"
-#include "mongo/util/stacktrace.h"
+#include "mongo/util/assert_util.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
+
 
 namespace mongo {
 namespace mozjs {
@@ -88,11 +109,11 @@ public:
         uassert(ErrorCodes::JSInterpreterFailure, "need at least one argument", args.length() > 0);
         uassert(ErrorCodes::JSInterpreterFailure,
                 "first argument must be a function",
-                args.get(0).isObject() && JS_ObjectIsFunction(cx, args.get(0).toObjectOrNull()));
+                args.get(0).isObject() && js::IsFunctionObject(args.get(0).toObjectOrNull()));
 
-        JS::RootedObject robj(cx, JS_NewArrayObject(cx, args));
+        JS::RootedObject robj(cx, JS::NewArrayObject(cx, args));
         if (!robj) {
-            uasserted(ErrorCodes::JSInterpreterFailure, "Failed to JS_NewArrayObject");
+            uasserted(ErrorCodes::JSInterpreterFailure, "Failed to JS::NewArrayObject");
         }
 
         _sharedData->_args = ObjectWrapper(cx, robj).toBSON();
@@ -107,24 +128,14 @@ public:
     void start() {
         uassert(ErrorCodes::JSInterpreterFailure, "Thread already started", !_started);
 
-        // Despite calling PR_CreateThread, we're actually using our own
-        // implementation of PosixNSPR.cpp in this directory. So these threads
-        // are actually hosted on top of stdx::threads and most of the flags
-        // don't matter.
-        _thread = PR_CreateThread(PR_USER_THREAD,
-                                  JSThread::run,
-                                  &_jsthread,
-                                  PR_PRIORITY_NORMAL,
-                                  PR_LOCAL_THREAD,
-                                  PR_JOINABLE_THREAD,
-                                  0);
+        _thread = stdx::thread(JSThread::run, &_jsthread);
         _started = true;
     }
 
     void join() {
         uassert(ErrorCodes::JSInterpreterFailure, "Thread not running", _started && !_done);
 
-        PR_JoinThread(_thread);
+        _thread.join();
         _done = true;
 
         uassertStatusOK(_sharedData->getErrorStatus());
@@ -195,12 +206,16 @@ private:
             auto thisv = static_cast<JSThread*>(priv);
 
             try {
-                MozJSImplScope scope(static_cast<MozJSScriptEngine*>(getGlobalScriptEngine()));
-
+                MozJSImplScope scope(static_cast<MozJSScriptEngine*>(getGlobalScriptEngine()),
+                                     boost::none /* Don't override global jsHeapLimitMB */);
+                Client::initThread("js", getGlobalServiceContext()->getService());
                 scope.setParentStack(thisv->_sharedData->_stack);
                 thisv->_sharedData->_returnData = scope.callThreadArgs(thisv->_sharedData->_args);
             } catch (...) {
                 auto status = exceptionToStatus();
+                LOGV2_WARNING(4988200,
+                              "JS Thread exiting after catching unhandled exception",
+                              "error"_attr = redact(status));
                 thisv->_sharedData->setErrorStatus(status);
                 thisv->_sharedData->_returnData = BSON("ret" << BSONUndefined);
             }
@@ -212,7 +227,7 @@ private:
 
     bool _started;
     bool _done;
-    PRThread* _thread = nullptr;
+    stdx::thread _thread;
     std::shared_ptr<SharedData> _sharedData;
     JSThread _jsthread;
 };
@@ -229,18 +244,19 @@ JSThreadConfig* getConfig(JSContext* cx, JS::CallArgs args) {
     if (!getScope(cx)->getProto<JSThreadInfo>().instanceOf(value))
         uasserted(ErrorCodes::BadValue, "_JSThreadConfig is not a JSThread");
 
-    return static_cast<JSThreadConfig*>(JS_GetPrivate(value.toObjectOrNull()));
+    return JS::GetMaybePtrFromReservedSlot<JSThreadConfig>(value.toObjectOrNull(),
+                                                           JSThreadInfo::JSThreadConfigSlot);
 }
 
 }  // namespace
 
-void JSThreadInfo::finalize(JSFreeOp* fop, JSObject* obj) {
-    auto config = static_cast<JSThreadConfig*>(JS_GetPrivate(obj));
+void JSThreadInfo::finalize(JS::GCContext* gcCtx, JSObject* obj) {
+    auto config = JS::GetMaybePtrFromReservedSlot<JSThreadConfig>(obj, JSThreadConfigSlot);
 
     if (!config)
         return;
 
-    getScope(fop)->trackedDelete(config);
+    getScope(gcCtx)->trackedDelete(config);
 }
 
 void JSThreadInfo::Functions::init::call(JSContext* cx, JS::CallArgs args) {
@@ -249,7 +265,7 @@ void JSThreadInfo::Functions::init::call(JSContext* cx, JS::CallArgs args) {
     JS::RootedObject obj(cx);
     scope->getProto<JSThreadInfo>().newObject(&obj);
     JSThreadConfig* config = scope->trackedNew<JSThreadConfig>(cx, args);
-    JS_SetPrivate(obj, config);
+    JS::SetReservedSlot(obj, JSThreadConfigSlot, JS::PrivateValue(config));
 
     ObjectWrapper(cx, args.thisv()).setObject(InternedString::_JSThreadConfig, obj);
 

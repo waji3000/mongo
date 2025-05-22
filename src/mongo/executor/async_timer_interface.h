@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,10 +29,9 @@
 
 #pragma once
 
+#include <functional>
 #include <system_error>
 
-#include "mongo/base/disallow_copying.h"
-#include "mongo/stdx/functional.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
@@ -43,12 +41,13 @@ namespace executor {
  * An asynchronous waitable timer interface.
  */
 class AsyncTimerInterface {
-    MONGO_DISALLOW_COPYING(AsyncTimerInterface);
+    AsyncTimerInterface(const AsyncTimerInterface&) = delete;
+    AsyncTimerInterface& operator=(const AsyncTimerInterface&) = delete;
 
 public:
     virtual ~AsyncTimerInterface() = default;
 
-    using Handler = stdx::function<void(std::error_code)>;
+    using Handler = std::function<void(std::error_code)>;
 
     /**
      * Cancel any asynchronous operations waiting on this timer, invoking
@@ -82,7 +81,8 @@ protected:
  * A factory for AsyncTimers.
  */
 class AsyncTimerFactoryInterface {
-    MONGO_DISALLOW_COPYING(AsyncTimerFactoryInterface);
+    AsyncTimerFactoryInterface(const AsyncTimerFactoryInterface&) = delete;
+    AsyncTimerFactoryInterface& operator=(const AsyncTimerFactoryInterface&) = delete;
 
 public:
     virtual ~AsyncTimerFactoryInterface() = default;

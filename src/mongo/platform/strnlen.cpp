@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -29,7 +28,7 @@
  */
 
 #include "mongo/platform/strnlen.h"
-#include "mongo/config.h"
+#include "mongo/config.h"  // IWYU pragma: keep
 
 #ifndef MONGO_CONFIG_HAVE_STRNLEN
 

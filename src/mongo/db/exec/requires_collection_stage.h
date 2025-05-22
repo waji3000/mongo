@@ -29,58 +29,65 @@
 
 #pragma once
 
+#include <cstdint>
+#include <memory>
+
 #include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/exec/plan_stage.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/query/plan_executor.h"
+#include "mongo/db/query/restore_context.h"
+#include "mongo/db/shard_role.h"
 #include "mongo/util/uuid.h"
 
 namespace mongo {
 
 /**
- * A base class for plan stages which access a collection. In addition to providing derived classes
+ * A class for plan stages which access a collection. In addition to providing derived classes
  * access to the Collection pointer, the primary purpose of this class is to assume responsibility
  * for checking that the collection is still valid (e.g. has not been dropped) when recovering from
  * yield.
  *
- * Subclasses must implement the saveStage() and restoreState() variants tagged with RequiresCollTag
+ * Subclasses must implement doSaveStateRequiresCollection() and doRestoreStateRequiresCollection()
  * in order to supply custom yield preparation or yield recovery logic.
- *
- * Templated on 'CollectionT', which may be instantiated using either Collection* or const
- * Collection*. This abstracts the implementation of this base class for use by derived classes
- * which read (e.g. COLLSCAN and MULTI_ITERATOR) and derived classes that write (e.g. UPDATE and
- * DELETE). Derived classes should use the 'RequiresCollectionStage' or
- * 'RequiresMutableCollectionStage' aliases provided below.
  */
-template <typename CollectionT>
-class RequiresCollectionStageBase : public PlanStage {
+class RequiresCollectionStage : public PlanStage {
 public:
-    RequiresCollectionStageBase(const char* stageType, OperationContext* opCtx, CollectionT coll)
-        : PlanStage(stageType, opCtx),
+    RequiresCollectionStage(const char* stageType,
+                            ExpressionContext* expCtx,
+                            VariantCollectionPtrOrAcquisition coll)
+        : PlanStage(stageType, expCtx),
           _collection(coll),
-          _collectionUUID(_collection->uuid().get()) {
-        invariant(_collection);
-    }
+          _collectionPtr(&coll.getCollectionPtr()),
+          _collectionUUID(coll.getCollectionPtr()->uuid()),
+          _catalogEpoch(getCatalogEpoch()),
+          _nss(coll.getCollectionPtr()->ns()) {}
 
-    virtual ~RequiresCollectionStageBase() = default;
+    ~RequiresCollectionStage() override = default;
 
 protected:
-    struct RequiresCollTag {};
-
     void doSaveState() final;
 
-    void doRestoreState() final;
+    void doRestoreState(const RestoreContext& context) final;
 
     /**
      * Performs yield preparation specific to a stage which subclasses from RequiresCollectionStage.
      */
-    virtual void saveState(RequiresCollTag) = 0;
+    virtual void doSaveStateRequiresCollection() = 0;
 
     /**
      * Performs yield recovery specific to a stage which subclasses from RequiresCollectionStage.
      */
-    virtual void restoreState(RequiresCollTag) = 0;
+    virtual void doRestoreStateRequiresCollection() = 0;
 
-    CollectionT collection() const {
+    const VariantCollectionPtrOrAcquisition& collection() const {
         return _collection;
+    }
+
+    const CollectionPtr& collectionPtr() const {
+        return *_collectionPtr;
     }
 
     UUID uuid() const {
@@ -88,14 +95,39 @@ protected:
     }
 
 private:
-    CollectionT _collection;
+    // This can only be called when the plan stage is attached to an operation context.
+    uint64_t getCatalogEpoch() const {
+        return CollectionCatalog::get(opCtx())->getEpoch();
+    }
+
+    // Pointer to a CollectionPtr that is stored at a high level in a AutoGetCollection or other
+    // helper. It needs to stay valid until the PlanExecutor saves its state. To avoid this pointer
+    // from dangling it needs to be reset when doRestoreState() is called and it is reset to a
+    // different CollectionPtr.
+    VariantCollectionPtrOrAcquisition _collection;
+    const CollectionPtr* _collectionPtr;
     const UUID _collectionUUID;
+    const uint64_t _catalogEpoch;
+
+    // TODO SERVER-31695: The namespace will no longer be needed once queries can survive collection
+    // renames.
+    const NamespaceString _nss;
 };
 
-// Type alias for use by PlanStages that read a Collection.
-using RequiresCollectionStage = RequiresCollectionStageBase<const Collection*>;
-
 // Type alias for use by PlanStages that write to a Collection.
-using RequiresMutableCollectionStage = RequiresCollectionStageBase<Collection*>;
+class RequiresWritableCollectionStage : public RequiresCollectionStage {
+public:
+    RequiresWritableCollectionStage(const char* stageType,
+                                    ExpressionContext* expCtx,
+                                    CollectionAcquisition coll)
+        : RequiresCollectionStage(stageType, expCtx, coll), _collectionAcquisition(coll) {}
+
+    const CollectionAcquisition& collectionAcquisition() const {
+        return _collectionAcquisition;
+    }
+
+private:
+    const CollectionAcquisition _collectionAcquisition;
+};
 
 }  // namespace mongo

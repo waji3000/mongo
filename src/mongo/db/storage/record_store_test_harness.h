@@ -1,6 +1,3 @@
-// record_store_test_harness.h
-
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -32,41 +29,69 @@
 
 #pragma once
 
-#include <cstdint>
+#include <functional>
+#include <memory>
+#include <string>
 
-#include "mongo/db/operation_context_noop.h"
-#include "mongo/db/service_context.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/storage/kv/kv_engine.h"
+#include "mongo/db/storage/record_store.h"
+#include "mongo/db/storage/storage_engine.h"
 #include "mongo/db/storage/test_harness_helper.h"
-#include "mongo/stdx/memory.h"
 
 namespace mongo {
 
-class RecordStore;
-class RecoveryUnit;
-
 class RecordStoreHarnessHelper : public HarnessHelper {
 public:
-    virtual std::unique_ptr<RecordStore> newNonCappedRecordStore() = 0;
+    enum class Options { Standalone, ReplicationEnabled };
 
-    virtual std::unique_ptr<RecordStore> newNonCappedRecordStore(const std::string& ns) = 0;
+    virtual std::unique_ptr<RecordStore> newRecordStore() = 0;
 
-    static const int64_t kDefaultCapedSizeBytes = 16 * 1024 * 1024;
-    virtual std::unique_ptr<RecordStore> newCappedRecordStore(
-        int64_t cappedSizeBytes = kDefaultCapedSizeBytes, int64_t cappedMaxDocs = -1) = 0;
+    std::unique_ptr<RecordStore> newRecordStore(const std::string& ns) {
+        return newRecordStore(ns, RecordStore::Options{});
+    }
 
-    virtual std::unique_ptr<RecordStore> newCappedRecordStore(const std::string& ns,
-                                                              int64_t cappedSizeBytes,
-                                                              int64_t cappedMaxDocs) = 0;
+    virtual std::unique_ptr<RecordStore> newRecordStore(const std::string& ns,
+                                                        const RecordStore::Options& rsOptions) = 0;
+
+    virtual std::unique_ptr<RecordStore> newOplogRecordStore() = 0;
+
+    virtual KVEngine* getEngine() = 0;
 
     /**
-     * Currently this requires that it is possible to have two independent open write operations
-     * at the same time one the same thread (with separate Clients, OperationContexts, and
-     * RecoveryUnits).
+     * For test convenience only - in general, the notion of a 'clustered' collection should exist
+     * above the storage layer.
+     *
+     * Returns RecordStore::Options for a 'clustered' collection.
      */
-    virtual bool supportsDocLocking() = 0;
+    RecordStore::Options clusteredRecordStoreOptions() {
+        RecordStore::Options clusteredRSOptions;
+        clusteredRSOptions.keyFormat = KeyFormat::String;
+        clusteredRSOptions.allowOverwrite = true;
+        return clusteredRSOptions;
+    }
+
+    /**
+     * Advances the stable timestamp of the engine.
+     */
+    void advanceStableTimestamp(Timestamp newTimestamp) {
+        auto engine = getEngine();
+        // Disable the callback for oldest active transaction as it blocks the timestamps from
+        // advancing.
+        engine->setOldestActiveTransactionTimestampCallback(
+            StorageEngine::OldestActiveTransactionTimestampCallback{});
+        engine->setInitialDataTimestamp(newTimestamp);
+        engine->setStableTimestamp(newTimestamp, true);
+        engine->checkpoint();
+    }
 };
 
-inline std::unique_ptr<RecordStoreHarnessHelper> newRecordStoreHarnessHelper() {
-    return dynamic_ptr_cast<RecordStoreHarnessHelper>(newHarnessHelper());
-}
+void registerRecordStoreHarnessHelperFactory(
+    std::function<std::unique_ptr<RecordStoreHarnessHelper>(RecordStoreHarnessHelper::Options)>
+        factory);
+
+std::unique_ptr<RecordStoreHarnessHelper> newRecordStoreHarnessHelper(
+    RecordStoreHarnessHelper::Options options =
+        RecordStoreHarnessHelper::Options::ReplicationEnabled);
+
 }  // namespace mongo

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,79 +27,117 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
-#define LOG_FOR_HEARTBEATS(level) \
-    MONGO_LOG_COMPONENT(level, ::mongo::logger::LogComponent::kReplicationHeartbeats)
 
-#include "mongo/platform/basic.h"
+#define LOGV2_FOR_HEARTBEATS(ID, DLEVEL, MESSAGE, ...) \
+    LOGV2_DEBUG_OPTIONS(                               \
+        ID, DLEVEL, {logv2::LogComponent::kReplicationHeartbeats}, MESSAGE, ##__VA_ARGS__)
 
-#include <boost/algorithm/string.hpp>
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <cstdint>
+#include <cstring>
+// IWYU pragma: no_include "ext/alloc_traits.h"
+#include <iosfwd>
+#include <memory>
+#include <set>
+#include <string>
+#include <utility>
+#include <vector>
 
-#include "mongo/db/repl/repl_set_command.h"
-
-#include "mongo/base/init.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/base/init.h"  // IWYU pragma: keep
 #include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/bson/oid.h"
+#include "mongo/bson/timestamp.h"
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/action_type.h"
-#include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/catalog/collection_catalog.h"
+#include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/server_status_metric.h"
 #include "mongo/db/commands/test_commands_enabled.h"
+#include "mongo/db/concurrency/d_concurrency.h"
+#include "mongo/db/concurrency/lock_manager_defs.h"
+#include "mongo/db/database_name.h"
 #include "mongo/db/dbhelpers.h"
-#include "mongo/db/lasterror.h"
-#include "mongo/db/op_observer.h"
-#include "mongo/db/repl/drop_pending_collection_reaper.h"
-#include "mongo/db/repl/oplog.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/repl/member_state.h"
+#include "mongo/db/repl/optime.h"
+#include "mongo/db/repl/repl_set_command.h"
+#include "mongo/db/repl/repl_set_config.h"
 #include "mongo/db/repl/repl_set_heartbeat_args_v1.h"
 #include "mongo/db/repl/repl_set_heartbeat_response.h"
+#include "mongo/db/repl/repl_settings.h"
 #include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/repl/replication_coordinator_external_state.h"
 #include "mongo/db/repl/replication_coordinator_external_state_impl.h"
 #include "mongo/db/repl/replication_process.h"
 #include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/repl/update_position_args.h"
+#include "mongo/db/server_options.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/storage_engine.h"
-#include "mongo/executor/network_interface.h"
-#include "mongo/transport/session.h"
-#include "mongo/transport/transport_layer.h"
-#include "mongo/util/fail_point_service.h"
-#include "mongo/util/log.h"
+#include "mongo/db/transaction_resources.h"
+#include "mongo/logv2/log.h"
+#include "mongo/rpc/metadata/repl_set_metadata.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/concurrency/admission_context.h"
+#include "mongo/util/decimal_counter.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/net/hostandport.h"
+#include "mongo/util/net/sockaddr.h"
 #include "mongo/util/net/socket_utils.h"
 #include "mongo/util/scopeguard.h"
+#include "mongo/util/time_support.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
+
 
 namespace mongo {
 namespace repl {
 
-using std::string;
-using std::stringstream;
+namespace {
+constexpr StringData kInternalIncludeNewlyAddedFieldName = "$_internalIncludeNewlyAdded"_sd;
 
-class ReplExecutorSSM : public ServerStatusMetric {
-public:
-    ReplExecutorSSM() : ServerStatusMetric("repl.executor") {}
-    virtual void appendAtLeaf(BSONObjBuilder& b) const {
-        ReplicationCoordinator::get(getGlobalServiceContext())->appendDiagnosticBSON(&b);
+struct ExecutorMetricPolicy {
+    void appendTo(BSONObjBuilder& b, StringData leafName) const {
+        ReplicationCoordinator::get(getGlobalServiceContext())->appendDiagnosticBSON(&b, leafName);
     }
-} replExecutorSSM;
+};
 
-// Testing only, enabled via command-line.
+auto& replExecutorSSM = *CustomMetricBuilder<ExecutorMetricPolicy>{"repl.executor"};
+}  // namespace
+
+// Test-only, enabled via command-line. See docs/test_commands.md.
 class CmdReplSetTest : public ReplSetCommand {
 public:
     std::string help() const override {
         return "Just for tests.\n";
     }
+
     // No auth needed because it only works when enabled via command line.
-    virtual Status checkAuthForCommand(Client* client,
-                                       const std::string& dbname,
-                                       const BSONObj& cmdObj) const {
+    Status checkAuthForOperation(OperationContext*,
+                                 const DatabaseName&,
+                                 const BSONObj&) const override {
         return Status::OK();
     }
+
     CmdReplSetTest() : ReplSetCommand("replSetTest") {}
-    virtual bool run(OperationContext* opCtx,
-                     const string&,
-                     const BSONObj& cmdObj,
-                     BSONObjBuilder& result) {
-        log() << "replSetTest command received: " << cmdObj.toString();
+    bool run(OperationContext* opCtx,
+             const DatabaseName&,
+             const BSONObj& cmdObj,
+             BSONObjBuilder& result) override {
+        LOGV2(21573, "replSetTest command received", "cmdObj"_attr = cmdObj);
 
         auto replCoord = ReplicationCoordinator::get(getGlobalServiceContext());
 
@@ -117,31 +154,52 @@ public:
             status = bsonExtractIntegerField(cmdObj, "timeoutMillis", &timeoutMillis);
             uassertStatusOK(status);
             Milliseconds timeout(timeoutMillis);
-            log() << "replSetTest: waiting " << timeout << " for member state to become "
-                  << expectedState;
+            LOGV2(21574,
+                  "replSetTest: waiting for member state to become expected state",
+                  "timeout"_attr = timeout,
+                  "expectedState"_attr = expectedState);
 
-            status = replCoord->waitForMemberState(expectedState, timeout);
-
-            uassertStatusOK(status);
-            return true;
-        } else if (cmdObj.hasElement("waitForDrainFinish")) {
-            long long timeoutMillis;
-            auto status = bsonExtractIntegerField(cmdObj, "waitForDrainFinish", &timeoutMillis);
-            uassertStatusOK(status);
-            Milliseconds timeout(timeoutMillis);
-            log() << "replSetTest: waiting " << timeout << " for applier buffer to finish draining";
-
-            status = replCoord->waitForDrainFinish(timeout);
+            status = replCoord->waitForMemberState(opCtx, expectedState, timeout);
 
             uassertStatusOK(status);
             return true;
         } else if (cmdObj.hasElement("getLastStableRecoveryTimestamp")) {
-            boost::optional<Timestamp> ts =
-                StorageInterface::get(getGlobalServiceContext())
-                    ->getLastStableRecoveryTimestamp(getGlobalServiceContext());
-            if (ts) {
-                result.append("lastStableRecoveryTimestamp", ts.get());
+            try {
+                ScopedAdmissionPriority<ExecutionAdmissionContext> admissionPriority(
+                    opCtx, AdmissionContext::Priority::kExempt);
+                // We need to hold the lock so that we don't run when storage is being shutdown.
+                Lock::GlobalLock lk(opCtx,
+                                    MODE_IS,
+                                    Date_t::now() + Milliseconds(5),
+                                    Lock::InterruptBehavior::kLeaveUnlocked,
+                                    [] {
+                                        Lock::GlobalLockSkipOptions options;
+                                        options.skipRSTLLock = true;
+                                        return options;
+                                    }());
+                if (lk.isLocked()) {
+                    boost::optional<Timestamp> ts =
+                        StorageInterface::get(getGlobalServiceContext())
+                            ->getLastStableRecoveryTimestamp(getGlobalServiceContext());
+                    if (ts) {
+                        result.append("lastStableRecoveryTimestamp", ts.value());
+                    }
+                } else {
+                    LOGV2_WARNING(
+                        6100700,
+                        "Failed to get last stable recovery timestamp due to lock acquire timeout. "
+                        "Note this is expected if shutdown is in progress.");
+                }
+            } catch (const ExceptionFor<ErrorCategory::CancellationError>& ex) {
+                LOGV2_WARNING(
+                    6100701,
+                    "Failed to get last stable recovery timestamp due to cancellation error. Note "
+                    "this is expected if shutdown is in progress.",
+                    "error"_attr = redact(ex));
             }
+            return true;
+        } else if (cmdObj.hasElement("restartHeartbeats")) {
+            replCoord->restartScheduledHeartbeats_forTest();
             return true;
         }
 
@@ -151,7 +209,7 @@ public:
     }
 };
 
-MONGO_REGISTER_TEST_COMMAND(CmdReplSetTest);
+MONGO_REGISTER_COMMAND(CmdReplSetTest).testOnly().forShard();
 
 /** get rollback id.  used to check if a rollback happened during some interval of time.
     as consumed, the rollback id is not in any particular order, it simply changes on each rollback.
@@ -160,17 +218,18 @@ MONGO_REGISTER_TEST_COMMAND(CmdReplSetTest);
 class CmdReplSetGetRBID : public ReplSetCommand {
 public:
     CmdReplSetGetRBID() : ReplSetCommand("replSetGetRBID") {}
-    virtual bool run(OperationContext* opCtx,
-                     const string&,
-                     const BSONObj& cmdObj,
-                     BSONObjBuilder& result) {
+    bool run(OperationContext* opCtx,
+             const DatabaseName&,
+             const BSONObj& cmdObj,
+             BSONObjBuilder& result) override {
         Status status = ReplicationCoordinator::get(opCtx)->checkReplEnabledForCommand(&result);
         uassertStatusOK(status);
 
         result.append("rbid", ReplicationProcess::get(opCtx)->getRollbackID());
         return true;
     }
-} cmdReplSetRBID;
+};
+MONGO_REGISTER_COMMAND(CmdReplSetGetRBID).forShard();
 
 class CmdReplSetGetConfig : public ReplSetCommand {
 public:
@@ -180,14 +239,31 @@ public:
                "http://dochub.mongodb.org/core/replicasetcommands";
     }
     CmdReplSetGetConfig() : ReplSetCommand("replSetGetConfig") {}
-    virtual bool run(OperationContext* opCtx,
-                     const string&,
-                     const BSONObj& cmdObj,
-                     BSONObjBuilder& result) {
+    bool run(OperationContext* opCtx,
+             const DatabaseName&,
+             const BSONObj& cmdObj,
+             BSONObjBuilder& result) override {
         Status status = ReplicationCoordinator::get(opCtx)->checkReplEnabledForCommand(&result);
         uassertStatusOK(status);
 
-        ReplicationCoordinator::get(opCtx)->processReplSetGetConfig(&result);
+        bool wantCommitmentStatus;
+        uassertStatusOK(bsonExtractBooleanFieldWithDefault(
+            cmdObj, "commitmentStatus", false, &wantCommitmentStatus));
+
+        if (cmdObj[kInternalIncludeNewlyAddedFieldName]) {
+            uassert(ErrorCodes::InvalidOptions,
+                    "The '$_internalIncludeNewlyAdded' option is only supported when testing"
+                    " commands are enabled",
+                    getTestCommandsEnabled());
+        }
+
+        bool includeNewlyAdded;
+        uassertStatusOK(bsonExtractBooleanFieldWithDefault(
+            cmdObj, kInternalIncludeNewlyAddedFieldName, false, &includeNewlyAdded));
+
+        ReplicationCoordinator::get(opCtx)->processReplSetGetConfig(
+            &result, wantCommitmentStatus, includeNewlyAdded);
+
         return true;
     }
 
@@ -195,7 +271,8 @@ private:
     ActionSet getAuthActionSet() const override {
         return ActionSet{ActionType::replSetGetConfig};
     }
-} cmdReplSetGetConfig;
+};
+MONGO_REGISTER_COMMAND(CmdReplSetGetConfig).forShard();
 
 namespace {
 HostAndPort someHostAndPortForMe() {
@@ -231,8 +308,8 @@ HostAndPort someHostAndPortForMe() {
     // We are listening externally, but we don't have a definite hostname.
     // Ask the OS.
     std::string h = getHostName();
-    verify(!h.empty());
-    verify(h != "localhost");
+    MONGO_verify(!h.empty());
+    MONGO_verify(h != "localhost");
     return HostAndPort(h, serverGlobalParams.port);
 }
 
@@ -244,19 +321,19 @@ void parseReplSetSeedList(ReplicationCoordinatorExternalState* externalState,
     const char* slash = strchr(p, '/');
     std::set<HostAndPort> seedSet;
     if (slash) {
-        *setname = string(p, slash - p);
+        *setname = std::string(p, slash - p);
     } else {
         *setname = p;
     }
 
-    if (slash == 0) {
+    if (slash == nullptr) {
         return;
     }
 
     p = slash + 1;
     while (1) {
         const char* comma = strchr(p, ',');
-        if (comma == 0) {
+        if (comma == nullptr) {
             comma = strchr(p, 0);
         }
         if (p == comma) {
@@ -264,7 +341,7 @@ void parseReplSetSeedList(ReplicationCoordinatorExternalState* externalState,
         }
         HostAndPort m;
         try {
-            m = HostAndPort(string(p, comma - p));
+            m = HostAndPort(std::string(p, comma - p));
         } catch (...) {
             uassert(13114, "bad --replSet seed hostname", false);
         }
@@ -272,7 +349,7 @@ void parseReplSetSeedList(ReplicationCoordinatorExternalState* externalState,
         seedSet.insert(m);
         // uassert(13101, "can't use localhost in replset host list", !m.isLocalHost());
         if (externalState->isSelf(m, getGlobalServiceContext())) {
-            LOG(1) << "ignoring seed " << m.toString() << " (=self)";
+            LOGV2_DEBUG(21576, 1, "Ignoring seed (=self)", "seed"_attr = m.toString());
         } else {
             seeds->push_back(m);
         }
@@ -291,34 +368,40 @@ public:
         return "Initiate/christen a replica set.\n"
                "http://dochub.mongodb.org/core/replicasetcommands";
     }
-    virtual bool run(OperationContext* opCtx,
-                     const string&,
-                     const BSONObj& cmdObj,
-                     BSONObjBuilder& result) {
+    bool run(OperationContext* opCtx,
+             const DatabaseName&,
+             const BSONObj& cmdObj,
+             BSONObjBuilder& result) override {
         BSONObj configObj;
         if (cmdObj["replSetInitiate"].type() == Object) {
             configObj = cmdObj["replSetInitiate"].Obj();
         }
 
-        std::string replSetString =
-            ReplicationCoordinator::get(opCtx)->getSettings().getReplSetString();
-        if (replSetString.empty()) {
+        const auto& settings = ReplicationCoordinator::get(opCtx)->getSettings();
+        if (!settings.isReplSet()) {
             uasserted(ErrorCodes::NoReplicationEnabled,
-                      "This node was not started with the replSet option");
+                      "This node was not started with replication enabled.");
+        }
+
+        if (settings.isServerless() && configObj.isEmpty()) {
+            uasserted(ErrorCodes::InvalidReplicaSetConfig,
+                      "A config must be provided when started in serverless mode.");
         }
 
         if (configObj.isEmpty()) {
-            string noConfigMessage =
+            std::string replSetString = settings.getReplSetString();
+
+            std::string noConfigMessage =
                 "no configuration specified. "
                 "Using a default configuration for the set";
             result.append("info2", noConfigMessage);
-            log() << "initiate : " << noConfigMessage;
+            LOGV2(
+                21577,
+                "Initiate: no configuration specified. Using a default configuration for the set");
 
-            ReplicationCoordinatorExternalStateImpl externalState(
-                opCtx->getServiceContext(),
-                DropPendingCollectionReaper::get(opCtx),
-                StorageInterface::get(opCtx),
-                ReplicationProcess::get(opCtx));
+            ReplicationCoordinatorExternalStateImpl externalState(opCtx->getServiceContext(),
+                                                                  StorageInterface::get(opCtx),
+                                                                  ReplicationProcess::get(opCtx));
             std::string name;
             std::vector<HostAndPort> seeds;
             parseReplSetSeedList(&externalState, replSetString, &name, &seeds);  // may throw...
@@ -328,15 +411,22 @@ public:
             b.append("version", 1);
             BSONObjBuilder members;
             HostAndPort me = someHostAndPortForMe();
-            members.append("0", BSON("_id" << 0 << "host" << me.toString()));
+
+            auto appendMember =
+                [&members, serial = DecimalCounter<uint32_t>()](const HostAndPort& host) mutable {
+                    members.append(
+                        StringData{serial},
+                        BSON("_id" << static_cast<int>(serial) << "host" << host.toString()));
+                    ++serial;
+                };
+            appendMember(me);
             result.append("me", me.toString());
-            for (unsigned i = 0; i < seeds.size(); i++) {
-                members.append(BSONObjBuilder::numStr(i + 1),
-                               BSON("_id" << i + 1 << "host" << seeds[i].toString()));
+            for (const HostAndPort& seed : seeds) {
+                appendMember(seed);
             }
             b.appendArray("members", members.obj());
             configObj = b.obj();
-            log() << "created this configuration for initiation : " << configObj.toString();
+            LOGV2(21578, "Created configuration for initiation", "config"_attr = configObj);
         }
 
         if (configObj.getField("version").eoo()) {
@@ -356,22 +446,25 @@ private:
     ActionSet getAuthActionSet() const override {
         return ActionSet{ActionType::replSetConfigure};
     }
-} cmdReplSetInitiate;
+};
+MONGO_REGISTER_COMMAND(CmdReplSetInitiate).forShard();
 
 class CmdReplSetReconfig : public ReplSetCommand {
 public:
+    CmdReplSetReconfig() : ReplSetCommand("replSetReconfig") {}
+
     std::string help() const override {
         return "Adjust configuration of a replica set\n"
                "{ replSetReconfig : config_object }\n"
                "http://dochub.mongodb.org/core/replicasetcommands";
     }
-    CmdReplSetReconfig() : ReplSetCommand("replSetReconfig") {}
-    virtual bool run(OperationContext* opCtx,
-                     const string&,
-                     const BSONObj& cmdObj,
-                     BSONObjBuilder& result) {
-        Status status = ReplicationCoordinator::get(opCtx)->checkReplEnabledForCommand(&result);
-        uassertStatusOK(status);
+
+    bool run(OperationContext* opCtx,
+             const DatabaseName&,
+             const BSONObj& cmdObj,
+             BSONObjBuilder& result) override {
+        const auto replCoord = ReplicationCoordinator::get(opCtx);
+        uassertStatusOK(replCoord->checkReplEnabledForCommand(&result));
 
         if (cmdObj["replSetReconfig"].type() != Object) {
             result.append("errmsg", "no configuration specified");
@@ -381,25 +474,39 @@ public:
         ReplicationCoordinator::ReplSetReconfigArgs parsedArgs;
         parsedArgs.newConfigObj = cmdObj["replSetReconfig"].Obj();
         parsedArgs.force = cmdObj.hasField("force") && cmdObj["force"].trueValue();
-        status =
-            ReplicationCoordinator::get(opCtx)->processReplSetReconfig(opCtx, parsedArgs, &result);
 
-        Lock::GlobalWrite globalWrite(opCtx);
-
-        WriteUnitOfWork wuow(opCtx);
-        if (status.isOK() && !parsedArgs.force) {
-            // Users must not be allowed to provide their own contents for the o2 field.
-            // o2 field of no-ops is supposed to be used internally.
-            getGlobalServiceContext()->getOpObserver()->onOpMessage(
-                opCtx,
-                BSON("msg"
-                     << "Reconfig set"
-                     << "version"
-                     << parsedArgs.newConfigObj["version"]));
+        // For safe reconfig, wait for the current config to be committed before running a new one.
+        // We will check again after acquiring the repl mutex in processReplSetReconfig(), in case
+        // of concurrent reconfigs.
+        if (!parsedArgs.force) {
+            // Skip the waiting if the current config is from a force reconfig.
+            auto configTerm = replCoord->getConfigTerm();
+            auto oplogWait = configTerm != OpTime::kUninitializedTerm;
+            auto status = replCoord->awaitConfigCommitment(opCtx, oplogWait, configTerm);
+            status.addContext("New config is rejected");
+            if (status == ErrorCodes::MaxTimeMSExpired) {
+                // Convert the error code to be more specific.
+                uasserted(ErrorCodes::CurrentConfigNotCommittedYet, status.reason());
+            } else if (status == ErrorCodes::PrimarySteppedDown) {
+                // Return NotWritablePrimary since the command has no side effect yet.
+                status = {ErrorCodes::NotWritablePrimary, status.reason()};
+            }
+            uassertStatusOK(status);
         }
-        wuow.commit();
 
+        auto status = replCoord->processReplSetReconfig(opCtx, parsedArgs, &result);
         uassertStatusOK(status);
+
+        // Now that the new config has been persisted and installed in memory, wait for the new
+        // config to become replicated. For force reconfigs we don't need to do this waiting.
+        if (!parsedArgs.force) {
+            auto configTerm = replCoord->getConfigTerm();
+            auto status = replCoord->awaitConfigCommitment(
+                opCtx, false /* waitForOplogCommitment */, configTerm);
+            uassertStatusOK(
+                status.withContext("Reconfig finished but failed to propagate to a majority"));
+        }
+
         return true;
     }
 
@@ -407,7 +514,8 @@ private:
     ActionSet getAuthActionSet() const override {
         return ActionSet{ActionType::replSetConfigure};
     }
-} cmdReplSetReconfig;
+};
+MONGO_REGISTER_COMMAND(CmdReplSetReconfig).forShard();
 
 class CmdReplSetFreeze : public ReplSetCommand {
 public:
@@ -422,14 +530,14 @@ public:
                "http://dochub.mongodb.org/core/replicasetcommands";
     }
     CmdReplSetFreeze() : ReplSetCommand("replSetFreeze") {}
-    virtual bool run(OperationContext* opCtx,
-                     const string&,
-                     const BSONObj& cmdObj,
-                     BSONObjBuilder& result) {
+    bool run(OperationContext* opCtx,
+             const DatabaseName&,
+             const BSONObj& cmdObj,
+             BSONObjBuilder& result) override {
         Status status = ReplicationCoordinator::get(opCtx)->checkReplEnabledForCommand(&result);
         uassertStatusOK(status);
 
-        int secs = (int)cmdObj.firstElement().numberInt();
+        auto secs = cmdObj.firstElement().safeNumberInt();
         uassertStatusOK(ReplicationCoordinator::get(opCtx)->processReplSetFreeze(secs, &result));
         return true;
     }
@@ -438,7 +546,17 @@ private:
     ActionSet getAuthActionSet() const override {
         return ActionSet{ActionType::replSetStateChange};
     }
-} cmdReplSetFreeze;
+};
+MONGO_REGISTER_COMMAND(CmdReplSetFreeze).forShard();
+
+namespace {
+auto& stepDownCmdsWithForceExecuted =
+    *MetricBuilder<Counter64>{"commands.replSetStepDownWithForce.total"}.setRole(
+        ClusterRole::ShardServer);
+auto& stepDownCmdsWithForceFailed =
+    *MetricBuilder<Counter64>{"commands.replSetStepDownWithForce.failed"}.setRole(
+        ClusterRole::ShardServer);
+}  // namespace
 
 class CmdReplSetStepDown : public ReplSetCommand {
 public:
@@ -450,15 +568,31 @@ public:
                "primary.)\n"
                "http://dochub.mongodb.org/core/replicasetcommands";
     }
+
+    bool shouldCheckoutSession() const final {
+        return false;
+    }
+
     CmdReplSetStepDown() : ReplSetCommand("replSetStepDown") {}
-    virtual bool run(OperationContext* opCtx,
-                     const string&,
-                     const BSONObj& cmdObj,
-                     BSONObjBuilder& result) {
+
+    bool run(OperationContext* opCtx,
+             const DatabaseName&,
+             const BSONObj& cmdObj,
+             BSONObjBuilder& result) override {
+        const bool force = cmdObj["force"].trueValue();
+
+        if (force) {
+            stepDownCmdsWithForceExecuted.increment();
+        }
+
+        ScopeGuard onExitGuard([&] {
+            if (force) {
+                stepDownCmdsWithForceFailed.increment();
+            }
+        });
+
         Status status = ReplicationCoordinator::get(opCtx)->checkReplEnabledForCommand(&result);
         uassertStatusOK(status);
-
-        const bool force = cmdObj["force"].trueValue();
 
         long long stepDownForSecs = cmdObj.firstElement().numberLong();
         if (stepDownForSecs == 0) {
@@ -494,10 +628,14 @@ public:
             uassertStatusOK(status);
         }
 
-        log() << "Attempting to step down in response to replSetStepDown command";
+        LOGV2(21579, "Attempting to step down in response to replSetStepDown command");
 
         ReplicationCoordinator::get(opCtx)->stepDown(
             opCtx, force, Seconds(secondaryCatchUpPeriodSecs), Seconds(stepDownForSecs));
+
+        LOGV2(21580, "replSetStepDown command completed");
+
+        onExitGuard.dismiss();
         return true;
     }
 
@@ -505,7 +643,8 @@ private:
     ActionSet getAuthActionSet() const override {
         return ActionSet{ActionType::replSetStateChange};
     }
-} cmdReplSetStepDown;
+};
+MONGO_REGISTER_COMMAND(CmdReplSetStepDown).forShard();
 
 class CmdReplSetMaintenance : public ReplSetCommand {
 public:
@@ -514,15 +653,15 @@ public:
                "Enable or disable maintenance mode.";
     }
     CmdReplSetMaintenance() : ReplSetCommand("replSetMaintenance") {}
-    virtual bool run(OperationContext* opCtx,
-                     const string&,
-                     const BSONObj& cmdObj,
-                     BSONObjBuilder& result) {
+    bool run(OperationContext* opCtx,
+             const DatabaseName&,
+             const BSONObj& cmdObj,
+             BSONObjBuilder& result) override {
         Status status = ReplicationCoordinator::get(opCtx)->checkReplEnabledForCommand(&result);
         uassertStatusOK(status);
 
         uassertStatusOK(ReplicationCoordinator::get(opCtx)->setMaintenanceMode(
-            cmdObj["replSetMaintenance"].trueValue()));
+            opCtx, cmdObj["replSetMaintenance"].trueValue()));
         return true;
     }
 
@@ -530,7 +669,8 @@ private:
     ActionSet getAuthActionSet() const override {
         return ActionSet{ActionType::replSetStateChange};
     }
-} cmdReplSetMaintenance;
+};
+MONGO_REGISTER_COMMAND(CmdReplSetMaintenance).forShard();
 
 class CmdReplSetSyncFrom : public ReplSetCommand {
 public:
@@ -540,15 +680,15 @@ public:
                "in-progress initial sync.";
     }
     CmdReplSetSyncFrom() : ReplSetCommand("replSetSyncFrom") {}
-    virtual bool run(OperationContext* opCtx,
-                     const string&,
-                     const BSONObj& cmdObj,
-                     BSONObjBuilder& result) {
+    bool run(OperationContext* opCtx,
+             const DatabaseName&,
+             const BSONObj& cmdObj,
+             BSONObjBuilder& result) override {
         Status status = ReplicationCoordinator::get(opCtx)->checkReplEnabledForCommand(&result);
         uassertStatusOK(status);
 
         HostAndPort targetHostAndPort;
-        status = targetHostAndPort.initialize(cmdObj["replSetSyncFrom"].valuestrsafe());
+        status = targetHostAndPort.initialize(cmdObj.getStringField("replSetSyncFrom"));
         uassertStatusOK(status);
 
         uassertStatusOK(ReplicationCoordinator::get(opCtx)->processReplSetSyncFrom(
@@ -560,15 +700,16 @@ private:
     ActionSet getAuthActionSet() const override {
         return ActionSet{ActionType::replSetStateChange};
     }
-} cmdReplSetSyncFrom;
+};
+MONGO_REGISTER_COMMAND(CmdReplSetSyncFrom).forShard();
 
 class CmdReplSetUpdatePosition : public ReplSetCommand {
 public:
     CmdReplSetUpdatePosition() : ReplSetCommand("replSetUpdatePosition") {}
-    virtual bool run(OperationContext* opCtx,
-                     const string&,
-                     const BSONObj& cmdObj,
-                     BSONObjBuilder& result) {
+    bool run(OperationContext* opCtx,
+             const DatabaseName&,
+             const BSONObj& cmdObj,
+             BSONObjBuilder& result) override {
         auto replCoord = repl::ReplicationCoordinator::get(opCtx->getClient()->getServiceContext());
 
         Status status = replCoord->checkReplEnabledForCommand(&result);
@@ -583,24 +724,23 @@ public:
         if (metadataResult.isOK()) {
             // New style update position command has metadata, which may inform the
             // upstream of a higher term.
-            auto metadata = metadataResult.getValue();
+            const auto& metadata = metadataResult.getValue();
+            if (metadata.hasReplicaSetId()) {
+                auto config = replCoord->getConfig();
+                uassert(ErrorCodes::InconsistentReplicaSetNames,
+                        "The current replicaSetId does not match the one in replSetMetaData",
+                        !config.isInitialized() ||
+                            config.getReplicaSetId() == metadata.getReplicaSetId());
+            }
+
             replCoord->processReplSetMetadata(metadata);
         }
-
-        // In the case of an update from a member with an invalid replica set config,
-        // we return our current config version.
-        long long configVersion = -1;
 
         UpdatePositionArgs args;
 
         status = args.initialize(cmdObj);
         if (status.isOK()) {
-            status = replCoord->processReplSetUpdatePosition(args, &configVersion);
-
-            if (status == ErrorCodes::InvalidReplicaSetConfig) {
-                result.append("configVersion", configVersion);
-            }
-            // TODO convert to uassertStatusOK once SERVER-34806 is done.
+            status = replCoord->processReplSetUpdatePosition(args);
             return CommandHelpers::appendCommandStatusNoThrow(result, status);
         } else {
             // Parsing error from UpdatePositionArgs.
@@ -608,7 +748,8 @@ public:
         }
         return true;
     }
-} cmdReplSetUpdatePosition;
+};
+MONGO_REGISTER_COMMAND(CmdReplSetUpdatePosition).forShard();
 
 namespace {
 /**
@@ -617,19 +758,17 @@ namespace {
  * Used to set the hasData field on replset heartbeat command response.
  */
 bool replHasDatabases(OperationContext* opCtx) {
-    std::vector<string> names;
-    StorageEngine* storageEngine = getGlobalServiceContext()->getStorageEngine();
-    storageEngine->listDatabases(&names);
+    std::vector<DatabaseName> dbNames = catalog::listDatabases();
 
-    if (names.size() >= 2)
+    if (dbNames.size() >= 2)
         return true;
-    if (names.size() == 1) {
-        if (names[0] != "local")
+    if (dbNames.size() == 1) {
+        if (!dbNames[0].isLocalDB())
             return true;
 
         // we have a local database.  return true if oplog isn't empty
         BSONObj o;
-        if (Helpers::getSingleton(opCtx, NamespaceString::kRsOplogNamespace.ns().c_str(), o)) {
+        if (Helpers::getSingleton(opCtx, NamespaceString::kRsOplogNamespace, o)) {
             return true;
         }
     }
@@ -638,29 +777,25 @@ bool replHasDatabases(OperationContext* opCtx) {
 
 }  // namespace
 
-MONGO_FAIL_POINT_DEFINE(rsDelayHeartbeatResponse);
-
 /* { replSetHeartbeat : <setname> } */
 class CmdReplSetHeartbeat : public ReplSetCommand {
 public:
     CmdReplSetHeartbeat() : ReplSetCommand("replSetHeartbeat") {}
-    virtual bool run(OperationContext* opCtx,
-                     const string&,
-                     const BSONObj& cmdObj,
-                     BSONObjBuilder& result) {
-        MONGO_FAIL_POINT_BLOCK(rsDelayHeartbeatResponse, delay) {
-            const BSONObj& data = delay.getData();
-            sleepsecs(data["delay"].numberInt());
-        }
-
-        LOG_FOR_HEARTBEATS(2) << "Received heartbeat request from " << cmdObj.getStringField("from")
-                              << ", " << cmdObj;
+    bool run(OperationContext* opCtx,
+             const DatabaseName&,
+             const BSONObj& cmdObj,
+             BSONObjBuilder& result) override {
+        LOGV2_FOR_HEARTBEATS(24095,
+                             2,
+                             "Received heartbeat request",
+                             "from"_attr = cmdObj.getStringField("from"),
+                             "cmdObj"_attr = cmdObj);
 
         Status status = Status(ErrorCodes::InternalError, "status not set in heartbeat code");
         /* we don't call ReplSetCommand::check() here because heartbeat
            checks many things that are pre-initialization. */
-        if (!ReplicationCoordinator::get(opCtx)->getSettings().usingReplSets()) {
-            status = Status(ErrorCodes::NoReplicationEnabled, "not running with --replSet");
+        if (!ReplicationCoordinator::get(opCtx)->getSettings().isReplSet()) {
+            status = Status(ErrorCodes::NoReplicationEnabled, "not running using replication");
             uassertStatusOK(status);
         }
 
@@ -672,31 +807,35 @@ public:
         if (status.isOK())
             response.addToBSON(&result);
 
-        LOG_FOR_HEARTBEATS(2) << "Processed heartbeat from " << cmdObj.getStringField("from")
-                              << " and generated response, " << response;
+        LOGV2_FOR_HEARTBEATS(24097,
+                             2,
+                             "Generated heartbeat response",
+                             "from"_attr = cmdObj.getStringField("from"),
+                             "response"_attr = response);
         uassertStatusOK(status);
         return true;
     }
-} cmdReplSetHeartbeat;
+};
+MONGO_REGISTER_COMMAND(CmdReplSetHeartbeat).forShard();
 
 class CmdReplSetStepUp : public ReplSetCommand {
 public:
     CmdReplSetStepUp() : ReplSetCommand("replSetStepUp") {}
 
-    virtual bool run(OperationContext* opCtx,
-                     const string&,
-                     const BSONObj& cmdObj,
-                     BSONObjBuilder& result) {
+    bool run(OperationContext* opCtx,
+             const DatabaseName&,
+             const BSONObj& cmdObj,
+             BSONObjBuilder& result) override {
         Status status = ReplicationCoordinator::get(opCtx)->checkReplEnabledForCommand(&result);
         uassertStatusOK(status);
 
-        log() << "Received replSetStepUp request";
+        LOGV2(21581, "Received replSetStepUp request");
 
         const bool skipDryRun = cmdObj["skipDryRun"].trueValue();
         status = ReplicationCoordinator::get(opCtx)->stepUpIfEligible(skipDryRun);
 
         if (!status.isOK()) {
-            log() << "replSetStepUp request failed" << causedBy(status);
+            LOGV2(21582, "replSetStepUp request failed", "error"_attr = causedBy(status));
         }
 
         uassertStatusOK(status);
@@ -707,7 +846,8 @@ private:
     ActionSet getAuthActionSet() const override {
         return ActionSet{ActionType::replSetStateChange};
     }
-} cmdReplSetStepUp;
+};
+MONGO_REGISTER_COMMAND(CmdReplSetStepUp).forShard();
 
 class CmdReplSetAbortPrimaryCatchUp : public ReplSetCommand {
 public:
@@ -719,17 +859,21 @@ public:
 
     CmdReplSetAbortPrimaryCatchUp() : ReplSetCommand("replSetAbortPrimaryCatchUp") {}
 
-    virtual bool run(OperationContext* opCtx,
-                     const string&,
-                     const BSONObj& cmdObj,
-                     BSONObjBuilder& result) override {
+    bool run(OperationContext* opCtx,
+             const DatabaseName&,
+             const BSONObj& cmdObj,
+             BSONObjBuilder& result) override {
         Status status = ReplicationCoordinator::get(opCtx)->checkReplEnabledForCommand(&result);
         uassertStatusOK(status);
-        log() << "Received replSetAbortPrimaryCatchUp request";
+        LOGV2(21583, "Received replSetAbortPrimaryCatchUp request");
 
-        status = ReplicationCoordinator::get(opCtx)->abortCatchupIfNeeded();
+        status = ReplicationCoordinator::get(opCtx)->abortCatchupIfNeeded(
+            ReplicationCoordinator::PrimaryCatchUpConclusionReason::
+                kFailedWithReplSetAbortPrimaryCatchUpCmd);
         if (!status.isOK()) {
-            log() << "replSetAbortPrimaryCatchUp request failed" << causedBy(status);
+            LOGV2(21584,
+                  "replSetAbortPrimaryCatchUp request failed",
+                  "error"_attr = causedBy(status));
         }
         uassertStatusOK(status);
         return true;
@@ -739,7 +883,8 @@ private:
     ActionSet getAuthActionSet() const override {
         return ActionSet{ActionType::replSetStateChange};
     }
-} cmdReplSetAbortPrimaryCatchUp;
+};
+MONGO_REGISTER_COMMAND(CmdReplSetAbortPrimaryCatchUp).forShard();
 
 }  // namespace repl
 }  // namespace mongo

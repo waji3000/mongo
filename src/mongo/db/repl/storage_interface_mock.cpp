@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -27,19 +26,22 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
 
-#include <numeric>
+#include <iterator>
+#include <mutex>
 
-#include "mongo/platform/basic.h"
+#include <boost/move/utility_core.hpp>
 
 #include "mongo/db/repl/storage_interface_mock.h"
+#include "mongo/logv2/log.h"
 
-#include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
+
 
 namespace mongo {
 namespace repl {
+
+StorageInterfaceMock::StorageInterfaceMock() = default;
 
 StatusWith<int> StorageInterfaceMock::getRollbackID(OperationContext* opCtx) {
     stdx::lock_guard<stdx::mutex> lock(_mutex);
@@ -70,7 +72,9 @@ StatusWith<int> StorageInterfaceMock::incrementRollbackID(OperationContext* opCt
     return _rbid;
 }
 
-void StorageInterfaceMock::setStableTimestamp(ServiceContext* serviceCtx, Timestamp snapshotName) {
+void StorageInterfaceMock::setStableTimestamp(ServiceContext* serviceCtx,
+                                              Timestamp snapshotName,
+                                              bool force) {
     stdx::lock_guard<stdx::mutex> lock(_mutex);
     _stableTimestamp = snapshotName;
 }
@@ -86,42 +90,39 @@ Timestamp StorageInterfaceMock::getStableTimestamp() const {
     return _stableTimestamp;
 }
 
-Timestamp StorageInterfaceMock::getInitialDataTimestamp() const {
+Timestamp StorageInterfaceMock::getInitialDataTimestamp(ServiceContext* serviceCtx) const {
     stdx::lock_guard<stdx::mutex> lock(_mutex);
     return _initialDataTimestamp;
 }
 
-Timestamp StorageInterfaceMock::getAllCommittedTimestamp(ServiceContext* serviceCtx) const {
-    return allCommittedTimestamp;
-}
-
-bool StorageInterfaceMock::supportsDocLocking(ServiceContext* serviceCtx) const {
-    return supportsDocLockingBool;
+Timestamp StorageInterfaceMock::getAllDurableTimestamp(ServiceContext* serviceCtx) const {
+    return allDurableTimestamp;
 }
 
 Status CollectionBulkLoaderMock::init(const std::vector<BSONObj>& secondaryIndexSpecs) {
-    LOG(1) << "CollectionBulkLoaderMock::init called";
+    LOGV2_DEBUG(21757, 1, "CollectionBulkLoaderMock::init called");
     stats->initCalled = true;
     return Status::OK();
-};
+}
 
 Status CollectionBulkLoaderMock::insertDocuments(const std::vector<BSONObj>::const_iterator begin,
-                                                 const std::vector<BSONObj>::const_iterator end) {
-    LOG(1) << "CollectionBulkLoaderMock::insertDocuments called";
-    const auto status = insertDocsFn(begin, end);
+                                                 const std::vector<BSONObj>::const_iterator end,
+                                                 ParseRecordIdAndDocFunc fn) {
+    LOGV2_DEBUG(21758, 1, "CollectionBulkLoaderMock::insertDocuments called");
+    auto status = insertDocsFn(begin, end, fn);
 
     // Only count if it succeeds.
     if (status.isOK()) {
         stats->insertCount += std::distance(begin, end);
     }
     return status;
-};
+}
 
 Status CollectionBulkLoaderMock::commit() {
-    LOG(1) << "CollectionBulkLoaderMock::commit called";
+    LOGV2_DEBUG(21759, 1, "CollectionBulkLoaderMock::commit called");
     stats->commitCalled = true;
     return commitFn();
-};
+}
 
 }  // namespace repl
 }  // namespace mongo

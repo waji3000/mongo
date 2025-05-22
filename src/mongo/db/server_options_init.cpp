@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,8 +27,12 @@
  *    it in the license file.
  */
 
-#include "mongo/base/init.h"
+#include <string>
+
+#include "mongo/base/init.h"  // IWYU pragma: keep
+#include "mongo/base/initializer.h"
 #include "mongo/db/server_options_server_helpers.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 
@@ -37,7 +40,7 @@ MONGO_INITIALIZER_GENERAL(ServerOptions_Setup,
                           ("BeginStartupOptionSetup"),
                           ("EndStartupOptionSetup"))
 (InitializerContext* context) {
-    return setupServerOptions(context->args());
+    uassertStatusOK(setupServerOptions(context->args()));
 }
 
 }  // namespace mongo

@@ -1,7 +1,3 @@
-// @file threadedtests.cpp - Tests for threaded code
-//
-
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -31,31 +27,32 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
-
-#include "mongo/platform/basic.h"
 
 #include <boost/version.hpp>
+#include <fmt/format.h>
 #include <iostream>
+#include <memory>
+#include <string>
+#include <typeinfo>
 
-#include "mongo/config.h"
 #include "mongo/db/client.h"
-#include "mongo/dbtests/dbtests.h"
+#include "mongo/logv2/log.h"
 #include "mongo/platform/atomic_word.h"
-#include "mongo/platform/bits.h"
-#include "mongo/stdx/functional.h"
+#include "mongo/stdx/mutex.h"
 #include "mongo/stdx/thread.h"
+#include "mongo/unittest/unittest.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/concurrency/admission_context.h"
 #include "mongo/util/concurrency/thread_pool.h"
 #include "mongo/util/concurrency/ticketholder.h"
-#include "mongo/util/log.h"
+#include "mongo/util/str.h"
+#include "mongo/util/time_support.h"
 #include "mongo/util/timer.h"
 
-namespace ThreadedTests {
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
-using std::unique_ptr;
-using std::cout;
-using std::endl;
-using std::string;
+namespace mongo {
+namespace ThreadedTests {
 
 template <int nthreads_param = 10>
 class ThreadedTest {
@@ -72,14 +69,14 @@ public:
         validate();
     }
 
-    virtual ~ThreadedTest(){};  // not necessary, but makes compilers happy
+    virtual ~ThreadedTest() {};  // not necessary, but makes compilers happy
 
 private:
     void launch_subthreads(int remaining) {
         if (!remaining)
             return;
 
-        stdx::thread athread([=] { subthread(remaining); });
+        stdx::thread athread([=, this] { subthread(remaining); });
         launch_subthreads(remaining - 1);
         athread.join();
     }
@@ -91,12 +88,12 @@ class IsAtomicWordAtomic : public ThreadedTest<> {
     typedef typename _AtomicUInt::WordType WordType;
     _AtomicUInt target;
 
-    void subthread(int) {
+    void subthread(int) override {
         for (int i = 0; i < iterations; i++) {
             target.fetchAndAdd(WordType(1));
         }
     }
-    void validate() {
+    void validate() override {
         ASSERT_EQUALS(target.load(), unsigned(nthreads * iterations));
 
         _AtomicUInt u;
@@ -119,7 +116,7 @@ class ThreadPoolTest {
     static const unsigned iterations = 10000;
     static const unsigned nThreads = 8;
 
-    AtomicUInt32 counter;
+    AtomicWord<unsigned> counter;
     void increment(unsigned n) {
         for (unsigned i = 0; i < n; i++) {
             counter.fetchAndAdd(1);
@@ -134,7 +131,10 @@ public:
         tp.startup();
 
         for (unsigned i = 0; i < iterations; i++) {
-            ASSERT_OK(tp.schedule([=] { increment(2); }));
+            tp.schedule([=, this](auto status) {
+                ASSERT_OK(status);
+                increment(2);
+            });
         }
 
         tp.waitForIdle();
@@ -177,15 +177,15 @@ private:
     char pad2[128];
     unsigned locks;
     char pad3[128];
-    AtomicInt32 k;
+    AtomicWord<int> k;
 
-    virtual void validate() {
+    void validate() override {
         if (once++ == 0) {
             // <= 1.35 we use a different rwmutex impl so worth noting
-            cout << "Boost version : " << BOOST_VERSION << endl;
+            std::cout << "Boost version : " << BOOST_VERSION << std::endl;
         }
-        cout << typeid(whichmutex).name() << " Slack useful work fraction: " << ((double)a) / b
-             << " locks:" << locks << endl;
+        std::cout << typeid(whichmutex).name() << " Slack useful work fraction: " << ((double)a) / b
+                  << " locks:" << locks << std::endl;
     }
     void watch() {
         while (1) {
@@ -199,8 +199,8 @@ private:
                 break;
         }
     }
-    AtomicBool done;
-    virtual void subthread(int x) {
+    AtomicWord<bool> done;
+    void subthread(int x) override {
         if (x == 1) {
             watch();
             return;
@@ -225,88 +225,24 @@ private:
     }
 };
 
-// Tests waiting on the TicketHolder by running many more threads than can fit into the "hotel", but
-// only max _nRooms threads should ever get in at once
-class TicketHolderWaits : public ThreadedTest<10> {
-    static const int checkIns = 1000;
-    static const int rooms = 3;
 
+class All : public unittest::OldStyleSuiteSpecification {
 public:
-    TicketHolderWaits() : _hotel(rooms), _tickets(_hotel._nRooms) {}
+    All() : OldStyleSuiteSpecification("threading") {}
 
-private:
-    class Hotel {
-    public:
-        Hotel(int nRooms) : _nRooms(nRooms), _checkedIn(0), _maxRooms(0) {}
-
-        void checkIn() {
-            stdx::lock_guard<stdx::mutex> lk(_frontDesk);
-            _checkedIn++;
-            verify(_checkedIn <= _nRooms);
-            if (_checkedIn > _maxRooms)
-                _maxRooms = _checkedIn;
-        }
-
-        void checkOut() {
-            stdx::lock_guard<stdx::mutex> lk(_frontDesk);
-            _checkedIn--;
-            verify(_checkedIn >= 0);
-        }
-
-        stdx::mutex _frontDesk;
-        int _nRooms;
-        int _checkedIn;
-        int _maxRooms;
-    };
-
-    Hotel _hotel;
-    TicketHolder _tickets;
-
-    virtual void subthread(int x) {
-        string threadName = (str::stream() << "ticketHolder" << x);
-        Client::initThread(threadName.c_str());
-
-        for (int i = 0; i < checkIns; i++) {
-            _tickets.waitForTicket();
-            TicketHolderReleaser whenDone(&_tickets);
-
-            _hotel.checkIn();
-
-            sleepalittle();
-            if (i == checkIns - 1)
-                sleepsecs(2);
-
-            _hotel.checkOut();
-
-            if ((i % (checkIns / 10)) == 0)
-                mongo::unittest::log() << "checked in " << i << " times..." << endl;
-        }
-    }
-
-    virtual void validate() {
-        // This should always be true, assuming that it takes < 1 sec for the hardware to process a
-        // check-out/check-in Time for test is then ~ #threads / _nRooms * 2 seconds
-        verify(_hotel._maxRooms == _hotel._nRooms);
-    }
-};
-
-class All : public Suite {
-public:
-    All() : Suite("threading") {}
-
-    void setupTests() {
+    void setupTests() override {
         // Slack is a test to see how long it takes for another thread to pick up
         // and begin work after another relinquishes the lock.  e.g. a spin lock
         // would have very little slack.
-        add<Slack<SimpleMutex, stdx::lock_guard<SimpleMutex>>>();
+        add<Slack<stdx::mutex, stdx::lock_guard<stdx::mutex>>>();
 
-        add<IsAtomicWordAtomic<AtomicUInt32>>();
-        add<IsAtomicWordAtomic<AtomicUInt64>>();
+        add<IsAtomicWordAtomic<AtomicWord<unsigned>>>();
+        add<IsAtomicWordAtomic<AtomicWord<unsigned long long>>>();
         add<ThreadPoolTest>();
-
-        add<TicketHolderWaits>();
     }
 };
 
-SuiteInstance<All> myall;
+unittest::OldStyleSuiteInitializer<All> myall;
+
 }  // namespace ThreadedTests
+}  // namespace mongo

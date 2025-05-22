@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,12 +27,20 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <exception>
+#include <memory>
+#include <type_traits>
+#include <utility>
 
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsontypes.h"
 #include "mongo/db/auth/address_restriction.h"
 #include "mongo/db/auth/address_restriction_gen.h"
-#include "mongo/db/server_options.h"
-#include "mongo/stdx/memory.h"
+#include "mongo/idl/idl_parser.h"
+#include "mongo/util/assert_util.h"
 
 constexpr mongo::StringData mongo::address_restriction_detail::ClientSource::label;
 constexpr mongo::StringData mongo::address_restriction_detail::ClientSource::field;
@@ -43,18 +50,18 @@ constexpr mongo::StringData mongo::address_restriction_detail::ServerAddress::fi
 
 mongo::StatusWith<mongo::RestrictionSet<>> mongo::parseAddressRestrictionSet(
     const BSONObj& obj) try {
-    IDLParserErrorContext ctx("address restriction");
+    IDLParserContext ctx("address restriction");
     const auto ar = Address_restriction::parse(ctx, obj);
     std::vector<std::unique_ptr<NamedRestriction>> vec;
 
     const boost::optional<std::vector<StringData>>& client = ar.getClientSource();
     if (client) {
-        vec.push_back(stdx::make_unique<ClientSourceRestriction>(client.get()));
+        vec.push_back(std::make_unique<ClientSourceRestriction>(client.value()));
     }
 
     const boost::optional<std::vector<StringData>>& server = ar.getServerAddress();
     if (server) {
-        vec.push_back(stdx::make_unique<ServerAddressRestriction>(server.get()));
+        vec.push_back(std::make_unique<ServerAddressRestriction>(server.value()));
     }
 
     if (vec.empty()) {
@@ -89,14 +96,14 @@ mongo::StatusWith<mongo::SharedRestrictionDocument> mongo::parseAuthenticationRe
         }
 
         doc.emplace_back(
-            stdx::make_unique<document_type::element_type>(std::move(restriction.getValue())));
+            std::make_unique<document_type::element_type>(std::move(restriction.getValue())));
     }
 
     return std::make_shared<document_type>(std::move(doc));
 }
 
 mongo::StatusWith<mongo::BSONArray> mongo::getRawAuthenticationRestrictions(
-    const BSONArray& arr) noexcept try {
+    const BSONArray& arr) try {
     BSONArrayBuilder builder;
 
     for (auto const& elem : arr) {
@@ -105,15 +112,15 @@ mongo::StatusWith<mongo::BSONArray> mongo::getRawAuthenticationRestrictions(
                           "'authenticationRestrictions' array sub-documents must be address "
                           "restriction objects");
         }
-        IDLParserErrorContext ctx("address restriction");
+        IDLParserContext ctx("address restriction");
         auto const ar = Address_restriction::parse(ctx, elem.Obj());
         if (auto const&& client = ar.getClientSource()) {
             // Validate
-            ClientSourceRestriction(client.get());
+            ClientSourceRestriction(client.value());
         }
         if (auto const&& server = ar.getServerAddress()) {
             // Validate
-            ServerAddressRestriction(server.get());
+            ServerAddressRestriction(server.value());
         }
         if (!ar.getClientSource() && !ar.getServerAddress()) {
             return Status(ErrorCodes::CollectionIsEmpty,

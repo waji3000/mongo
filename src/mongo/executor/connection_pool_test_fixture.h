@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,17 +27,31 @@
  *    it in the license file.
  */
 
+#include <boost/optional/optional.hpp>
+#include <cstddef>
 #include <deque>
 #include <memory>
 #include <set>
+#include <string>
 
+#include "mongo/base/status.h"
 #include "mongo/executor/connection_pool.h"
+#include "mongo/transport/transport_layer.h"
+#include "mongo/util/clock_source.h"
+#include "mongo/util/clock_source_mock.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/executor_test_util.h"
+#include "mongo/util/functional.h"
+#include "mongo/util/net/hostandport.h"
+#include "mongo/util/out_of_line_executor.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo {
 namespace executor {
 namespace connection_pool_test_details {
 
 class ConnectionPoolTest;
+
 class PoolImpl;
 
 /**
@@ -46,12 +59,14 @@ class PoolImpl;
  */
 class TimerImpl final : public ConnectionPool::TimerInterface {
 public:
-    TimerImpl(PoolImpl* global);
+    explicit TimerImpl(PoolImpl* global);
     ~TimerImpl() override;
 
     void setTimeout(Milliseconds timeout, TimeoutCallback cb) override;
 
     void cancelTimeout() override;
+
+    Date_t now() override;
 
     // launches all timers for whom now() has passed
     static void fireIfNecessary();
@@ -76,19 +91,17 @@ private:
  */
 class ConnectionImpl final : public ConnectionPool::ConnectionInterface {
 public:
-    using PushSetupCallback = stdx::function<Status()>;
-    using PushRefreshCallback = stdx::function<Status()>;
+    using PushSetupCallback = unique_function<Status()>;
+    using PushRefreshCallback = unique_function<Status()>;
 
     ConnectionImpl(const HostAndPort& hostAndPort, size_t generation, PoolImpl* global);
 
     size_t id() const;
 
-    void indicateSuccess() override;
-    void indicateFailure(Status status) override;
-
-    void resetToUnknown() override;
-
     const HostAndPort& getHostAndPort() const override;
+    transport::ConnectSSLMode getSslMode() const override {
+        return transport::kGlobalSSLMode;
+    }
 
     bool isHealthy() override;
 
@@ -105,32 +118,26 @@ public:
     static void pushRefresh(Status status);
     static size_t refreshQueueDepth();
 
-private:
-    void indicateUsed() override;
-
-    Date_t getLastUsed() const override;
-
-    const Status& getStatus() const override;
-
     void setTimeout(Milliseconds timeout, TimeoutCallback cb) override;
 
     void cancelTimeout() override;
 
-    void setup(Milliseconds timeout, SetupCallback cb) override;
+    Date_t now() override;
+
+private:
+    void setup(Milliseconds timeout, SetupCallback cb, std::string) override;
 
     void refresh(Milliseconds timeout, RefreshCallback cb) override;
 
-    size_t getGeneration() const override;
+    static void processSetup();
+    static void processRefresh();
 
     HostAndPort _hostAndPort;
-    Date_t _lastUsed;
-    Status _status = Status::OK();
     SetupCallback _setupCallback;
     RefreshCallback _refreshCallback;
     TimerImpl _timer;
     PoolImpl* _global;
     size_t _id;
-    size_t _generation;
 
     // Answer queues
     static std::deque<PushSetupCallback> _pushSetupQueue;
@@ -148,14 +155,24 @@ private:
  */
 class PoolImpl final : public ConnectionPool::DependentTypeFactoryInterface {
     friend class ConnectionImpl;
+    friend class TimerImpl;
 
 public:
+    explicit PoolImpl(const std::shared_ptr<OutOfLineExecutor>& executor) : _executor(executor) {}
     std::shared_ptr<ConnectionPool::ConnectionInterface> makeConnection(
-        const HostAndPort& hostAndPort, size_t generation) override;
+        const HostAndPort& hostAndPort,
+        transport::ConnectSSLMode sslMode,
+        size_t generation) override;
 
     std::shared_ptr<ConnectionPool::TimerInterface> makeTimer() override;
 
+    const std::shared_ptr<OutOfLineExecutor>& getExecutor() override;
+
     Date_t now() override;
+
+    ClockSource* getFastClockSource() override {
+        return &_fastClockSource;
+    }
 
     void shutdown() override {
         TimerImpl::clear();
@@ -168,8 +185,10 @@ public:
 
 private:
     ConnectionPool* _pool = nullptr;
+    std::shared_ptr<OutOfLineExecutor> _executor;
 
     static boost::optional<Date_t> _now;
+    static ClockSourceMock _fastClockSource;
 };
 
 }  // namespace connection_pool_test_details

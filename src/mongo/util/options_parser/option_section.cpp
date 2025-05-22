@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -138,7 +137,9 @@ OptionDescription& OptionSection::addOptionChaining(
     const OptionType type,
     const std::string& description,
     const std::vector<std::string>& deprecatedDottedNames,
-    const std::vector<std::string>& deprecatedSingleNames) {
+    const std::vector<std::string>& deprecatedSingleNames,
+    OptionParserUsageType) {
+
     OptionDescription option(
         dottedName, singleName, type, description, deprecatedDottedNames, deprecatedSingleNames);
 
@@ -156,8 +157,7 @@ OptionDescription& OptionSection::addOptionChaining(
     // Should not be the same as dottedName.
     uassert(ErrorCodes::InternalError,
             str::stream() << "Attempted to register option with conflict between dottedName and "
-                          << "deprecatedDottedName: "
-                          << dottedName,
+                          << "deprecatedDottedName: " << dottedName,
             !std::count(deprecatedDottedNames.begin(), deprecatedDottedNames.end(), dottedName));
 
     // Verify deprecated single names.
@@ -169,8 +169,7 @@ OptionDescription& OptionSection::addOptionChaining(
     // Should not be the same as singleName.
     uassert(ErrorCodes::InternalError,
             str::stream() << "Attempted to register option with conflict between singleName and "
-                          << "deprecatedSingleName: "
-                          << singleName,
+                          << "deprecatedSingleName: " << singleName,
             !std::count(deprecatedSingleNames.begin(), deprecatedSingleNames.end(), singleName));
 
     // Should not contain any already registered name.
@@ -535,24 +534,26 @@ Status OptionSection::getBoostPositionalOptions(
 // TODO: should I make this an iterator?
 
 Status OptionSection::getAllOptions(std::vector<OptionDescription>* options) const {
-    std::list<OptionDescription>::const_iterator oditerator;
-    for (oditerator = _options.begin(); oditerator != _options.end(); oditerator++) {
+    for (const auto& opt : _options) {
         // We need to check here that we didn't register an option with an empty single name
         // that is allowed on the command line or in an old style config, since we don't have
         // this information available all at once when the option is registered
-        if (oditerator->_singleName.empty() && oditerator->_sources & SourceAllLegacy) {
+        if (opt._singleName.empty() && (opt._sources & SourceAllLegacy)) {
             StringBuilder sb;
-            sb << "Found option allowed on the command line with an empty singleName: "
-               << oditerator->_dottedName;
-            return Status(ErrorCodes::InternalError, sb.str());
+            return {ErrorCodes::InternalError,
+                    str::stream()
+                        << "Found option allowed on the command line with an empty singleName: "
+                        << opt._dottedName};
         }
 
-        options->push_back(*oditerator);
+        options->push_back(opt);
     }
 
-    std::list<OptionSection>::const_iterator ositerator;
-    for (ositerator = _subSections.begin(); ositerator != _subSections.end(); ositerator++) {
-        ositerator->getAllOptions(options).transitional_ignore();
+    for (const auto& section : _subSections) {
+        auto status = section.getAllOptions(options);
+        if (!status.isOK()) {
+            return status;
+        }
     }
 
     return Status::OK();

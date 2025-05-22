@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2018 MongoDB, Inc.
+ * Copyright (c) 2014-present MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -8,45 +8,50 @@
 
 #include "util.h"
 
-static int usage(void);
-
-int
-util_alter(WT_SESSION *session, int argc, char *argv[])
-{
-	WT_DECL_RET;
-	int ch;
-	char **configp;
-
-	while ((ch = __wt_getopt(progname, argc, argv, "")) != EOF)
-		switch (ch) {
-		case '?':
-		default:
-			return (usage());
-		}
-
-	argc -= __wt_optind;
-	argv += __wt_optind;
-
-	/* The remaining arguments are uri/string pairs. */
-	if (argc % 2 != 0)
-		return (usage());
-
-	for (configp = argv; *configp != NULL; configp += 2)
-		if ((ret = session->alter(
-		    session, configp[0], configp[1])) != 0) {
-			(void)util_err(session, ret,
-			    "session.alter: %s, %s", configp[0], configp[1]);
-			return (1);
-		}
-	return (0);
-}
-
+/*
+ * usage --
+ *     Display a usage message for the alter command.
+ */
 static int
 usage(void)
 {
-	(void)fprintf(stderr,
-	    "usage: %s %s "
-	    "alter uri configuration ...\n",
-	    progname, usage_prefix);
-	return (1);
+    static const char *options[] = {"-?", "show this message", NULL, NULL};
+
+    util_usage("alter uri configuration ...", "options:", options);
+    return (1);
+}
+
+/*
+ * util_alter --
+ *     The alter command.
+ */
+int
+util_alter(WT_SESSION *session, int argc, char *argv[])
+{
+    WT_DECL_RET;
+    int ch;
+    char **configp;
+
+    while ((ch = __wt_getopt(progname, argc, argv, "?")) != EOF)
+        switch (ch) {
+        case '?':
+            usage();
+            return (0);
+        default:
+            return (usage());
+        }
+
+    argc -= __wt_optind;
+    argv += __wt_optind;
+
+    /* The remaining arguments are uri/string pairs. */
+    if (argc == 0 || argc % 2 != 0)
+        return (usage());
+
+    for (configp = argv; *configp != NULL; configp += 2)
+        if ((ret = session->alter(session, configp[0], configp[1])) != 0) {
+            (void)util_err(session, ret, "session.alter: %s, %s", configp[0], configp[1]);
+            return (1);
+        }
+    return (0);
 }

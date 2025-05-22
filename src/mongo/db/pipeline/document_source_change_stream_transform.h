@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,132 +29,89 @@
 
 #pragma once
 
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+#include <set>
+
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/pipeline/change_stream_event_transform.h"
+#include "mongo/db/pipeline/dependencies.h"
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/document_source_change_stream.h"
 #include "mongo/db/pipeline/document_source_change_stream_gen.h"
-#include "mongo/db/pipeline/document_source_match.h"
-#include "mongo/db/pipeline/field_path.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/pipeline.h"
+#include "mongo/db/pipeline/stage_constraints.h"
+#include "mongo/db/pipeline/variables.h"
+#include "mongo/db/query/query_shape/serialization_options.h"
 
 namespace mongo {
 
-class DocumentSourceChangeStreamTransform : public DocumentSource {
+class DocumentSourceChangeStreamTransform : public DocumentSourceInternalChangeStreamStage {
 public:
+    static constexpr StringData kStageName = "$_internalChangeStreamTransform"_sd;
+
     /**
      * Creates a new transformation stage from the given specification.
      */
     static boost::intrusive_ptr<DocumentSourceChangeStreamTransform> create(
-        const boost::intrusive_ptr<ExpressionContext>&,
-        const ServerGlobalParams::FeatureCompatibility::Version&,
-        BSONObj changeStreamSpec);
+        const boost::intrusive_ptr<ExpressionContext>& expCtx,
+        const DocumentSourceChangeStreamSpec& spec);
+
+    static boost::intrusive_ptr<DocumentSourceChangeStreamTransform> createFromBson(
+        BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& expCtx);
 
     Document applyTransformation(const Document& input);
+
     DepsTracker::State getDependencies(DepsTracker* deps) const final;
+
+    void addVariableRefs(std::set<Variables::Id>* refs) const final {}
+
     DocumentSource::GetModPathsReturn getModifiedPaths() const final;
 
-    Value serialize(boost::optional<ExplainOptions::Verbosity> explain) const;
-    StageConstraints constraints(Pipeline::SplitState pipeState) const final;
-    DocumentSource::GetNextResult getNext();
-    const char* getSourceName() const {
-        return DocumentSourceChangeStream::kStageName.rawData();
+    Value serialize(const SerializationOptions& opts = SerializationOptions{}) const final;
+
+    /**
+     * This function should never be called, since this DocumentSource has its own serialize method.
+     */
+    Value doSerialize(const SerializationOptions& opts) const final {
+        MONGO_UNREACHABLE;
     }
+
+    StageConstraints constraints(Pipeline::SplitState pipeState) const final;
+
+    boost::optional<DistributedPlanLogic> distributedPlanLogic() final {
+        return boost::none;
+    }
+
+    const char* getSourceName() const final {
+        return kStageName.data();
+    }
+
+    static const Id& id;
+
+    Id getId() const override {
+        return id;
+    }
+
+protected:
+    DocumentSource::GetNextResult doGetNext() override;
 
 private:
     // This constructor is private, callers should use the 'create()' method above.
-    DocumentSourceChangeStreamTransform(const boost::intrusive_ptr<ExpressionContext>&,
-                                        const ServerGlobalParams::FeatureCompatibility::Version&,
-                                        BSONObj changeStreamSpec);
+    DocumentSourceChangeStreamTransform(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                        DocumentSourceChangeStreamSpec spec);
 
-    struct DocumentKeyCacheEntry {
-        DocumentKeyCacheEntry() = default;
+    DocumentSourceChangeStreamSpec _changeStreamSpec;
 
-        DocumentKeyCacheEntry(std::pair<std::vector<FieldPath>, bool> documentKeyFieldsIn)
-            : documentKeyFields(documentKeyFieldsIn.first), isFinal(documentKeyFieldsIn.second){};
-        // Fields of the document key, in order, including "_id" and the shard key if the
-        // collection is sharded. Empty until the first oplog entry with a uuid is encountered.
-        // Needed for transforming 'insert' oplog entries.
-        std::vector<FieldPath> documentKeyFields;
-
-        // Set to true if the document key fields for this entry are definitively known and will
-        // not change. This implies that either the collection has become sharded or has been
-        // dropped.
-        bool isFinal;
-    };
-
-    /**
-     * Represents the DocumentSource's state if it's currently reading from an 'applyOps' entry
-     * which was created as part of a transaction.
-     */
-    struct TransactionContext {
-        MONGO_DISALLOW_COPYING(TransactionContext);
-
-        // The array of oplog entries from an 'applyOps' representing the transaction. Only kept
-        // around so that the underlying memory of 'arr' isn't freed.
-        Value opArray;
-
-        // Array representation of the 'opArray' field. Stored like this to avoid re-typechecking
-        // each call to next(), or copying the entire array.
-        const std::vector<Value>& arr;
-
-        // Our current place in the 'opArray'.
-        size_t pos;
-
-        // The clusterTime of the applyOps.
-        Timestamp clusterTime;
-
-        // Fields that were taken from the 'applyOps' oplog entry.
-        Document lsid;
-        TxnNumber txnNumber;
-
-        TransactionContext(const Value& applyOpsVal,
-                           Timestamp ts,
-                           const Document& lsidDoc,
-                           TxnNumber n)
-            : opArray(applyOpsVal),
-              arr(opArray.getArray()),
-              pos(0),
-              clusterTime(ts),
-              lsid(lsidDoc),
-              txnNumber(n) {}
-    };
-
-    /**
-     * Helper used for determining what resume token to return.
-     */
-    ResumeTokenData getResumeToken(Value ts, Value uuid, Value documentKey);
-    void initializeTransactionContext(const Document& input);
-
-    /**
-     * Gets the next relevant applyOps entry that should be returned. If there is none, returns
-     * empty document.
-     */
-    boost::optional<Document> extractNextApplyOpsEntry();
-
-    /**
-     * Helper for extractNextApplyOpsEntry(). Checks the namespace of the given document to see
-     * if it should be returned in the change stream.
-     */
-    bool isDocumentRelevant(const Document& d);
-
-    BSONObj _changeStreamSpec;
-
-    // Map of collection UUID to document key fields.
-    std::map<UUID, DocumentKeyCacheEntry> _documentKeyCache;
-
-    // Regex for matching the "ns" field in applyOps sub-entries. Only used when we have a
-    // change stream on the entire DB. When watching just a single collection, this field is
-    // boost::none, and an exact string equality check is used instead.
-    boost::optional<pcrecpp::RE> _nsRegex;
-
-    // Represents if the current 'applyOps' we're unwinding, if any.
-    boost::optional<TransactionContext> _txnContext;
+    ChangeStreamEventTransformer _transformer;
 
     // Set to true if this transformation stage can be run on the collectionless namespace.
     bool _isIndependentOfAnyCollection;
-
-    // '_fcv' is used to determine which version of the resume token to generate for each change.
-    // This is a snapshot of what the feature compatibility version was at the time the stream was
-    // opened or resumed.
-    ServerGlobalParams::FeatureCompatibility::Version _fcv;
 };
 
 }  // namespace mongo

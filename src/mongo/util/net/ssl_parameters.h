@@ -29,40 +29,27 @@
 
 #pragma once
 
+#include <boost/optional.hpp>
 #include <string>
 
 #include "mongo/base/status.h"
-#include "mongo/base/string_data.h"
-#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/tenant_id.h"
 
 namespace mongo {
-class OperationContext;
 
 /**
  * Validation callback for setParameter 'opensslCipherConfig'.
  */
-Status validateOpensslCipherConfig(const std::string&);
+Status validateOpensslCipherConfig(const std::string&, const boost::optional<TenantId>&);
 
 /**
  * Validation callback for setParameter 'disableNonTLSConnectionLogging'.
  */
-Status validateDisableNonTLSConnectionLogging(const bool&);
+Status validateDisableNonTLSConnectionLogging(const bool&, const boost::optional<TenantId>&);
 
 /**
  * Records that disableNonTLSConnectionLogging has been set.
  */
 Status onUpdateDisableNonTLSConnectionLogging(const bool&);
-
-/**
- * Callbacks for setParameter 'sslMode'
- */
-void appendSSLModeToBSON(OperationContext*, BSONObjBuilder*, StringData);
-Status setSSLModeFromString(StringData);
-
-/**
- * Callbacks for setParameter 'clusterAuthMode'
- */
-void appendClusterAuthModeToBSON(OperationContext*, BSONObjBuilder*, StringData);
-Status setClusterAuthModeFromString(StringData);
 
 }  // namespace mongo

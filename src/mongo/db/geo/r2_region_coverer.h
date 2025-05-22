@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,9 +29,14 @@
 
 #pragma once
 
+#include <boost/core/noncopyable.hpp>
 #include <boost/noncopyable.hpp>
 #include <boost/scoped_ptr.hpp>
+#include <boost/smart_ptr/scoped_ptr.hpp>
+#include <memory>
 #include <queue>
+#include <string>
+#include <utility>
 #include <vector>
 
 #include "mongo/db/geo/hash.h"
@@ -47,7 +51,7 @@ class R2RegionCoverer : boost::noncopyable {
     static const int kDefaultMaxCells;  // = 8;
 
 public:
-    R2RegionCoverer(GeoHashConverter* hashConverter);
+    R2RegionCoverer(std::unique_ptr<GeoHashConverter> hashConverter);
     ~R2RegionCoverer();
 
     // Set the minimum and maximum cell level to be used.  The default is to use
@@ -74,6 +78,8 @@ public:
     }
 
     void getCovering(const R2Region& region, std::vector<GeoHash>* cover);
+
+    const GeoHashConverter& getHashConverter() const;
 
 private:
     struct Candidate {
@@ -103,7 +109,7 @@ private:
     // Computes a set of initial candidates that cover the given region.
     void getInitialCandidates();
 
-    GeoHashConverter* _hashConverter;  // Not owned.
+    std::unique_ptr<GeoHashConverter> _hashConverter;
     // min / max level as unsigned so as to be consistent with GeoHash
     unsigned int _minLevel;
     unsigned int _maxLevel;
@@ -128,9 +134,9 @@ class R2CellUnion : boost::noncopyable {
 public:
     void init(const std::vector<GeoHash>& cellIds);
     // Returns true if the cell union contains the given cell id.
-    bool contains(const GeoHash cellId) const;
+    bool contains(GeoHash cellId) const;
     // Return true if the cell union intersects the given cell id.
-    bool intersects(const GeoHash cellId) const;
+    bool intersects(GeoHash cellId) const;
     std::string toString() const;
 
     // Direct access to the underlying vector.

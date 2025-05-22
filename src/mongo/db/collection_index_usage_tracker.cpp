@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,45 +27,104 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
-
-#include "mongo/platform/basic.h"
 
 #include "mongo/db/collection_index_usage_tracker.h"
+
+#include <absl/container/flat_hash_map.h>
+#include <absl/meta/type_traits.h>
+#include <utility>
+
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
 #include "mongo/util/assert_util.h"
 #include "mongo/util/clock_source.h"
-#include "mongo/util/log.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
+
 
 namespace mongo {
 
-CollectionIndexUsageTracker::CollectionIndexUsageTracker(ClockSource* clockSource)
-    : _clockSource(clockSource) {
+CollectionIndexUsageTracker::CollectionIndexUsageTracker(
+    AggregatedIndexUsageTracker* aggregatedIndexUsageTracker, ClockSource* clockSource)
+    : _clockSource(clockSource),
+      _aggregatedIndexUsageTracker(aggregatedIndexUsageTracker),
+      _sharedStats(new CollectionScanStatsStorage()) {
     invariant(_clockSource);
 }
 
-void CollectionIndexUsageTracker::recordIndexAccess(StringData indexName) {
+void CollectionIndexUsageTracker::recordIndexAccess(StringData indexName) const {
     invariant(!indexName.empty());
-    dassert(_indexUsageMap.find(indexName) != _indexUsageMap.end());
 
-    _indexUsageMap[indexName].accesses.fetchAndAdd(1);
+    auto it = _indexUsageStatsMap.find(indexName);
+
+    // The index is guaranteed to be tracked
+    invariant(it != _indexUsageStatsMap.end());
+
+    _aggregatedIndexUsageTracker->onAccess(it->second->features);
+
+    // Increment the index usage atomic counter.
+    it->second->accesses.fetchAndAdd(1);
 }
 
-void CollectionIndexUsageTracker::registerIndex(StringData indexName, const BSONObj& indexKey) {
-    invariant(!indexName.empty());
-    dassert(_indexUsageMap.find(indexName) == _indexUsageMap.end());
+void CollectionIndexUsageTracker::recordCollectionScans(unsigned long long collectionScans) const {
+    _sharedStats->_collectionScans.fetchAndAdd(collectionScans);
+}
 
-    // Create map entry.
-    _indexUsageMap[indexName] = IndexUsageStats(_clockSource->now(), indexKey);
+void CollectionIndexUsageTracker::recordCollectionScansNonTailable(
+    unsigned long long collectionScansNonTailable) const {
+    _sharedStats->_collectionScansNonTailable.fetchAndAdd(collectionScansNonTailable);
+}
+
+void CollectionIndexUsageTracker::registerIndex(StringData indexName,
+                                                const BSONObj& indexKey,
+                                                const IndexFeatures& features) {
+    invariant(!indexName.empty());
+
+    // Create the map entry.
+    auto inserted = _indexUsageStatsMap.try_emplace(
+        indexName, make_intrusive<IndexUsageStats>(_clockSource->now(), indexKey, features));
+    invariant(inserted.second);
+
+    _aggregatedIndexUsageTracker->onRegister(inserted.first->second->features);
 }
 
 void CollectionIndexUsageTracker::unregisterIndex(StringData indexName) {
     invariant(!indexName.empty());
 
-    _indexUsageMap.erase(indexName);
+    auto it = _indexUsageStatsMap.find(indexName);
+    // Only finished/ready indexes are tracked and this function may be called for an unfinished
+    // index. When that happens there is nothing we need to do.
+    if (it == _indexUsageStatsMap.end()) {
+        return;
+    }
+
+    _aggregatedIndexUsageTracker->onUnregister(it->second->features);
+
+    // Remove the map entry.
+    _indexUsageStatsMap.erase(it);
 }
 
-CollectionIndexUsageMap CollectionIndexUsageTracker::getUsageStats() const {
-    return _indexUsageMap;
+void CollectionIndexUsageTracker::recordCollectionIndexUsage(
+    long long collectionScans,
+    long long collectionScansNonTailable,
+    const std::set<std::string>& indexesUsed) const {
+    recordCollectionScans(collectionScans);
+    recordCollectionScansNonTailable(collectionScansNonTailable);
+
+    // Record indexes used to fulfill query.
+    for (auto it = indexesUsed.begin(); it != indexesUsed.end(); ++it) {
+        recordIndexAccess(*it);
+    }
 }
 
+const CollectionIndexUsageTracker::CollectionIndexUsageMap&
+CollectionIndexUsageTracker::getUsageStats() const {
+    return _indexUsageStatsMap;
+}
+
+CollectionIndexUsageTracker::CollectionScanStats
+CollectionIndexUsageTracker::getCollectionScanStats() const {
+    return {_sharedStats->_collectionScans.load(),
+            _sharedStats->_collectionScansNonTailable.load()};
+}
 }  // namespace mongo

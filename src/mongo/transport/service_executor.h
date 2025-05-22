@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,58 +29,66 @@
 
 #pragma once
 
+#include <cstddef>
+#include <functional>
+#include <memory>
+
 #include "mongo/base/status.h"
 #include "mongo/bson/bsonobjbuilder.h"
-#include "mongo/platform/bitwise_enum_operators.h"
-#include "mongo/stdx/functional.h"
-#include "mongo/transport/service_executor_task_names.h"
-#include "mongo/transport/transport_mode.h"
+#include "mongo/db/client.h"
+#include "mongo/db/service_context.h"
+#include "mongo/platform/atomic_word.h"
+#include "mongo/stdx/utility.h"
+#include "mongo/transport/session.h"
 #include "mongo/util/duration.h"
+#include "mongo/util/functional.h"
+#include "mongo/util/out_of_line_executor.h"
+#include "mongo/util/time_support.h"
 
-namespace mongo {
-// This needs to be forward declared here because the service_context.h is a circular dependency.
-class ServiceContext;
-
-namespace transport {
+namespace mongo::transport {
 
 /*
  * This is the interface for all ServiceExecutors.
  */
 class ServiceExecutor {
 public:
-    virtual ~ServiceExecutor() = default;
-    using Task = stdx::function<void()>;
-    enum ScheduleFlags {
-        // No flags (kEmptyFlags) specifies that this is a normal task and that the executor should
-        // launch new threads as needed to run the task.
-        kEmptyFlags = 1 << 0,
+    using Task = OutOfLineExecutor::Task;
 
-        // Deferred tasks will never get a new thread launched to run them.
-        kDeferredTask = 1 << 1,
-
-        // MayRecurse indicates that a task may be run recursively.
-        kMayRecurse = 1 << 2,
-
-        // MayYieldBeforeSchedule indicates that the executor may yield on the current thread before
-        // scheduling the task.
-        kMayYieldBeforeSchedule = 1 << 3,
+    class TaskRunner : public OutOfLineExecutor {
+    public:
+        /**
+         * Awaits the availability of incoming data for the specified session. On success, it will
+         * schedule the callback on current executor. Otherwise, it will invoke the callback with a
+         * non-okay status on the caller thread.
+         */
+        virtual void runOnDataAvailable(std::shared_ptr<Session> session, Task task) = 0;
     };
+
+    /**
+     * Starts up all executors registered as ServiceContext decorations.
+     * If an executor fails to start up, it will throw and that exception will bubble up here.
+     */
+    static void startupAll(ServiceContext* svcCtx);
+
+    /**
+     * Shuts down all executors registered as ServiceContext decorations.
+     * If an executor fails to shut down, a warning will be logged, but shutdowns will continue.
+     */
+    static void shutdownAll(ServiceContext* svcCtx, Milliseconds timeout);
+
+    /**
+     * Append statistics to the `network.serviceExecutors` serverStatus output.
+     */
+    static void appendAllServerStats(BSONObjBuilder*, ServiceContext*);
+
+    virtual ~ServiceExecutor() = default;
+
+    virtual std::unique_ptr<TaskRunner> makeTaskRunner() = 0;
 
     /*
      * Starts the ServiceExecutor. This may create threads even if no tasks are scheduled.
      */
-    virtual Status start() = 0;
-
-    /*
-     * Schedules a task with the ServiceExecutor and returns immediately.
-     *
-     * This is guaranteed to unwind the stack before running the task, although the task may be
-     * run later in the same thread.
-     *
-     * If defer is true, then the executor may defer execution of this Task until an available
-     * thread is available.
-     */
-    virtual Status schedule(Task task, ScheduleFlags flags, ServiceExecutorTaskName taskName) = 0;
+    virtual void start() = 0;
 
     /*
      * Stops and joins the ServiceExecutor. Any outstanding tasks will not be executed, and any
@@ -91,19 +98,110 @@ public:
      */
     virtual Status shutdown(Milliseconds timeout) = 0;
 
-    /*
-     * Returns if this service executor is using asynchronous or synchronous networking.
-     */
-    virtual Mode transportMode() const = 0;
+    virtual size_t getRunningThreads() const = 0;
 
-    /*
-     * Appends statistics about task scheduling to a BSONObjBuilder for serverStatus output.
-     */
+    /** Appends statistics about task scheduling to a BSONObjBuilder for serverStatus output. */
     virtual void appendStats(BSONObjBuilder* bob) const = 0;
+
+    /** Yield if this executor controls more threads than we have cores. */
+    void yieldIfAppropriate() const;
+
+    /**
+     * Returns the class name of this service executor.
+     * Used in logging and exception messaging.
+     */
+    virtual StringData getName() const = 0;
 };
 
-}  // namespace transport
+/**
+ * ServiceExecutorContext determines which ServiceExecutor is used for each Client.
+ */
+class ServiceExecutorContext {
+public:
+    // Roughly a 1:1 mapping to the ServiceExecutor type which will be used.
+    // ThreadModel::kSynchronous + canUseReserved may result in ServiceExecutorReserved.
+    enum class ThreadModel {
+        kSynchronous,
+        kInline,
+    };
 
-ENABLE_BITMASK_OPERATORS(transport::ServiceExecutor::ScheduleFlags)
+    // Manually hoist these enum values into the class to aid callsite usage.
+    // As our toolchain is updated, we may be able to replace this with a simple:
+    // `using enum ThreadModel;`
+    static constexpr inline auto kSynchronous = ThreadModel::kSynchronous;
+    static constexpr inline auto kInline = ThreadModel::kInline;
 
-}  // namespace mongo
+    /**
+     * Get a pointer to the ServiceExecutorContext for a given client.
+     *
+     * This function is valid to invoke either on the Client thread or with the Client lock.
+     */
+    static ServiceExecutorContext* get(Client* client);
+
+    /**
+     * Set the ServiceExecutorContext for a given client.
+     *
+     * This function may only be invoked once and only while under the Client lock.
+     */
+    static void set(Client* client, std::unique_ptr<ServiceExecutorContext> seCtx);
+
+
+    /**
+     * Reset the ServiceExecutorContext for a given client.
+     *
+     * This function may only be invoked once and only while under the Client lock.
+     */
+    static void reset(Client* client);
+
+    ServiceExecutorContext() = default;
+    /** Test only */
+    explicit ServiceExecutorContext(std::function<ServiceExecutor*()> getServiceExecutorForTest)
+        : _getServiceExecutorForTest(getServiceExecutorForTest) {}
+    ServiceExecutorContext(const ServiceExecutorContext&) = delete;
+    ServiceExecutorContext& operator=(const ServiceExecutorContext&) = delete;
+    ServiceExecutorContext(ServiceExecutorContext&&) = delete;
+    ServiceExecutorContext& operator=(ServiceExecutorContext&&) = delete;
+
+    /**
+     * Set the thread model for the associated Client's service execution.
+     *
+     * These functions are only valid to invoke with the Client lock or before the Client is set.
+     */
+    void setThreadModel(ThreadModel model);
+
+    /**
+     * Set if reserved resources are available for the associated Client's service execution.
+     *
+     * This function is only valid to invoke with the Client lock or before the Client is set.
+     */
+    void setCanUseReserved(bool canUseReserved);
+
+    /**
+     * Get an appropriate ServiceExecutor given the current parameters.
+     *
+     * This function is only valid to invoke from the associated Client thread. This function does
+     * not require the Client lock since all writes must also happen from that thread.
+     */
+    ServiceExecutor* getServiceExecutor();
+
+private:
+    Client* _client = nullptr;
+
+    bool _canUseReserved = false;
+    bool _hasUsedSynchronous = false;
+    ThreadModel _threadModel{ThreadModel::kSynchronous};
+
+    /** For tests to override the behavior of `getServiceExecutor()`. */
+    std::function<ServiceExecutor*()> _getServiceExecutorForTest;
+};
+
+/**
+ * A small statlet for tracking which executors may be in use.
+ */
+class ServiceExecutorStats {
+public:
+    // The number of Clients that are allowed to ignore maxConns and use reserved resources.
+    AtomicWord<std::size_t> limitExempt{0};
+};
+
+}  // namespace mongo::transport

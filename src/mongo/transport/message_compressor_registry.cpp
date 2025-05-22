@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,24 +27,30 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/transport/message_compressor_registry.h"
-
-#include "mongo/base/init.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/transport/message_compressor_noop.h"
-#include "mongo/transport/message_compressor_snappy.h"
-#include "mongo/transport/message_compressor_zlib.h"
-#include "mongo/util/options_parser/option_section.h"
-
+#include <algorithm>
 #include <boost/algorithm/string/classification.hpp>
 #include <boost/algorithm/string/split.hpp>
+#include <memory>
+#include <ostream>
+#include <utility>
+
+#include <absl/container/flat_hash_map.h>
+// IWYU pragma: no_include "boost/algorithm/string/detail/classification.hpp"
+#include <boost/core/addressof.hpp>
+#include <boost/function/function_base.hpp>
+#include <boost/iterator/iterator_facade.hpp>
+#include <boost/type_index/type_index_facade.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/init.h"  // IWYU pragma: keep
+#include "mongo/base/initializer.h"
+#include "mongo/transport/message_compressor_noop.h"
+#include "mongo/transport/message_compressor_registry.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 namespace {
-const auto kDisabledConfigValue = "disabled"_sd;
-const auto kDefaultConfigValue = "snappy,zlib"_sd;
+constexpr auto kDisabledConfigValue = "disabled"_sd;
 }  // namespace
 
 StringData getMessageCompressorName(MessageCompressor id) {
@@ -56,8 +61,10 @@ StringData getMessageCompressorName(MessageCompressor id) {
             return "snappy"_sd;
         case MessageCompressor::kZlib:
             return "zlib"_sd;
+        case MessageCompressor::kZstd:
+            return "zstd"_sd;
         default:
-            fassert(40269, "Invalid message compressor ID");
+            fasserted(40269);  // Invalid message compressor ID
     }
     MONGO_UNREACHABLE;
 }
@@ -113,22 +120,6 @@ void MessageCompressorRegistry::setSupportedCompressors(std::vector<std::string>
     _compressorNames = std::move(names);
 }
 
-Status addMessageCompressionOptions(moe::OptionSection* options, bool forShell) {
-    auto& ret =
-        options
-            ->addOptionChaining("net.compression.compressors",
-                                "networkMessageCompressors",
-                                moe::String,
-                                "Comma-separated list of compressors to use for network messages")
-            .setImplicit(moe::Value(kDisabledConfigValue.toString()));
-    if (forShell) {
-        ret.setDefault(moe::Value(kDisabledConfigValue.toString())).hidden();
-    } else {
-        ret.setDefault(moe::Value(kDefaultConfigValue.toString()));
-    }
-    return Status::OK();
-}
-
 Status storeMessageCompressionOptions(const std::string& compressors) {
     std::vector<std::string> restrict;
     if (compressors != kDisabledConfigValue) {
@@ -148,14 +139,13 @@ MONGO_INITIALIZER_GENERAL(NoopMessageCompressorInit,
                           ("AllCompressorsRegistered"))
 (InitializerContext* context) {
     auto& compressorRegistry = MessageCompressorRegistry::get();
-    compressorRegistry.registerImplementation(stdx::make_unique<NoopMessageCompressor>());
-    return Status::OK();
+    compressorRegistry.registerImplementation(std::make_unique<NoopMessageCompressor>());
 }
 
 // This cleans up any compressors that were requested by the user, but weren't registered by
 // any compressor. It must be run after all the compressors have registered themselves with
 // the global registry.
 MONGO_INITIALIZER(AllCompressorsRegistered)(InitializerContext* context) {
-    return MessageCompressorRegistry::get().finalizeSupportedCompressors();
+    uassertStatusOK(MessageCompressorRegistry::get().finalizeSupportedCompressors());
 }
 }  // namespace mongo

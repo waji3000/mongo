@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Public Domain 2014-2018 MongoDB, Inc.
+# Public Domain 2014-present MongoDB, Inc.
 # Public Domain 2008-2014 WiredTiger, Inc.
 #
 # This is free and unencumbered software released into the public domain.
@@ -26,7 +26,7 @@
 # ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
 # OTHER DEALINGS IN THE SOFTWARE.
 
-import wiredtiger, wttest
+import wttest
 from wtscenario import make_scenarios
 
 # test_base05.py
@@ -34,25 +34,11 @@ from wtscenario import make_scenarios
 class test_base05(wttest.WiredTigerTestCase):
     """
     Test that various types of content can be stored
-    Test the 'english' huffman encoding with English and non-English strings.
     """
 
     table_name1 = 'test_base05a'
     table_name2 = 'test_base05b'
     nentries = 1000
-    scenarios = make_scenarios([
-        ('no_huffman', dict(extraconfig='')),
-        ('huffman_key', dict(extraconfig='huffman_key="english"')),
-        ('huffman_val', dict(extraconfig='huffman_value="english"')),
-        ('huffman_keyval', dict(extraconfig='huffman_key="english",huffman_value="english"'))
-        ])
-
-    def config_string(self):
-        """
-        Return any additional configuration.
-        This method may be overridden.
-        """
-        return self.extraconfig
 
     def session_create(self, name, args):
         """
@@ -127,7 +113,7 @@ class test_base05(wttest.WiredTigerTestCase):
     non_english_strings = [
         # This notation creates 'string' objects that have embedded unicode.
         '\u20320\u22909',
-        '\u1571\u1604\u1587\u1617\u1604\u1575\u1605\u32\u1593\u1604\u1610\u1603\u1605',
+        '\u1571\u1604\u1587\u1617\u1604\u1575\u1605\u0032\u1593\u1604\u1610\u1603\u1605',
         '\u1513\u1500\u1493\u1501',
         '\u20170\u26085\u12399',
         '\u50504\u45397\u54616\u49464\u50836',
@@ -159,7 +145,7 @@ class test_base05(wttest.WiredTigerTestCase):
         """
         Create entries, and read back in a cursor: key=string, value=string
         """
-        create_args = 'key_format=S,value_format=S,' + self.config_string()
+        create_args = 'key_format=S,value_format=S,'
         self.session_create("table:" + self.table_name1, create_args)
         self.pr('creating cursor')
         cursor = self.session.open_cursor('table:' + self.table_name1)
@@ -172,7 +158,7 @@ class test_base05(wttest.WiredTigerTestCase):
 
         # quick spot check to make sure searches work
         for divisor in [3, 5, 7]:
-            i = self.nentries / divisor
+            i = self.nentries // divisor
             key = self.mixed_string(i)
             value = self.mixed_string(i+1)
             cursor.set_key(key)
@@ -200,21 +186,21 @@ class test_base05(wttest.WiredTigerTestCase):
         non-ASCII (UTF) chars and optionally converts them to
         Unicode (considered a type separate from string in Python).
         """
-        create_args = 'key_format=S,value_format=S,' + self.config_string()
+        create_args = 'key_format=S,value_format=S,'
         self.session_create("table:" + self.table_name1, create_args)
         self.pr('creating cursor')
         cursor = self.session.open_cursor('table:' + self.table_name1)
         strlist = self.non_english_strings
         for i in range(0, len(strlist)):
             if convert:
-                key = val = unicode(strlist[i])
+                key = val = str(strlist[i])
             else:
                 key = val = strlist[i]
             cursor[key] = val
 
         for i in range(0, len(strlist)):
             if convert:
-                key = val = unicode(strlist[i])
+                key = val = str(strlist[i])
             else:
                 key = val = strlist[i]
             cursor.set_key(key)
@@ -235,6 +221,3 @@ class test_base05(wttest.WiredTigerTestCase):
         and read back in a cursor: key=string, value=string
         """
         self.do_test_table_base(True)
-
-if __name__ == '__main__':
-    wttest.run()

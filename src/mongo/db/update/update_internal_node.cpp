@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,25 +27,21 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
 
 #include "mongo/db/update/update_internal_node.h"
 
 namespace mongo {
-namespace {
-
-std::string toArrayFilterIdentifier(const std::string& fieldName) {
-    return "$[" + fieldName + "]";
-}
-}
 
 // static
-std::map<std::string, clonable_ptr<UpdateNode>> UpdateInternalNode::createUpdateNodeMapByMerging(
-    const std::map<std::string, clonable_ptr<UpdateNode>>& leftMap,
-    const std::map<std::string, clonable_ptr<UpdateNode>>& rightMap,
+std::map<std::string, clonable_ptr<UpdateNode>, pathsupport::cmpPathsAndArrayIndexes>
+UpdateInternalNode::createUpdateNodeMapByMerging(
+    const std::map<std::string, clonable_ptr<UpdateNode>, pathsupport::cmpPathsAndArrayIndexes>&
+        leftMap,
+    const std::map<std::string, clonable_ptr<UpdateNode>, pathsupport::cmpPathsAndArrayIndexes>&
+        rightMap,
     FieldRef* pathTaken,
     bool wrapFieldNameAsArrayFilterIdentifier) {
-    std::map<std::string, clonable_ptr<UpdateNode>> mergedMap;
+    std::map<std::string, clonable_ptr<UpdateNode>, pathsupport::cmpPathsAndArrayIndexes> mergedMap;
 
     // Get the union of the field names we know about among the leftMap and rightMap.
     stdx::unordered_set<std::string> allFields;
@@ -92,7 +87,7 @@ std::unique_ptr<UpdateNode> UpdateInternalNode::copyOrMergeAsNecessary(
     } else if (!rightNode) {
         return leftNode->clone();
     } else {
-        FieldRefTempAppend tempAppend(
+        FieldRef::FieldRefTempAppend tempAppend(
             *pathTaken,
             wrapFieldNameAsArrayFilterIdentifier ? toArrayFilterIdentifier(nextField) : nextField);
         return UpdateNode::createUpdateNodeByMerging(*leftNode, *rightNode, pathTaken);

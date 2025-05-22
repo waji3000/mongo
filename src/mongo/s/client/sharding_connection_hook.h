@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,9 +29,12 @@
 
 #pragma once
 
+#include <memory>
+
 #include "mongo/client/connpool.h"
+#include "mongo/client/dbclient_base.h"
 #include "mongo/rpc/metadata.h"
-#include "mongo/s/sharding_egress_metadata_hook.h"
+#include "mongo/rpc/metadata/metadata_hook.h"
 
 namespace mongo {
 
@@ -44,16 +46,12 @@ class DBClientBase;
  */
 class ShardingConnectionHook : public DBConnectionHook {
 public:
-    ShardingConnectionHook(bool shardedConnections,
-                           std::unique_ptr<rpc::EgressMetadataHook> egressHook);
+    ShardingConnectionHook(std::unique_ptr<rpc::EgressMetadataHook> egressHook);
 
     void onCreate(DBClientBase* conn) override;
-    void onDestroy(DBClientBase* conn) override;
     void onRelease(DBClientBase* conn) override;
 
 private:
-    bool _shardedConnections;
-
     // Use the implementation of the metadata readers and writers in ShardingEgressMetadataHook,
     // since that is the hook for Network Interface ASIO and this hook is to be deprecated.
     std::unique_ptr<rpc::EgressMetadataHook> _egressHook;

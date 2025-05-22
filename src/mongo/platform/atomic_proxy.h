@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -36,23 +35,21 @@
 #include <type_traits>
 
 #include "mongo/base/static_assert.h"
-#include "mongo/config.h"
+#include "mongo/config.h"  // IWYU pragma: keep
 
 namespace mongo {
 
 /**
-* Provides a simple version of an atomic version of T
-* that uses std::atomic<BaseWordT> as a backing type;
-*/
+ * Provides a simple version of an atomic version of T
+ * that uses std::atomic<BaseWordT> as a backing type;
+ */
 template <typename T, typename BaseWordT>
 class AtomicProxy {
     MONGO_STATIC_ASSERT_MSG(sizeof(T) == sizeof(BaseWordT),
                             "T and BaseWordT must have the same size");
-    MONGO_STATIC_ASSERT_MSG(std::is_integral<BaseWordT>::value,
-                            "BaseWordT must be an integral type");
-#if MONGO_HAVE_STD_IS_TRIVIALLY_COPYABLE
-    MONGO_STATIC_ASSERT_MSG(std::is_trivially_copyable<T>::value, "T must be trivially copyable");
-#endif
+    MONGO_STATIC_ASSERT_MSG(std::is_integral_v<BaseWordT>, "BaseWordT must be an integral type");
+    MONGO_STATIC_ASSERT_MSG(std::is_trivially_copyable_v<T>, "T must be trivially copyable");
+
 public:
     using value_type = T;
     using base_type = BaseWordT;
@@ -88,4 +85,4 @@ private:
 };
 
 using AtomicDouble = AtomicProxy<double, std::uint64_t>;
-}
+}  // namespace mongo

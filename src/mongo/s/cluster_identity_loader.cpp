@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,18 +27,23 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
-
-#include "mongo/platform/basic.h"
-
 #include "mongo/s/cluster_identity_loader.h"
 
+#include <boost/move/utility_core.hpp>
+// IWYU pragma: no_include "cxxabi.h"
+#include <mutex>
+#include <utility>
+
 #include "mongo/base/status_with.h"
+#include "mongo/db/cluster_role.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/server_options.h"
 #include "mongo/db/service_context.h"
-#include "mongo/s/catalog/sharding_catalog_client.h"
-#include "mongo/s/catalog/type_config_version.h"
-#include "mongo/s/grid.h"
+#include "mongo/s/catalog/type_config_version_gen.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/decorable.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 namespace mongo {
 namespace {
@@ -57,16 +61,22 @@ ClusterIdentityLoader* ClusterIdentityLoader::get(OperationContext* operationCon
 }
 
 OID ClusterIdentityLoader::getClusterId() {
+    // TODO SERVER-78051: Re-evaluate use of ClusterIdentityLoader for shards.
+    tassert(7800000,
+            "Unexpectedly tried to get cluster id on a non config server node",
+            serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer));
+
     stdx::unique_lock<stdx::mutex> lk(_mutex);
     invariant(_initializationState == InitializationState::kInitialized && _lastLoadResult.isOK());
     return _lastLoadResult.getValue();
 }
 
 Status ClusterIdentityLoader::loadClusterId(OperationContext* opCtx,
+                                            ShardingCatalogClient* catalogClient,
                                             const repl::ReadConcernLevel& readConcernLevel) {
     stdx::unique_lock<stdx::mutex> lk(_mutex);
     if (_initializationState == InitializationState::kInitialized) {
-        invariant(_lastLoadResult.isOK());
+        invariant(_lastLoadResult.getStatus());
         return Status::OK();
     }
 
@@ -81,7 +91,7 @@ Status ClusterIdentityLoader::loadClusterId(OperationContext* opCtx,
     _initializationState = InitializationState::kLoading;
 
     lk.unlock();
-    auto loadStatus = _fetchClusterIdFromConfig(opCtx, readConcernLevel);
+    auto loadStatus = _fetchClusterIdFromConfig(opCtx, catalogClient, readConcernLevel);
     lk.lock();
 
     invariant(_initializationState == InitializationState::kLoading);
@@ -96,8 +106,9 @@ Status ClusterIdentityLoader::loadClusterId(OperationContext* opCtx,
 }
 
 StatusWith<OID> ClusterIdentityLoader::_fetchClusterIdFromConfig(
-    OperationContext* opCtx, const repl::ReadConcernLevel& readConcernLevel) {
-    auto catalogClient = Grid::get(opCtx)->catalogClient();
+    OperationContext* opCtx,
+    ShardingCatalogClient* catalogClient,
+    const repl::ReadConcernLevel& readConcernLevel) {
     auto loadResult = catalogClient->getConfigVersion(opCtx, readConcernLevel);
     if (!loadResult.isOK()) {
         return loadResult.getStatus().withContext("Error loading clusterID");

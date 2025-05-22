@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,6 +29,8 @@
 
 #include "mongo/db/fts/fts_basic_phrase_matcher.h"
 
+#include <cstring>
+
 #include "mongo/platform/strcasestr.h"
 
 namespace mongo {
@@ -44,7 +45,7 @@ bool BasicFTSPhraseMatcher::phraseMatches(const string& phrase,
         return haystack.find(phrase) != string::npos;
     }
 
-    return strcasestr(haystack.c_str(), phrase.c_str()) != NULL;
+    return strcasestr(haystack.c_str(), phrase.c_str()) != nullptr;
 }
 
 }  // namespace fts

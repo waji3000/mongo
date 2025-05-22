@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,33 +27,48 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
 
-#include "mongo/platform/basic.h"
+// IWYU pragma: no_include "cxxabi.h"
+#include <functional>
+#include <mutex>
+#include <utility>
 
-#include "mongo/db/commands.h"
-#include "mongo/db/commands/test_commands_enabled.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/db/admission/execution_admission_context.h"
+#include "mongo/db/client.h"
 #include "mongo/db/concurrency/d_concurrency.h"
-#include "mongo/db/concurrency/write_conflict_exception.h"
-#include "mongo/db/curop.h"
+#include "mongo/db/concurrency/exception_util.h"
+#include "mongo/db/concurrency/lock_manager_defs.h"
+#include "mongo/db/database_name.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/op_observer.h"
+#include "mongo/db/op_observer/op_observer.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/repl/noop_writer.h"
-#include "mongo/db/repl/oplog.h"
-#include "mongo/db/server_parameters.h"
-#include "mongo/stdx/functional.h"
+#include "mongo/db/repl/repl_server_parameters_gen.h"
+#include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/logv2/log.h"
+#include "mongo/platform/atomic_word.h"
+#include "mongo/stdx/condition_variable.h"
+#include "mongo/stdx/thread.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/concurrency/admission_context.h"
 #include "mongo/util/concurrency/idle_thread_block.h"
-#include "mongo/util/log.h"
+#include "mongo/util/testing_proctor.h"
+#include "mongo/util/time_support.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
+
 
 namespace mongo {
 namespace repl {
 
 namespace {
 
-MONGO_EXPORT_SERVER_PARAMETER(writePeriodicNoops, bool, true);
-
-const auto kMsgObj = BSON("msg"
-                          << "periodic noop");
+const auto kMsgObj = BSON("msg" << "periodic noop");
 
 }  // namespace
 
@@ -63,13 +77,16 @@ const auto kMsgObj = BSON("msg"
  *  Runs the noopWrite argument with waitTime period until its destroyed.
  */
 class NoopWriter::PeriodicNoopRunner {
-    MONGO_DISALLOW_COPYING(PeriodicNoopRunner);
+    PeriodicNoopRunner(const PeriodicNoopRunner&) = delete;
+    PeriodicNoopRunner& operator=(const PeriodicNoopRunner&) = delete;
 
-    using NoopWriteFn = stdx::function<void(OperationContext*)>;
+    using NoopWriteFn = std::function<void(OperationContext*)>;
 
 public:
-    PeriodicNoopRunner(Seconds waitTime, NoopWriteFn noopWrite)
-        : _thread([this, noopWrite, waitTime] { run(waitTime, std::move(noopWrite)); }) {}
+    PeriodicNoopRunner(const Seconds& waitTime, NoopWriteFn&& noopWrite)
+        : _thread([this, noopWrite = std::move(noopWrite), waitTime]() mutable {
+              run(waitTime, std::move(noopWrite));
+          }) {}
 
     ~PeriodicNoopRunner() {
         stdx::unique_lock<stdx::mutex> lk(_mutex);
@@ -80,20 +97,29 @@ public:
     }
 
 private:
-    void run(Seconds waitTime, NoopWriteFn noopWrite) {
-        Client::initThread("NoopWriter");
-        while (true) {
-            const ServiceContext::UniqueOperationContext opCtxPtr = cc().makeOperationContext();
-            OperationContext& opCtx = *opCtxPtr;
-            {
-                stdx::unique_lock<stdx::mutex> lk(_mutex);
-                MONGO_IDLE_THREAD_BLOCK;
-                _cv.wait_for(lk, waitTime.toSystemDuration(), [&] { return _inShutdown; });
+    void run(Seconds waitTime, NoopWriteFn&& noopWrite) {
+        Client::initThread("NoopWriter",
+                           getGlobalServiceContext()->getService(ClusterRole::ShardServer));
 
-                if (_inShutdown)
-                    return;
+        while (true) {
+            try {
+                const ServiceContext::UniqueOperationContext opCtxPtr = cc().makeOperationContext();
+                OperationContext& opCtx = *opCtxPtr;
+                {
+                    stdx::unique_lock<stdx::mutex> lk(_mutex);
+                    MONGO_IDLE_THREAD_BLOCK;
+                    _cv.wait_for(lk, waitTime.toSystemDuration(), [&] { return _inShutdown; });
+
+                    if (_inShutdown)
+                        return;
+                }
+                noopWrite(&opCtx);
+            } catch (ExceptionFor<ErrorCategory::Interruption>& ex) {
+                LOGV2_DEBUG(7465602,
+                            2,
+                            "NoopWriter interrupted, will retry in the next run",
+                            "{reason}"_attr = ex.reason());
             }
-            noopWrite(&opCtx);
         }
     }
 
@@ -132,8 +158,15 @@ Status NoopWriter::startWritingPeriodicNoops(OpTime lastKnownOpTime) {
     _lastKnownOpTime = lastKnownOpTime;
 
     invariant(!_noopRunner);
-    _noopRunner = stdx::make_unique<PeriodicNoopRunner>(
-        _writeInterval, [this](OperationContext* opCtx) { _writeNoop(opCtx); });
+    _noopRunner =
+        std::make_unique<PeriodicNoopRunner>(_writeInterval, [this](OperationContext* opCtx) {
+            // Noop writes are critical for the cluster stability, so we mark it as having Immediate
+            // priority. As a result it will skip both flow control and waiting for ticket
+            // acquisition.
+            ScopedAdmissionPriority<ExecutionAdmissionContext> priority(
+                opCtx, AdmissionContext::Priority::kExempt);
+            _writeNoop(opCtx);
+        });
     return Status::OK();
 }
 
@@ -148,14 +181,14 @@ void NoopWriter::_writeNoop(OperationContext* opCtx) {
     Lock::GlobalLock lock(
         opCtx, MODE_IX, Date_t::now() + Milliseconds(1), Lock::InterruptBehavior::kLeaveUnlocked);
     if (!lock.isLocked()) {
-        LOG(1) << "Global lock is not available skipping noopWrite";
+        LOGV2_DEBUG(21219, 1, "Global lock is not available, skipping the noop write");
         return;
     }
 
     auto replCoord = ReplicationCoordinator::get(opCtx);
     // Its a proxy for being a primary
-    if (!replCoord->canAcceptWritesForDatabase(opCtx, "admin")) {
-        LOG(1) << "Not a primary, skipping the noop write";
+    if (!replCoord->canAcceptWritesForDatabase(opCtx, DatabaseName::kAdmin)) {
+        LOGV2_DEBUG(21220, 1, "Not a primary, skipping the noop write");
         return;
     }
 
@@ -163,26 +196,30 @@ void NoopWriter::_writeNoop(OperationContext* opCtx) {
 
     // _lastKnownOpTime is not protected by lock as its used only by one thread.
     if (lastAppliedOpTime != _lastKnownOpTime) {
-        LOG(1) << "Not scheduling a noop write. Last known OpTime: " << _lastKnownOpTime
-               << " != last primary OpTime: " << lastAppliedOpTime;
+        LOGV2_DEBUG(21221,
+                    1,
+                    "Not scheduling a noop write. Last known OpTime != last primary OpTime",
+                    "lastKnownOpTime"_attr = _lastKnownOpTime,
+                    "lastAppliedOpTime"_attr = lastAppliedOpTime);
     } else {
         if (writePeriodicNoops.load()) {
-            const auto logLevel = getTestCommandsEnabled() ? 0 : 1;
-            LOG(logLevel)
-                << "Writing noop to oplog as there has been no writes to this replica set in over "
-                << _writeInterval;
-            writeConflictRetry(
-                opCtx, "writeNoop", NamespaceString::kRsOplogNamespace.ns(), [&opCtx] {
-                    WriteUnitOfWork uow(opCtx);
-                    opCtx->getClient()->getServiceContext()->getOpObserver()->onOpMessage(opCtx,
-                                                                                          kMsgObj);
-                    uow.commit();
-                });
+            const auto logLevel = TestingProctor::instance().isEnabled() ? 0 : 1;
+            LOGV2_DEBUG(21222,
+                        logLevel,
+                        "Writing noop to oplog as there has been no writes to this replica set "
+                        "within write interval",
+                        "writeInterval"_attr = _writeInterval);
+            writeConflictRetry(opCtx, "writeNoop", NamespaceString::kRsOplogNamespace, [&opCtx] {
+                WriteUnitOfWork uow(opCtx);
+                opCtx->getClient()->getServiceContext()->getOpObserver()->onOpMessage(opCtx,
+                                                                                      kMsgObj);
+                uow.commit();
+            });
         }
     }
 
     _lastKnownOpTime = replCoord->getMyLastAppliedOpTime();
-    LOG(1) << "Set last known op time to " << _lastKnownOpTime;
+    LOGV2_DEBUG(21223, 1, "Set last known op time", "lastKnownOpTime"_attr = _lastKnownOpTime);
 }
 
 }  // namespace repl

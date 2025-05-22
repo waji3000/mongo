@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -45,12 +44,16 @@
  */
 #pragma once
 
+#include <cstddef>
+#include <cstdint>
+#include <functional>
 #include <map>
 #include <string>
 
-#include "mongo/db/jsobj.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/platform/random.h"
-#include "mongo/stdx/functional.h"
 
 namespace mongo {
 
@@ -75,7 +78,8 @@ namespace mongo {
  *
  */
 class BsonTemplateEvaluator {
-    MONGO_DISALLOW_COPYING(BsonTemplateEvaluator);
+    BsonTemplateEvaluator(const BsonTemplateEvaluator&) = delete;
+    BsonTemplateEvaluator& operator=(const BsonTemplateEvaluator&) = delete;
 
 public:
     /* Status of template evaluation. Logically the  the status are "success", "bad operator"
@@ -93,10 +97,10 @@ public:
      *      fieldName : key
      *      in : { #RAND_INT: [10, 20] }
      */
-    typedef stdx::function<Status(BsonTemplateEvaluator* btl,
-                                  const char* fieldName,
-                                  const BSONObj& in,
-                                  BSONObjBuilder& builder)>
+    typedef std::function<Status(BsonTemplateEvaluator* btl,
+                                 const char* fieldName,
+                                 const BSONObj& in,
+                                 BSONObjBuilder& builder)>
         OperatorFn;
 
     /*
@@ -146,7 +150,7 @@ private:
     VarMap _varMap;
 
     // evaluates a BSON element. This is internally called by the top level evaluate method.
-    Status _evalElem(const BSONElement in, BSONObjBuilder& out);
+    Status _evalElem(BSONElement in, BSONObjBuilder& out);
 
     // evaluates a BSON object. This is internally called by the top level evaluate method
     // and the _evalElem method.
@@ -269,4 +273,4 @@ private:
     PseudoRandom rng;
 };
 
-}  // end namespace
+}  // namespace mongo

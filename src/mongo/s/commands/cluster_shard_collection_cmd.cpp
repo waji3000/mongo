@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,40 +27,38 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
 
-#include "mongo/platform/basic.h"
+#include <cstdint>
+#include <string>
+#include <utility>
 
-#include <list>
-#include <set>
-#include <vector>
+#include <boost/cstdint.hpp>
+#include <boost/move/utility_core.hpp>
 
-#include "mongo/bson/simple_bsonelement_comparator.h"
-#include "mongo/bson/simple_bsonobj_comparator.h"
-#include "mongo/bson/util/bson_extract.h"
-#include "mongo/client/connpool.h"
-#include "mongo/db/audit.h"
-#include "mongo/db/auth/action_set.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
-#include "mongo/db/client.h"
+#include "mongo/db/auth/resource_pattern.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/hasher.h"
-#include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/query/collation/collator_factory_interface.h"
-#include "mongo/db/write_concern_options.h"
-#include "mongo/s/balancer_configuration.h"
-#include "mongo/s/catalog/sharding_catalog_client.h"
-#include "mongo/s/catalog_cache.h"
-#include "mongo/s/client/shard_registry.h"
-#include "mongo/s/cluster_commands_helpers.h"
-#include "mongo/s/config_server_client.h"
-#include "mongo/s/grid.h"
-#include "mongo/s/request_types/migration_secondary_throttle_options.h"
-#include "mongo/s/request_types/shard_collection_gen.h"
-#include "mongo/util/log.h"
-#include "mongo/util/scopeguard.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/timeseries/timeseries_gen.h"
+#include "mongo/idl/idl_parser.h"
+#include "mongo/s/cluster_ddl.h"
+#include "mongo/s/commands/shard_collection_gen.h"
+#include "mongo/s/request_types/sharded_ddl_commands_gen.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/namespace_string_util.h"
+#include "mongo/util/uuid.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
+
 
 namespace mongo {
 namespace {
@@ -83,61 +80,68 @@ public:
     }
 
     std::string help() const override {
-        return "Shard a collection. Requires key. Optional unique."
-               " Sharding must already be enabled for the database.\n"
-               "   { enablesharding : \"<dbname>\" }\n";
+        return "Shard a collection. Requires key. Optional unique.";
     }
 
-    Status checkAuthForCommand(Client* client,
-                               const std::string& dbname,
-                               const BSONObj& cmdObj) const override {
-        if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
-                ResourcePattern::forExactNamespace(NamespaceString(parseNs(dbname, cmdObj))),
-                ActionType::enableSharding)) {
+    Status checkAuthForOperation(OperationContext* opCtx,
+                                 const DatabaseName& dbName,
+                                 const BSONObj& cmdObj) const override {
+        if (!AuthorizationSession::get(opCtx->getClient())
+                 ->isAuthorizedForActionsOnResource(
+                     ResourcePattern::forExactNamespace(parseNs(dbName, cmdObj)),
+                     ActionType::enableSharding)) {
             return Status(ErrorCodes::Unauthorized, "Unauthorized");
         }
 
         return Status::OK();
     }
 
-    std::string parseNs(const std::string& dbname, const BSONObj& cmdObj) const override {
-        return CommandHelpers::parseNsFullyQualified(cmdObj);
+    NamespaceString parseNs(const DatabaseName& dbName, const BSONObj& cmdObj) const override {
+        return NamespaceStringUtil::deserialize(dbName.tenantId(),
+                                                CommandHelpers::parseNsFullyQualified(cmdObj),
+                                                SerializationContext::stateDefault());
     }
 
     bool run(OperationContext* opCtx,
-             const std::string& dbname,
+             const DatabaseName& dbName,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) override {
-        const NamespaceString nss(parseNs(dbname, cmdObj));
-        auto shardCollRequest =
-            ShardCollection::parse(IDLParserErrorContext("ShardCollection"), cmdObj);
+        const NamespaceString nss(parseNs(dbName, cmdObj));
 
-        ConfigsvrShardCollectionRequest configShardCollRequest;
-        configShardCollRequest.set_configsvrShardCollection(nss);
-        configShardCollRequest.setKey(shardCollRequest.getKey());
-        configShardCollRequest.setUnique(shardCollRequest.getUnique());
-        configShardCollRequest.setNumInitialChunks(shardCollRequest.getNumInitialChunks());
-        configShardCollRequest.setCollation(shardCollRequest.getCollation());
+        uassert(5731501,
+                "Sharding a buckets collection is not allowed",
+                !nss.isTimeseriesBucketsCollection());
 
-        // Invalidate the routing table cache entry for this collection so that we reload the
-        // collection the next time it's accessed, even if we receive a failure, e.g. NetworkError.
-        ON_BLOCK_EXIT(
-            [opCtx, nss] { Grid::get(opCtx)->catalogCache()->invalidateShardedCollection(nss); });
+        uassert(6464401,
+                "Sharding a Queryable Encryption state collection is not allowed",
+                !nss.isFLE2StateCollection());
 
-        auto configShard = Grid::get(opCtx)->shardRegistry()->getConfigShard();
-        auto cmdResponse = uassertStatusOK(configShard->runCommandWithFixedRetryAttempts(
-            opCtx,
-            ReadPreferenceSetting(ReadPreference::PrimaryOnly),
-            "admin",
-            CommandHelpers::appendMajorityWriteConcern(
-                CommandHelpers::appendPassthroughFields(cmdObj, configShardCollRequest.toBSON())),
-            Shard::RetryPolicy::kIdempotent));
+        auto clusterRequest = ShardCollection::parse(IDLParserContext(""), cmdObj);
+        ShardsvrCreateCollectionRequest serverRequest;
+        serverRequest.setShardKey(clusterRequest.getKey());
+        serverRequest.setUnique(clusterRequest.getUnique());
+        serverRequest.setNumInitialChunks(clusterRequest.getNumInitialChunks());
+        serverRequest.setPresplitHashedZones(clusterRequest.getPresplitHashedZones());
+        serverRequest.setCollation(clusterRequest.getCollation());
+        serverRequest.setTimeseries(clusterRequest.getTimeseries());
+        serverRequest.setCollectionUUID(clusterRequest.getCollectionUUID());
+        serverRequest.setImplicitlyCreateIndex(clusterRequest.getImplicitlyCreateIndex());
+        serverRequest.setEnforceUniquenessCheck(clusterRequest.getEnforceUniquenessCheck());
 
-        CommandHelpers::filterCommandReplyForPassthrough(cmdResponse.response, &result);
+        ShardsvrCreateCollection shardsvrCreateCommand(nss);
+        shardsvrCreateCommand.setShardsvrCreateCollectionRequest(std::move(serverRequest));
+        shardsvrCreateCommand.setDbName(nss.dbName());
+
+        cluster::createCollection(opCtx, std::move(shardsvrCreateCommand));
+
+        // Add only collectionsharded as a response parameter and remove the version to maintain the
+        // same format as before.
+        result.append("collectionsharded",
+                      NamespaceStringUtil::serialize(nss, SerializationContext::stateDefault()));
         return true;
     }
-
-} shardCollectionCmd;
+};
+MONGO_REGISTER_COMMAND(ShardCollectionCmd).forRouter();
 
 }  // namespace
 }  // namespace mongo

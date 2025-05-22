@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,16 +27,20 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <memory>
+#include <string>
+#include <utility>
 
-#include "mongo/executor/task_executor_test_fixture.h"
-
+#include "mongo/base/error_codes.h"
 #include "mongo/base/status.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/executor/network_interface_mock.h"
 #include "mongo/executor/remote_command_request.h"
-#include "mongo/stdx/memory.h"
+#include "mongo/executor/task_executor.h"
+#include "mongo/executor/task_executor_test_fixture.h"
+#include "mongo/unittest/unittest.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 namespace executor {
@@ -62,26 +65,41 @@ RemoteCommandRequest TaskExecutorTest::assertRemoteCommandNameEquals(
 TaskExecutorTest::~TaskExecutorTest() = default;
 
 void TaskExecutorTest::setUp() {
-    auto net = stdx::make_unique<NetworkInterfaceMock>();
+    auto net = std::make_unique<NetworkInterfaceMock>();
     _net = net.get();
     _executor = makeTaskExecutor(std::move(net));
 }
 
 void TaskExecutorTest::tearDown() {
-    _executor.reset(nullptr);
+    shutdownExecutorThread();
+    joinExecutorThread();
+    _executor.reset();
     _net = nullptr;
+}
+
+void TaskExecutorTest::runReadyNetworkOperations() {
+    executor::NetworkInterfaceMock::InNetworkGuard guard(getNet());
+    getNet()->runReadyNetworkOperations();
 }
 
 void TaskExecutorTest::launchExecutorThread() {
     _executor->startup();
+    _needsShutDown = true;
     postExecutorThreadLaunch();
 }
 
 void TaskExecutorTest::shutdownExecutorThread() {
+    if (!_needsShutDown) {
+        return;
+    }
+
     _executor->shutdown();
+    runReadyNetworkOperations();
 }
 
 void TaskExecutorTest::joinExecutorThread() {
+    _net->enterNetwork();
+    _net->drainUnfinishedNetworkOperations();
     _net->exitNetwork();
     _executor->join();
 }

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,39 +29,46 @@
 
 #include "mongo/db/update/path_support.h"
 
-#include <cstdint>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
+#include <absl/container/node_hash_map.h>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
 #include "mongo/base/error_codes.h"
-#include "mongo/base/owned_pointer_vector.h"
-#include "mongo/base/simple_string_data_comparator.h"
 #include "mongo/base/status.h"
 #include "mongo/base/string_data.h"
+#include "mongo/base/string_data_comparator.h"
 #include "mongo/bson/bsonelement_comparator.h"
-#include "mongo/bson/mutable/algorithm.h"
-#include "mongo/bson/mutable/document.h"
-#include "mongo/bson/mutable/mutable_bson_test_utils.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/bson/json.h"
+#include "mongo/db/exec/mutable_bson/algorithm.h"
+#include "mongo/db/exec/mutable_bson/const_element.h"
+#include "mongo/db/exec/mutable_bson/document.h"
 #include "mongo/db/field_ref.h"
-#include "mongo/db/jsobj.h"
-#include "mongo/db/json.h"
 #include "mongo/db/matcher/expression.h"
 #include "mongo/db/matcher/expression_leaf.h"
 #include "mongo/db/matcher/expression_parser.h"
+#include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/expression_context_for_test.h"
-#include "mongo/stdx/memory.h"
+#include "mongo/stdx/type_traits.h"
 #include "mongo/unittest/unittest.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/intrusive_counter.h"
+#include "mongo/util/str.h"
 
 namespace {
 
 using namespace mongo;
 using namespace pathsupport;
-using mongoutils::str::stream;
 using mutablebson::Element;
-using std::unique_ptr;
 using std::string;
+using std::unique_ptr;
+using str::stream;
 
 class EmptyDoc : public mongo::unittest::Test {
 public:
@@ -92,19 +98,21 @@ private:
 TEST_F(EmptyDoc, EmptyPath) {
     setField("");
 
-    size_t idxFound;
+    FieldIndex idxFound;
     Element elemFound = root();
-    Status status = findLongestPrefix(field(), root(), &idxFound, &elemFound);
-    ASSERT_EQUALS(status, ErrorCodes::NonExistentPath);
+    auto swFound = findLongestPrefix(field(), root(), &idxFound, &elemFound);
+    ASSERT_OK(swFound);
+    ASSERT_FALSE(swFound.getValue());
 }
 
 TEST_F(EmptyDoc, NewField) {
     setField("a");
 
-    size_t idxFound;
+    FieldIndex idxFound;
     Element elemFound = root();
-    Status status = findLongestPrefix(field(), root(), &idxFound, &elemFound);
-    ASSERT_EQUALS(status, ErrorCodes::NonExistentPath);
+    auto swFound = findLongestPrefix(field(), root(), &idxFound, &elemFound);
+    ASSERT_OK(swFound);
+    ASSERT_FALSE(swFound.getValue());
 
     Element newElem = doc().makeElementInt("a", 1);
     ASSERT_TRUE(newElem.ok());
@@ -117,10 +125,11 @@ TEST_F(EmptyDoc, NewField) {
 TEST_F(EmptyDoc, NewPath) {
     setField("a.b.c");
 
-    size_t idxFound;
+    FieldIndex idxFound;
     Element elemFound = root();
-    Status status = findLongestPrefix(field(), root(), &idxFound, &elemFound);
-    ASSERT_EQUALS(status, ErrorCodes::NonExistentPath);
+    auto swFound = findLongestPrefix(field(), root(), &idxFound, &elemFound);
+    ASSERT_OK(swFound);
+    ASSERT_FALSE(swFound.getValue());
 
     Element newElem = doc().makeElementInt("c", 1);
     ASSERT_TRUE(newElem.ok());
@@ -134,7 +143,7 @@ class SimpleDoc : public mongo::unittest::Test {
 public:
     SimpleDoc() : _doc() {}
 
-    virtual void setUp() {
+    void setUp() override {
         // {a: 1}
         ASSERT_OK(root().appendInt("a", 1));
     }
@@ -162,18 +171,21 @@ private:
 TEST_F(SimpleDoc, EmptyPath) {
     setField("");
 
-    size_t idxFound;
+    FieldIndex idxFound;
     Element elemFound = root();
-    Status status = findLongestPrefix(field(), root(), &idxFound, &elemFound);
-    ASSERT_EQUALS(status, ErrorCodes::NonExistentPath);
+    auto swFound = findLongestPrefix(field(), root(), &idxFound, &elemFound);
+    ASSERT_OK(swFound);
+    ASSERT_FALSE(swFound.getValue());
 }
 
 TEST_F(SimpleDoc, SimplePath) {
     setField("a");
 
-    size_t idxFound;
+    FieldIndex idxFound;
     Element elemFound = root();
-    ASSERT_OK(findLongestPrefix(field(), root(), &idxFound, &elemFound));
+    auto swFound = findLongestPrefix(field(), root(), &idxFound, &elemFound);
+    ASSERT_OK(swFound);
+    ASSERT_TRUE(swFound.getValue());
     ASSERT_TRUE(elemFound.ok());
     ASSERT_EQUALS(idxFound, 0U);
     ASSERT_EQUALS(elemFound.compareWithElement(root()["a"], nullptr), 0);
@@ -182,10 +194,10 @@ TEST_F(SimpleDoc, SimplePath) {
 TEST_F(SimpleDoc, LongerPath) {
     setField("a.b");
 
-    size_t idxFound;
+    FieldIndex idxFound;
     Element elemFound = root();
-    Status status = findLongestPrefix(field(), root(), &idxFound, &elemFound);
-    ASSERT_EQUALS(status, ErrorCodes::PathNotViable);
+    auto swFound = findLongestPrefix(field(), root(), &idxFound, &elemFound);
+    ASSERT_EQUALS(swFound.getStatus().code(), ErrorCodes::PathNotViable);
     ASSERT_TRUE(elemFound.ok());
     ASSERT_EQUALS(idxFound, 0U);
     ASSERT_EQUALS(elemFound.compareWithElement(root()["a"], nullptr), 0);
@@ -194,10 +206,11 @@ TEST_F(SimpleDoc, LongerPath) {
 TEST_F(SimpleDoc, NotCommonPrefix) {
     setField("b");
 
-    size_t idxFound;
+    FieldIndex idxFound;
     Element elemFound = root();
-    Status status = findLongestPrefix(field(), root(), &idxFound, &elemFound);
-    ASSERT_EQUALS(status, ErrorCodes::NonExistentPath);
+    auto swFound = findLongestPrefix(field(), root(), &idxFound, &elemFound);
+    ASSERT_OK(swFound);
+    ASSERT_FALSE(swFound.getValue());
 
     // From this point on, handles the creation of the '.b' part that wasn't found.
     Element newElem = doc().makeElementInt("b", 1);
@@ -236,7 +249,7 @@ class NestedDoc : public mongo::unittest::Test {
 public:
     NestedDoc() : _doc() {}
 
-    virtual void setUp() {
+    void setUp() override {
         // {a: {b: {c: 1}}}
         Element elemA = _doc.makeElementObject("a");
         ASSERT_TRUE(elemA.ok());
@@ -273,9 +286,11 @@ private:
 TEST_F(NestedDoc, SimplePath) {
     setField("a");
 
-    size_t idxFound;
+    FieldIndex idxFound;
     Element elemFound = root();
-    ASSERT_OK(findLongestPrefix(field(), root(), &idxFound, &elemFound));
+    auto swFound = findLongestPrefix(field(), root(), &idxFound, &elemFound);
+    ASSERT_OK(swFound);
+    ASSERT_TRUE(swFound.getValue());
     ASSERT_TRUE(elemFound.ok());
     ASSERT_EQUALS(idxFound, 0U);
     ASSERT_EQUALS(elemFound.compareWithElement(root()["a"], nullptr), 0);
@@ -284,9 +299,11 @@ TEST_F(NestedDoc, SimplePath) {
 TEST_F(NestedDoc, ShorterPath) {
     setField("a.b");
 
-    size_t idxFound;
+    FieldIndex idxFound;
     Element elemFound = root();
-    ASSERT_OK(findLongestPrefix(field(), root(), &idxFound, &elemFound));
+    auto swFound = findLongestPrefix(field(), root(), &idxFound, &elemFound);
+    ASSERT_OK(swFound);
+    ASSERT_TRUE(swFound.getValue());
     ASSERT_EQUALS(idxFound, 1U);
     ASSERT_EQUALS(elemFound.compareWithElement(root()["a"]["b"], nullptr), 0);
 }
@@ -294,9 +311,11 @@ TEST_F(NestedDoc, ShorterPath) {
 TEST_F(NestedDoc, ExactPath) {
     setField("a.b.c");
 
-    size_t idxFound;
+    FieldIndex idxFound;
     Element elemFound = root();
-    ASSERT_OK(findLongestPrefix(field(), root(), &idxFound, &elemFound));
+    auto swFound = findLongestPrefix(field(), root(), &idxFound, &elemFound);
+    ASSERT_OK(swFound);
+    ASSERT_TRUE(swFound.getValue());
     ASSERT_TRUE(elemFound.ok());
     ASSERT_EQUALS(idxFound, 2U);
     ASSERT_EQUALS(elemFound.compareWithElement(root()["a"]["b"]["c"], nullptr), 0);
@@ -306,10 +325,10 @@ TEST_F(NestedDoc, LongerPath) {
     //  This would for 'c' to change from NumberInt to Object, which is invalid.
     setField("a.b.c.d");
 
-    size_t idxFound;
+    FieldIndex idxFound;
     Element elemFound = root();
-    Status status = findLongestPrefix(field(), root(), &idxFound, &elemFound);
-    ASSERT_EQUALS(status.code(), ErrorCodes::PathNotViable);
+    auto swFound = findLongestPrefix(field(), root(), &idxFound, &elemFound);
+    ASSERT_EQUALS(swFound.getStatus().code(), ErrorCodes::PathNotViable);
     ASSERT_TRUE(elemFound.ok());
     ASSERT_EQUALS(idxFound, 2U);
     ASSERT_EQUALS(elemFound.compareWithElement(root()["a"]["b"]["c"], nullptr), 0);
@@ -318,9 +337,11 @@ TEST_F(NestedDoc, LongerPath) {
 TEST_F(NestedDoc, NewFieldNested) {
     setField("a.b.d");
 
-    size_t idxFound;
+    FieldIndex idxFound;
     Element elemFound = root();
-    ASSERT_OK(findLongestPrefix(field(), root(), &idxFound, &elemFound));
+    auto swFound = findLongestPrefix(field(), root(), &idxFound, &elemFound);
+    ASSERT_OK(swFound);
+    ASSERT_TRUE(swFound.getValue());
     ASSERT_EQUALS(idxFound, 1U);
     ASSERT_EQUALS(elemFound.compareWithElement(root()["a"]["b"], nullptr), 0);
 
@@ -338,9 +359,11 @@ TEST_F(NestedDoc, NewFieldNested) {
 TEST_F(NestedDoc, NotStartingFromRoot) {
     setField("b.c");
 
-    size_t idxFound;
+    FieldIndex idxFound;
     Element elemFound = root();
-    ASSERT_OK(findLongestPrefix(field(), root()["a"], &idxFound, &elemFound));
+    auto swFound = findLongestPrefix(field(), root()["a"], &idxFound, &elemFound);
+    ASSERT_OK(swFound);
+    ASSERT_TRUE(swFound.getValue());
     ASSERT_EQUALS(idxFound, 1U);
     ASSERT_EQUALS(elemFound.compareWithElement(root()["a"]["b"]["c"], nullptr), 0);
 }
@@ -349,7 +372,7 @@ class ArrayDoc : public mongo::unittest::Test {
 public:
     ArrayDoc() : _doc() {}
 
-    virtual void setUp() {
+    void setUp() override {
         // {a: []}
         Element elemA = _doc.makeElementArray("a");
         ASSERT_TRUE(elemA.ok());
@@ -389,9 +412,11 @@ private:
 TEST_F(ArrayDoc, PathOnEmptyArray) {
     setField("a.0");
 
-    size_t idxFound;
+    FieldIndex idxFound;
     Element elemFound = root();
-    ASSERT_OK(findLongestPrefix(field(), root(), &idxFound, &elemFound));
+    auto swFound = findLongestPrefix(field(), root(), &idxFound, &elemFound);
+    ASSERT_OK(swFound);
+    ASSERT_TRUE(swFound.getValue());
     ASSERT_TRUE(elemFound.ok());
     ASSERT_EQUALS(idxFound, 0U);
     ASSERT_EQUALS(elemFound.compareWithElement(root()["a"], nullptr), 0);
@@ -400,9 +425,11 @@ TEST_F(ArrayDoc, PathOnEmptyArray) {
 TEST_F(ArrayDoc, PathOnPopulatedArray) {
     setField("b.0");
 
-    size_t idxFound;
+    FieldIndex idxFound;
     Element elemFound = root();
-    ASSERT_OK(findLongestPrefix(field(), root(), &idxFound, &elemFound));
+    auto swFound = findLongestPrefix(field(), root(), &idxFound, &elemFound);
+    ASSERT_OK(swFound);
+    ASSERT_TRUE(swFound.getValue());
     ASSERT_TRUE(elemFound.ok());
     ASSERT_EQUALS(idxFound, 1U);
     ASSERT_EQUALS(elemFound.compareWithElement(root()["b"][0], nullptr), 0);
@@ -411,9 +438,11 @@ TEST_F(ArrayDoc, PathOnPopulatedArray) {
 TEST_F(ArrayDoc, MixedArrayAndObjectPath) {
     setField("b.0.c");
 
-    size_t idxFound;
+    FieldIndex idxFound;
     Element elemFound = root();
-    ASSERT_OK(findLongestPrefix(field(), root(), &idxFound, &elemFound));
+    auto swFound = findLongestPrefix(field(), root(), &idxFound, &elemFound);
+    ASSERT_OK(swFound);
+    ASSERT_TRUE(swFound.getValue());
     ASSERT_TRUE(elemFound.ok());
     ASSERT_EQUALS(idxFound, 2U);
     ASSERT_EQUALS(elemFound.compareWithElement(root()["b"][0]["c"], nullptr), 0);
@@ -422,9 +451,11 @@ TEST_F(ArrayDoc, MixedArrayAndObjectPath) {
 TEST_F(ArrayDoc, ExtendingExistingObject) {
     setField("b.0.d");
 
-    size_t idxFound;
+    FieldIndex idxFound;
     Element elemFound = root();
-    ASSERT_OK(findLongestPrefix(field(), root(), &idxFound, &elemFound));
+    auto swFound = findLongestPrefix(field(), root(), &idxFound, &elemFound);
+    ASSERT_OK(swFound);
+    ASSERT_TRUE(swFound.getValue());
     ASSERT_TRUE(elemFound.ok());
     ASSERT_EQUALS(idxFound, 1U);
     ASSERT_EQUALS(elemFound.compareWithElement(root()["b"][0], nullptr), 0);
@@ -444,9 +475,11 @@ TEST_F(ArrayDoc, ExtendingExistingObject) {
 TEST_F(ArrayDoc, NewObjectInsideArray) {
     setField("b.1.c");
 
-    size_t idxFound;
+    FieldIndex idxFound;
     Element elemFound = root();
-    ASSERT_OK(findLongestPrefix(field(), root(), &idxFound, &elemFound));
+    auto swFound = findLongestPrefix(field(), root(), &idxFound, &elemFound);
+    ASSERT_OK(swFound);
+    ASSERT_TRUE(swFound.getValue());
     ASSERT_TRUE(elemFound.ok());
     ASSERT_EQUALS(idxFound, 0U);
     ASSERT_EQUALS(elemFound.compareWithElement(root()["b"], nullptr), 0);
@@ -466,9 +499,11 @@ TEST_F(ArrayDoc, NewObjectInsideArray) {
 TEST_F(ArrayDoc, NewNestedObjectInsideArray) {
     setField("b.1.c.d");
 
-    size_t idxFound;
+    FieldIndex idxFound;
     Element elemFound = root();
-    ASSERT_OK(findLongestPrefix(field(), root(), &idxFound, &elemFound));
+    auto swFound = findLongestPrefix(field(), root(), &idxFound, &elemFound);
+    ASSERT_OK(swFound);
+    ASSERT_TRUE(swFound.getValue());
     ASSERT_TRUE(elemFound.ok());
     ASSERT_EQUALS(idxFound, 0U);
     ASSERT_EQUALS(elemFound.compareWithElement(root()["b"], nullptr), 0);
@@ -488,9 +523,11 @@ TEST_F(ArrayDoc, NewNestedObjectInsideArray) {
 TEST_F(ArrayDoc, ArrayPaddingNecessary) {
     setField("b.5");
 
-    size_t idxFound;
+    FieldIndex idxFound;
     Element elemFound = root();
-    ASSERT_OK(findLongestPrefix(field(), root(), &idxFound, &elemFound));
+    auto swFound = findLongestPrefix(field(), root(), &idxFound, &elemFound);
+    ASSERT_OK(swFound);
+    ASSERT_TRUE(swFound.getValue());
     ASSERT_TRUE(elemFound.ok());
     ASSERT_EQUALS(idxFound, 0U);
     ASSERT_EQUALS(elemFound.compareWithElement(root()["b"], nullptr), 0);
@@ -513,9 +550,11 @@ TEST_F(ArrayDoc, ExcessivePaddingRequested) {
     string paddedField = stream() << "b." << mongo::pathsupport::kMaxPaddingAllowed + 2;
     setField(paddedField);
 
-    size_t idxFound;
+    FieldIndex idxFound;
     Element elemFound = root();
-    ASSERT_OK(findLongestPrefix(field(), root(), &idxFound, &elemFound));
+    auto swFound = findLongestPrefix(field(), root(), &idxFound, &elemFound);
+    ASSERT_OK(swFound);
+    ASSERT_TRUE(swFound.getValue());
 
     // From this point on, try to create the padded part that wasn't found.
     Element newElem = doc().makeElementInt("", 1);
@@ -539,9 +578,11 @@ TEST_F(ArrayDoc, ExcessivePaddingNotRequestedIfArrayAlreadyPadded) {
         arrayA.appendInt("", 1).transitional_ignore();
     }
 
-    size_t idxFound;
+    FieldIndex idxFound;
     Element elemFound = root();
-    ASSERT_OK(findLongestPrefix(field(), root(), &idxFound, &elemFound));
+    auto swFound = findLongestPrefix(field(), root(), &idxFound, &elemFound);
+    ASSERT_OK(swFound);
+    ASSERT_TRUE(swFound.getValue());
     ASSERT_TRUE(elemFound.ok());
     ASSERT_EQUALS(countChildren(elemFound), 5u);
 
@@ -564,10 +605,10 @@ TEST_F(ArrayDoc, ExcessivePaddingNotRequestedIfArrayAlreadyPadded) {
 TEST_F(ArrayDoc, NonNumericPathInArray) {
     setField("b.z");
 
-    size_t idxFound;
+    FieldIndex idxFound;
     Element elemFound = root();
-    Status status = findLongestPrefix(field(), root(), &idxFound, &elemFound);
-    ASSERT_EQUALS(status.code(), ErrorCodes::PathNotViable);
+    auto swFound = findLongestPrefix(field(), root(), &idxFound, &elemFound);
+    ASSERT_EQUALS(swFound.getStatus().code(), ErrorCodes::PathNotViable);
     ASSERT_TRUE(elemFound.ok());
     ASSERT_EQUALS(idxFound, 0U);
     ASSERT_EQUALS(elemFound.compareWithElement(root()["b"], nullptr), 0);
@@ -605,12 +646,10 @@ static void assertContains(const EqualityMatches& equalities, const BSONObj& wra
     }
 
     BSONElementComparator eltCmp(BSONElementComparator::FieldNamesMode::kIgnore,
-                                 &SimpleStringDataComparator::kInstance);
+                                 &simpleStringDataComparator);
     if (eltCmp.evaluate(it->second->getData() != value)) {
         FAIL(stream() << "Equality match at path \"" << path << "\" contains value "
-                      << it->second->getData()
-                      << ", not value "
-                      << value);
+                      << it->second->getData() << ", not value " << value);
     }
 }
 
@@ -725,8 +764,8 @@ public:
     ImmutablePaths() {}
 
     void addPath(const string& path) {
-        _ownedPaths.push_back(stdx::make_unique<FieldRef>(path));
-        FieldRef const* conflictPath = NULL;
+        _ownedPaths.push_back(std::make_unique<FieldRef>(path));
+        FieldRef const* conflictPath = nullptr;
         ASSERT(_immutablePathSet.insert(_ownedPaths.back().get(), &conflictPath));
     }
 
@@ -900,19 +939,14 @@ static void assertParent(const EqualityMatches& equalities,
     StringData foundParentPath = path.dottedSubstring(0, parentPathPart);
     if (foundParentPath != parentPath) {
         FAIL(stream() << "Equality match parent at path \"" << foundParentPath
-                      << "\" does not match \""
-                      << parentPath
-                      << "\"");
+                      << "\" does not match \"" << parentPath << "\"");
     }
 
     BSONElementComparator eltCmp(BSONElementComparator::FieldNamesMode::kIgnore,
-                                 &SimpleStringDataComparator::kInstance);
+                                 &simpleStringDataComparator);
     if (eltCmp.evaluate(parentEl != value)) {
         FAIL(stream() << "Equality match parent for \"" << pathStr << "\" at path \"" << parentPath
-                      << "\" contains value "
-                      << parentEl
-                      << ", not value "
-                      << value);
+                      << "\" contains value " << parentEl << ", not value " << value);
     }
 }
 
@@ -932,8 +966,7 @@ static void assertNoParent(const EqualityMatches& equalities, StringData pathStr
     if (!parentEl.eoo()) {
         StringData foundParentPath = path.dottedSubstring(0, parentPathPart);
         FAIL(stream() << "Equality matches contained parent for \"" << pathStr << "\" at \""
-                      << foundParentPath
-                      << "\"");
+                      << foundParentPath << "\"");
     }
 }
 

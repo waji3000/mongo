@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,55 +27,58 @@
  *    it in the license file.
  */
 
+#include <algorithm>
 #include <iostream>
 #include <string>
 #include <vector>
 
+
+#include "mongo/base/init.h"  // IWYU pragma: keep
 #include "mongo/base/initializer.h"
 #include "mongo/base/status.h"
-#include "mongo/logger/logger.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/db/commands/test_commands_enabled.h"
+#include "mongo/logv2/log_severity.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/unittest/log_test.h"
+#include "mongo/unittest/temp_dir.h"
+#include "mongo/unittest/unittest_options_gen.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/exit_code.h"
 #include "mongo/util/options_parser/environment.h"
 #include "mongo/util/options_parser/option_section.h"
 #include "mongo/util/options_parser/options_parser.h"
+#include "mongo/util/options_parser/value.h"
 #include "mongo/util/signal_handlers_synchronous.h"
+#include "mongo/util/testing_proctor.h"
 
-using mongo::Status;
+using ::mongo::Status;
 
-int main(int argc, char** argv, char** envp) {
+namespace moe = ::mongo::optionenvironment;
+
+int main(int argc, char** argv) {
+    std::vector<std::string> argVec(argv, argv + argc);
+
     ::mongo::clearSignalMask();
     ::mongo::setupSynchronousSignalHandlers();
 
-    ::mongo::runGlobalInitializersOrDie(argc, argv, envp);
+    ::mongo::TestingProctor::instance().setEnabled(true);
+    ::mongo::runGlobalInitializersOrDie(argVec);
+    ::mongo::setTestCommandsEnabled(true);
 
-    namespace moe = ::mongo::optionenvironment;
+    moe::OptionSection options;
+
+    Status status = mongo::unittest::addUnitTestOptions(&options);
+    if (!status.isOK()) {
+        std::cerr << status;
+        return static_cast<int>(mongo::ExitCode::fail);
+    }
+
     moe::OptionsParser parser;
     moe::Environment environment;
-    moe::OptionSection options;
-    std::map<std::string, std::string> env;
-
-    // Register our allowed options with our OptionSection
-    auto listDesc = "List all test suites in this unit test.";
-    options.addOptionChaining("list", "list", moe::Switch, listDesc).setDefault(moe::Value(false));
-
-    auto suiteDesc = "Test suite name. Specify --suite more than once to run multiple suites.";
-    options.addOptionChaining("suite", "suite", moe::StringVector, suiteDesc);
-
-    auto filterDesc = "Test case name filter. Specify the substring of the test names.";
-    options.addOptionChaining("filter", "filter", moe::String, filterDesc);
-
-    auto repeatDesc = "Specifies the number of runs for each test.";
-    options.addOptionChaining("repeat", "repeat", moe::Int, repeatDesc).setDefault(moe::Value(1));
-
-    auto verboseDesc = "Log more verbose output.  Specify one or more 'v's to increase verbosity.";
-    options.addOptionChaining("verbose", "verbose", moe::String, verboseDesc)
-        .setImplicit(moe::Value(std::string("v")));
-
-    std::vector<std::string> argVector(argv, argv + argc);
-    Status ret = parser.run(options, argVector, env, &environment);
+    Status ret = parser.run(options, argVec, &environment);
     if (!ret.isOK()) {
         std::cerr << options.helpString();
-        return EXIT_FAILURE;
+        return static_cast<int>(::mongo::ExitCode::fail);
     }
 
     bool list = false;
@@ -84,30 +86,63 @@ int main(int argc, char** argv, char** envp) {
     std::string filter;
     int repeat = 1;
     std::string verbose;
-    // "list" and "repeat" will be assigned with default values, if not present.
+    std::string fileNameFilter;
+    std::string internalRunDeathTest;
+    mongo::unittest::AutoUpdateConfig autoUpdateConfig;
+    autoUpdateConfig.executablePath =
+        boost::filesystem::canonical(boost::filesystem::path(argVec[0]));
+
+    // "list", "repeat", and "autoUpdateAsserts" will be assigned with default values, if
+    // not present.
     invariant(environment.get("list", &list));
     invariant(environment.get("repeat", &repeat));
+    invariant(environment.get("autoUpdateAsserts", &autoUpdateConfig.updateFailingAsserts));
+    invariant(environment.get("rewriteAllAutoAsserts", &autoUpdateConfig.revalidateAll));
+
     // The default values of "suite" "filter" and "verbose" are empty.
     environment.get("suite", &suites).ignore();
     environment.get("filter", &filter).ignore();
     environment.get("verbose", &verbose).ignore();
+    environment.get("fileNameFilter", &fileNameFilter).ignore();
+    environment.get("internalRunDeathTest", &internalRunDeathTest).ignore();
+
+    if (environment.count("tempPath")) {
+        ::mongo::unittest::TempDir::setTempPath(environment["tempPath"].as<std::string>());
+    }
+
+    mongo::unittest::getSpawnInfo() = {argVec, internalRunDeathTest, true};
+
+    if (autoUpdateConfig.revalidateAll && !autoUpdateConfig.updateFailingAsserts) {
+        std::cerr << "--rewriteAllAutoAsserts can only be set if --autoUpdateAsserts is also set."
+                  << std::endl;
+        return static_cast<int>(mongo::ExitCode::fail);
+    }
+    mongo::unittest::getAutoUpdateConfig() = autoUpdateConfig;
 
     if (std::any_of(verbose.cbegin(), verbose.cend(), [](char ch) { return ch != 'v'; })) {
         std::cerr << "The string for the --verbose option cannot contain characters other than 'v'"
                   << std::endl;
         std::cerr << options.helpString();
-        return EXIT_FAILURE;
+        return static_cast<int>(mongo::ExitCode::fail);
     }
-    ::mongo::logger::globalLogDomain()->setMinimumLoggedSeverity(
-        ::mongo::logger::LogSeverity::Debug(verbose.length()));
+    mongo::unittest::setMinimumLoggedSeverity(mongo::logv2::LogSeverity::Debug(verbose.size()));
 
     if (list) {
         auto suiteNames = ::mongo::unittest::getAllSuiteNames();
-        for (auto name : suiteNames) {
+        for (const auto& name : suiteNames) {
             std::cout << name << std::endl;
         }
-        return EXIT_SUCCESS;
+        return static_cast<int>(mongo::ExitCode::clean);
     }
 
-    return ::mongo::unittest::Suite::run(suites, filter, repeat);
+    auto result = ::mongo::unittest::Suite::run(suites, filter, fileNameFilter, repeat);
+
+    ret = ::mongo::runGlobalDeinitializers();
+    if (!ret.isOK()) {
+        std::cerr << "Global deinitilization failed: " << ret.reason() << std::endl;
+    }
+
+    ::mongo::TestingProctor::instance().exitAbruptlyIfDeferredErrors();
+
+    return result;
 }

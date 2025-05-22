@@ -1,7 +1,3 @@
-// basictests.cpp : basic unit tests
-//
-
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -31,24 +27,31 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
+#include <absl/strings/str_join.h>
+#include <absl/strings/str_split.h>
+#include <cstddef>
 #include <iostream>
+#include <memory>
+#include <string>
+#include <vector>
 
-#include "mongo/db/client.h"
-#include "mongo/dbtests/dbtests.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/util/builder.h"
+#include "mongo/bson/util/builder_fwd.h"
+#include "mongo/dbtests/dbtests.h"  // IWYU pragma: keep
+#include "mongo/unittest/unittest.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/base64.h"
+#include "mongo/util/debug_util.h"
+#include "mongo/util/net/hostandport.h"
 #include "mongo/util/queue.h"
-#include "mongo/util/stringutils.h"
-#include "mongo/util/text.h"
-#include "mongo/util/thread_safe_string.h"
-#include "mongo/util/time_support.h"
+#include "mongo/util/str.h"
+#include "mongo/util/text.h"  // IWYU pragma: keep
 #include "mongo/util/timer.h"
 
+namespace mongo {
 namespace BasicTests {
 
-using std::unique_ptr;
-using std::shared_ptr;
 using std::cout;
 using std::dec;
 using std::endl;
@@ -91,7 +94,7 @@ public:
 
     void roundTrip(const unsigned char* _data, int len) {
         const char* data = (const char*)_data;
-        string s = base64::encode(data, len);
+        string s = base64::encode(StringData(data, len));
         string out = base64::decode(s);
         ASSERT_EQUALS(out.size(), static_cast<size_t>(len));
         bool broke = false;
@@ -114,12 +117,12 @@ public:
     }
 
     void run() {
-        ASSERT_EQUALS("ZWxp", base64::encode("eli", 3));
-        ASSERT_EQUALS("ZWxpb3Rz", base64::encode("eliots", 6));
+        ASSERT_EQUALS("ZWxp", base64::encode("eli"_sd));
+        ASSERT_EQUALS("ZWxpb3Rz", base64::encode("eliots"_sd));
         ASSERT_EQUALS("ZWxpb3Rz", base64::encode("eliots"));
 
-        ASSERT_EQUALS("ZQ==", base64::encode("e", 1));
-        ASSERT_EQUALS("ZWw=", base64::encode("el", 2));
+        ASSERT_EQUALS("ZQ==", base64::encode("e"_sd));
+        ASSERT_EQUALS("ZWw=", base64::encode("el"_sd));
 
         roundTrip("e");
         roundTrip("el");
@@ -164,7 +167,7 @@ public:
 };
 
 class simple1 : public Base {
-    void pop() {
+    void pop() override {
         SBTGB(1);
         SBTGB("yo");
         SBTGB(2);
@@ -172,7 +175,7 @@ class simple1 : public Base {
 };
 
 class simple2 : public Base {
-    void pop() {
+    void pop() override {
         SBTGB(1);
         SBTGB("yo");
         SBTGB(2);
@@ -219,31 +222,6 @@ public:
 };
 }  // namespace stringbuildertests
 
-class SleepBackoffTest {
-public:
-    void run() {
-        int maxSleepTimeMillis = 1000;
-
-        Backoff backoff(maxSleepTimeMillis, maxSleepTimeMillis * 2);
-
-        // Double previous sleep duration
-        ASSERT_EQUALS(backoff.getNextSleepMillis(0, 0, 0), 1);
-        ASSERT_EQUALS(backoff.getNextSleepMillis(2, 0, 0), 4);
-        ASSERT_EQUALS(backoff.getNextSleepMillis(256, 0, 0), 512);
-
-        // Make sure our backoff increases to the maximum value
-        ASSERT_EQUALS(backoff.getNextSleepMillis(maxSleepTimeMillis - 200, 0, 0),
-                      maxSleepTimeMillis);
-        ASSERT_EQUALS(backoff.getNextSleepMillis(maxSleepTimeMillis * 2, 0, 0), maxSleepTimeMillis);
-
-        // Make sure that our backoff gets reset if we wait much longer than the maximum wait
-        unsigned long long resetAfterMillis = maxSleepTimeMillis + maxSleepTimeMillis * 2;
-        ASSERT_EQUALS(backoff.getNextSleepMillis(20, resetAfterMillis, 0), 40);  // no reset here
-        ASSERT_EQUALS(backoff.getNextSleepMillis(20, resetAfterMillis + 1, 0),
-                      1);  // reset expected
-    }
-};
-
 class AssertTests {
 public:
     int x;
@@ -269,35 +247,10 @@ public:
     }
 };
 
-class ThreadSafeStringTest {
-public:
-    void run() {
-        ThreadSafeString s;
-        s = "eliot";
-        ASSERT_EQUALS(s.toString(), "eliot");
-        ASSERT(s.toString() != "eliot2");
-
-        ThreadSafeString s2;
-        s2 = s.toString().c_str();
-        ASSERT_EQUALS(s2.toString(), "eliot");
-
-
-        {
-            string foo;
-            {
-                ThreadSafeString bar;
-                bar = "eliot2";
-                foo = bar.toString();
-            }
-            ASSERT_EQUALS("eliot2", foo);
-        }
-    }
-};
-
 struct StringSplitterTest {
     void test(string s) {
-        vector<string> v = StringSplitter::split(s, ",");
-        ASSERT_EQUALS(s, StringSplitter::join(v, ","));
+        vector<string> v = absl::StrSplit(s, ",");
+        ASSERT_EQUALS(s, absl::StrJoin(v, ","));
     }
 
     void run() {
@@ -305,13 +258,19 @@ struct StringSplitterTest {
         test("a,b");
         test("a,b,c");
 
-        vector<string> x = StringSplitter::split("axbxc", "x");
+        vector<string> x = absl::StrSplit("axbxc", "x", absl::SkipEmpty());
         ASSERT_EQUALS(3, (int)x.size());
         ASSERT_EQUALS("a", x[0]);
         ASSERT_EQUALS("b", x[1]);
         ASSERT_EQUALS("c", x[2]);
 
-        x = StringSplitter::split("axxbxxc", "xx");
+        x = absl::StrSplit("axxbxxc", "xx", absl::SkipEmpty());
+        ASSERT_EQUALS(3, (int)x.size());
+        ASSERT_EQUALS("a", x[0]);
+        ASSERT_EQUALS("b", x[1]);
+        ASSERT_EQUALS("c", x[2]);
+
+        x = absl::StrSplit("xxaxxxxbxxcxx", "xx", absl::SkipEmpty());
         ASSERT_EQUALS(3, (int)x.size());
         ASSERT_EQUALS("a", x[0]);
         ASSERT_EQUALS("b", x[1]);
@@ -360,7 +319,7 @@ public:
         Timer t;
         int x;
         ASSERT(!q.blockingPop(x, 5));
-        ASSERT(t.seconds() > 3 && t.seconds() < 9);
+        ASSERT(t.seconds() > 3);
     }
 };
 
@@ -386,11 +345,11 @@ public:
     }
 };
 
-class All : public Suite {
+class All : public unittest::OldStyleSuiteSpecification {
 public:
-    All() : Suite("basic") {}
+    All() : OldStyleSuiteSpecification("basic") {}
 
-    void setupTests() {
+    void setupTests() override {
         add<RarelyTest>();
         add<Base64Tests>();
 
@@ -399,7 +358,6 @@ public:
         add<stringbuildertests::reset1>();
         add<stringbuildertests::reset2>();
 
-        add<SleepBackoffTest>();
         add<AssertTests>();
 
         add<StringSplitterTest>();
@@ -413,6 +371,7 @@ public:
     }
 };
 
-SuiteInstance<All> myall;
+unittest::OldStyleSuiteInitializer<All> myall;
 
 }  // namespace BasicTests
+}  // namespace mongo

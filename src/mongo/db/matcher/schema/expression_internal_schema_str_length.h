@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,49 +29,58 @@
 
 #pragma once
 
+#include <functional>
+#include <memory>
+
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/clonable_ptr.h"
 #include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/bson/util/builder_fwd.h"
+#include "mongo/db/matcher/expression.h"
 #include "mongo/db/matcher/expression_leaf.h"
-#include "mongo/stdx/functional.h"
+#include "mongo/db/query/query_shape/serialization_options.h"
 
 namespace mongo {
 
 class InternalSchemaStrLengthMatchExpression : public LeafMatchExpression {
 public:
-    using Validator = stdx::function<bool(int)>;
+    using Validator = std::function<bool(int)>;
 
     InternalSchemaStrLengthMatchExpression(MatchType type,
-                                           StringData path,
+                                           boost::optional<StringData> path,
                                            long long strLen,
-                                           StringData name);
+                                           StringData name,
+                                           clonable_ptr<ErrorAnnotation> annotation = nullptr);
 
-    virtual ~InternalSchemaStrLengthMatchExpression() {}
+    ~InternalSchemaStrLengthMatchExpression() override {}
 
     virtual Validator getComparator() const = 0;
 
-    bool matchesSingleElement(const BSONElement& elem,
-                              MatchDetails* details = nullptr) const final {
-        if (elem.type() != BSONType::String) {
-            return false;
-        }
+    void debugString(StringBuilder& debug, int indentationLevel) const final;
 
-        auto len = str::lengthInUTF8CodePoints(elem.valueStringData());
-        return getComparator()(len);
-    };
-
-    void debugString(StringBuilder& debug, int level) const final;
-
-    void serialize(BSONObjBuilder* out) const final;
+    void appendSerializedRightHandSide(BSONObjBuilder* bob,
+                                       const SerializationOptions& opts = {},
+                                       bool includePath = true) const final;
 
     bool equivalent(const MatchExpression* other) const final;
 
-protected:
+    StringData getName() const {
+        return _name;
+    }
+
     long long strLen() const {
         return _strLen;
     }
 
 private:
     ExpressionOptimizerFunc getOptimizer() const final {
-        return [](std::unique_ptr<MatchExpression> expression) { return expression; };
+        return [](std::unique_ptr<MatchExpression> expression) {
+            return expression;
+        };
     }
 
     StringData _name;

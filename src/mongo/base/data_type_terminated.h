@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -31,8 +30,10 @@
 #pragma once
 
 #include <cstring>
+#include <iosfwd>
 
 #include "mongo/base/data_type.h"
+#include "mongo/base/status.h"
 
 namespace mongo {
 

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,35 +27,48 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
-
-#include "mongo/platform/basic.h"
 
 #include <iostream>
+#include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
+#include "mongo/base/init.h"  // IWYU pragma: keep
 #include "mongo/base/initializer.h"
+#include "mongo/base/status_with.h"
 #include "mongo/client/connection_string.h"
+#include "mongo/db/commands/test_commands_enabled.h"
+#include "mongo/db/server_options_base.h"
+#include "mongo/db/server_options_helpers.h"
 #include "mongo/db/service_context.h"
-#include "mongo/transport/transport_layer_asio.h"
-#include "mongo/unittest/unittest.h"
-#include "mongo/util/log.h"
+#include "mongo/db/wire_version.h"
+#include "mongo/logv2/log.h"
+#include "mongo/stdx/type_traits.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/exit_code.h"
 #include "mongo/util/options_parser/environment.h"
 #include "mongo/util/options_parser/option_section.h"
-#include "mongo/util/options_parser/options_parser.h"
 #include "mongo/util/options_parser/startup_option_init.h"
 #include "mongo/util/options_parser/startup_options.h"
+#include "mongo/util/options_parser/value.h"
 #include "mongo/util/quick_exit.h"
 #include "mongo/util/signal_handlers_synchronous.h"
+#include "mongo/util/testing_proctor.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
+
 
 using namespace mongo;
 
 namespace {
 
 ConnectionString fixtureConnectionString{};
-
-const char kConnectionStringFlag[] = "connectionString";
+std::string testFilter;
+std::string fileNameFilter;
+std::vector<std::string> testSuites{};
+bool useEgressGRPC;
 
 }  // namespace
 
@@ -67,64 +79,77 @@ ConnectionString getFixtureConnectionString() {
     return fixtureConnectionString;
 }
 
+bool shouldUseGRPCEgress() {
+    return useEgressGRPC;
+}
+
 }  // namespace unittest
 }  // namespace mongo
 
-int main(int argc, char** argv, char** envp) {
+namespace {
+ServiceContext::ConstructorActionRegisterer registerWireSpec{
+    "RegisterWireSpec", [](ServiceContext* service) {
+        WireSpec::getWireSpec(service).initialize(WireSpec::Specification{});
+    }};
+}  // namespace
+
+int main(int argc, char** argv) {
     setupSynchronousSignalHandlers();
-    runGlobalInitializersOrDie(argc, argv, envp);
-    setGlobalServiceContext(ServiceContext::make());
-    quickExit(unittest::Suite::run(std::vector<std::string>(), "", 1));
+    TestingProctor::instance().setEnabled(true);
+    runGlobalInitializersOrDie(std::vector<std::string>(argv, argv + argc));
+    setTestCommandsEnabled(true);
+    auto serviceContextHolder = ServiceContext::make();
+    setGlobalServiceContext(std::move(serviceContextHolder));
+    quickExit(unittest::Suite::run(testSuites, testFilter, fileNameFilter, 1));
 }
+
+namespace {
 
 namespace moe = mongo::optionenvironment;
 
+MONGO_INITIALIZER_GENERAL(ForkServer, ("EndStartupOptionHandling"), ("default"))
+(InitializerContext* context) {
+    // Integration tests do not fork, however the init graph requires a deliberate initializer that
+    // _could_ fork and here choses not to do so.
+}
+
 MONGO_GENERAL_STARTUP_OPTIONS_REGISTER(IntegrationTestOptions)(InitializerContext*) {
-    auto& opts = moe::startupOptions;
-    opts.addOptionChaining("help", "help", moe::Switch, "Display help");
-    opts.addOptionChaining(kConnectionStringFlag,
-                           kConnectionStringFlag,
-                           moe::String,
-                           "The connection string associated with the test fixture that this "
-                           "integration test should run against.")
-        .setDefault(moe::Value("localhost:27017"));
-    return Status::OK();
+    uassertStatusOK(addBaseServerOptions(&moe::startupOptions));
 }
 
 MONGO_STARTUP_OPTIONS_VALIDATE(IntegrationTestOptions)(InitializerContext*) {
     auto& env = moe::startupOptionsParsed;
     auto& opts = moe::startupOptions;
 
-    auto ret = env.validate();
-
-    if (!ret.isOK()) {
-        return ret;
-    }
+    uassertStatusOK(env.validate());
+    uassertStatusOK(validateBaseOptions(env));
 
     if (env.count("help")) {
         std::cout << opts.helpString() << std::endl;
-        quickExit(EXIT_SUCCESS);
+        quickExit(ExitCode::clean);
     }
-
-    return Status::OK();
 }
 
 MONGO_STARTUP_OPTIONS_STORE(IntegrationTestOptions)(InitializerContext*) {
     auto& env = moe::startupOptionsParsed;
-    moe::Value connectionString;
-    auto ret = env.get(moe::Key(kConnectionStringFlag), &connectionString);
-    if (!ret.isOK()) {
-        return ret;
-    }
 
-    auto swConnectionString = ConnectionString::parse(connectionString.as<std::string>());
-    if (!swConnectionString.isOK()) {
-        return swConnectionString.getStatus();
-    }
+    uassertStatusOK(canonicalizeBaseOptions(&env));
+    uassertStatusOK(storeBaseOptions(env));
 
-    log() << "Using test fixture with connection string = " << connectionString.as<std::string>();
+    std::string connectionString = env["connectionString"].as<std::string>();
+    useEgressGRPC = env["useEgressGRPC"].as<bool>();
+
+    env.get("filter", &testFilter).ignore();
+    env.get("fileNameFilter", &fileNameFilter).ignore();
+    env.get("suite", &testSuites).ignore();
+
+    auto swConnectionString = ConnectionString::parse(connectionString);
+    uassertStatusOK(swConnectionString);
 
     fixtureConnectionString = std::move(swConnectionString.getValue());
-
-    return Status::OK();
+    LOGV2(23050,
+          "Using test fixture with connection string = {connectionString}",
+          "connectionString"_attr = connectionString);
 }
+
+}  // namespace

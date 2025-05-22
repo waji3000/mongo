@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,13 +29,23 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
 #include <string>
 
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/client/connection_string.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/s/migration_session_id.h"
+#include "mongo/db/session/logical_session_id.h"
+#include "mongo/db/session/logical_session_id_gen.h"
+#include "mongo/db/shard_id.h"
 #include "mongo/s/request_types/migration_secondary_throttle_options.h"
-#include "mongo/s/shard_id.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/uuid.h"
 
 namespace mongo {
 
@@ -49,6 +58,9 @@ class StatusWith;
  */
 class StartChunkCloneRequest {
 public:
+    static constexpr auto kSupportsCriticalSectionDuringCatchUp =
+        "supportsCriticalSectionDuringCatchUp"_sd;
+
     /**
      * Parses the input command and produces a request corresponding to its arguments.
      */
@@ -62,6 +74,9 @@ public:
      */
     static void appendAsCommand(BSONObjBuilder* builder,
                                 const NamespaceString& nss,
+                                const UUID& migrationId,
+                                const LogicalSessionId& lsid,
+                                TxnNumber txnNumber,
                                 const MigrationSessionId& sessionId,
                                 const ConnectionString& fromShardConnectionString,
                                 const ShardId& fromShardId,
@@ -81,6 +96,27 @@ public:
 
     const ConnectionString& getFromShardConnectionString() const {
         return _fromShardCS;
+    }
+
+    bool hasMigrationId() const {
+        return _migrationId.is_initialized();
+    }
+
+    bool parallelFetchingSupported() const {
+        return _parallelFetchingSupported;
+    }
+
+    const UUID& getMigrationId() const {
+        invariant(_migrationId);
+        return *_migrationId;
+    }
+
+    const LogicalSessionId& getLsid() const {
+        return _lsid;
+    }
+
+    TxnNumber getTxnNumber() const {
+        return _txnNumber;
     }
 
     const ShardId& getFromShardId() const {
@@ -115,6 +151,10 @@ private:
     // The collection for which this request applies
     NamespaceString _nss;
 
+    boost::optional<UUID> _migrationId;
+    LogicalSessionId _lsid;
+    TxnNumber _txnNumber{kUninitializedTxnNumber};
+
     // The session id of this migration
     MigrationSessionId _sessionId;
 
@@ -134,6 +174,8 @@ private:
 
     // The parsed secondary throttle options
     MigrationSecondaryThrottleOptions _secondaryThrottle;
+
+    bool _parallelFetchingSupported;
 };
 
 }  // namespace mongo

@@ -1,6 +1,3 @@
-// util/hex.cpp
-
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -32,82 +29,106 @@
 
 #include "mongo/util/hex.h"
 
-#include <iomanip>
-#include <sstream>
+#include <algorithm>
+#include <cstddef>
+#include <fmt/format.h>
 #include <string>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/ctype.h"
 
 namespace mongo {
 
-template <typename T>
-std::string integerToHexDef(T inInt) {
-    if (!inInt)
-        return "0";
+namespace {
 
-    static const char hexchars[] = "0123456789ABCDEF";
+constexpr StringData kHexUpper = "0123456789ABCDEF"_sd;
+constexpr StringData kHexLower = "0123456789abcdef"_sd;
 
-    static const size_t outbufSize = sizeof(T) * 2 + 1;
-    char outbuf[outbufSize];
-    outbuf[outbufSize - 1] = '\0';
-
-    char c;
-    int lastSeenNumber = 0;
-    for (int j = int(outbufSize) - 2; j >= 0; j--) {
-        c = hexchars[inInt & 0xF];
-        if (c != '0')
-            lastSeenNumber = j;
-        outbuf[j] = c;
-        inInt = inInt >> 4;
+std::string _hexPack(StringData data, StringData hexchars) {
+    std::string out;
+    out.reserve(2 * data.size());
+    for (auto c : data) {
+        out.append({hexchars[(c & 0xF0) >> 4], hexchars[(c & 0x0F)]});
     }
-    char* bufPtr = outbuf;
-    bufPtr += lastSeenNumber;
-
-    return std::string(bufPtr);
+    return out;
 }
 
-template <>
-std::string integerToHex<char>(char val) {
-    return integerToHexDef(val);
-}
-template <>
-std::string integerToHex<int>(int val) {
-    return integerToHexDef(val);
-}
-template <>
-std::string integerToHex<unsigned int>(unsigned int val) {
-    return integerToHexDef(val);
-}
-template <>
-std::string integerToHex<long>(long val) {
-    return integerToHexDef(val);
-}
-template <>
-std::string integerToHex<unsigned long>(unsigned long val) {
-    return integerToHexDef(val);
-}
-template <>
-std::string integerToHex<long long>(long long val) {
-    return integerToHexDef(val);
-}
-template <>
-std::string integerToHex<unsigned long long>(unsigned long long val) {
-    return integerToHexDef(val);
+template <typename F>
+void _decode(StringData s, const F& f) {
+    uassert(ErrorCodes::FailedToParse, "Hex blob with odd digit count", s.size() % 2 == 0);
+    for (std::size_t i = 0; i != s.size(); i += 2)
+        f(hexblob::decodePair(s.substr(i, 2)));
 }
 
-std::string unsignedIntToFixedLengthHex(uint32_t val) {
-    char buf[9];
-    invariant(snprintf(buf, 9, "%08X", val) == 8);
-    return std::string(buf, 8);
+}  // namespace
+
+namespace hexblob {
+
+unsigned char decodeDigit(unsigned char c) {
+    if (c >= '0' && c <= '9')
+        return c - '0';
+    if (c >= 'a' && c <= 'f')
+        return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F')
+        return c - 'A' + 10;
+    uasserted(ErrorCodes::FailedToParse,
+              fmt::format("The character \\x{:02x} failed to parse from hex.", c));
 }
 
-std::string hexdump(const char* data, unsigned len) {
-    verify(len < 1000000);
-    const unsigned char* p = (const unsigned char*)data;
-    std::stringstream ss;
-    ss << std::hex << std::setfill('0');
-    for (unsigned i = 0; i < len; i++) {
-        ss << std::setw(2) << static_cast<unsigned>(p[i]) << ' ';
+unsigned char decodePair(StringData c) {
+    uassert(ErrorCodes::FailedToParse, "Need two hex digits", c.size() == 2);
+    return (decodeDigit(c[0]) << 4) | decodeDigit(c[1]);
+}
+
+bool validate(StringData s) {
+    // There must be an even number of characters, since each pair encodes a single byte.
+    return s.size() % 2 == 0 &&
+        std::all_of(s.begin(), s.end(), [](auto c) { return ctype::isXdigit(c); });
+}
+
+std::string encode(StringData data) {
+    return _hexPack(data, kHexUpper);
+}
+
+std::string encodeLower(StringData data) {
+    return _hexPack(data, kHexLower);
+}
+
+void decode(StringData s, BufBuilder* buf) {
+    _decode(s, [&](unsigned char c) { buf->appendChar(c); });
+}
+
+std::string decode(StringData s) {
+    std::string r;
+    r.reserve(s.size() / 2);
+    _decode(s, [&](unsigned char c) { r.push_back(c); });
+    return r;
+}
+
+}  // namespace hexblob
+
+std::string hexdump(StringData data) {
+    tassert(7781000, "Data length exceeds maximum buffer size", data.size() < kHexDumpMaxSize);
+    std::string out;
+    out.reserve(3 * data.size());
+    char sep = 0;
+    for (auto c : data) {
+        if (sep)
+            out.push_back(sep);
+        out.append({kHexLower[(c & 0xF0) >> 4], kHexLower[(c & 0x0F)]});
+        sep = ' ';
     }
-    std::string s = ss.str();
-    return s;
+    return out;
 }
+
+std::ostream& StreamableHexdump::_streamTo(std::ostream& os) const {
+    StringData sep;
+    for (auto p = _data; p != _data + _size; ++p) {
+        os << sep << kHexLower[(*p >> 4) & 0x0f] << kHexLower[*p & 0x0f];
+        sep = " "_sd;
+    }
+    return os;
 }
+
+}  // namespace mongo

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,16 +27,19 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/storage/encryption_hooks.h"
-
 #include <boost/filesystem/path.hpp>
+#include <boost/move/utility_core.hpp>
+#include <memory>
+#include <utility>
 
-#include "mongo/base/init.h"
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/init.h"  // IWYU pragma: keep
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/data_protector.h"
-#include "mongo/stdx/memory.h"
+#include "mongo/db/storage/encryption_hooks.h"
+#include "mongo/util/decorable.h"
 
 namespace mongo {
 
@@ -76,14 +78,22 @@ boost::filesystem::path EncryptionHooks::getProtectedPathSuffix() {
     return "";
 }
 
-Status EncryptionHooks::protectTmpData(
-    const uint8_t* in, size_t inLen, uint8_t* out, size_t outLen, size_t* resultLen) {
+Status EncryptionHooks::protectTmpData(const uint8_t* in,
+                                       size_t inlen,
+                                       uint8_t* out,
+                                       size_t outLen,
+                                       size_t* resultLen,
+                                       boost::optional<DatabaseName> dbName) {
     return Status(ErrorCodes::InternalError,
                   "Encryption hooks must be enabled to use preprocessTmpData.");
 }
 
-Status EncryptionHooks::unprotectTmpData(
-    const uint8_t* in, size_t inLen, uint8_t* out, size_t outLen, size_t* resultLen) {
+Status EncryptionHooks::unprotectTmpData(const uint8_t* in,
+                                         size_t inLen,
+                                         uint8_t* out,
+                                         size_t outLen,
+                                         size_t* resultLen,
+                                         boost::optional<DatabaseName> dbName) {
     return Status(ErrorCodes::InternalError,
                   "Encryption hooks must be enabled to use postprocessTmpData.");
 }

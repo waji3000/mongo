@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -32,13 +31,15 @@
 
 #include <memory>
 
-#include "mongo/base/disallow_copying.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/auth/cluster_auth_mode.h"
 #include "mongo/db/query/collation/collator_interface.h"
 
 namespace mongo {
 
 class BSONObj;
 class ServiceContext;
+
 template <typename T>
 class StatusWith;
 
@@ -46,7 +47,8 @@ class StatusWith;
  * An interface which can be used to retrieve a collator.
  */
 class CollatorFactoryInterface {
-    MONGO_DISALLOW_COPYING(CollatorFactoryInterface);
+    CollatorFactoryInterface(const CollatorFactoryInterface&) = delete;
+    CollatorFactoryInterface& operator=(const CollatorFactoryInterface&) = delete;
 
 public:
     CollatorFactoryInterface() = default;

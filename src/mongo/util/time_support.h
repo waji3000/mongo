@@ -1,6 +1,3 @@
-// @file time_support.h
-
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -32,19 +29,23 @@
 
 #pragma once
 
-#include <boost/date_time/gregorian/gregorian_types.hpp>
-#include <boost/date_time/posix_time/posix_time_types.hpp>
+#include <array>
+#include <chrono>
+#include <cstdint>
 #include <ctime>
 #include <iosfwd>
+#include <limits>
 #include <string>
 
 #include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/platform/atomic_word.h"
 #include "mongo/stdx/chrono.h"
-#include "mongo/stdx/mutex.h"
 #include "mongo/util/duration.h"
 
 namespace mongo {
 
+class BackgroundThreadClockSource;
 template <typename Allocator>
 class StringBuilderImpl;
 
@@ -70,7 +71,7 @@ public:
      * The minimum representable Date_t.
      */
     static constexpr Date_t min() {
-        return fromMillisSinceEpoch(0);
+        return fromMillisSinceEpoch(std::numeric_limits<long long>::min());
     }
 
     /**
@@ -178,7 +179,7 @@ public:
 
     template <typename Duration>
     Date_t& operator+=(Duration d) {
-        millis += duration_cast<Milliseconds>(d).count();
+        *this = *this + d;
         return *this;
     }
 
@@ -189,9 +190,7 @@ public:
 
     template <typename Duration>
     Date_t operator+(Duration d) const {
-        Date_t result = *this;
-        result += d;
-        return result;
+        return Date_t::fromDurationSinceEpoch(toDurationSinceEpoch() + d);
     }
 
     template <typename Duration>
@@ -234,43 +233,86 @@ public:
         return out;
     }
 
+    /**
+     * Only exposed for testing.  See lastNow()
+     */
+    static Date_t lastNowForTest() {
+        return lastNow();
+    }
+
 private:
     constexpr explicit Date_t(long long m) : millis(m) {}
 
     long long millis = 0;
+
+    friend class BackgroundThreadClockSource;
+
+    /**
+     * Returns the last time fetched from Date_t::now()
+     *
+     * Note that this is a private semi-implementation detail for BackgroundThreadClockSource.  Use
+     * svc->getFastClockSource()->now() over calling this method.
+     *
+     * If you think you have another use for it, please reconsider, or at least consider very
+     * carefully as correctly using it is complicated.
+     */
+    static Date_t lastNow() {
+        return fromMillisSinceEpoch(lastNowVal.loadRelaxed());
+    }
+
+    // Holds the last value returned from now()
+    static AtomicWord<long long> lastNowVal;
 };
 
-// uses ISO 8601 dates without trailing Z
-// colonsOk should be false when creating filenames
-std::string terseCurrentTime(bool colonsOk = true);
+class DateStringBuffer {
+public:
+    /** Fill with formatted `date`, either in `local` or UTC. */
+    DateStringBuffer& iso8601(Date_t date, bool local);
+
+    /**
+     * Fill with formatted `date`, in modified ctime format.
+     * Like ctime, but newline and year removed, and milliseconds added.
+     */
+    DateStringBuffer& ctime(Date_t date);
+
+    explicit operator StringData() const {
+        return StringData{_data.data(), _size};
+    }
+
+    explicit operator std::string() const {
+        return std::string{StringData{*this}};
+    }
+
+private:
+    std::array<char, 64> _data;
+    size_t _size = 0;
+};
 
 /**
- * Produces a short UTC date + time approriate for file names with Z appended.
+ * Uses a format similar to, but incompatable with ISO 8601
+ * to produce UTC based datetimes suitable for use in filenames.
  */
-std::string terseUTCCurrentTime();
+std::string terseCurrentTimeForFilename(bool appendZed = false);
 
+/** @{ */
 /**
- * Formats "date" according to the ISO 8601 extended form standard, including date,
- * and time with milliseconds decimal component, in the UTC timezone.
- *
- * Sample format: "2013-07-23T18:42:14.072Z"
+ * Formats "date" in 3 formats to 3 kinds of output.
+ * Function variants are provided to produce ISO local, ISO UTC, or modified ctime formats.
+ * The ISO formats are according to the ISO 8601 extended form standard, including date and
+ * time with a milliseconds decimal component.
+ * Modified ctime format is like `ctime`, but with milliseconds and no year.
+ *     "2013-07-23T18:42:14.072Z"       // *ToISOStringUTC
+ *     "2013-07-23T18:42:14.072-05:00"  // *ToISOStringLocal
+ *     "Wed Oct 31 13:34:47.996"        // *ToCtimeString (modified ctime)
+ * Output can be a std::string, or put to a std::ostream.
  */
 std::string dateToISOStringUTC(Date_t date);
-
-/**
- * Formats "date" according to the ISO 8601 extended form standard, including date,
- * and time with milliseconds decimal component, in the local timezone.
- *
- * Sample format: "2013-07-23T18:42:14.072-05:00"
- */
 std::string dateToISOStringLocal(Date_t date);
-
-/**
- * Formats "date" in fixed width in the local time zone.
- *
- * Sample format: "Wed Oct 31 13:34:47.996"
- */
 std::string dateToCtimeString(Date_t date);
+void outputDateAsISOStringUTC(std::ostream& os, Date_t date);
+void outputDateAsISOStringLocal(std::ostream& os, Date_t date);
+void outputDateAsCtime(std::ostream& os, Date_t date);
+/** @} */
 
 /**
  * Parses a Date_t from an ISO 8601 std::string representation.
@@ -281,26 +323,6 @@ std::string dateToCtimeString(Date_t date);
  * Local times are currently not supported.
  */
 StatusWith<Date_t> dateFromISOString(StringData dateString);
-
-/**
- * Like dateToISOStringUTC, except outputs to a std::ostream.
- */
-void outputDateAsISOStringUTC(std::ostream& os, Date_t date);
-
-/**
- * Like dateToISOStringLocal, except outputs to a std::ostream.
- */
-void outputDateAsISOStringLocal(std::ostream& os, Date_t date);
-
-/**
- * Like dateToCtimeString, except outputs to a std::ostream.
- */
-void outputDateAsCtime(std::ostream& os, Date_t date);
-
-boost::gregorian::date currentDate();
-
-// parses time of day in "hh:mm" format assuming 'hh' is 00-23
-bool toPointInTime(const std::string& str, boost::posix_time::ptime* timeOfDay);
 
 void sleepsecs(int s);
 void sleepmillis(long long ms);
@@ -313,39 +335,31 @@ void sleepFor(DurationType time) {
 
 class Backoff {
 public:
-    Backoff(int maxSleepMillis, int resetAfter)
-        : _maxSleepMillis(maxSleepMillis),
-          _resetAfterMillis(maxSleepMillis + resetAfter),  // Don't reset < the max sleep
+    Backoff(Milliseconds maxSleep, Milliseconds resetAfter)
+        : _maxSleepMillis(durationCount<Milliseconds>(maxSleep)),
+          _resetAfterMillis(
+              durationCount<Milliseconds>(resetAfter)),  // Don't reset < the max sleep
           _lastSleepMillis(0),
           _lastErrorTimeMillis(0) {}
 
-    void nextSleepMillis();
+    Milliseconds nextSleep();
 
     /**
      * testing-only function. used in dbtests/basictests.cpp
      */
-    int getNextSleepMillis(int lastSleepMillis,
+    int getNextSleepMillis(long long lastSleepMillis,
                            unsigned long long currTimeMillis,
                            unsigned long long lastErrorTimeMillis) const;
 
 private:
     // Parameters
-    int _maxSleepMillis;
-    int _resetAfterMillis;
+    long long _maxSleepMillis;
+    long long _resetAfterMillis;
 
     // Last sleep information
-    int _lastSleepMillis;
+    long long _lastSleepMillis;
     unsigned long long _lastErrorTimeMillis;
 };
-
-// DO NOT TOUCH except for testing
-void jsTimeVirtualSkew(long long skew);
-
-void jsTimeVirtualThreadSkew(long long skew);
-long long getJSTimeVirtualThreadSkew();
-
-/** Date_t is milliseconds since epoch */
-Date_t jsTime();
 
 unsigned long long curTimeMicros64();
 unsigned long long curTimeMillis64();

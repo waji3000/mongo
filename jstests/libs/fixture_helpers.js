@@ -1,12 +1,11 @@
-"use strict";
-
 /**
  * Helper functions that help get information or manipulate nodes in the fixture, whether it's a
  * replica set, a sharded cluster, etc.
  */
-var FixtureHelpers = (function() {
-    load("jstests/concurrency/fsm_workload_helpers/server_types.js");  // For isMongos.
+import {isMongos} from "jstests/concurrency/fsm_workload_helpers/server_types.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
+export var FixtureHelpers = (function() {
     function _getHostStringForReplSet(connectionToNodeInSet) {
         const isMaster = assert.commandWorked(connectionToNodeInSet.getDB("test").isMaster());
         assert(
@@ -19,7 +18,7 @@ var FixtureHelpers = (function() {
      * Returns an array of connections to each data-bearing replica set in the fixture (not
      * including the config servers).
      */
-    function _getAllReplicas(db) {
+    function getAllReplicas(db) {
         let replicas = [];
         if (isMongos(db)) {
             const shardObjs = db.getSiblingDB("config").shards.find().sort({_id: 1});
@@ -36,7 +35,7 @@ var FixtureHelpers = (function() {
      * Asserts if the fixture is a standalone or if the shards are standalones.
      */
     function awaitReplication(db) {
-        _getAllReplicas(db).forEach((replSet) => replSet.awaitReplication());
+        getAllReplicas(db).forEach((replSet) => replSet.awaitReplication());
     }
 
     /**
@@ -47,7 +46,7 @@ var FixtureHelpers = (function() {
      * Asserts if the fixture is a standalone or if the shards are standalones.
      */
     function awaitLastOpCommitted(db) {
-        _getAllReplicas(db).forEach((replSet) => replSet.awaitLastOpCommitted());
+        getAllReplicas(db).forEach((replSet) => replSet.awaitLastOpCommitted());
     }
 
     /**
@@ -55,8 +54,78 @@ var FixtureHelpers = (function() {
      * sharded.
      */
     function isSharded(coll) {
-        const db = coll.getDB();
-        return db.getSiblingDB("config").collections.find({_id: coll.getFullName()}).count() > 0;
+        const collEntry =
+            coll.getDB().getSiblingDB("config").collections.findOne({_id: coll.getFullName()});
+        if (collEntry === null) {
+            return false;
+        }
+        return collEntry.unsplittable === null || !collEntry.unsplittable;
+    }
+
+    /**
+     * Looks for an entry in the sharding catalog for the given collection, to check whether it's
+     * unsplittable.
+     */
+    function isUnsplittable(coll) {
+        const collEntry =
+            coll.getDB().getSiblingDB("config").collections.findOne({_id: coll.getFullName()});
+        if (collEntry === null) {
+            return false;
+        }
+        return collEntry.unsplittable !== null && collEntry.unsplittable;
+    }
+
+    /**
+     * Looks for an entry in the sharding catalog for the given collection to check whether it is
+     * present.
+     *
+     * TODO (SERVER-86443): remove this utility once all collections are tracked.
+     */
+    function isTracked(coll) {
+        return isSharded(coll) || isUnsplittable(coll);
+    }
+
+    /**
+     * Returns an array with the shardIds that own data for the given collection.
+     */
+    function getShardsOwningDataForCollection(coll) {
+        if (isSharded(coll) || isUnsplittable(coll)) {
+            const res = db.getSiblingDB('config')
+                .collections
+                .aggregate([
+                    {$match: {_id: coll.getFullName()}},
+                    {
+                        $lookup:
+                            {from: 'chunks', localField: 'uuid', foreignField: 'uuid', as: 'chunks'}
+                    },
+                    {$group: {_id: '$chunks.shard'}}
+                ])
+                .toArray();
+            return res.map((x) => x._id).flat();
+        } else {
+            const dbMetadata =
+                db.getSiblingDB('config').databases.findOne({_id: coll.getDB().getName()});
+            return dbMetadata ? [dbMetadata.primary] : [];
+        }
+    }
+
+    /**
+     * Utility to determine whether the collections in 'collList' are colocated or not.
+     */
+    function areCollectionsColocated(collList) {
+        if (!FixtureHelpers.isMongos(db)) {
+            return true;
+        }
+        let set = new Set();
+        for (const coll of collList) {
+            for (const shard of getShardsOwningDataForCollection(coll)) {
+                set.add(shard);
+                if (set.size > 1) {
+                    return false;
+                }
+            }
+        }
+        return true;
     }
 
     /**
@@ -64,6 +133,16 @@ var FixtureHelpers = (function() {
      */
     function getViewDefinition(db, collName) {
         return db.getCollectionInfos({type: "view", name: collName}).shift();
+    }
+
+    function getTopologyTime(db) {
+        const shards =
+            db.getSiblingDB('config').shards.find({}).sort({'topologyTime': -1}).limit(1).toArray();
+        if (!shards.length) {
+            // In case we are on a replicaset config.shards is empty
+            return Timestamp();
+        }
+        return shards[0].topologyTime;
     }
 
     /**
@@ -77,19 +156,73 @@ var FixtureHelpers = (function() {
             // shard.
             return 1;
         }
-        return db.getSiblingDB("config").chunks.distinct("shard", {ns: coll.getFullName()}).length;
+        const collMetadata =
+            db.getSiblingDB("config").collections.findOne({_id: coll.getFullName()});
+        if (collMetadata.timestamp) {
+            return db.getSiblingDB("config")
+                .chunks.distinct("shard", {uuid: collMetadata.uuid})
+                .length;
+        } else {
+            return db.getSiblingDB("config")
+                .chunks.distinct("shard", {ns: coll.getFullName()})
+                .length;
+        }
     }
 
     /**
-     * Runs the command given by 'cmdObj' on the database given by 'db' on each replica set in
+     * Runs the function given by 'func' passing the database given by 'db' from each shard nodes in
+     * the fixture (besides the config servers). Returns the array of return values from executed
+     * functions. If the fixture is a standalone, will run the function on the database directly.
+     */
+    function mapOnEachShardNode({db, func, primaryNodeOnly}) {
+        function getRequestedConns(conn) {
+            const isMaster = conn.getDB("test").isMaster();
+
+            if (isMaster.hasOwnProperty("setName")) {
+                // It's a repl set.
+                const rs = new ReplSetTest(isMaster.me);
+                return primaryNodeOnly ? [rs.getPrimary()] : rs.nodes;
+            } else {
+                // It's a standalone.
+                return [conn];
+            }
+        }
+
+        let connList = [];
+        if (isMongos(db)) {
+            const shardObjs = db.getSiblingDB("config").shards.find().sort({_id: 1}).toArray();
+
+            for (let shardObj of shardObjs) {
+                connList = connList.concat(
+                    getRequestedConns(new Mongo(shardObj.host, undefined, {gRPC: false})));
+            }
+        } else {
+            connList = getRequestedConns(
+                new Mongo(db.getMongo().host, undefined, {gRPC: db.getMongo().isGRPC()}));
+        }
+
+        return connList.map((conn) => func(conn.getDB(db.getName())));
+    }
+
+    /**
+     * Runs the command given by 'cmdObj' on the database given by 'db' on each shard nodes in
      * the fixture (besides the config servers). Asserts that each command works, and returns an
      * array with the responses from each shard, or with a single element if the fixture was a
-     * replica set. Asserts if the fixture is a standalone or if the shards are standalones.
+     * replica set. If the fixture is a standalone, will run the command directly.
+     */
+    function runCommandOnAllShards({db, cmdObj, primaryNodeOnly}) {
+        return mapOnEachShardNode({
+            db,
+            func: (primaryDb) => assert.commandWorked(primaryDb.runCommand(cmdObj)),
+            primaryNodeOnly
+        });
+    }
+
+    /**
+     * A helper function for 'runCommandOnAllShards' to only run command on the primary nodes.
      */
     function runCommandOnEachPrimary({db, cmdObj}) {
-        return _getAllReplicas(db).map(
-            (replSet) =>
-                assert.commandWorked(replSet.getPrimary().getDB(db.getName()).runCommand(cmdObj)));
+        return runCommandOnAllShards({db, cmdObj, primaryNodeOnly: true});
     }
 
     /**
@@ -105,11 +238,27 @@ var FixtureHelpers = (function() {
         configDB.databases.find().forEach(function(dbObj) {
             if (dbObj._id === db.getName()) {
                 const shardObj = configDB.shards.findOne({_id: dbObj.primary});
-                shardConn = new Mongo(shardObj.host);
+                shardConn = new Mongo(shardObj.host, undefined, {gRPC: false});
             }
         });
         assert.neq(null, shardConn, "could not find shard hosting database " + db.getName());
         return shardConn;
+    }
+
+    /**
+     * Returns a collection of connections to each primary in a cluster.
+     */
+    function getPrimaries(db) {
+        return getAllReplicas(db).map((replSet) => replSet.getPrimary());
+    }
+
+    /**
+     * Returns a collection of connections to secondaries in a cluster.
+     */
+    function getSecondaries(db) {
+        return getAllReplicas(db).reduce((array, replSet) => {
+            return array.concat(replSet.getSecondaries());
+        }, []);
     }
 
     /**
@@ -120,15 +269,33 @@ var FixtureHelpers = (function() {
         return primaryInfo.hasOwnProperty('setName');
     }
 
+    /**
+     * Returns true if we have a standalone mongod.
+     */
+    function isStandalone(db) {
+        return !isMongos(db) && !isReplSet(db);
+    }
+
     return {
         isMongos: isMongos,
         isSharded: isSharded,
+        isUnsplittable: isUnsplittable,
+        isTracked: isTracked,
+        areCollectionsColocated: areCollectionsColocated,
+        getShardsOwningDataForCollection: getShardsOwningDataForCollection,
+        getTopologyTime: getTopologyTime,
         getViewDefinition: getViewDefinition,
         numberOfShardsForCollection: numberOfShardsForCollection,
         awaitReplication: awaitReplication,
         awaitLastOpCommitted: awaitLastOpCommitted,
+        mapOnEachShardNode: mapOnEachShardNode,
+        runCommandOnAllShards: runCommandOnAllShards,
         runCommandOnEachPrimary: runCommandOnEachPrimary,
+        getAllReplicas: getAllReplicas,
+        getPrimaries: getPrimaries,
+        getSecondaries: getSecondaries,
         getPrimaryForNodeHostingDatabase: getPrimaryForNodeHostingDatabase,
         isReplSet: isReplSet,
+        isStandalone: isStandalone,
     };
 })();

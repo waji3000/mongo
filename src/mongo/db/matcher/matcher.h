@@ -1,6 +1,3 @@
-// matcher.h
-
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -33,13 +30,17 @@
 #pragma once
 
 
-#include "mongo/base/disallow_copying.h"
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+#include <memory>
+#include <string>
+
 #include "mongo/base/status.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/db/matcher/expression.h"
 #include "mongo/db/matcher/expression_parser.h"
+#include "mongo/db/matcher/extensions_callback.h"
 #include "mongo/db/matcher/extensions_callback_noop.h"
-#include "mongo/db/matcher/match_details.h"
+#include "mongo/db/pipeline/expression_context.h"
 
 
 namespace mongo {
@@ -50,7 +51,8 @@ class CollatorInterface;
  * Matcher is a simple wrapper around a BSONObj and the MatchExpression created from it.
  */
 class Matcher {
-    MONGO_DISALLOW_COPYING(Matcher);
+    Matcher(const Matcher&) = delete;
+    Matcher& operator=(const Matcher&) = delete;
 
 public:
     /**
@@ -62,17 +64,19 @@ public:
             MatchExpressionParser::AllowedFeatureSet allowedFeatures =
                 MatchExpressionParser::kDefaultSpecialFeatures);
 
-    bool matches(const BSONObj& doc, MatchDetails* details = NULL) const;
-
     const BSONObj* getQuery() const {
         return &_pattern;
-    };
+    }
 
     std::string toString() const {
         return _pattern.toString();
     }
 
     MatchExpression* getMatchExpression() {
+        return _expression.get();
+    }
+
+    const MatchExpression* getMatchExpression() const {
         return _expression.get();
     }
 

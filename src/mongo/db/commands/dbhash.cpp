@@ -1,6 +1,3 @@
-// dbhash.cpp
-
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,169 +27,322 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
 
-#include "mongo/platform/basic.h"
-
-#include <boost/optional.hpp>
 #include <map>
+#include <memory>
+#include <set>
 #include <string>
+#include <utility>
 
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/auth/action_type.h"
+#include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/auth/resource_pattern.h"
 #include "mongo/db/catalog/collection.h"
-#include "mongo/db/catalog/database.h"
-#include "mongo/db/catalog/database_catalog_entry.h"
+#include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/catalog/index_catalog.h"
+#include "mongo/db/catalog_raii.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/db_raii.h"
-#include "mongo/db/exec/working_set_common.h"
+#include "mongo/db/commands/test_commands_enabled.h"
+#include "mongo/db/concurrency/d_concurrency.h"
+#include "mongo/db/concurrency/lock_manager_defs.h"
+#include "mongo/db/database_name.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/query/index_bounds.h"
 #include "mongo/db/query/internal_plans.h"
-#include "mongo/db/transaction_participant.h"
-#include "mongo/stdx/mutex.h"
-#include "mongo/util/log.h"
-#include "mongo/util/md5.hpp"
+#include "mongo/db/query/plan_executor.h"
+#include "mongo/db/query/plan_yield_policy.h"
+#include "mongo/db/read_concern_support_result.h"
+#include "mongo/db/repl/optime.h"
+#include "mongo/db/repl/read_concern_level.h"
+#include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/s/operation_sharding_state.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/storage/recovery_unit.h"
+#include "mongo/db/storage/storage_engine.h"
+#include "mongo/db/transaction_resources.h"
+#include "mongo/logv2/log.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/md5.h"
 #include "mongo/util/net/socket_utils.h"
+#include "mongo/util/str.h"
 #include "mongo/util/timer.h"
+#include "mongo/util/uuid.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
+
 
 namespace mongo {
 
 namespace {
 
-class DBHashCmd : public ErrmsgCommandDeprecated {
-public:
-    DBHashCmd() : ErrmsgCommandDeprecated("dbHash", "dbhash") {}
+constexpr char SKIP_TEMP_COLLECTION[] = "skipTempCollections";
+constexpr char EXCLUDE_RECORDIDS[] = "excludeRecordIds";
 
-    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+std::shared_ptr<const CollectionCatalog> getConsistentCatalogAndSnapshot(OperationContext* opCtx) {
+    // Loop until we get a consistent catalog and snapshot. This is only used for the lock-free
+    // implementation of dbHash which skips acquiring database and collection locks.
+    while (true) {
+        auto catalogBeforeSnapshot = CollectionCatalog::get(opCtx);
+        shard_role_details::getRecoveryUnit(opCtx)->preallocateSnapshot();
+        const auto catalogAfterSnapshot = CollectionCatalog::get(opCtx);
+        if (catalogBeforeSnapshot == catalogAfterSnapshot) {
+            return catalogBeforeSnapshot;
+        }
+        shard_role_details::getRecoveryUnit(opCtx)->abandonSnapshot();
+    }
+}
+
+// Includes Records and their RecordIds explicitly in the hash.
+void hashRecordsAndRecordIds(const CollectionPtr& collection, PlanExecutor* exec, md5_state_t* st) {
+    // Clustered collections implicitly replicate RecordIds. Clustered collections are also the only
+    // collections which have RecordIds that aren't of type "Long". This method assumes RecordIds
+    // are of type "Long" to optimize their translation into the hash.
+    invariant(!collection->isClustered());
+
+    BSONObj c;
+    RecordId rid;
+    while (exec->getNext(&c, &rid) == PlanExecutor::ADVANCED) {
+        md5_append(st, (const md5_byte_t*)c.objdata(), c.objsize());
+        const auto ridInt = rid.getLong();
+        md5_append(st, (const md5_byte_t*)&ridInt, sizeof(ridInt));
+    }
+}
+
+void hashRecordsOnly(PlanExecutor* exec, md5_state_t* st) {
+    BSONObj c;
+    while (exec->getNext(&c, nullptr) == PlanExecutor::ADVANCED) {
+        md5_append(st, (const md5_byte_t*)c.objdata(), c.objsize());
+    }
+}
+
+class DBHashCmd : public BasicCommand {
+public:
+    DBHashCmd() : BasicCommand("dbHash", "dbhash") {}
+
+    bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
+    }
+
+    bool allowsAfterClusterTime(const BSONObj& cmd) const override {
+        return false;
+    }
+
+    bool canIgnorePrepareConflicts() const override {
+        return true;
     }
 
     ReadWriteType getReadWriteType() const override {
         return ReadWriteType::kRead;
     }
 
-    bool supportsReadConcern(const std::string& dbName,
-                             const BSONObj& cmdObj,
-                             repl::ReadConcernLevel level) const override {
-        return level == repl::ReadConcernLevel::kLocalReadConcern ||
-            level == repl::ReadConcernLevel::kSnapshotReadConcern;
-    }
-
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kAlways;
     }
 
-    virtual void addRequiredPrivileges(const std::string& dbname,
-                                       const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) const {
-        ActionSet actions;
-        actions.addAction(ActionType::dbHash);
-        out->push_back(Privilege(ResourcePattern::forDatabaseName(dbname), actions));
+    bool maintenanceOk() const override {
+        return false;
     }
 
-    virtual bool errmsgRun(OperationContext* opCtx,
-                           const std::string& dbname,
-                           const BSONObj& cmdObj,
-                           std::string& errmsg,
-                           BSONObjBuilder& result) {
+    ReadConcernSupportResult supportsReadConcern(const BSONObj& cmdObj,
+                                                 repl::ReadConcernLevel level,
+                                                 bool isImplicitDefault) const final {
+
+        static const Status kReadConcernNotSupported{ErrorCodes::InvalidOptions,
+                                                     "read concern not supported"};
+        static const Status kDefaultReadConcernNotPermitted{ErrorCodes::InvalidOptions,
+                                                            "default read concern not permitted"};
+        // The dbHash command only supports local and snapshot read concern. Additionally, snapshot
+        // read concern is only supported if test commands are enabled.
+        return {{level != repl::ReadConcernLevel::kLocalReadConcern &&
+                     (!getTestCommandsEnabled() ||
+                      level != repl::ReadConcernLevel::kSnapshotReadConcern),
+                 kReadConcernNotSupported},
+                kDefaultReadConcernNotPermitted};
+    }
+
+    Status checkAuthForOperation(OperationContext* opCtx,
+                                 const DatabaseName& dbName,
+                                 const BSONObj& cmdObj) const override {
+        auto* as = AuthorizationSession::get(opCtx->getClient());
+        if (!as->isAuthorizedForActionsOnResource(ResourcePattern::forDatabaseName(dbName),
+                                                  ActionType::dbHash)) {
+            return {ErrorCodes::Unauthorized, "unauthorized"};
+        }
+
+        return Status::OK();
+    }
+
+    bool run(OperationContext* opCtx,
+             const DatabaseName& dbName,
+             const BSONObj& cmdObj,
+             BSONObjBuilder& result) override {
         Timer timer;
+
+        // We want the dbCheck command to be allowed via direct shard connections despite the fact
+        // that it acquires a collection lock on a user collection. This is an exception, and should
+        // not be repeated elsewhere without sufficient need.
+        OperationShardingState::get(opCtx).setShouldSkipDirectShardConnectionChecks();
 
         std::set<std::string> desiredCollections;
         if (cmdObj["collections"].type() == Array) {
             BSONObjIterator i(cmdObj["collections"].Obj());
             while (i.more()) {
                 BSONElement e = i.next();
-                if (e.type() != String) {
-                    errmsg = "collections entries have to be strings";
-                    return false;
-                }
+                uassert(ErrorCodes::BadValue,
+                        "collections entries have to be strings",
+                        e.type() == String);
                 desiredCollections.insert(e.String());
             }
         }
 
-        const std::string ns = parseNs(dbname, cmdObj);
+        const bool skipTempCollections =
+            cmdObj.hasField(SKIP_TEMP_COLLECTION) && cmdObj[SKIP_TEMP_COLLECTION].trueValue();
+        if (skipTempCollections) {
+            LOGV2(6859700, "Skipping hash computation for temporary collections");
+        }
+
+        const bool excludeRecordIds =
+            cmdObj.hasField(EXCLUDE_RECORDIDS) && cmdObj[EXCLUDE_RECORDIDS].trueValue();
+        if (excludeRecordIds) {
+            LOGV2(6859701, "Exclude recordIds in dbHash for recordIdsReplicated collections");
+        }
+
         uassert(ErrorCodes::InvalidNamespace,
-                str::stream() << "Invalid db name: " << ns,
-                NamespaceString::validDBName(ns, NamespaceString::DollarInDbNameBehavior::Allow));
+                "Cannot pass empty string for 'dbHash' field",
+                !(cmdObj.firstElement().type() == mongo::String &&
+                  cmdObj.firstElement().valueStringData().empty()));
 
-        // We lock the entire database in S-mode in order to ensure that the contents will not
-        // change for the snapshot.
-        auto lockMode = LockMode::MODE_S;
-        auto txnParticipant = TransactionParticipant::get(opCtx);
-        if (txnParticipant && txnParticipant->inMultiDocumentTransaction()) {
-            // However, if we are inside a multi-statement transaction, then we only need to lock
-            // the database in intent mode to ensure that none of the collections get dropped.
-            lockMode = getLockModeForQuery(opCtx);
-        }
-        AutoGetDb autoDb(opCtx, ns, lockMode);
-        Database* db = autoDb.getDb();
-        std::list<std::string> colls;
-        if (db) {
-            db->getDatabaseCatalogEntry()->getCollectionNamespaces(&colls);
-            colls.sort();
+        const bool isPointInTimeRead =
+            shard_role_details::getRecoveryUnit(opCtx)->getTimestampReadSource() ==
+            RecoveryUnit::ReadSource::kProvided;
+
+        // We take the global lock here as dbHash runs lock-free with point-in-time catalog lookups.
+        Lock::GlobalLock globalLock(opCtx, MODE_IS);
+
+        // The CollectionCatalog to use for lock-free reads with point-in-time catalog lookups.
+        std::shared_ptr<const CollectionCatalog> catalog = getConsistentCatalogAndSnapshot(opCtx);
+
+        boost::optional<AutoGetDb> autoDb;
+        if (isPointInTimeRead) {
+            // We only need to lock the database in intent mode and then collection in intent
+            // mode as well to ensure that none of the collections get dropped.
+            // TODO:SERVER-75848 Make this lock-free
+            autoDb.emplace(opCtx, dbName, MODE_IS);
+        } else {
+            // We lock the entire database in S-mode in order to ensure that the contents will not
+            // change for the snapshot when not reading at a timestamp.
+            autoDb.emplace(opCtx, dbName, MODE_S);
         }
 
-        result.append("host", prettyHostName());
+        result.append("host", prettyHostName(opCtx->getClient()->getLocalPort()));
 
         md5_state_t globalState;
-        md5_init(&globalState);
+        md5_init_state(&globalState);
 
-        // A set of 'system' collections that are replicated, and therefore included in the db hash.
-        const std::set<StringData> replicatedSystemCollections{"system.backup_users",
-                                                               "system.js",
-                                                               "system.new_users",
-                                                               "system.roles",
-                                                               "system.users",
-                                                               "system.version",
-                                                               "system.views"};
+        std::map<std::string, std::string> collectionToHashMap;
+        std::map<std::string, UUID> collectionToUUIDMap;
+        std::set<std::string> cappedCollectionSet;
 
-        BSONArrayBuilder cappedCollections;
-        BSONObjBuilder collectionsByUUID;
+        auto checkAndHashCollection = [&](const Collection* collection) -> bool {
+            auto collNss = collection->ns();
 
-        BSONObjBuilder bb(result.subobjStart("collections"));
-        for (const auto& collectionName : colls) {
+            uassert(ErrorCodes::BadValue,
+                    str::stream() << "weird fullCollectionName [" << collNss.toStringForErrorMsg()
+                                  << "]",
+                    collNss.size() - 1 > dbName.size());
 
-            NamespaceString collNss(collectionName);
-
-            if (collNss.size() - 1 <= dbname.size()) {
-                errmsg = str::stream() << "weird fullCollectionName [" << collNss.toString() << "]";
-                return false;
+            if (repl::ReplicationCoordinator::isOplogDisabledForNS(collNss)) {
+                return true;
             }
 
-            // Only include 'system' collections that are replicated.
-            bool isReplicatedSystemColl =
-                (replicatedSystemCollections.count(collNss.coll().toString()) > 0);
-            if (collNss.isSystem() && !isReplicatedSystemColl)
-                continue;
+            if (collNss.coll().starts_with("tmp.mr.")) {
+                // We skip any incremental map reduce collections as they also aren't
+                // replicated.
+                return true;
+            }
 
-            if (collNss.coll().startsWith("tmp.mr.")) {
-                // We skip any incremental map reduce collections as they also aren't replicated.
-                continue;
+            if (skipTempCollections && collection->isTemporary()) {
+                return true;
             }
 
             if (desiredCollections.size() > 0 &&
                 desiredCollections.count(collNss.coll().toString()) == 0)
-                continue;
+                return true;
 
-            // Don't include 'drop pending' collections.
-            if (collNss.isDropPendingNamespace())
-                continue;
-
-            if (Collection* collection = db->getCollection(opCtx, collectionName)) {
-                if (collection->isCapped()) {
-                    cappedCollections.append(collNss.coll());
-                }
-
-                if (OptionalCollectionUUID uuid = collection->uuid()) {
-                    uuid->appendToBuilder(&collectionsByUUID, collNss.coll());
-                }
+            if (collection->isCapped()) {
+                cappedCollectionSet.insert(collNss.coll().toString());
             }
 
-            // Compute the hash for this collection.
-            std::string hash = _hashCollection(opCtx, db, collNss.toString());
+            collectionToUUIDMap.emplace(collNss.coll().toString(), collection->uuid());
 
-            bb.append(collNss.coll(), hash);
+            // Compute the hash for this collection.
+            // TODO(SERVER-103401): Investigate usage validity of
+            // CollectionPtr::CollectionPtr_UNSAFE
+            std::string hash = _hashCollection(
+                opCtx, CollectionPtr::CollectionPtr_UNSAFE(collection), excludeRecordIds);
+
+            collectionToHashMap[collNss.coll().toString()] = hash;
+
+            return true;
+        };
+
+        for (auto&& coll : catalog->range(dbName)) {
+            UUID uuid = coll->uuid();
+
+            // The namespace must be found as the UUID is fetched from the same
+            // CollectionCatalog instance.
+            boost::optional<NamespaceString> nss = catalog->lookupNSSByUUID(opCtx, uuid);
+            invariant(nss);
+
+            // TODO:SERVER-75848 Make this lock-free
+            Lock::CollectionLock clk(opCtx, *nss, MODE_IS);
+
+            auto collection = catalog->establishConsistentCollection(
+                opCtx,
+                {dbName, uuid},
+                shard_role_details::getRecoveryUnit(opCtx)->getPointInTimeReadTimestamp());
+
+            if (!collection) {
+                // The collection did not exist at the read timestamp with the given UUID.
+                continue;
+            }
+
+            (void)checkAndHashCollection(collection.get());
+        }
+
+        BSONObjBuilder bb(result.subobjStart("collections"));
+        BSONArrayBuilder cappedCollections;
+        BSONObjBuilder collectionsByUUID;
+
+        for (const auto& elem : cappedCollectionSet) {
+            cappedCollections.append(elem);
+        }
+
+        for (const auto& entry : collectionToUUIDMap) {
+            auto collName = entry.first;
+            auto uuid = entry.second;
+            uuid.appendToBuilder(&collectionsByUUID, collName);
+        }
+
+        for (const auto& entry : collectionToHashMap) {
+            auto collName = entry.first;
+            auto hash = entry.second;
+            bb.append(collName, hash);
             md5_append(&globalState, (const md5_byte_t*)hash.c_str(), hash.size());
         }
+
         bb.done();
 
         result.append("capped", BSONArray(cappedCollections.done()));
@@ -205,93 +355,71 @@ public:
         result.append("md5", hash);
         result.appendNumber("timeMillis", timer.millis());
 
-        return 1;
+        return true;
     }
 
 private:
     std::string _hashCollection(OperationContext* opCtx,
-                                Database* db,
-                                const std::string& fullCollectionName) {
-
-        NamespaceString ns(fullCollectionName);
-
-        Collection* collection = db->getCollection(opCtx, ns);
-        if (!collection)
-            return "";
-
-        boost::optional<Lock::CollectionLock> collLock;
-        auto txnParticipant = TransactionParticipant::get(opCtx);
-        if (txnParticipant && txnParticipant->inMultiDocumentTransaction()) {
-            // When inside a multi-statement transaction, we are only holding the database lock in
-            // intent mode. We need to also acquire the collection lock in intent mode to ensure
-            // reading from the consistent snapshot doesn't overlap with any catalog operations on
-            // the collection.
-            invariant(
-                opCtx->lockState()->isDbLockedForMode(db->name(), getLockModeForQuery(opCtx)));
-            collLock.emplace(opCtx->lockState(), fullCollectionName, getLockModeForQuery(opCtx));
-
-            auto minSnapshot = collection->getMinimumVisibleSnapshot();
-            auto mySnapshot = opCtx->recoveryUnit()->getPointInTimeReadTimestamp();
-            invariant(mySnapshot);
-
-            uassert(ErrorCodes::SnapshotUnavailable,
-                    str::stream() << "Unable to read from a snapshot due to pending collection"
-                                     " catalog changes; please retry the operation. Snapshot"
-                                     " timestamp is "
-                                  << mySnapshot->toString()
-                                  << ". Collection minimum timestamp is "
-                                  << minSnapshot->toString(),
-                    !minSnapshot || *mySnapshot >= *minSnapshot);
-        } else {
-            invariant(opCtx->lockState()->isDbLockedForMode(db->name(), MODE_S));
-        }
-
-        IndexDescriptor* desc = collection->getIndexCatalog()->findIdIndex(opCtx);
+                                const CollectionPtr& collection,
+                                bool excludeRecordIds) {
+        auto desc = collection->getIndexCatalog()->findIdIndex(opCtx);
 
         std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> exec;
-        if (desc) {
+
+        // Replicated RecordIds circumvent the need to perform an _id lookup because natural
+        // scan order is preserved across nodes. If to exclude recordIds, existing _id scan should
+        // be kept too. This way a customer will get the same hash with excludeRecordIds option as
+        // the one before upgrade.
+        bool includeRids = collection->areRecordIdsReplicated() && !excludeRecordIds;
+
+        if (desc && !includeRids) {
             exec = InternalPlanner::indexScan(opCtx,
-                                              collection,
+                                              &collection,
                                               desc,
                                               BSONObj(),
                                               BSONObj(),
                                               BoundInclusion::kIncludeStartKeyOnly,
-                                              PlanExecutor::NO_YIELD,
+                                              PlanYieldPolicy::YieldPolicy::INTERRUPT_ONLY,
                                               InternalPlanner::FORWARD,
                                               InternalPlanner::IXSCAN_FETCH);
-        } else if (collection->isCapped()) {
+        } else if (collection->isClustered() || includeRids) {
             exec = InternalPlanner::collectionScan(
-                opCtx, fullCollectionName, collection, PlanExecutor::NO_YIELD);
+                opCtx, &collection, PlanYieldPolicy::YieldPolicy::INTERRUPT_ONLY);
         } else {
-            log() << "can't find _id index for: " << fullCollectionName;
-            return "no _id _index";
+            LOGV2(20455, "Can't find _id index for namespace", logAttrs(collection->ns()));
+            return "no _id index";
         }
 
         md5_state_t st;
-        md5_init(&st);
+        md5_init_state(&st);
 
-        long long n = 0;
-        PlanExecutor::ExecState state;
-        BSONObj c;
-        verify(NULL != exec.get());
-        while (PlanExecutor::ADVANCED == (state = exec->getNext(&c, NULL))) {
-            md5_append(&st, (const md5_byte_t*)c.objdata(), c.objsize());
-            n++;
+        try {
+            MONGO_verify(nullptr != exec.get());
+
+            // It's unnecessary to explicitly include the RecordIds of a clustered collection in the
+            // hash. In a clustered collection, each RecordId is generated by the _id, which is
+            // already hashed as a part of the Record.
+            const bool explicitlyHashRecordIds = includeRids && !collection->isClustered();
+            if (explicitlyHashRecordIds) {
+                hashRecordsAndRecordIds(collection, exec.get(), &st);
+            } else {
+                hashRecordsOnly(exec.get(), &st);
+            }
+        } catch (DBException& exception) {
+            LOGV2_WARNING(
+                20456, "Error while hashing, db possibly dropped", logAttrs(collection->ns()));
+            exception.addContext("Plan executor error while running dbHash command");
+            throw;
         }
-        if (PlanExecutor::IS_EOF != state) {
-            warning() << "error while hashing, db dropped? ns=" << fullCollectionName;
-            uasserted(34371,
-                      "Plan executor error while running dbHash command: " +
-                          WorkingSetCommon::toStatusString(c));
-        }
+
         md5digest d;
         md5_finish(&st, d);
         std::string hash = digestToString(d);
 
         return hash;
     }
-
-} dbhashCmd;
+};
+MONGO_REGISTER_COMMAND(DBHashCmd).forShard();
 
 }  // namespace
 }  // namespace mongo

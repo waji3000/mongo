@@ -1,36 +1,34 @@
 // Test that clients support "BEGIN PRIVATE KEY" pems with RSA keys
-load('jstests/ssl/libs/ssl_helpers.js');
+const SERVER_CERT = "jstests/libs/server.pem";
+const CA_CERT = "jstests/libs/ca.pem";
+const CLIENT_CERT = "jstests/libs/client_privatekey.pem";
 
-(function() {
-    "use strict";
+function authAndTest(port) {
+    const mongo = runMongoProgram("mongo",
+                                  "--host",
+                                  "localhost",
+                                  "--port",
+                                  port,
+                                  "--tls",
+                                  "--tlsCAFile",
+                                  CA_CERT,
+                                  "--tlsCertificateKeyFile",
+                                  CLIENT_CERT,
+                                  "--eval",
+                                  "1");
 
-    const SERVER_CERT = "jstests/libs/server.pem";
-    const CA_CERT = "jstests/libs/ca.pem";
-    const CLIENT_CERT = "jstests/libs/client_privatekey.pem";
+    // runMongoProgram returns 0 on success
+    assert.eq(0, mongo, "Connection attempt failed");
+}
 
-    function authAndTest(port) {
-        const mongo = runMongoProgram("mongo",
-                                      "--host",
-                                      "localhost",
-                                      "--port",
-                                      port,
-                                      "--ssl",
-                                      "--sslCAFile",
-                                      CA_CERT,
-                                      "--sslPEMKeyFile",
-                                      CLIENT_CERT,
-                                      "--eval",
-                                      "1");
+const x509_options = {
+    tlsMode: "requireTLS",
+    tlsCertificateKeyFile: SERVER_CERT,
+    tlsCAFile: CA_CERT
+};
 
-        // runMongoProgram returns 0 on success
-        assert.eq(0, mongo, "Connection attempt failed");
-    }
+let mongo = MongoRunner.runMongod(Object.merge(x509_options, {auth: ""}));
 
-    const x509_options = {sslMode: "requireSSL", sslPEMKeyFile: SERVER_CERT, sslCAFile: CA_CERT};
+authAndTest(mongo.port);
 
-    let mongo = MongoRunner.runMongod(Object.merge(x509_options, {auth: ""}));
-
-    authAndTest(mongo.port);
-
-    MongoRunner.stopMongod(mongo);
-}());
+MongoRunner.stopMongod(mongo);

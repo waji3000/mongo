@@ -1,9 +1,3 @@
-/* hasher.cpp
- *
- * Defines a simple hash function class
- */
-
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -33,47 +27,75 @@
  *    it in the license file.
  */
 
+/**
+ * Defines a simple hash function class.
+ */
+
 #include "mongo/db/hasher.h"
 
+#include <cstddef>
+#include <memory>
 
-#include "mongo/db/jsobj.h"
-#include "mongo/util/md5.hpp"
-#include "mongo/util/startup_test.h"
+#include "mongo/base/data_type_endian.h"
+#include "mongo/base/data_view.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/platform/endian.h"
+#include "mongo/util/md5.h"
 
 namespace mongo {
-
-using std::unique_ptr;
 
 namespace {
 
 typedef unsigned char HashDigest[16];
 
 class Hasher {
-    MONGO_DISALLOW_COPYING(Hasher);
+    Hasher(const Hasher&) = delete;
+    Hasher& operator=(const Hasher&) = delete;
 
 public:
     explicit Hasher(HashSeed seed);
-    ~Hasher(){};
+    ~Hasher() {};
 
     // pointer to next part of input key, length in bytes to read
     void addData(const void* keyData, size_t numBytes);
+
+    void addSeed(int32_t number) {
+        addIntegerData(number);
+    }
+
+    // All numerical values should be converted to an int64_t before being added to the hash input.
+    void addNumber(int64_t number) {
+        addIntegerData(number);
+    }
 
     // finish computing the hash, put the result in the digest
     // only call this once per Hasher
     void finish(HashDigest out);
 
 private:
+    // Convert 'number' to little endian and then append it to the digest input. The number of bytes
+    // appended is determined by the input type, so ensure that type T has a well defined size that
+    // is the same on all platforms.
+    template <typename T>
+    void addIntegerData(T number);
+
     md5_state_t _md5State;
-    HashSeed _seed;
 };
 
-Hasher::Hasher(HashSeed seed) : _seed(seed) {
-    md5_init(&_md5State);
-    md5_append(&_md5State, reinterpret_cast<const md5_byte_t*>(&_seed), sizeof(_seed));
+Hasher::Hasher(HashSeed seed) {
+    md5_init_state(&_md5State);
+    addSeed(seed);
 }
 
 void Hasher::addData(const void* keyData, size_t numBytes) {
     md5_append(&_md5State, static_cast<const md5_byte_t*>(keyData), numBytes);
+}
+
+template <typename T>
+void Hasher::addIntegerData(T number) {
+    const auto data = endian::nativeToLittle(number);
+    addData(&data, sizeof(data));
 }
 
 void Hasher::finish(HashDigest out) {
@@ -92,9 +114,8 @@ void recursiveHash(Hasher* h, const BSONElement& e, bool includeFieldName) {
         // if there are no embedded objects (subobjects or arrays),
         // compute the hash, squashing numeric types to 64-bit ints
         if (e.isNumber()) {
-            // Use safeNumberLong, it is well-defined for troublesome doubles.
-            const auto i = endian::nativeToLittle(e.safeNumberLong());
-            h->addData(&i, sizeof(i));
+            // Use safeNumberLongForHash, because it is well-defined for troublesome doubles.
+            h->addNumber(static_cast<int64_t>(e.safeNumberLongForHash()));
         } else {
             h->addData(e.value(), e.valuesize());
         }
@@ -110,21 +131,13 @@ void recursiveHash(Hasher* h, const BSONElement& e, bool includeFieldName) {
         } else {
             b = e.embeddedObject();
         }
-        BSONObjIterator i(b);
-        while (i.moreWithEOO()) {
-            BSONElement el = i.next();
+        for (auto&& el : b) {
             recursiveHash(h, el, true);
         }
+        // Handle EOO case
+        recursiveHash(h, BSONElement{}, true);
     }
 }
-
-struct HasherUnitTest : public StartupTest {
-    void run() {
-        // Hard-coded check to ensure the hash function is consistent across platforms
-        BSONObj o = BSON("check" << 42);
-        verify(BSONElementHasher::hash64(o.firstElement(), 0) == -944302157085130861LL);
-    }
-} hasherUnitTest;
 
 }  // namespace
 

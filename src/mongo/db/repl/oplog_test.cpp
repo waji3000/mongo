@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,28 +27,42 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include <algorithm>
+#include <boost/move/utility_core.hpp>
+#include <fmt/format.h>
+#include <iterator>
 #include <map>
+#include <memory>
+#include <mutex>
+#include <ostream>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/catalog_raii.h"
 #include "mongo/db/client.h"
-#include "mongo/db/concurrency/lock_manager_test_help.h"
-#include "mongo/db/db_raii.h"
-#include "mongo/db/field_parser.h"
+#include "mongo/db/concurrency/lock_manager_defs.h"
+#include "mongo/db/repl/member_state.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/oplog_entry.h"
+#include "mongo/db/repl/oplog_entry_gen.h"
+#include "mongo/db/repl/oplog_interface.h"
 #include "mongo/db/repl/oplog_interface_local.h"
 #include "mongo/db/repl/repl_client_info.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/replication_coordinator_mock.h"
 #include "mongo/db/service_context_d_test_fixture.h"
-#include "mongo/stdx/functional.h"
+#include "mongo/db/storage/write_unit_of_work.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/unittest/barrier.h"
+#include "mongo/unittest/unittest.h"
 #include "mongo/util/concurrency/thread_pool.h"
-
+#include "mongo/util/decorable.h"
 
 namespace mongo {
 namespace repl {
@@ -68,8 +81,7 @@ void OplogTest::setUp() {
     auto opCtx = cc().makeOperationContext();
 
     // Set up ReplicationCoordinator and create oplog.
-    ReplicationCoordinator::set(service, stdx::make_unique<ReplicationCoordinatorMock>(service));
-    setOplogCollectionName(service);
+    ReplicationCoordinator::set(service, std::make_unique<ReplicationCoordinatorMock>(service));
     createOplog(opCtx.get());
 
     // Ensure that we are primary.
@@ -81,11 +93,12 @@ void OplogTest::setUp() {
  * Assert that oplog only has a single entry and return that oplog entry.
  */
 OplogEntry _getSingleOplogEntry(OperationContext* opCtx) {
-    OplogInterfaceLocal oplogInterface(opCtx, NamespaceString::kRsOplogNamespace.ns());
+    OplogInterfaceLocal oplogInterface(opCtx);
     auto oplogIter = oplogInterface.makeIterator();
     auto opEntry = unittest::assertGet(oplogIter->next());
     ASSERT_EQUALS(ErrorCodes::CollectionIsEmpty, oplogIter->next().getStatus())
-        << "Expected only 1 document in the oplog collection " << NamespaceString::kRsOplogNamespace
+        << "Expected only 1 document in the oplog collection "
+        << NamespaceString::kRsOplogNamespace.toStringForErrorMsg()
         << " but found more than 1 document instead";
     return unittest::assertGet(OplogEntry::parse(opEntry.first));
 }
@@ -93,28 +106,20 @@ OplogEntry _getSingleOplogEntry(OperationContext* opCtx) {
 TEST_F(OplogTest, LogOpReturnsOpTimeOnSuccessfulInsertIntoOplogCollection) {
     auto opCtx = cc().makeOperationContext();
 
-    const NamespaceString nss("test.coll");
-    auto msgObj = BSON("msg"
-                       << "hello, world!");
+    const NamespaceString nss = NamespaceString::createNamespaceString_forTest("test.coll");
+    auto msgObj = BSON("msg" << "hello, world!");
 
     // Write to the oplog.
     OpTime opTime;
     {
-        AutoGetDb autoDb(opCtx.get(), nss.db(), MODE_X);
+        MutableOplogEntry oplogEntry;
+        oplogEntry.setOpType(repl::OpTypeEnum::kNoop);
+        oplogEntry.setNss(nss);
+        oplogEntry.setObject(msgObj);
+        oplogEntry.setWallClockTime(Date_t::now());
+        AutoGetDb autoDb(opCtx.get(), nss.dbName(), MODE_X);
         WriteUnitOfWork wunit(opCtx.get());
-        opTime = logOp(opCtx.get(),
-                       "n",
-                       nss,
-                       {},
-                       msgObj,
-                       nullptr,
-                       false,
-                       Date_t::now(),
-                       {},
-                       kUninitializedStmtId,
-                       {},
-                       false /* prepare */,
-                       OplogSlot());
+        opTime = logOp(opCtx.get(), &oplogEntry);
         ASSERT_FALSE(opTime.isNull());
         wunit.commit();
     }
@@ -125,10 +130,10 @@ TEST_F(OplogTest, LogOpReturnsOpTimeOnSuccessfulInsertIntoOplogCollection) {
     ASSERT_EQUALS(opTime, oplogEntry.getOpTime())
         << "OpTime returned from logOp() did not match that in the oplog entry written to the "
            "oplog: "
-        << oplogEntry.toBSON();
-    ASSERT(OpTypeEnum::kNoop == oplogEntry.getOpType()) << "Expected 'n' op type but found '"
-                                                        << OpType_serializer(oplogEntry.getOpType())
-                                                        << "' instead: " << oplogEntry.toBSON();
+        << oplogEntry.toBSONForLogging();
+    ASSERT(OpTypeEnum::kNoop == oplogEntry.getOpType())
+        << "Expected 'n' op type but found '" << OpType_serializer(oplogEntry.getOpType())
+        << "' instead: " << oplogEntry.toBSONForLogging();
     ASSERT_BSONOBJ_EQ(msgObj, oplogEntry.getObject());
 
     // Ensure that the msg optime returned is the same as the last optime in the ReplClientInfo.
@@ -141,8 +146,8 @@ TEST_F(OplogTest, LogOpReturnsOpTimeOnSuccessfulInsertIntoOplogCollection) {
 void _checkOplogEntry(const OplogEntry& oplogEntry,
                       const OpTime& expectedOpTime,
                       const NamespaceString& expectedNss) {
-    ASSERT_EQUALS(expectedOpTime, oplogEntry.getOpTime()) << oplogEntry.toBSON();
-    ASSERT_EQUALS(expectedNss, oplogEntry.getNss()) << oplogEntry.toBSON();
+    ASSERT_EQUALS(expectedOpTime, oplogEntry.getOpTime()) << oplogEntry.toBSONForLogging();
+    ASSERT_EQUALS(expectedNss, oplogEntry.getNss()) << oplogEntry.toBSONForLogging();
 }
 void _checkOplogEntry(const OplogEntry& oplogEntry,
                       const std::pair<OpTime, NamespaceString>& expectedOpTimeAndNss) {
@@ -156,12 +161,8 @@ void _checkOplogEntry(const OplogEntry& oplogEntry,
  * the contents of the oplog collection.
  */
 using OpTimeNamespaceStringMap = std::map<OpTime, NamespaceString>;
-using MakeTaskFunction =
-    stdx::function<ThreadPoolInterface::Task(const NamespaceString& nss,
-                                             stdx::mutex* mtx,
-                                             OpTimeNamespaceStringMap* opTimeNssMap,
-                                             unittest::Barrier* barrier)>;
-void _testConcurrentLogOp(const MakeTaskFunction& makeTaskFunction,
+template <typename F>
+void _testConcurrentLogOp(const F& makeTaskFunction,
                           OpTimeNamespaceStringMap* opTimeNssMap,
                           std::vector<OplogEntry>* oplogEntries,
                           std::size_t expectedNumOplogEntries) {
@@ -170,7 +171,9 @@ void _testConcurrentLogOp(const MakeTaskFunction& makeTaskFunction,
     // Run 2 concurrent logOp() requests using the thread pool.
     ThreadPool::Options options;
     options.maxThreads = 2U;
-    options.onCreateThread = [](const std::string& name) { Client::initThread(name); };
+    options.onCreateThread = [](const std::string& name) {
+        Client::initThread(name, getGlobalServiceContext()->getService());
+    };
     ThreadPool pool(options);
     pool.startup();
 
@@ -178,13 +181,20 @@ void _testConcurrentLogOp(const MakeTaskFunction& makeTaskFunction,
     // Use a barrier with a thread count of 3 to ensure both logOp() tasks are complete before this
     // test thread can proceed with shutting the thread pool down.
     stdx::mutex mtx;
+    ;
     unittest::Barrier barrier(3U);
-    const NamespaceString nss1("test1.coll");
-    const NamespaceString nss2("test2.coll");
-    ASSERT_OK(pool.schedule(makeTaskFunction(nss1, &mtx, opTimeNssMap, &barrier)))
-        << "Failed to schedule logOp() task for namespace " << nss1;
-    ASSERT_OK(pool.schedule(makeTaskFunction(nss2, &mtx, opTimeNssMap, &barrier)))
-        << "Failed to schedule logOp() task for namespace " << nss2;
+    const NamespaceString nss1 = NamespaceString::createNamespaceString_forTest("test1.coll");
+    const NamespaceString nss2 = NamespaceString::createNamespaceString_forTest("test2.coll");
+    pool.schedule([&](auto status) mutable {
+        ASSERT_OK(status) << "Failed to schedule logOp() task for namespace "
+                          << nss1.toStringForErrorMsg();
+        makeTaskFunction(nss1, &mtx, opTimeNssMap, &barrier)();
+    });
+    pool.schedule([&](auto status) mutable {
+        ASSERT_OK(status) << "Failed to schedule logOp() task for namespace "
+                          << nss2.toStringForErrorMsg();
+        makeTaskFunction(nss2, &mtx, opTimeNssMap, &barrier)();
+    });
     barrier.countDownAndWait();
 
     // Shut thread pool down.
@@ -194,7 +204,7 @@ void _testConcurrentLogOp(const MakeTaskFunction& makeTaskFunction,
     // Read oplog entries from the oplog collection starting with the entry with the most recent
     // optime.
     auto opCtx = cc().makeOperationContext();
-    OplogInterfaceLocal oplogInterface(opCtx.get(), NamespaceString::kRsOplogNamespace.ns());
+    OplogInterfaceLocal oplogInterface(opCtx.get());
     auto oplogIter = oplogInterface.makeIterator();
     auto nextValue = oplogIter->next();
     while (nextValue.isOK()) {
@@ -221,35 +231,24 @@ OpTime _logOpNoopWithMsg(OperationContext* opCtx,
                          stdx::mutex* mtx,
                          OpTimeNamespaceStringMap* opTimeNssMap,
                          const NamespaceString& nss) {
-    stdx::lock_guard<stdx::mutex> lock(*mtx);
-
-    // logOp() must be called while holding lock because ephemeralForTest storage engine does not
-    // support concurrent updates to its internal state.
-    const auto msgObj = BSON("msg" << nss.ns());
-    auto opTime = logOp(opCtx,
-                        "n",
-                        nss,
-                        {},
-                        msgObj,
-                        nullptr,
-                        false,
-                        Date_t::now(),
-                        {},
-                        kUninitializedStmtId,
-                        {},
-                        false /* prepare */,
-                        OplogSlot());
+    MutableOplogEntry oplogEntry;
+    oplogEntry.setOpType(repl::OpTypeEnum::kNoop);
+    oplogEntry.setNss(nss);
+    oplogEntry.setObject(BSON("msg" << nss.ns_forTest()));
+    oplogEntry.setWallClockTime(Date_t::now());
+    auto opTime = logOp(opCtx, &oplogEntry);
     ASSERT_FALSE(opTime.isNull());
 
+    stdx::lock_guard<stdx::mutex> lock(*mtx);
     ASSERT(opTimeNssMap->find(opTime) == opTimeNssMap->end())
-        << "Unable to add namespace " << nss << " to map - map contains duplicate entry for optime "
-        << opTime;
+        << "Unable to add namespace " << nss.toStringForErrorMsg()
+        << " to map - map contains duplicate entry for optime " << opTime;
     opTimeNssMap->insert(std::make_pair(opTime, nss));
 
     return opTime;
 }
 
-TEST_F(OplogTest, ConcurrentLogOpWithoutDocLockingSupport) {
+TEST_F(OplogTest, ConcurrentLogOp) {
     OpTimeNamespaceStringMap opTimeNssMap;
     std::vector<OplogEntry> oplogEntries;
 
@@ -260,47 +259,14 @@ TEST_F(OplogTest, ConcurrentLogOpWithoutDocLockingSupport) {
            unittest::Barrier* barrier) {
             return [=] {
                 auto opCtx = cc().makeOperationContext();
-                AutoGetDb autoDb(opCtx.get(), nss.db(), MODE_X);
+                AutoGetDb autoDb(opCtx.get(), nss.dbName(), MODE_X);
                 WriteUnitOfWork wunit(opCtx.get());
 
                 _logOpNoopWithMsg(opCtx.get(), mtx, opTimeNssMap, nss);
 
-                // In a storage engine that does not support doc locking, upon returning from
-                // logOp(), this thread still holds an implicit MODE_X lock on the oplog collection
-                // until it commits the WriteUnitOfWork. Therefore, we must wait on the barrier
-                // after the WUOW is committed.
-                wunit.commit();
-                barrier->countDownAndWait();
-            };
-        },
-        &opTimeNssMap,
-        &oplogEntries,
-        2U);
-
-    _checkOplogEntry(oplogEntries[0], *(opTimeNssMap.begin()));
-    _checkOplogEntry(oplogEntries[1], *(opTimeNssMap.rbegin()));
-}
-
-TEST_F(OplogTest, ConcurrentLogOpWithDocLockingSupport) {
-    OpTimeNamespaceStringMap opTimeNssMap;
-    std::vector<OplogEntry> oplogEntries;
-
-    ForceSupportsDocLocking support(true);
-    _testConcurrentLogOp(
-        [](const NamespaceString& nss,
-           stdx::mutex* mtx,
-           OpTimeNamespaceStringMap* opTimeNssMap,
-           unittest::Barrier* barrier) {
-            return [=] {
-                auto opCtx = cc().makeOperationContext();
-                AutoGetDb autoDb(opCtx.get(), nss.db(), MODE_X);
-                WriteUnitOfWork wunit(opCtx.get());
-
-                _logOpNoopWithMsg(opCtx.get(), mtx, opTimeNssMap, nss);
-
-                // In a storage engine that supports doc locking, it is okay for multiple threads to
-                // maintain uncommitted WUOWs upon returning from logOp() because each thread will
-                // hold an implicit MODE_IX lock on the oplog collection.
+                // It is okay for multiple threads to maintain uncommitted WUOWs upon returning from
+                // logOp() because each thread will hold an implicit MODE_IX lock on the oplog
+                // collection.
                 barrier->countDownAndWait();
                 wunit.commit();
             };
@@ -313,11 +279,10 @@ TEST_F(OplogTest, ConcurrentLogOpWithDocLockingSupport) {
     _checkOplogEntry(oplogEntries[1], *(opTimeNssMap.rbegin()));
 }
 
-TEST_F(OplogTest, ConcurrentLogOpWithDocLockingSupportRevertFirstOplogEntry) {
+TEST_F(OplogTest, ConcurrentLogOpRevertFirstOplogEntry) {
     OpTimeNamespaceStringMap opTimeNssMap;
     std::vector<OplogEntry> oplogEntries;
 
-    ForceSupportsDocLocking support(true);
     _testConcurrentLogOp(
         [](const NamespaceString& nss,
            stdx::mutex* mtx,
@@ -325,14 +290,14 @@ TEST_F(OplogTest, ConcurrentLogOpWithDocLockingSupportRevertFirstOplogEntry) {
            unittest::Barrier* barrier) {
             return [=] {
                 auto opCtx = cc().makeOperationContext();
-                AutoGetDb autoDb(opCtx.get(), nss.db(), MODE_X);
+                AutoGetDb autoDb(opCtx.get(), nss.dbName(), MODE_X);
                 WriteUnitOfWork wunit(opCtx.get());
 
                 auto opTime = _logOpNoopWithMsg(opCtx.get(), mtx, opTimeNssMap, nss);
 
-                // In a storage engine that supports doc locking, it is okay for multiple threads to
-                // maintain uncommitted WUOWs upon returning from logOp() because each thread will
-                // hold an implicit MODE_IX lock on the oplog collection.
+                // It is okay for multiple threads to maintain uncommitted WUOWs upon returning from
+                // logOp() because each thread will hold an implicit MODE_IX lock on the oplog
+                // collection.
                 barrier->countDownAndWait();
 
                 // Revert the first logOp() call and confirm that there are no holes in the
@@ -360,11 +325,10 @@ TEST_F(OplogTest, ConcurrentLogOpWithDocLockingSupportRevertFirstOplogEntry) {
     _checkOplogEntry(oplogEntries[0], *(opTimeNssMap.crbegin()));
 }
 
-TEST_F(OplogTest, ConcurrentLogOpWithDocLockingSupportRevertLastOplogEntry) {
+TEST_F(OplogTest, ConcurrentLogOpRevertLastOplogEntry) {
     OpTimeNamespaceStringMap opTimeNssMap;
     std::vector<OplogEntry> oplogEntries;
 
-    ForceSupportsDocLocking support(true);
     _testConcurrentLogOp(
         [](const NamespaceString& nss,
            stdx::mutex* mtx,
@@ -372,14 +336,14 @@ TEST_F(OplogTest, ConcurrentLogOpWithDocLockingSupportRevertLastOplogEntry) {
            unittest::Barrier* barrier) {
             return [=] {
                 auto opCtx = cc().makeOperationContext();
-                AutoGetDb autoDb(opCtx.get(), nss.db(), MODE_X);
+                AutoGetDb autoDb(opCtx.get(), nss.dbName(), MODE_X);
                 WriteUnitOfWork wunit(opCtx.get());
 
                 auto opTime = _logOpNoopWithMsg(opCtx.get(), mtx, opTimeNssMap, nss);
 
-                // In a storage engine that supports doc locking, it is okay for multiple threads to
-                // maintain uncommitted WUOWs upon returning from logOp() because each thread will
-                // hold an implicit MODE_IX lock on the oplog collection.
+                // It is okay for multiple threads to maintain uncommitted WUOWs upon returning from
+                // logOp() because each thread will hold an implicit MODE_IX lock on the oplog
+                // collection.
                 barrier->countDownAndWait();
 
                 // Revert the last logOp() call and confirm that there are no holes in the

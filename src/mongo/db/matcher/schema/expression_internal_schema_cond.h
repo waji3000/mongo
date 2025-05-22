@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,8 +29,15 @@
 
 #pragma once
 
+#include <array>
+#include <memory>
+#include <utility>
+
+#include "mongo/base/clonable_ptr.h"
 #include "mongo/base/string_data.h"
+#include "mongo/db/matcher/expression.h"
 #include "mongo/db/matcher/expression_arity.h"
+#include "mongo/db/matcher/expression_visitor.h"
 
 namespace mongo {
 
@@ -44,8 +50,10 @@ public:
     static constexpr StringData kName = "$_internalSchemaCond"_sd;
 
     explicit InternalSchemaCondMatchExpression(
-        std::array<std::unique_ptr<MatchExpression>, 3> expressions)
-        : FixedArityMatchExpression(MatchType::INTERNAL_SCHEMA_COND, std::move(expressions)) {}
+        std::array<std::unique_ptr<MatchExpression>, 3> expressions,
+        clonable_ptr<ErrorAnnotation> annotation = nullptr)
+        : FixedArityMatchExpression(
+              MatchType::INTERNAL_SCHEMA_COND, std::move(expressions), std::move(annotation)) {}
 
     const MatchExpression* condition() const {
         return expressions()[0].get();
@@ -67,12 +75,13 @@ public:
         return MatchCategory::kOther;
     }
 
-    /**
-     * If the input object matches 'condition', returns the result of matching it against
-     * 'thenBranch'. Otherwise, returns the result of matching it against 'elseBranch'.
-     */
-    bool matches(const MatchableDocument* doc, MatchDetails* details = nullptr) const final;
-    bool matchesSingleElement(const BSONElement& elem, MatchDetails* details = nullptr) const final;
+    void acceptVisitor(MatchExpressionMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(MatchExpressionConstVisitor* visitor) const final {
+        visitor->visit(this);
+    }
 };
 
 }  // namespace mongo

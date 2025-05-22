@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,15 +27,28 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include "mongo/platform/process_id.h"
 
-#include <iostream>
+
+// IWYU pragma: no_include "syscall.h"
+
+#ifndef _WIN32
+#include <pthread.h>  // IWYU pragma: keep
+#endif
+
+#if defined(__linux__)
+#include <sys/syscall.h>  // IWYU pragma: keep
+#include <sys/types.h>    // IWYU pragma: keep
+#endif
+#ifdef __FreeBSD__
+#include <pthread_np.h>
+#endif
+
 #include <limits>
-#include <sstream>
+#include <sstream>  // IWYU pragma: keep
 
 #include "mongo/base/static_assert.h"
+#include "mongo/util/assert_util.h"  // IWYU pragma: keep
 
 namespace mongo {
 
@@ -52,10 +64,35 @@ inline NativeProcessId getCurrentNativeProcessId() {
     return getpid();
 }
 #endif
+
+#ifdef _WIN32
+inline NativeProcessId getCurrentNativeThreadId() {
+    return GetCurrentThreadId();
+}
+#elif __APPLE__
+inline NativeProcessId getCurrentNativeThreadId() {
+    // macOS deprecated syscall in 10.12.
+    uint64_t tid;
+    invariant(::pthread_threadid_np(NULL, &tid) == 0);
+    return tid;
+}
+#elif __FreeBSD__
+inline NativeProcessId getCurrentNativeThreadId() {
+    return pthread_getthreadid_np();
+}
+#else
+inline NativeProcessId getCurrentNativeThreadId() {
+    return ::syscall(SYS_gettid);
+}
+#endif
 }  // namespace
 
 ProcessId ProcessId::getCurrent() {
     return fromNative(getCurrentNativeProcessId());
+}
+
+ProcessId ProcessId::getCurrentThreadId() {
+    return fromNative(getCurrentNativeThreadId());
 }
 
 int64_t ProcessId::asInt64() const {

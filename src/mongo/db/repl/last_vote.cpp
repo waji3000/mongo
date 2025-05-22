@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,9 +29,13 @@
 
 #include "mongo/db/repl/last_vote.h"
 
-#include "mongo/bson/util/bson_check.h"
+#include <boost/move/utility_core.hpp>
+
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/util/bson_extract.h"
-#include "mongo/db/jsobj.h"
 
 namespace mongo {
 namespace repl {
@@ -42,20 +45,14 @@ constexpr StringData kCandidateIndexFieldName = "candidateIndex"_sd;
 constexpr StringData kTermFieldName = "term"_sd;
 constexpr StringData kIdFieldName = "_id"_sd;
 
-constexpr StringData kLegalFieldNames[] = {kCandidateIndexFieldName, kTermFieldName, kIdFieldName};
-
 }  // namespace
 
 LastVote::LastVote(long long term, long long candidateIndex)
     : _candidateIndex(candidateIndex), _term(term) {}
 
 StatusWith<LastVote> LastVote::readFromLastVote(const BSONObj& doc) {
-    Status status = bsonCheckOnlyHasFields("LastVote", doc, kLegalFieldNames);
-    if (!status.isOK())
-        return status;
-
     long long term;
-    status = bsonExtractIntegerField(doc, kTermFieldName, &term);
+    Status status = bsonExtractIntegerField(doc, kTermFieldName, &term);
     if (!status.isOK())
         return status;
 

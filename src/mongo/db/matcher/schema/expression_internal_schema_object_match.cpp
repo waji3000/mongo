@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,8 +27,15 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <utility>
 
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/db/matcher/path.h"
 #include "mongo/db/matcher/schema/expression_internal_schema_object_match.h"
 
 namespace mongo {
@@ -37,33 +43,27 @@ namespace mongo {
 constexpr StringData InternalSchemaObjectMatchExpression::kName;
 
 InternalSchemaObjectMatchExpression::InternalSchemaObjectMatchExpression(
-    StringData path, std::unique_ptr<MatchExpression> expr)
+    boost::optional<StringData> path,
+    std::unique_ptr<MatchExpression> expr,
+    clonable_ptr<ErrorAnnotation> annotation)
     : PathMatchExpression(INTERNAL_SCHEMA_OBJECT_MATCH,
                           path,
                           ElementPath::LeafArrayBehavior::kNoTraversal,
-                          ElementPath::NonLeafArrayBehavior::kTraverse),
+                          ElementPath::NonLeafArrayBehavior::kTraverse,
+                          std::move(annotation)),
       _sub(std::move(expr)) {}
 
-bool InternalSchemaObjectMatchExpression::matchesSingleElement(const BSONElement& elem,
-                                                               MatchDetails* details) const {
-    if (elem.type() != BSONType::Object) {
-        return false;
-    }
-    return _sub->matchesBSON(elem.Obj());
+void InternalSchemaObjectMatchExpression::debugString(StringBuilder& debug,
+                                                      int indentationLevel) const {
+    _debugAddSpace(debug, indentationLevel);
+    debug << kName;
+    _debugStringAttachTagInfo(&debug);
+    _sub->debugString(debug, indentationLevel + 1);
 }
 
-void InternalSchemaObjectMatchExpression::debugString(StringBuilder& debug, int level) const {
-    _debugAddSpace(debug, level);
-    debug << kName << "\n";
-    _sub->debugString(debug, level + 1);
-}
-
-void InternalSchemaObjectMatchExpression::serialize(BSONObjBuilder* out) const {
-    BSONObjBuilder objMatchBob(out->subobjStart(path()));
-    BSONObjBuilder subBob(objMatchBob.subobjStart(kName));
-    _sub->serialize(&subBob);
-    subBob.doneFast();
-    objMatchBob.doneFast();
+void InternalSchemaObjectMatchExpression::appendSerializedRightHandSide(
+    BSONObjBuilder* bob, const SerializationOptions& opts, bool includePath) const {
+    bob->append(kName, _sub->serialize(opts, includePath));
 }
 
 bool InternalSchemaObjectMatchExpression::equivalent(const MatchExpression* other) const {
@@ -74,9 +74,9 @@ bool InternalSchemaObjectMatchExpression::equivalent(const MatchExpression* othe
     return _sub->equivalent(other->getChild(0));
 }
 
-std::unique_ptr<MatchExpression> InternalSchemaObjectMatchExpression::shallowClone() const {
-    auto clone =
-        stdx::make_unique<InternalSchemaObjectMatchExpression>(path(), _sub->shallowClone());
+std::unique_ptr<MatchExpression> InternalSchemaObjectMatchExpression::clone() const {
+    auto clone = std::make_unique<InternalSchemaObjectMatchExpression>(
+        path(), _sub->clone(), _errorAnnotation);
     if (getTag()) {
         clone->setTag(getTag()->clone());
     }
@@ -87,8 +87,10 @@ MatchExpression::ExpressionOptimizerFunc InternalSchemaObjectMatchExpression::ge
     return [](std::unique_ptr<MatchExpression> expression) {
         auto& objectMatchExpression =
             static_cast<InternalSchemaObjectMatchExpression&>(*expression);
-        objectMatchExpression._sub =
-            MatchExpression::optimize(std::move(objectMatchExpression._sub));
+        // The Boolean simplifier does not support schema expressions for we haven't figured out how
+        // to simplify them and whether we want them to be simplified or not.
+        objectMatchExpression._sub = MatchExpression::optimize(
+            std::move(objectMatchExpression._sub), /* enableSimplification */ false);
 
         return expression;
     };

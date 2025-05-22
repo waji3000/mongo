@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,32 +27,38 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
-
-#include "mongo/platform/basic.h"
-
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <cstddef>
+#include <stack>
+#include <string>
+#include <tuple>
+#include <utility>
 #include <vector>
 
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
 #include "mongo/bson/util/bson_check.h"
 #include "mongo/bson/util/bson_extract.h"
-#include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/auth/authorization_session.h"  // IWYU pragma: keep
 #include "mongo/db/catalog/document_validation.h"
-#include "mongo/db/catalog/uuid_catalog.h"
-#include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/oplog_application_checks.h"
-#include "mongo/db/concurrency/write_conflict_exception.h"
-#include "mongo/db/db_raii.h"
-#include "mongo/db/dbdirectclient.h"
-#include "mongo/db/jsobj.h"
+#include "mongo/db/database_name.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/apply_ops.h"
+#include "mongo/db/repl/apply_ops_command_info.h"
 #include "mongo/db/repl/oplog.h"
-#include "mongo/db/repl/repl_client_info.h"
+#include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/service_context.h"
-#include "mongo/util/log.h"
-#include "mongo/util/scopeguard.h"
-#include "mongo/util/uuid.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 namespace {
@@ -94,7 +99,7 @@ OplogApplicationValidity validateApplyOpsCommand(const BSONObj& cmdObj) {
 
     auto operationContainsUUID = [](const BSONObj& opObj) {
         auto anyTopLevelElementIsUUID = [](const BSONObj& opObj) {
-            for (const BSONElement opElement : opObj) {
+            for (const BSONElement& opElement : opObj) {
                 if (opElement.type() == BSONType::BinData &&
                     opElement.binDataType() == BinDataType::newUUID) {
                     return true;
@@ -124,6 +129,10 @@ OplogApplicationValidity validateApplyOpsCommand(const BSONObj& cmdObj) {
     };
 
     OplogApplicationValidity ret = OplogApplicationValidity::kOk;
+    auto demandAuthorization = [&ret](OplogApplicationValidity oplogApplicationValidity) {
+        // Uses the fact that OplogApplicationValidity is ordered by increasing requirements
+        ret = oplogApplicationValidity > ret ? oplogApplicationValidity : ret;
+    };
 
     // Insert the top level applyOps command into the stack.
     toCheck.emplace(std::make_pair(0, cmdObj));
@@ -138,6 +147,7 @@ OplogApplicationValidity validateApplyOpsCommand(const BSONObj& cmdObj) {
         // Check if the applyOps command is empty. This is probably not something that should
         // happen, so require a superuser to do this.
         if (applyOpsObj.firstElement().Array().empty()) {
+            // TODO(SERVER-96657): Do not return here, as it skips the remaining validations
             return OplogApplicationValidity::kNeedsSuperuser;
         }
 
@@ -150,6 +160,7 @@ OplogApplicationValidity validateApplyOpsCommand(const BSONObj& cmdObj) {
                 auto oplogEntry = e.Obj();
                 if (checkCOperationType(oplogEntry, "create"_sd) ||
                     checkCOperationType(oplogEntry, "renameCollection"_sd)) {
+                    // TODO(SERVER-96657): Do not return here, as it skips the remaining validations
                     return OplogApplicationValidity::kNeedsSuperuser;
                 }
             }
@@ -160,15 +171,33 @@ OplogApplicationValidity validateApplyOpsCommand(const BSONObj& cmdObj) {
             checkBSONType(BSONType::Object, element);
             BSONObj opObj = element.Obj();
 
+            // Applying an entry with using a given FCV requires superuser privileges,
+            // as it may create inconsistencies if it doesn't match the current FCV.
+            if (opObj.hasField(repl::OplogEntryBase::kVersionContextFieldName)) {
+                uassert(
+                    10296501, "versionContext is not allowed inside nested applyOps", depth == 0);
+                demandAuthorization(OplogApplicationValidity::kNeedsSuperuser);
+            }
+
             bool opHasUUIDs = operationContainsUUID(opObj);
 
             // If the op uses any UUIDs at all then the user must possess extra privileges.
-            if (opHasUUIDs && ret == OplogApplicationValidity::kOk)
-                ret = OplogApplicationValidity::kNeedsUseUUID;
+            if (opHasUUIDs) {
+                demandAuthorization(OplogApplicationValidity::kNeedsUseUUID);
+            }
             if (opHasUUIDs && checkCOperationType(opObj, "create"_sd)) {
                 // If the op is 'c' and forces the server to ingest a collection
                 // with a specific, user defined UUID.
-                ret = OplogApplicationValidity::kNeedsForceAndUseUUID;
+                demandAuthorization(OplogApplicationValidity::kNeedsForceAndUseUUID);
+            }
+
+            if (checkCOperationType(opObj, "dropDatabase"_sd)) {
+                // dropDatabase is not allowed to run inside a nested applyOps command.
+                // Typically applyOps takes the global write lock, but dropDatabase requires the
+                // lock not to be taken. We allow it on a top-level applyOps as a special case,
+                // but running it inside a nested applyOps is non-trivial and does not fulfill any
+                // use case, so we disallow it and return an error instead.
+                uassert(9585500, "dropDatabase is not allowed inside nested applyOps", depth == 0);
             }
 
             // If the op contains a nested applyOps...
@@ -203,19 +232,18 @@ public:
     }
 
     std::string help() const override {
-        return "internal (sharding)\n{ applyOps : [ ] , preCondition : [ { ns : ... , q : ... , "
-               "res : ... } ] }";
+        return "internal command to apply oplog entries\n{ applyOps : [ ] }";
     }
 
     Status checkAuthForOperation(OperationContext* opCtx,
-                                 const std::string& dbname,
+                                 const DatabaseName& dbName,
                                  const BSONObj& cmdObj) const override {
         OplogApplicationValidity validity = validateApplyOpsCommand(cmdObj);
-        return OplogApplicationChecks::checkAuthForCommand(opCtx, dbname, cmdObj, validity);
+        return OplogApplicationChecks::checkAuthForOperation(opCtx, dbName, cmdObj, validity);
     }
 
     bool run(OperationContext* opCtx,
-             const std::string& dbname,
+             const DatabaseName& dbName,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) override {
         validateApplyOpsCommand(cmdObj);
@@ -261,13 +289,16 @@ public:
                                                << repl::ApplyOps::kOplogApplicationModeFieldName));
         }
 
+        OperationShardingState::ScopedAllowImplicitCollectionCreate_UNSAFE unsafeCreateCollection(
+            opCtx);
+
         auto applyOpsStatus = CommandHelpers::appendCommandStatusNoThrow(
-            result, repl::applyOps(opCtx, dbname, cmdObj, oplogApplicationMode, &result));
+            result, repl::applyOps(opCtx, dbName, cmdObj, oplogApplicationMode, &result));
 
         return applyOpsStatus;
     }
-
-} applyOpsCmd;
+};
+MONGO_REGISTER_COMMAND(ApplyOpsCmd).forShard();
 
 }  // namespace
 }  // namespace mongo

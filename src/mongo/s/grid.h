@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,37 +29,40 @@
 
 #pragma once
 
-#include "mongo/db/repl/optime.h"
+#include <functional>
+#include <memory>
+
+#include <boost/move/utility_core.hpp>
+
+#include "mongo/db/operation_context.h"
+#include "mongo/db/service_context.h"
+#include "mongo/executor/connection_pool_stats.h"
+#include "mongo/executor/task_executor_pool.h"
+#include "mongo/platform/atomic_word.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
+#include "mongo/s/catalog_cache.h"
 #include "mongo/s/client/shard_registry.h"
-#include "mongo/stdx/functional.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/stdx/mutex.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 
 class BalancerConfiguration;
-class CatalogCache;
 class ClusterCursorManager;
-class OperationContext;
-class ServiceContext;
 
 namespace executor {
-struct ConnectionPoolStats;
 class NetworkInterface;
-class TaskExecutorPool;
 }  // namespace executor
 
 /**
- * Holds the global sharding context. Single instance exists for a running server. Exists on
- * both MongoD and MongoS.
+ * Contains the sharding context for a running server. Exists on both MongoD and MongoS.
  */
 class Grid {
 public:
     Grid();
     ~Grid();
 
-    using CustomConnectionPoolStatsFn = stdx::function<void(executor::ConnectionPoolStats* stats)>;
+    using CustomConnectionPoolStatsFn = std::function<void(executor::ConnectionPoolStats* stats)>;
 
     /**
      * Retrieves the instance of Grid associated with the current service/operation context.
@@ -77,7 +79,7 @@ public:
      */
     void init(std::unique_ptr<ShardingCatalogClient> catalogClient,
               std::unique_ptr<CatalogCache> catalogCache,
-              std::unique_ptr<ShardRegistry> shardRegistry,
+              std::shared_ptr<ShardRegistry> shardRegistry,
               std::unique_ptr<ClusterCursorManager> cursorManager,
               std::unique_ptr<BalancerConfiguration> balancerConfig,
               std::unique_ptr<executor::TaskExecutorPool> executorPool,
@@ -90,10 +92,20 @@ public:
     bool isShardingInitialized() const;
 
     /**
+     * Throws if sharding is not initialized.
+     */
+    void assertShardingIsInitialized() const;
+
+    /**
      * Used to indicate the sharding initialization process is complete. Should only be called once
      * in the lifetime of a server. Protected by an atomic access guard.
      */
     void setShardingInitialized();
+
+    /**
+     * Returns true if init() has successfully completed.
+     */
+    bool isInitialized() const;
 
     /**
      * If the instance as which this sharding component is running (config/shard/mongos) uses
@@ -104,64 +116,49 @@ public:
     void setCustomConnectionPoolStatsFn(CustomConnectionPoolStatsFn statsFn);
 
     /**
-     * Deprecated. This is only used on mongos, and once addShard is solely handled by the configs,
-     * it can be deleted.
-     * @return true if shards and config servers are allowed to use 'localhost' in address
+     * These getter methods are safe to run only when Grid::init has been called.
      */
-    bool allowLocalHost() const;
-
-    /**
-     * Deprecated. This is only used on mongos, and once addShard is solely handled by the configs,
-     * it can be deleted.
-     * @param whether to allow shards and config servers to use 'localhost' in address
-     */
-    void setAllowLocalHost(bool allow);
-
     ShardingCatalogClient* catalogClient() const {
+        _assertInitialized();
         return _catalogClient.get();
     }
 
-    /**
-     * Can return nullptr. For example, if this is a mongod that is not a shard server. This is
-     * always present on mongos after startup.
-     */
     CatalogCache* catalogCache() const {
+        _assertInitialized();
         return _catalogCache.get();
     }
 
     ShardRegistry* shardRegistry() const {
+        _assertInitialized();
         return _shardRegistry.get();
     }
 
     ClusterCursorManager* getCursorManager() const {
+        _assertInitialized();
         return _cursorManager.get();
     }
 
     executor::TaskExecutorPool* getExecutorPool() const {
+        _assertInitialized();
         return _executorPool.get();
     }
 
     executor::NetworkInterface* getNetwork() {
+        _assertInitialized();
         return _network;
     }
 
     BalancerConfiguration* getBalancerConfiguration() const {
+        _assertInitialized();
         return _balancerConfig.get();
     }
 
     /**
-     * Returns the the last optime that a shard or config server has reported as the current
-     * committed optime on the config server.
-     * NOTE: This is not valid to call on a config server instance.
+     * Shuts down all the services that are managed by the Grid class.
      */
-    repl::OpTime configOpTime() const;
-
-    /**
-     * Called whenever a mongos or shard gets a response from a config server or shard and updates
-     * what we've seen as the last config server optime.
-     * NOTE: This is not valid to call on a config server instance.
-     */
-    void advanceConfigOpTime(repl::OpTime opTime);
+    void shutdown(OperationContext* opCtx,
+                  BSONObjBuilder* shutdownTimeElapsedBuilder,
+                  bool isMongos = false);
 
     /**
      * Clears the grid object so that it can be reused between test executions. This will not
@@ -175,9 +172,15 @@ public:
     void clearForUnitTests();
 
 private:
+    void _assertInitialized() const {
+        uassert(ErrorCodes::ShardingStateNotInitialized,
+                "Grid cannot be accessed before it is initialized",
+                _isGridInitialized.load());
+    }
+
     std::unique_ptr<ShardingCatalogClient> _catalogClient;
     std::unique_ptr<CatalogCache> _catalogCache;
-    std::unique_ptr<ShardRegistry> _shardRegistry;
+    std::shared_ptr<ShardRegistry> _shardRegistry;
     std::unique_ptr<ClusterCursorManager> _cursorManager;
     std::unique_ptr<BalancerConfiguration> _balancerConfig;
 
@@ -189,21 +192,12 @@ private:
     // questions about the network configuration, such as getting the current server's hostname.
     executor::NetworkInterface* _network{nullptr};
 
-    CustomConnectionPoolStatsFn _customConnectionPoolStatsFn;
+    AtomicWord<bool> _shardingInitialized{false};
+    AtomicWord<bool> _isGridInitialized{false};
 
-    AtomicBool _shardingInitialized{false};
-
-    // Protects _configOpTime.
     mutable stdx::mutex _mutex;
 
-    // Last known highest opTime from the config server that should be used when doing reads.
-    // This value is updated any time a shard or mongos talks to a config server or a shard.
-    repl::OpTime _configOpTime;
-
-    // Deprecated. This is only used on mongos, and once addShard is solely handled by the configs,
-    // it can be deleted.
-    // Can 'localhost' be used in shard addresses?
-    bool _allowLocalShard{true};
+    CustomConnectionPoolStatsFn _customConnectionPoolStatsFn;
 };
 
 }  // namespace mongo

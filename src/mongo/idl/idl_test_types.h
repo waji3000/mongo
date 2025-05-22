@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -79,7 +78,7 @@ public:
         return object;
     }
 
-    const BSONObj serializeToBSON() const {
+    BSONObj serializeToBSON() const {
         return _obj;
     }
 
@@ -104,7 +103,7 @@ public:
     }
 
     ConstDataRange serializeToBSON() const {
-        return makeCDR(_vec);
+        return ConstDataRange(_vec);
     }
 
     const std::vector<std::uint8_t>& getVector() const {
@@ -163,6 +162,29 @@ public:
 
 private:
     std::int64_t _num;
+};
+
+class ViewChainedType {
+public:
+    static ViewChainedType parseFromBSON(const BSONObj& obj) {
+        ViewChainedType object;
+        object._obj = obj;
+        return object;
+    }
+
+    void serializeToBSON(BSONObjBuilder* builder) const {
+        builder->append("view_type", _obj);
+    }
+
+    BSONObj getView_type() const {
+        return _obj;
+    }
+    void setView_type(BSONObj obj) {
+        _obj = obj;
+    }
+
+private:
+    BSONObj _obj;
 };
 
 }  // namespace mongo

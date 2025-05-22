@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,13 +27,19 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <boost/filesystem/operations.hpp>
+#include <boost/filesystem/path.hpp>
+#include <boost/optional/optional.hpp>
 
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/server_parameter.h"
 #include "mongo/db/storage/storage_options.h"
-
-#include "mongo/db/server_parameters.h"
-#include "mongo/platform/compiler.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/db/storage/storage_parameters_gen.h"
+#include "mongo/db/tenant_id.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -48,18 +53,38 @@ void StorageGlobalParams::reset() {
     dbpath = kDefaultDbPath;
     upgrade = false;
     repair = false;
-
-    // The intention here is to enable the journal by default if we are running on a 64 bit system.
-    dur = (sizeof(void*) == 8);
+    validate = false;
+    restore = false;
+    magicRestore = false;
 
     noTableScan.store(false);
     directoryperdb = false;
     syncdelay = 60.0;
-    readOnly = false;
+    queryableBackupMode = false;
     groupCollections = false;
+    oplogMinRetentionHours.store(0.0);
+    allowOplogTruncation = true;
+    forceDisableTableLogging = false;
+}
+
+std::string StorageGlobalParams::getSpillDbPath() const {
+    return (boost::filesystem::path(dbpath) / "_tmp" / "spilldb").string();
 }
 
 StorageGlobalParams storageGlobalParams;
+
+Status StorageDirectoryPerDbParameter::setFromString(StringData, const boost::optional<TenantId>&) {
+    return {ErrorCodes::IllegalOperation,
+            str::stream() << name() << " cannot be set via setParameter"};
+};
+
+void StorageDirectoryPerDbParameter::append(OperationContext* opCtx,
+                                            BSONObjBuilder* builder,
+                                            StringData name,
+                                            const boost::optional<TenantId>&) {
+    builder->append(name, storageGlobalParams.directoryperdb);
+}
+
 
 /**
  * The directory where the mongod instance stores its data.
@@ -72,57 +97,4 @@ const char* StorageGlobalParams::kDefaultDbPath = "/data/db";
 const char* StorageGlobalParams::kDefaultConfigDbPath = "/data/configdb";
 #endif
 
-const int StorageGlobalParams::kMaxJournalCommitIntervalMs = 500;
-const double StorageGlobalParams::kMaxSyncdelaySecs = 9.0 * 1000.0 * 1000.0;
-
-namespace {
-/**
- * Specify whether all queries must use indexes.
- * If 1, MongoDB will not execute queries that require a table scan and will return an error.
- * NOT recommended for production use.
- */
-ExportedServerParameter<bool, ServerParameterType::kStartupAndRuntime> NoTableScanSetting(
-    ServerParameterSet::getGlobal(), "notablescan", &storageGlobalParams.noTableScan);
-
-/**
- * Specify the interval in seconds between fsync operations where mongod flushes its
- * working memory to disk. By default, mongod flushes memory to disk every 60 seconds.
- * In almost every situation you should not set this value and use the default setting.
- */
-MONGO_COMPILER_VARIABLE_UNUSED auto _exportedSyncdelay =
-    (new ExportedServerParameter<double, ServerParameterType::kStartupAndRuntime>(
-        ServerParameterSet::getGlobal(), "syncdelay", &storageGlobalParams.syncdelay))
-        -> withValidator([](const double& potentialNewValue) {
-            if (potentialNewValue < 0.0 ||
-                potentialNewValue > StorageGlobalParams::kMaxSyncdelaySecs) {
-                return Status(ErrorCodes::BadValue,
-                              str::stream() << "syncdelay must be between 0 and "
-                                            << StorageGlobalParams::kMaxSyncdelaySecs
-                                            << ", but attempted to set to: "
-                                            << potentialNewValue);
-            }
-            return Status::OK();
-        });
-
-/**
- * Specify an integer between 1 and kMaxJournalCommitInterval signifying the number of milliseconds
- * (ms) between journal commits.
- */
-MONGO_COMPILER_VARIABLE_UNUSED auto _exportedJournalCommitInterval =
-    (new ExportedServerParameter<int, ServerParameterType::kRuntimeOnly>(
-        ServerParameterSet::getGlobal(),
-        "journalCommitInterval",
-        &storageGlobalParams.journalCommitIntervalMs))
-        -> withValidator([](const int& potentialNewValue) {
-            if (potentialNewValue < 1 ||
-                potentialNewValue > StorageGlobalParams::kMaxJournalCommitIntervalMs) {
-                return Status(ErrorCodes::BadValue,
-                              str::stream() << "journalCommitInterval must be between 1 and "
-                                            << StorageGlobalParams::kMaxJournalCommitIntervalMs
-                                            << ", but attempted to set to: "
-                                            << potentialNewValue);
-            }
-            return Status::OK();
-        });
-}  // namespace
 }  // namespace mongo

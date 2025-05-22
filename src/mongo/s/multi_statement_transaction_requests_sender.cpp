@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,58 +27,136 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <utility>
 
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/db/baton.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/executor/remote_command_response.h"
 #include "mongo/s/multi_statement_transaction_requests_sender.h"
-
+#include "mongo/s/resource_yielders.h"
 #include "mongo/s/transaction_router.h"
+#include "mongo/s/transaction_router_resource_yielder.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/database_name_util.h"
 
 namespace mongo {
 
+namespace transaction_request_sender_details {
 namespace {
+void processReplyMetadata(OperationContext* opCtx,
+                          const ShardId& shardId,
+                          const BSONObj& responseBson,
+                          bool forAsyncGetMore = false) {
+    auto txnRouter = TransactionRouter::get(opCtx);
+    if (!txnRouter) {
+        return;
+    }
+
+    txnRouter.processParticipantResponse(opCtx, shardId, responseBson, forAsyncGetMore);
+}
+}  // namespace
 
 std::vector<AsyncRequestsSender::Request> attachTxnDetails(
     OperationContext* opCtx, const std::vector<AsyncRequestsSender::Request>& requests) {
+    bool activeTxnParticipantAddParticipants =
+        opCtx->isActiveTransactionParticipant() && opCtx->inMultiDocumentTransaction();
+
     auto txnRouter = TransactionRouter::get(opCtx);
+
     if (!txnRouter) {
         return requests;
+    }
+
+    if (activeTxnParticipantAddParticipants) {
+        auto opCtxTxnNum = opCtx->getTxnNumber();
+        invariant(opCtxTxnNum);
+        txnRouter.beginOrContinueTxn(
+            opCtx, *opCtxTxnNum, TransactionRouter::TransactionActions::kStartOrContinue);
     }
 
     std::vector<AsyncRequestsSender::Request> newRequests;
     newRequests.reserve(requests.size());
 
-    for (auto request : requests) {
+    for (const auto& request : requests) {
         newRequests.emplace_back(
-            request.shardId, txnRouter->attachTxnFieldsIfNeeded(request.shardId, request.cmdObj));
+            request.shardId,
+            txnRouter.attachTxnFieldsIfNeeded(opCtx, request.shardId, request.cmdObj));
     }
 
     return newRequests;
 }
 
-}  // unnamed namespace
+void processReplyMetadata(OperationContext* opCtx,
+                          const AsyncRequestsSender::Response& response,
+                          bool forAsyncGetMore) {
+    if (!response.swResponse.isOK()) {
+        return;
+    }
+
+    processReplyMetadata(
+        opCtx, response.shardId, response.swResponse.getValue().data, forAsyncGetMore);
+}
+
+void processReplyMetadataForAsyncGetMore(OperationContext* opCtx,
+                                         const ShardId& shardId,
+                                         const BSONObj& responseBson) {
+    processReplyMetadata(opCtx, shardId, responseBson, true /* forAsyncGetMore */);
+}
+
+}  // namespace transaction_request_sender_details
 
 MultiStatementTransactionRequestsSender::MultiStatementTransactionRequestsSender(
     OperationContext* opCtx,
-    executor::TaskExecutor* executor,
-    StringData dbName,
+    std::shared_ptr<executor::TaskExecutor> executor,
+    const DatabaseName& dbName,
     const std::vector<AsyncRequestsSender::Request>& requests,
     const ReadPreferenceSetting& readPreference,
-    Shard::RetryPolicy retryPolicy)
+    Shard::RetryPolicy retryPolicy,
+    AsyncRequestsSender::ShardHostMap designatedHostsMap)
     : _opCtx(opCtx),
-      _ars(
-          opCtx, executor, dbName, attachTxnDetails(opCtx, requests), readPreference, retryPolicy) {
+      _ars(std::make_unique<AsyncRequestsSender>(
+          opCtx,
+          std::move(executor),
+          dbName,
+          transaction_request_sender_details::attachTxnDetails(opCtx, requests),
+          readPreference,
+          retryPolicy,
+          ResourceYielderFactory::get(*opCtx->getService()).make(opCtx, "request-sender"),
+          designatedHostsMap)) {}
+
+MultiStatementTransactionRequestsSender::~MultiStatementTransactionRequestsSender() {
+    invariant(_opCtx);
+    auto baton = _opCtx->getBaton();
+    invariant(baton);
+    // Delegate the destruction of `_ars` to the `_opCtx` baton to potentially move the cost off of
+    // the critical path. The assumption is that postponing the destruction is safe so long as the
+    // `_opCtx` that corresponds to `_ars` remains alive.
+    baton->schedule([ars = std::move(_ars)](Status) mutable { ars.reset(); });
 }
 
-bool MultiStatementTransactionRequestsSender::done() {
-    return _ars.done();
+bool MultiStatementTransactionRequestsSender::done() const {
+    return _ars->done();
 }
 
-AsyncRequestsSender::Response MultiStatementTransactionRequestsSender::next() {
-    return _ars.next();
+AsyncRequestsSender::Response MultiStatementTransactionRequestsSender::next(bool forMergeCursors) {
+    auto response = nextResponse();
+    validateResponse(response, forMergeCursors);
+    return response;
+}
+
+AsyncRequestsSender::Response MultiStatementTransactionRequestsSender::nextResponse() {
+    return _ars->next();
+}
+
+void MultiStatementTransactionRequestsSender::validateResponse(
+    const AsyncRequestsSender::Response& response, bool forMergeCursors) const {
+    transaction_request_sender_details::processReplyMetadata(_opCtx, response, forMergeCursors);
 }
 
 void MultiStatementTransactionRequestsSender::stopRetrying() {
-    _ars.stopRetrying();
+    _ars->stopRetrying();
 }
 
 }  // namespace mongo

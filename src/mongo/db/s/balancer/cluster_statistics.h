@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,20 +29,20 @@
 
 #pragma once
 
-#include <memory>
+#include <cstdint>
 #include <set>
 #include <string>
 #include <vector>
 
-#include "mongo/base/disallow_copying.h"
-#include "mongo/s/client/shard.h"
+#include "mongo/base/status_with.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/shard_id.h"
 
 namespace mongo {
 
 class BSONObj;
+
 class OperationContext;
-template <typename T>
-class StatusWith;
 
 /**
  * This interface serves as means for obtaining data distribution and shard utilization statistics
@@ -51,7 +50,8 @@ class StatusWith;
  * the statistics collection. There should be one instance of this object per service context.
  */
 class ClusterStatistics {
-    MONGO_DISALLOW_COPYING(ClusterStatistics);
+    ClusterStatistics(const ClusterStatistics&) = delete;
+    ClusterStatistics& operator=(const ClusterStatistics&) = delete;
 
 public:
     /**
@@ -59,47 +59,21 @@ public:
      */
     struct ShardStatistics {
     public:
-        ShardStatistics(ShardId shardId,
-                        uint64_t maxSizeMB,
-                        uint64_t currSizeMB,
-                        bool isDraining,
-                        std::set<std::string> shardTags,
-                        std::string mongoVersion);
-
-        /**
-         * Returns true if a shard is not allowed to receive any new chunks because it has reached
-         * the per-shard data size limit.
-         */
-        bool isSizeMaxed() const;
-
-        /**
-         * Returns BSON representation of this shard's statistics, for reporting purposes.
-         */
-        BSONObj toBSON() const;
+        ShardStatistics(ShardId shardId, bool isDraining, std::set<std::string> shardZones);
 
         // The id of the shard for which this statistic applies
         ShardId shardId;
 
-        // The maximum storage size allowed for the shard. Zero means no maximum specified.
-        uint64_t maxSizeMB{0};
-
-        // The current storage size of the shard.
-        uint64_t currSizeMB{0};
-
         // Whether the shard is in draining mode
         bool isDraining{false};
 
-        // Set of tags for the shard
-        std::set<std::string> shardTags;
-
-        // Version of mongod, which runs on this shard's primary
-        std::string mongoVersion;
+        // Set of zones for the shard
+        std::set<std::string> shardZones;
     };
-
     virtual ~ClusterStatistics();
 
     /**
-     * Retrieves a snapshot of the current shard utilization state. The implementation of this
+     * Retrieves a snapshot of the current state of the shards. The implementation of this
      * method may block if necessary in order to refresh its state or may return a cached value.
      */
     virtual StatusWith<std::vector<ShardStatistics>> getStats(OperationContext* opCtx) = 0;

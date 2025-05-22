@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,11 +27,15 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <boost/container/flat_set.hpp>
 
-#include "mongo/db/query/index_entry.h"
+#include <boost/container/vector.hpp>
 
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/util/builder.h"
 #include "mongo/db/matcher/expression.h"
+#include "mongo/db/query/index_entry.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 
@@ -55,7 +58,7 @@ std::string IndexEntry::toString() const {
     sb << " name: '" << identifier << "'";
 
     if (filterExpr) {
-        sb << " filterExpr: " << filterExpr->toString();
+        sb << " filterExpr: " << filterExpr->debugString();
     }
 
     if (!infoObj.isEmpty()) {
@@ -80,6 +83,19 @@ bool IndexEntry::pathHasMultikeyComponent(StringData indexedField) const {
     }
 
     MONGO_UNREACHABLE;
+}
+
+BSONElement IndexEntry::getWildcardField() const {
+    uassert(7246601, "The index is not a wildcard index", type == IndexType::INDEX_WILDCARD);
+
+    BSONObjIterator it(keyPattern);
+    BSONElement wildcardElt = it.next();
+    for (size_t i = 0; i < wildcardFieldPos; ++i) {
+        invariant(it.more());
+        wildcardElt = it.next();
+    }
+
+    return wildcardElt;
 }
 
 std::ostream& operator<<(std::ostream& stream, const IndexEntry::Identifier& ident) {

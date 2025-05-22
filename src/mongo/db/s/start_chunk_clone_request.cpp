@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,24 +27,38 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <string>
+#include <utility>
 
-#include "mongo/db/s/start_chunk_clone_request.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
 
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
+#include "mongo/bson/bsonelement.h"
 #include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
 #include "mongo/bson/util/bson_extract.h"
+#include "mongo/db/s/start_chunk_clone_request.h"
+#include "mongo/idl/idl_parser.h"
+#include "mongo/util/namespace_string_util.h"
 
 namespace mongo {
 namespace {
 
 const char kRecvChunkStart[] = "_recvChunkStart";
 const char kFromShardConnectionString[] = "from";
+// Note: The UUID parsing code relies on this field being named 'uuid'.
+const char kMigrationId[] = "uuid";
+const char kLsid[] = "lsid";
+const char kTxnNumber[] = "txnNumber";
 const char kFromShardId[] = "fromShardName";
 const char kToShardId[] = "toShardName";
 const char kChunkMinKey[] = "min";
 const char kChunkMaxKey[] = "max";
 const char kShardKeyPattern[] = "shardKeyPattern";
+const char kParallelMigration[] = "parallelMigrateCloneSupported";
 
 }  // namespace
 
@@ -148,12 +161,28 @@ StatusWith<StartChunkCloneRequest> StartChunkCloneRequest::createFromCommand(Nam
         }
     }
 
+    {
+        Status status = bsonExtractBooleanFieldWithDefault(
+            obj, kParallelMigration, false, &request._parallelFetchingSupported);
+        if (!status.isOK()) {
+            return status;
+        }
+    }
+
+    request._migrationId = UUID::parse(obj);
+    request._lsid =
+        LogicalSessionId::parse(IDLParserContext("StartChunkCloneRequest"), obj[kLsid].Obj());
+    request._txnNumber = obj.getField(kTxnNumber).Long();
+
     return request;
 }
 
 void StartChunkCloneRequest::appendAsCommand(
     BSONObjBuilder* builder,
     const NamespaceString& nss,
+    const UUID& migrationId,
+    const LogicalSessionId& lsid,
+    TxnNumber txnNumber,
     const MigrationSessionId& sessionId,
     const ConnectionString& fromShardConnectionString,
     const ShardId& fromShardId,
@@ -166,7 +195,14 @@ void StartChunkCloneRequest::appendAsCommand(
     invariant(nss.isValid());
     invariant(fromShardConnectionString.isValid());
 
-    builder->append(kRecvChunkStart, nss.ns());
+    builder->append(kRecvChunkStart,
+                    NamespaceStringUtil::serialize(nss, SerializationContext::stateDefault()));
+    builder->append(kParallelMigration, true);
+
+    migrationId.appendToBuilder(builder, kMigrationId);
+    builder->append(kLsid, lsid.toBSON());
+    builder->append(kTxnNumber, txnNumber);
+
     sessionId.append(builder);
     builder->append(kFromShardConnectionString, fromShardConnectionString.toString());
     builder->append(kFromShardId, fromShardId.toString());

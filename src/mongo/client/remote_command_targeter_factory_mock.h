@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -31,12 +30,14 @@
 #pragma once
 
 #include <map>
+#include <memory>
 
+#include "mongo/client/connection_string.h"
+#include "mongo/client/remote_command_targeter.h"
 #include "mongo/client/remote_command_targeter_factory.h"
+#include "mongo/client/remote_command_targeter_mock.h"
 
 namespace mongo {
-
-class RemoteCommandTargeterMock;
 
 /**
  * Factory which instantiates mock remote command targeters. This class is not thread-safe and is
@@ -45,7 +46,7 @@ class RemoteCommandTargeterMock;
 class RemoteCommandTargeterFactoryMock final : public RemoteCommandTargeterFactory {
 public:
     RemoteCommandTargeterFactoryMock();
-    ~RemoteCommandTargeterFactoryMock();
+    ~RemoteCommandTargeterFactoryMock() override;
 
     /**
      * If the input connection string matches one of the pre-defined targeters added through an

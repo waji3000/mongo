@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,20 +27,24 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <js/CallArgs.h>
+#include <js/RootingAPI.h>
+#include <js/TypeDecls.h>
 
+#include <js/PropertySpec.h>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/scripting/mozjs/object.h"
-
-#include "mongo/scripting/mozjs/implscope.h"
-#include "mongo/scripting/mozjs/objectwrapper.h"
-#include "mongo/scripting/mozjs/valuereader.h"
 #include "mongo/scripting/mozjs/valuewriter.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 namespace mozjs {
 
 const JSFunctionSpec ObjectInfo::methods[2] = {
-    MONGO_ATTACH_JS_FUNCTION(bsonsize), JS_FS_END,
+    MONGO_ATTACH_JS_FUNCTION(bsonsize),
+    JS_FS_END,
 };
 
 const char* const ObjectInfo::className = "Object";

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,8 +27,6 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include "mongo/executor/network_interface.h"
 
 
@@ -39,8 +36,9 @@ namespace executor {
 NetworkInterface::NetworkInterface() {}
 NetworkInterface::~NetworkInterface() {}
 
-MONGO_FAIL_POINT_DEFINE(networkInterfaceDiscardCommandsBeforeAcquireConn);
-MONGO_FAIL_POINT_DEFINE(networkInterfaceDiscardCommandsAfterAcquireConn);
+MONGO_FAIL_POINT_DEFINE(networkInterfaceHangCommandsAfterAcquireConn);
+MONGO_FAIL_POINT_DEFINE(networkInterfaceCommandsFailedWithErrorCode);
+MONGO_FAIL_POINT_DEFINE(networkInterfaceShouldNotKillPendingRequests);
 
 }  // namespace executor
 }  // namespace mongo

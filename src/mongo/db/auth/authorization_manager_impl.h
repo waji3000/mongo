@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,57 +29,56 @@
 
 #pragma once
 
-#include "mongo/db/auth/authorization_manager.h"
-
+#include <absl/container/node_hash_map.h>
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr.hpp>
+#include <map>
 #include <memory>
-#include <string>
+#include <utility>
+#include <vector>
 
-#include "mongo/base/disallow_copying.h"
-#include "mongo/base/secure_allocator.h"
 #include "mongo/base/status.h"
-#include "mongo/bson/mutable/element.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/bson/oid.h"
-#include "mongo/db/auth/action_set.h"
+#include "mongo/db/auth/authorization_manager.h"
+#include "mongo/db/auth/authorization_router.h"
+#include "mongo/db/auth/privilege.h"
 #include "mongo/db/auth/privilege_format.h"
-#include "mongo/db/auth/resource_pattern.h"
-#include "mongo/db/auth/role_graph.h"
+#include "mongo/db/auth/role_name.h"
 #include "mongo/db/auth/user.h"
+#include "mongo/db/auth/user_acquisition_stats.h"
 #include "mongo/db/auth/user_name.h"
-#include "mongo/db/auth/user_name_hash.h"
-#include "mongo/db/jsobj.h"
+#include "mongo/db/client.h"
+#include "mongo/db/database_name.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/server_options.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/tenant_id.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/functional.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/stdx/unordered_map.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/concurrency/thread_pool.h"
+#include "mongo/util/concurrency/thread_pool_interface.h"
 #include "mongo/util/invalidating_lru_cache.h"
+#include "mongo/util/read_through_cache.h"
 
 namespace mongo {
-class AuthorizationSession;
-class AuthzManagerExternalState;
-class OperationContext;
-class ServiceContext;
-class UserDocumentParser;
 
 /**
  * Contains server/cluster-wide information about Authorization.
  */
 class AuthorizationManagerImpl : public AuthorizationManager {
 public:
+    AuthorizationManagerImpl(Service* service, std::unique_ptr<AuthorizationRouter> authzRouter);
+
     ~AuthorizationManagerImpl() override;
 
-    AuthorizationManagerImpl();
-
-    struct InstallMockForTestingOrAuthImpl {
-        explicit InstallMockForTestingOrAuthImpl() = default;
-    };
-
-    AuthorizationManagerImpl(std::unique_ptr<AuthzManagerExternalState> externalState,
-                             InstallMockForTestingOrAuthImpl);
-
-    std::unique_ptr<AuthorizationSession> makeAuthorizationSession() override;
+    std::unique_ptr<AuthorizationSession> makeAuthorizationSession(Client* client) override;
 
     void setShouldValidateAuthSchemaOnStartup(bool validate) override;
 
@@ -90,173 +88,65 @@ public:
 
     bool isAuthEnabled() const override;
 
-    Status getAuthorizationVersion(OperationContext* opCtx, int* version) override;
-
     OID getCacheGeneration() override;
 
     bool hasAnyPrivilegeDocuments(OperationContext* opCtx) override;
 
-    Status getUserDescription(OperationContext* opCtx,
-                              const UserName& userName,
-                              BSONObj* result) override;
+    void notifyDDLOperation(OperationContext* opCtx,
+                            StringData op,
+                            const NamespaceString& nss,
+                            const BSONObj& o,
+                            const BSONObj* o2) override;
 
-    Status getRoleDescription(OperationContext* opCtx,
-                              const RoleName& roleName,
-                              PrivilegeFormat privilegeFormat,
-                              AuthenticationRestrictionsFormat,
-                              BSONObj* result) override;
+    StatusWith<UserHandle> acquireUser(OperationContext* opCtx,
+                                       std::unique_ptr<UserRequest> userRequest) override;
+    StatusWith<UserHandle> reacquireUser(OperationContext* opCtx, const UserHandle& user) override;
 
-    Status getRolesDescription(OperationContext* opCtx,
-                               const std::vector<RoleName>& roleName,
-                               PrivilegeFormat privilegeFormat,
-                               AuthenticationRestrictionsFormat,
-                               BSONObj* result) override;
+    /**
+     * Invalidate a user, and repin it if necessary.
+     */
+    void invalidateUserByName(const UserName& user) override;
 
-    Status getRoleDescriptionsForDB(OperationContext* opCtx,
-                                    StringData dbname,
-                                    PrivilegeFormat privilegeFormat,
-                                    AuthenticationRestrictionsFormat,
-                                    bool showBuiltinRoles,
-                                    std::vector<BSONObj>* result) override;
+    void invalidateUsersFromDB(const DatabaseName& dbname) override;
 
-    StatusWith<UserHandle> acquireUser(OperationContext* opCtx, const UserName& userName) override;
+    void invalidateUsersByTenant(const boost::optional<TenantId>& tenant) override;
 
-    void invalidateUserByName(OperationContext* opCtx, const UserName& user) override;
-
-    void invalidateUsersFromDB(OperationContext* opCtx, StringData dbname) override;
+    /**
+     * Verify role information for users in the $external database and insert updated information
+     * into the cache if necessary. Currently, this is only used to refresh LDAP users.
+     */
+    Status refreshExternalUsers(OperationContext* opCtx) override;
 
     Status initialize(OperationContext* opCtx) override;
 
-    void invalidateUserCache(OperationContext* opCtx) override;
+    /**
+     * Invalidate the user cache, and repin all pinned users.
+     */
+    void invalidateUserCache() override;
 
-    Status _initializeUserFromPrivilegeDocument(User* user, const BSONObj& privDoc) override;
+    std::vector<AuthorizationRouter::CachedUserInfo> getUserCacheInfo() const override;
 
-    void logOp(OperationContext* opCtx,
-               const char* opstr,
-               const NamespaceString& nss,
-               const BSONObj& obj,
-               const BSONObj* patt) override;
-
-    std::vector<CachedUserInfo> getUserCacheInfo() const override;
-
-    void setInUserManagementCommand(OperationContext* opCtx, bool val) override;
+    /**
+     * @brief Get the Authorization Router object
+     * Should only be used in test.
+     */
+    AuthorizationRouter* getAuthorizationRouter_forTest();
 
 private:
-    /**
-     * Type used to guard accesses and updates to the user cache.
-     */
-    class CacheGuard;
-    friend class AuthorizationManagerImpl::CacheGuard;
+    std::unique_ptr<AuthorizationRouter> _authzRouter;
 
-    /**
-     * Invalidates all User objects in the cache and removes them from the cache.
-     * Should only be called when already holding _cacheMutex.
-     */
-    void _invalidateUserCache_inlock(const CacheGuard&);
+    // True if AuthSchema startup checks should be applied in this AuthorizationManager. Changes to
+    // its value are not synchronized, so it should only be set once, at initalization time.
+    // Note that since AuthorizationVersion has been removed, this only controls whether system
+    // indexes are checked at startup.
+    bool _startupAuthSchemaValidation{true};
 
-    /**
-     * Given the objects describing an oplog entry that affects authorization data, invalidates
-     * the portion of the user cache that is affected by that operation.  Should only be called
-     * with oplog entries that have been pre-verified to actually affect authorization data.
-     */
-    void _invalidateRelevantCacheData(OperationContext* opCtx,
-                                      const char* op,
-                                      const NamespaceString& ns,
-                                      const BSONObj& o,
-                                      const BSONObj* o2);
+    // True if access control enforcement is enabled in this AuthorizationManager. Changes to its
+    // value are not synchronized, so it should only be set once, at initalization time.
+    bool _authEnabled{false};
 
-    /**
-     * Updates _cacheGeneration to a new OID
-     */
-    void _updateCacheGeneration_inlock(const CacheGuard&);
-
-
-    void _recachePinnedUsers(CacheGuard& guard, OperationContext* opCtx);
-
-    StatusWith<UserHandle> _acquireUserSlowPath(CacheGuard& guard,
-                                                OperationContext* opCtx,
-                                                const UserName& userName);
-
-    /**
-     * Fetches user information from a v2-schema user document for the named user,
-     * and stores a pointer to a new user object into *acquiredUser on success.
-     */
-    Status _fetchUserV2(OperationContext* opCtx,
-                        const UserName& userName,
-                        std::unique_ptr<User>* acquiredUser);
-
-    /**
-     * True if AuthSchema startup checks should be applied in this AuthorizationManager.
-     *
-     * Defaults to true.  Changes to its value are not synchronized, so it should only be set
-     * at initalization-time.
-     */
-    bool _startupAuthSchemaValidation;
-
-    /**
-     * True if access control enforcement is enabled in this AuthorizationManager.
-     *
-     * Defaults to false.  Changes to its value are not synchronized, so it should only be set
-     * at initalization-time.
-     */
-    bool _authEnabled;
-
-    /**
-     * A cache of whether there are any users set up for the cluster.
-     */
-    AtomicBool _privilegeDocsExist;
-
-    std::unique_ptr<AuthzManagerExternalState> _externalState;
-
-    /**
-     * Cached value of the authorization schema version.
-     *
-     * May be set by acquireUser() and getAuthorizationVersion().  Invalidated by
-     * invalidateUserCache().
-     *
-     * Reads and writes guarded by CacheGuard.
-     */
-    int _version;
-
-    /**
-     * Caches User objects with information about user privileges, to avoid the need to
-     * go to disk to read user privilege documents whenever possible.  Every User object
-     * has a reference count - the AuthorizationManager must not delete a User object in the
-     * cache unless its reference count is zero.
-     */
-    struct UserCacheInvalidator {
-        void operator()(User* user);
-    };
-
-    InvalidatingLRUCache<UserName, User, UserCacheInvalidator> _userCache;
-    std::vector<UserHandle> _pinnedUsers;
-
-    /**
-     * Protects _cacheGeneration, _version and _isFetchPhaseBusy.  Manipulated
-     * via CacheGuard.
-     */
-    stdx::mutex _cacheWriteMutex;
-
-    /**
-     * Current generation of cached data.  Updated every time part of the cache gets
-     * invalidated.  Protected by CacheGuard.
-     */
-    OID _fetchGeneration;
-
-    /**
-     * True if there is an update to the _userCache in progress, and that update is currently in
-     * the "fetch phase", during which it does not hold the _cacheMutex.
-     *
-     * Manipulated via CacheGuard.
-     */
-    bool _isFetchPhaseBusy;
-
-    /**
-     * Condition used to signal that it is OK for another CacheGuard to enter a fetch phase.
-     * Manipulated via CacheGuard.
-     */
-    stdx::condition_variable _fetchPhaseIsReady;
-
-    AtomicBool _inUserManagementCommand{false};
+    // A cache of whether there are any users set up for the cluster.
+    AtomicWord<bool> _privilegeDocsExist{false};
 };
+
 }  // namespace mongo

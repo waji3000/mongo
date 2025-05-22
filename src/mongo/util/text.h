@@ -1,6 +1,3 @@
-// text.h
-
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -32,53 +29,26 @@
 
 #pragma once
 
+#include <memory>
 #include <string>
 #include <vector>
 
-#include "mongo/base/disallow_copying.h"
-#include "mongo/config.h"
+#include "mongo/base/string_data.h"
+#include "mongo/config.h"  // IWYU pragma: keep
 
 namespace mongo {
-
-class StringSplitter {
-public:
-    /** @param big the std::string to be split
-        @param splitter the delimiter
-    */
-    StringSplitter(const char* big, const char* splitter) : _big(big), _splitter(splitter) {}
-
-    /** @return true if more to be taken via next() */
-    bool more() const {
-        return _big[0] != 0;
-    }
-
-    /** get next split std::string fragment */
-    std::string next();
-
-    void split(std::vector<std::string>& l);
-
-    std::vector<std::string> split();
-
-    static std::vector<std::string> split(const std::string& big, const std::string& splitter);
-
-    static std::string join(const std::vector<std::string>& l, const std::string& split);
-
-private:
-    const char* _big;
-    const char* _splitter;
-};
 
 /* This doesn't defend against ALL bad UTF8, but it will guarantee that the
  * std::string can be converted to sequence of codepoints. However, it doesn't
  * guarantee that the codepoints are valid.
  */
-bool isValidUTF8(const char* s);
-bool isValidUTF8(const std::string& s);
+bool isValidUTF8(StringData s);
 
 #if defined(_WIN32)
 
 std::string toUtf8String(const std::wstring& wide);
 
+std::wstring toWideStringFromStringData(StringData s);
 std::wstring toWideString(const char* s);
 
 bool writeUtf8ToWindowsConsole(const char* utf8String, unsigned int utf8StringSize);
@@ -96,19 +66,15 @@ inline std::wstring toNativeString(const char* s) {
 #endif
 
 class WindowsCommandLine {
-    MONGO_DISALLOW_COPYING(WindowsCommandLine);
-    char** _argv;
-    char** _envp;
-
 public:
-    WindowsCommandLine(int argc, wchar_t* argvW[], wchar_t* envpW[]);
+    WindowsCommandLine(int argc, wchar_t** argvW);
     ~WindowsCommandLine();
-    char** argv(void) const {
-        return _argv;
-    };
-    char** envp(void) const {
-        return _envp;
-    };
+
+    char** argv() const;
+
+private:
+    class Impl;
+    std::unique_ptr<Impl> _impl;
 };
 
 #endif  // #if defined(_WIN32)

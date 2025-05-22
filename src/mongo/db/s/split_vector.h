@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -31,15 +30,17 @@
 #pragma once
 
 #include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
 #include <vector>
+
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/namespace_string.h"
 
 namespace mongo {
 
 class BSONObj;
-class NamespaceString;
+
 class OperationContext;
-template <typename T>
-class StatusWith;
 
 /**
  * Given a chunk, determines whether it can be split and returns the split points if so. This
@@ -57,15 +58,14 @@ class StatusWith;
  * If force is set, split at the halfway point of the chunk. This also effectively
  * makes maxChunkSize equal the size of the chunk.
  */
-StatusWith<std::vector<BSONObj>> splitVector(OperationContext* opCtx,
-                                             const NamespaceString& nss,
-                                             const BSONObj& keyPattern,
-                                             const BSONObj& min,
-                                             const BSONObj& max,
-                                             bool force,
-                                             boost::optional<long long> maxSplitPoints,
-                                             boost::optional<long long> maxChunkObjects,
-                                             boost::optional<long long> maxChunkSize,
-                                             boost::optional<long long> maxChunkSizeBytes);
+std::vector<BSONObj> splitVector(OperationContext* opCtx,
+                                 const NamespaceString& nss,
+                                 const BSONObj& keyPattern,
+                                 const BSONObj& min,
+                                 const BSONObj& max,
+                                 bool force,
+                                 boost::optional<long long> maxSplitPoints,
+                                 boost::optional<long long> maxChunkObjects,
+                                 boost::optional<long long> maxChunkSizeBytes);
 
 }  // namespace mongo

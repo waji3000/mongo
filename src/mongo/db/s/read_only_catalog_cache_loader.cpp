@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,32 +27,28 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/s/read_only_catalog_cache_loader.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 
 using CollectionAndChangedChunks = CatalogCacheLoader::CollectionAndChangedChunks;
 
-void ReadOnlyCatalogCacheLoader::waitForCollectionFlush(OperationContext* opCtx,
-                                                        const NamespaceString& nss) {
-    MONGO_UNREACHABLE;
+ReadOnlyCatalogCacheLoader::~ReadOnlyCatalogCacheLoader() {
+    shutDown();
 }
 
-void ReadOnlyCatalogCacheLoader::waitForDatabaseFlush(OperationContext* opCtx, StringData dbName) {
-    MONGO_UNREACHABLE;
+void ReadOnlyCatalogCacheLoader::shutDown() {
+    _configServerLoader.shutDown();
 }
 
-std::shared_ptr<Notification<void>> ReadOnlyCatalogCacheLoader::getChunksSince(
-    const NamespaceString& nss, ChunkVersion version, GetChunksSinceCallbackFn callbackFn) {
-    return _configServerLoader.getChunksSince(nss, version, callbackFn);
+SemiFuture<CollectionAndChangedChunks> ReadOnlyCatalogCacheLoader::getChunksSince(
+    const NamespaceString& nss, ChunkVersion version) {
+    return _configServerLoader.getChunksSince(nss, version);
 }
 
-void ReadOnlyCatalogCacheLoader::getDatabase(
-    StringData dbName,
-    stdx::function<void(OperationContext*, StatusWith<DatabaseType>)> callbackFn) {
-    return _configServerLoader.getDatabase(dbName, callbackFn);
+SemiFuture<DatabaseType> ReadOnlyCatalogCacheLoader::getDatabase(const DatabaseName& dbName) {
+    return _configServerLoader.getDatabase(dbName);
 }
 
 }  // namespace mongo

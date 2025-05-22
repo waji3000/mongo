@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,20 +29,10 @@
 
 #pragma once
 
-#include <atomic>
-
-#include "mongo/client/connection_string.h"
-#include "mongo/db/query/explain_options.h"
-#include "mongo/s/client/shard.h"
+#include "mongo/db/dbmessage.h"
+#include "mongo/db/request_execution_context.h"
 
 namespace mongo {
-
-class DbMessage;
-struct DbResponse;
-class Message;
-class NamespaceString;
-class OperationContext;
-class QueryRequest;
 
 /**
  * Legacy interface for processing client read/write/cmd requests.
@@ -51,82 +40,12 @@ class QueryRequest;
 class Strategy {
 public:
     /**
-     * Handles a legacy-style opQuery request and sends the response back on success or throws on
-     * error.
-     *
-     * Must not be called with legacy '.$cmd' commands.
-     */
-    static DbResponse queryOp(OperationContext* opCtx, const NamespaceString& nss, DbMessage* dbm);
-
-    /**
-     * Handles a legacy-style getMore request and sends the response back on success (or cursor not
-     * found) or throws on error.
-     */
-    static DbResponse getMore(OperationContext* opCtx, const NamespaceString& nss, DbMessage* dbm);
-
-    /**
-     * Handles a legacy-style killCursors request. Doesn't send any response on success or throws on
-     * error.
-     */
-    static void killCursors(OperationContext* opCtx, DbMessage* dbm);
-
-    /**
-     * Handles a legacy-style write operation request and updates the last error state on the client
-     * with the result from the operation. Doesn't send any response back and does not throw on
-     * errors.
-     */
-    static void writeOp(OperationContext* opCtx, DbMessage* dbm);
-
-    /**
      * Executes a command from either OP_QUERY or OP_MSG wire protocols.
      *
-     * Catches StaleConfigException errors and retries the command automatically after refreshing
-     * the metadata for the failing namespace.
+     * Catches StaleConfig errors and retries the command automatically after refreshing the
+     * metadata for the failing namespace.
      */
-    static DbResponse clientCommand(OperationContext* opCtx, const Message& message);
-
-    /**
-     * Helper to run an explain of a find operation on the shards. Fills 'out' with the result of
-     * the of the explain command on success. On failure, throws and does not modify 'out'.
-     *
-     * Used both if mongos receives an explain command and if it receives an OP_QUERY find with the
-     * $explain modifier.
-     */
-    static void explainFind(OperationContext* opCtx,
-                            const BSONObj& findCommand,
-                            const QueryRequest& qr,
-                            ExplainOptions::Verbosity verbosity,
-                            const ReadPreferenceSetting& readPref,
-                            BSONObjBuilder* out);
-
-    struct CommandResult {
-        CommandResult() = default;
-        CommandResult(ShardId shardId, ConnectionString target, BSONObj result)
-            : shardTargetId(std::move(shardId)),
-              target(std::move(target)),
-              result(std::move(result)) {}
-        ShardId shardTargetId;
-        ConnectionString target;
-        BSONObj result;
-    };
-
-    /**
-     * Executes a command against a particular database, and targets the command based on a
-     * collection in that database, according to 'targetingQuery' and 'targetingCollation'. If
-     * 'targetingCollation' is empty, the collection default collation is used for targeting.
-     *
-     * This version should be used by internal commands when possible.
-     *
-     * TODO: Replace these methods and all other methods of command dispatch with a more general
-     * command op framework.
-     */
-    static void commandOp(OperationContext* opCtx,
-                          const std::string& db,
-                          const BSONObj& command,
-                          const std::string& versionedNS,
-                          const BSONObj& targetingQuery,
-                          const BSONObj& targetingCollation,
-                          std::vector<CommandResult>* results);
+    static DbResponse clientCommand(RequestExecutionContext* rec);
 };
 
 }  // namespace mongo

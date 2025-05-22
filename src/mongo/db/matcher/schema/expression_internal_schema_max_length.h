@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,7 +29,16 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <memory>
+#include <utility>
+
+#include "mongo/base/clonable_ptr.h"
+#include "mongo/base/string_data.h"
 #include "mongo/bson/bsonelement.h"
+#include "mongo/db/matcher/expression.h"
+#include "mongo/db/matcher/expression_visitor.h"
 #include "mongo/db/matcher/schema/expression_internal_schema_str_length.h"
 
 namespace mongo {
@@ -38,10 +46,14 @@ namespace mongo {
 class InternalSchemaMaxLengthMatchExpression final : public InternalSchemaStrLengthMatchExpression {
 
 public:
-    InternalSchemaMaxLengthMatchExpression(StringData path, long long strLen)
-        : InternalSchemaStrLengthMatchExpression(
-              MatchType::INTERNAL_SCHEMA_MAX_LENGTH, path, strLen, "$_internalSchemaMaxLength"_sd) {
-    }
+    InternalSchemaMaxLengthMatchExpression(boost::optional<StringData> path,
+                                           long long strLen,
+                                           clonable_ptr<ErrorAnnotation> annotation = nullptr)
+        : InternalSchemaStrLengthMatchExpression(MatchType::INTERNAL_SCHEMA_MAX_LENGTH,
+                                                 path,
+                                                 strLen,
+                                                 "$_internalSchemaMaxLength"_sd,
+                                                 std::move(annotation)) {}
 
     Validator getComparator() const final {
         return [strLen = strLen()](int lenWithoutNullTerm) {
@@ -49,13 +61,22 @@ public:
         };
     }
 
-    std::unique_ptr<MatchExpression> shallowClone() const final {
+    std::unique_ptr<MatchExpression> clone() const final {
         std::unique_ptr<InternalSchemaMaxLengthMatchExpression> maxLen =
-            stdx::make_unique<InternalSchemaMaxLengthMatchExpression>(path(), strLen());
+            std::make_unique<InternalSchemaMaxLengthMatchExpression>(
+                path(), strLen(), _errorAnnotation);
         if (getTag()) {
             maxLen->setTag(getTag()->clone());
         }
-        return std::move(maxLen);
+        return maxLen;
+    }
+
+    void acceptVisitor(MatchExpressionMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(MatchExpressionConstVisitor* visitor) const final {
+        visitor->visit(this);
     }
 };
 

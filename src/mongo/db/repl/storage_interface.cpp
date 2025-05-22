@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,13 +27,13 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <utility>
 
 #include "mongo/db/client.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/service_context.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/decorable.h"
 
 namespace mongo {
 namespace repl {
@@ -56,7 +55,6 @@ StorageInterface* StorageInterface::get(ServiceContext& service) {
 StorageInterface* StorageInterface::get(OperationContext* opCtx) {
     return get(opCtx->getClient()->getServiceContext());
 }
-
 
 void StorageInterface::set(ServiceContext* service, std::unique_ptr<StorageInterface> storage) {
     auto& storageInterface = getStorageInterface(service);

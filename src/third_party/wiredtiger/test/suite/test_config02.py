@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Public Domain 2014-2018 MongoDB, Inc.
+# Public Domain 2014-present MongoDB, Inc.
 # Public Domain 2008-2014 WiredTiger, Inc.
 #
 # This is free and unencumbered software released into the public domain.
@@ -25,12 +25,18 @@
 # OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
 # ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
 # OTHER DEALINGS IN THE SOFTWARE.
+#
+# [TEST_TAGS]
+# connection_api:wiredtiger_open
+# config_api
+# [END_TAGS]
 
 import os
 import wiredtiger, wttest
 
 # test_config02.py
 #    The home directory for wiredtiger_open
+@wttest.skip_for_hook("tiered", "using environment variable to set WT home")
 class test_config02(wttest.WiredTigerTestCase):
     table_name1 = 'test_config02'
     nentries = 100
@@ -74,6 +80,12 @@ class test_config02(wttest.WiredTigerTestCase):
         WIREDTIGER_HOME is set to homeenv, if it is not null.
         configextra are any extra configuration strings needed on the open.
         """
+        try:
+            os.putenv('SOMEVAR', 'somevalue')
+            os.unsetenv('SOMEVAR')
+        except:
+            self.skipTest('putenv and/or unsetenv not support on this OS')
+            return
         configarg = 'create'
         if configextra != None:
             configarg += ',' + configextra
@@ -152,10 +164,7 @@ class test_config02(wttest.WiredTigerTestCase):
             self.skipTest('Unix specific test skipped on Windows')
         dir = 'subdir'
         os.mkdir(dir)
-        os.chmod(dir, 0555)
+        os.chmod(dir, 0o555)
         self.assertRaisesWithMessage(wiredtiger.WiredTigerError,
             lambda: self.wiredtiger_open(dir, 'create'),
             '/Permission denied/')
-
-if __name__ == '__main__':
-    wttest.run()

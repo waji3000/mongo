@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -29,16 +28,19 @@
  */
 #pragma once
 
+// IWYU pragma: no_include "cxxabi.h"
 #include <cstdint>
+#include <memory>
+#include <mutex>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/stdx/condition_variable.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/stdx/unordered_map.h"
 #include "mongo/util/concurrency/idle_thread_block.h"
-#include "mongo/util/concurrency/mutex.h"
+#include "mongo/util/concurrency/thread_name.h"
+#include "mongo/util/duration.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
@@ -71,7 +73,8 @@ int getScriptingEngineInterruptInterval();
  */
 template <typename _Task>
 class DeadlineMonitor {
-    MONGO_DISALLOW_COPYING(DeadlineMonitor);
+    DeadlineMonitor(const DeadlineMonitor&) = delete;
+    DeadlineMonitor& operator=(const DeadlineMonitor&) = delete;
 
 public:
     DeadlineMonitor() {
@@ -188,8 +191,9 @@ private:
     }
 
     using TaskDeadlineMap = stdx::unordered_map<_Task*, Date_t>;
-    TaskDeadlineMap _tasks;      // map of running tasks with deadlines
-    stdx::mutex _deadlineMutex;  // protects all non-const members, except _monitorThread
+    TaskDeadlineMap _tasks;  // map of running tasks with deadlines
+    // protects all non-const members, except _monitorThread
+    stdx::mutex _deadlineMutex;
     stdx::condition_variable _newDeadlineAvailable;    // Signaled for timeout, start and stop
     stdx::thread _monitorThread;                       // the deadline monitor thread
     Date_t _nearestDeadlineWallclock = Date_t::max();  // absolute time of the nearest deadline

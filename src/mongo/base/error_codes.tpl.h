@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -40,11 +39,18 @@
 namespace mongo {
 
 class Status;
+class DBException;
 
 // ErrorExtraInfo subclasses:
 //#for $ec in $codes:
 //#if $ec.extra
-class $ec.extra;
+//#if $ec.extra_ns
+namespace $ec.extra_ns {
+    //#end if
+    class $ec.extra_class;
+    //#if $ec.extra_ns
+}  // namespace extra_ns
+//#end if
 //#end if
 //#end for
 
@@ -56,10 +62,10 @@ enum class ErrorCategory {
 
 /**
  * This is a generated class containing a table of error codes and their corresponding error
- * strings. The class is derived from the definitions in src/mongo/base/error_codes.err file and the
+ * strings. The class is derived from the definitions in src/mongo/base/error_codes.yml file and the
  * src/mongo/base/error_codes.tpl.h template.
  *
- * Do not update this file directly. Update src/mongo/base/error_codes.err instead.
+ * Do not update this file directly. Update src/mongo/base/error_codes.yml instead.
  */
 class ErrorCodes {
 public:
@@ -82,7 +88,7 @@ public:
     static Error fromString(StringData name);
 
     /**
-     * Reuses a unique numeric code in a way that supresses the duplicate code detection. This
+     * Reuses a unique numeric code in a way that suppresses the duplicate code detection. This
      * should only be used when testing error cases to ensure that the code under test fails in the
      * right place. It should NOT be used in non-test code to either make a new error site (use
      * ErrorCodes::Error(CODE) for that) or to see if a specific failure case occurred (use named
@@ -101,22 +107,41 @@ public:
     template <ErrorCategory category>
     static bool isA(Error code);
 
+    template <ErrorCategory category, typename ErrorContainer>
+    static bool isA(const ErrorContainer& object);
+
     //#for $cat in $categories
     static bool is${cat.name}(Error code);
-    //#end for
+    template <typename ErrorContainer>
+    static bool is${cat.name}(const ErrorContainer& object);
 
-    static bool shouldHaveExtraInfo(Error code);
+    //#end for
+    static bool canHaveExtraInfo(Error code);
+    static bool mustHaveExtraInfo(Error code);
 };
 
 std::ostream& operator<<(std::ostream& stream, ErrorCodes::Error code);
 
-//#for $cat in $categories
-template <>
-inline bool ErrorCodes::isA<ErrorCategory::$cat.name>(Error code) {
-    return is${cat.name}(code);
+template <ErrorCategory category, typename ErrorContainer>
+inline bool ErrorCodes::isA(const ErrorContainer& object) {
+    return isA<category>(object.code());
 }
-//#end for
 
+//#for $cat in $categories
+// Category function declarations for "${cat.name}"
+template <>
+bool ErrorCodes::isA<ErrorCategory::$cat.name>(Error code);
+
+inline bool ErrorCodes::is${cat.name}(Error code) {
+    return isA<ErrorCategory::$cat.name>(code);
+}
+
+template <typename ErrorContainer>
+inline bool ErrorCodes::is${cat.name}(const ErrorContainer& object) {
+    return isA<ErrorCategory::$cat.name>(object.code());
+}
+
+//#end for
 /**
  * This namespace contains implementation details for our error handling code and should not be used
  * directly in general code.
@@ -127,7 +152,7 @@ template <int32_t code>
 constexpr bool isNamedCode = false;
 //#for $ec in $codes
 template <>
-constexpr bool isNamedCode<ErrorCodes::$ec.name> = true;
+constexpr inline bool isNamedCode<ErrorCodes::$ec.name> = true;
 //#end for
 
 MONGO_COMPILER_NORETURN void throwExceptionForStatus(const Status& status);

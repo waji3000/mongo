@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,22 +27,26 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/util/icu.h"
-
+#include <cstddef>
+#include <cstdint>
 #include <memory>
-#include <unicode/localpointer.h>
-#include <unicode/putil.h>
-#include <unicode/uiter.h>
-#include <unicode/unistr.h>
+#include <unicode/uchar.h>
+#include <unicode/umachine.h>
 #include <unicode/usprep.h>
 #include <unicode/ustring.h>
+#include <unicode/utf8.h>
 #include <unicode/utypes.h>
 #include <vector>
 
+#include <absl/base/attributes.h>
+#include <boost/move/utility_core.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/init.h"  // IWYU pragma: keep
+#include "mongo/base/initializer.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/icu.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 namespace {
@@ -78,7 +81,7 @@ public:
     static UString fromUTF8(StringData str) {
         UErrorCode error = U_ZERO_ERROR;
         int32_t len = 0;
-        u_strFromUTF8(nullptr, 0, &len, str.rawData(), str.size(), &error);
+        u_strFromUTF8(nullptr, 0, &len, str.data(), str.size(), &error);
         uassert(ErrorCodes::BadValue, "Non UTF-8 data encountered", error != U_INVALID_CHAR_FOUND);
         uassert(50687,
                 str::stream() << "Error preflighting UTF-8 conversion: " << u_errorName(error),
@@ -86,7 +89,7 @@ public:
 
         error = U_ZERO_ERROR;
         UString ret(len);
-        u_strFromUTF8(ret.data(), ret.capacity(), &len, str.rawData(), str.size(), &error);
+        u_strFromUTF8(ret.data(), ret.capacity(), &len, str.data(), str.size(), &error);
         uassert(50688,
                 str::stream() << "Error converting UTF-8 string: " << u_errorName(error),
                 U_SUCCESS(error));
@@ -172,11 +175,28 @@ private:
 };
 
 }  // namespace
-}  // namespace mongo
 
-mongo::StatusWith<std::string> mongo::saslPrep(StringData str, UStringPrepOptions options) try {
+StatusWith<std::string> icuSaslPrep(StringData str, UStringPrepOptions options) try {
     const auto opts = (options == kUStringPrepDefault) ? USPREP_DEFAULT : USPREP_ALLOW_UNASSIGNED;
     return USPrep(USPREP_RFC4013_SASLPREP).prepare(UString::fromUTF8(str), opts).toUTF8();
 } catch (const DBException& e) {
     return e.toStatus();
 }
+
+StatusWith<std::string> icuX509DNPrep(StringData str) try {
+    return USPrep(USPREP_RFC4518_LDAP).prepare(UString::fromUTF8(str), USPREP_DEFAULT).toUTF8();
+} catch (const DBException& e) {
+    return e.toStatus();
+}
+
+/**
+ * ICU has a subtle undefined behavior race condition in the USPrep cache code. While unlikely to
+ * cause a problem, we can mitigate by causing the caches to be initialized at startup time.
+ */
+MONGO_INITIALIZER_GENERAL(LoadIcuPrep, ("LoadICUData"), ("default"))(InitializerContext*) {
+    // Force ICU to load its caches by calling each function.
+    invariant(icuSaslPrep("a"_sd).getStatus());
+    invariant(icuX509DNPrep("a"_sd).getStatus());
+}
+
+}  // namespace mongo

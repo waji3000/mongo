@@ -1,9 +1,9 @@
 /**
  * Sets up a test for WriteConflictException handling in applyOps with an insert workload.
  */
-var ApplyOpsInsertWriteConflictTest = function(options) {
-    'use strict';
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
+export var ApplyOpsInsertWriteConflictTest = function(options) {
     // Skip db hash check because this test may throw write conflicts and collmod fails.
     TestData.skipCheckDBHashes = true;
 
@@ -40,10 +40,7 @@ var ApplyOpsInsertWriteConflictTest = function(options) {
         });
 
         // Probabilities for WCE are chosen based on empirical testing.
-        // The probability for WCE during an atomic applyOps should be much smaller than that for
-        // the non-atomic case because we have to attempt to re-apply the entire batch of 'numOps'
-        // operations on WCE in the atomic case.
-        var probability = (options.atomic ? 0.1 : 5.0) / numOps;
+        var probability = 5.0 / numOps;
 
         // Set up failpoint to trigger WriteConflictException during write operations.
         assert.commandWorked(
@@ -57,7 +54,7 @@ var ApplyOpsInsertWriteConflictTest = function(options) {
         var previousLogLevel =
             assert.commandWorked(primaryDB.setLogLevel(3, 'replication')).was.replication.verbosity;
 
-        var applyOpsResult = primaryDB.adminCommand({applyOps: ops, allowAtomic: options.atomic});
+        var applyOpsResult = primaryDB.adminCommand({applyOps: ops});
 
         // Reset log level.
         primaryDB.setLogLevel(previousLogLevel, 'replication');

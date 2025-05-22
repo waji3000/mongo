@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,31 +29,75 @@
 
 #include "mongo/db/auth/user.h"
 
+#include <absl/container/node_hash_map.h>
+#include <absl/container/node_hash_set.h>
+#include <absl/meta/type_traits.h>
+#include <cstddef>
+#include <memory>
 #include <vector>
 
+
+#include "mongo/base/data_range.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/crypto/sha1_block.h"
 #include "mongo/crypto/sha256_block.h"
-#include "mongo/db/auth/authorization_manager.h"
+#include "mongo/db/auth/auth_name.h"
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/auth/resource_pattern.h"
+#include "mongo/db/auth/restriction_environment.h"
 #include "mongo/db/auth/role_name.h"
 #include "mongo/db/auth/user_name.h"
-#include "mongo/platform/atomic_word.h"
-#include "mongo/util/assert_util.h"
-#include "mongo/util/sequence_util.h"
+#include "mongo/db/multitenancy_gen.h"
+#include "mongo/util/str.h"
+#include "mongo/util/uuid.h"
 
 namespace mongo {
 
 namespace {
+// Field names used when serializing User objects to BSON for usersInfo.
+constexpr auto kIdFieldName = "_id"_sd;
+constexpr auto kUserIdFieldName = "userId"_sd;
+constexpr auto kUserFieldName = "user"_sd;
+constexpr auto kDbFieldName = "db"_sd;
+constexpr auto kMechanismsFieldName = "mechanisms"_sd;
+constexpr auto kCredentialsFieldName = "credentials"_sd;
+constexpr auto kRolesFieldName = "roles"_sd;
+constexpr auto kInheritedRolesFieldName = "inheritedRoles"_sd;
+constexpr auto kInheritedPrivilegesFieldName = "inheritedPrivileges"_sd;
+constexpr auto kInheritedAuthenticationRestrictionsFieldName =
+    "inheritedAuthenticationRestrictions"_sd;
+constexpr auto kAuthenticationRestrictionsFieldName = "authenticationRestrictions"_sd;
 
 SHA256Block computeDigest(const UserName& name) {
-    const auto& fn = name.getFullName();
+    auto fn = name.getDisplayName();
     return SHA256Block::computeHash({ConstDataRange(fn.c_str(), fn.size())});
 };
 
 }  // namespace
 
-User::User(const UserName& name) : _name(name), _digest(computeDigest(_name)) {}
+std::vector<std::string> UserRequest::getUserNameAndRolesVector(
+    const UserName& userName, const boost::optional<std::set<RoleName>>& roles) {
+    std::vector<std::string> hashElements;
+    hashElements.push_back(userName.getUnambiguousName());
+
+    if (roles) {
+        for (auto& role : *roles) {
+            hashElements.push_back(role.getRole());
+        }
+    }
+
+    return hashElements;
+}
+
+UserRequest::UserRequestCacheKey UserRequestGeneral::generateUserRequestCacheKey() const {
+    return UserRequestCacheKey(getUserName(), getUserNameAndRolesVector(getUserName(), getRoles()));
+}
+
+User::User(std::unique_ptr<UserRequest> request)
+    : _request(std::move(request)),
+      _isInvalidated(false),
+      _digest(computeDigest(_request->getUserName())) {}
 
 template <>
 User::SCRAMCredentials<SHA1Block>& User::CredentialData::scram<SHA1Block>() {
@@ -90,19 +133,13 @@ const User::CredentialData& User::getCredentials() const {
     return _credentials;
 }
 
-bool User::isValid() const {
-    return _isValid.loadRelaxed();
-}
-
-
-const ActionSet User::getActionsForResource(const ResourcePattern& resource) const {
-    stdx::unordered_map<ResourcePattern, Privilege>::const_iterator it = _privileges.find(resource);
-    if (it == _privileges.end()) {
-        return ActionSet();
+ActionSet User::getActionsForResource(const ResourcePattern& resource) const {
+    if (auto it = _privileges.find(resource); it != _privileges.end()) {
+        return it->second.getActions();
     }
-    return it->second.getActions();
-}
 
+    return ActionSet();
+}
 
 bool User::hasActionsForResource(const ResourcePattern& resource) const {
     return !getActionsForResource(resource).empty();
@@ -124,6 +161,8 @@ void User::setIndirectRoles(RoleNameIterator indirectRoles) {
     while (indirectRoles.more()) {
         _indirectRoles.push_back(indirectRoles.next());
     }
+    // Keep indirectRoles sorted for more efficient comparison against other users.
+    std::sort(_indirectRoles.begin(), _indirectRoles.end());
 }
 
 void User::setPrivileges(const PrivilegeVector& privileges) {
@@ -161,12 +200,122 @@ void User::addPrivileges(const PrivilegeVector& privileges) {
     }
 }
 
-void User::setRestrictions(RestrictionDocuments restrictions)& {
+void User::setRestrictions(RestrictionDocuments restrictions) & {
     _restrictions = std::move(restrictions);
 }
 
-void User::_invalidate() {
-    _isValid.store(false);
+void User::setIndirectRestrictions(RestrictionDocuments restrictions) & {
+    _indirectRestrictions = std::move(restrictions);
+}
+
+Status User::validateRestrictions(OperationContext* opCtx) const {
+    auto& transportSession = opCtx->getClient()->session();
+    if (!transportSession) {
+        // If Client has no transport session, it must be internal system connection
+        invariant(opCtx->getClient()->isFromSystemConnection());
+        return Status::OK();
+    }
+
+    auto& env = transportSession->getAuthEnvironment();
+    auto status = _restrictions.validate(env);
+    if (!status.isOK()) {
+        return {status.code(),
+                str::stream() << "Evaluation of direct authentication restrictions failed: "
+                              << status.reason()};
+    }
+
+    status = _indirectRestrictions.validate(env);
+    if (!status.isOK()) {
+        return {status.code(),
+                str::stream() << "Evaluation of indirect authentication restrictions failed: "
+                              << status.reason()};
+    }
+
+    return Status::OK();
+}
+
+void User::reportForUsersInfo(BSONObjBuilder* builder,
+                              bool showCredentials,
+                              bool showPrivileges,
+                              bool showAuthenticationRestrictions) const {
+    builder->append(kIdFieldName, getName().getUnambiguousName());
+    UUID::fromCDR(ConstDataRange(_id)).appendToBuilder(builder, kUserIdFieldName);
+    builder->append(kUserFieldName, getName().getUser());
+    builder->append(kDbFieldName, getName().getDB());
+
+    BSONArrayBuilder mechanismNamesBuilder(builder->subarrayStart(kMechanismsFieldName));
+    for (StringData mechanism : _credentials.toMechanismsVector()) {
+        mechanismNamesBuilder.append(mechanism);
+    }
+    mechanismNamesBuilder.doneFast();
+
+    BSONArrayBuilder rolesBuilder(builder->subarrayStart(kRolesFieldName));
+    for (const auto& role : _roles) {
+        role.serializeToBSON(&rolesBuilder);
+    }
+    rolesBuilder.doneFast();
+
+    if (showCredentials) {
+        BSONObjBuilder credentialsBuilder(builder->subobjStart(kCredentialsFieldName));
+        _credentials.toBSON(&credentialsBuilder);
+        credentialsBuilder.doneFast();
+    }
+
+    if (showPrivileges || showAuthenticationRestrictions) {
+        BSONArrayBuilder inheritedRolesBuilder(builder->subarrayStart(kInheritedRolesFieldName));
+        for (const auto& indirectRole : _indirectRoles) {
+            indirectRole.serializeToBSON(&inheritedRolesBuilder);
+        }
+        inheritedRolesBuilder.doneFast();
+
+        BSONArrayBuilder privsBuilder(builder->subarrayStart(kInheritedPrivilegesFieldName));
+        for (const auto& resourceToPrivilege : _privileges) {
+            privsBuilder.append(resourceToPrivilege.second.toBSON());
+        }
+        privsBuilder.doneFast();
+
+        BSONArray indirectRestrictionsArr = _indirectRestrictions.toBSON();
+        builder->append(kInheritedAuthenticationRestrictionsFieldName, indirectRestrictionsArr);
+    }
+
+    if (showAuthenticationRestrictions) {
+        // The user document parser expects an array of documents, where each document represents
+        // a restriction. Since _restrictions is of type RestrictionDocuments, its serialization
+        // logic supports multiple arrays of documents rather than just one. Therefore, we only
+        // should append the first array here.
+        BSONArray authenticationRestrictionsArr = _restrictions.toBSON();
+        if (authenticationRestrictionsArr.nFields() == 0) {
+            builder->append(kAuthenticationRestrictionsFieldName, BSONArray());
+        } else {
+            builder->append(kAuthenticationRestrictionsFieldName,
+                            BSONArray(authenticationRestrictionsArr.begin()->Obj()));
+        }
+    }
+}
+
+bool User::hasDifferentRoles(const User& otherUser) const {
+    // If the number of direct or indirect roles in the users' are not the same, they have
+    // different roles.
+    if (_roles.size() != otherUser._roles.size() ||
+        _indirectRoles.size() != otherUser._indirectRoles.size()) {
+        return true;
+    }
+
+    // At this point, it is known that the users have the same number of direct roles. The
+    // direct roles sets are equivalent if all of the roles in the first user's directRoles are
+    // also in the other user's directRoles.
+    for (const auto& role : _roles) {
+        if (otherUser._roles.find(role) == otherUser._roles.end()) {
+            return true;
+        }
+    }
+
+    // Indirect roles should always be sorted.
+    dassert(std::is_sorted(_indirectRoles.begin(), _indirectRoles.end()));
+    dassert(std::is_sorted(otherUser._indirectRoles.begin(), otherUser._indirectRoles.end()));
+
+    return !std::equal(
+        _indirectRoles.begin(), _indirectRoles.end(), otherUser._indirectRoles.begin());
 }
 
 }  // namespace mongo

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,8 +29,25 @@
 
 #pragma once
 
+#include <memory>
+#include <vector>
+
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/exec/mutable_bson/element.h"
+#include "mongo/db/field_ref.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/query/collation/collator_interface.h"
 #include "mongo/db/update/modifier_node.h"
-#include "mongo/stdx/memory.h"
+#include "mongo/db/update/update_node.h"
+#include "mongo/db/update/update_node_visitor.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/safe_num.h"
 
 namespace mongo {
 
@@ -43,14 +59,18 @@ public:
     Status init(BSONElement modExpr, const boost::intrusive_ptr<ExpressionContext>& expCtx) final;
 
     std::unique_ptr<UpdateNode> clone() const final {
-        return stdx::make_unique<BitNode>(*this);
+        return std::make_unique<BitNode>(*this);
     }
 
     void setCollator(const CollatorInterface* collator) final {}
 
+    void acceptVisitor(UpdateNodeVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
 protected:
     ModifyResult updateExistingElement(mutablebson::Element* element,
-                                       std::shared_ptr<FieldRef> elementPath) const final;
+                                       const FieldRef& elementPath) const final;
     void setValueForNewElement(mutablebson::Element* element) const final;
 
     bool allowCreation() const final {
@@ -58,6 +78,31 @@ protected:
     }
 
 private:
+    StringData operatorName() const final {
+        return "$bit";
+    }
+
+    BSONObj operatorValue() const final {
+        BSONObjBuilder bob;
+        {
+            BSONObjBuilder subBuilder(bob.subobjStart(""));
+            for (const auto& [bitOperator, operand] : _opList) {
+                operand.toBSON(
+                    [](SafeNum (SafeNum::*bitOperator)(const SafeNum&) const) {
+                        if (bitOperator == &SafeNum::bitAnd)
+                            return "and";
+                        if (bitOperator == &SafeNum::bitOr)
+                            return "or";
+                        if (bitOperator == &SafeNum::bitXor)
+                            return "xor";
+                        MONGO_UNREACHABLE;
+                    }(bitOperator),
+                    &subBuilder);
+            }
+        }
+        return bob.obj();
+    }
+
     /**
      * Applies each op in "_opList" to "value" and returns the result.
      */

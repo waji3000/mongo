@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -31,14 +30,40 @@
 #pragma once
 
 #include <boost/intrusive_ptr.hpp>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
 #include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+#include <cstddef>
 #include <memory>
+#include <set>
+#include <string>
+#include <utility>
 #include <vector>
 
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/auth/privilege.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/exec/plan_stats.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/dependencies.h"
 #include "mongo/db/pipeline/document_source.h"
+#include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/lite_parsed_document_source.h"
 #include "mongo/db/pipeline/lite_parsed_pipeline.h"
 #include "mongo/db/pipeline/pipeline.h"
+#include "mongo/db/pipeline/stage_constraints.h"
+#include "mongo/db/pipeline/tee_buffer.h"
+#include "mongo/db/pipeline/variables.h"
+#include "mongo/db/query/query_knobs_gen.h"
+#include "mongo/db/query/query_shape/serialization_options.h"
+#include "mongo/platform/atomic_word.h"
+#include "mongo/stdx/unordered_set.h"
+#include "mongo/util/intrusive_counter.h"
 
 namespace mongo {
 
@@ -57,8 +82,10 @@ class NamespaceString;
  * stage which will produce a document like the following:
  * {facetA: [<all input documents except the first one>], facetB: [<the first document>]}.
  */
-class DocumentSourceFacet final : public DocumentSource, public NeedsMergerDocumentSource {
+class DocumentSourceFacet final : public DocumentSource {
 public:
+    static constexpr StringData kStageName = "$facet"_sd;
+    static constexpr StringData kTeeConsumerStageName = "$internalFacetTeeConsumer"_sd;
     struct FacetPipeline {
         FacetPipeline(std::string name, std::unique_ptr<Pipeline, PipelineDeleter> pipeline)
             : name(std::move(name)), pipeline(std::move(pipeline)) {}
@@ -67,26 +94,20 @@ public:
         std::unique_ptr<Pipeline, PipelineDeleter> pipeline;
     };
 
-    class LiteParsed : public LiteParsedDocumentSource {
+    class LiteParsed final : public LiteParsedDocumentSourceNestedPipelines {
     public:
-        static std::unique_ptr<LiteParsed> parse(const AggregationRequest& request,
-                                                 const BSONElement& spec);
+        static std::unique_ptr<LiteParsed> parse(const NamespaceString& nss,
+                                                 const BSONElement& spec,
+                                                 const LiteParserOptions& options);
 
-        LiteParsed(std::vector<LiteParsedPipeline> liteParsedPipelines, PrivilegeVector privileges)
-            : _liteParsedPipelines(std::move(liteParsedPipelines)),
-              _requiredPrivileges(std::move(privileges)) {}
+        LiteParsed(std::string parseTimeName, std::vector<LiteParsedPipeline> pipelines)
+            : LiteParsedDocumentSourceNestedPipelines(
+                  std::move(parseTimeName), boost::none, std::move(pipelines)) {}
 
-        PrivilegeVector requiredPrivileges(bool isMongos) const final {
-            return _requiredPrivileges;
-        }
-
-        stdx::unordered_set<NamespaceString> getInvolvedNamespaces() const final;
-
-        bool allowShardedForeignCollection(NamespaceString nss) const final;
-
-    private:
-        const std::vector<LiteParsedPipeline> _liteParsedPipelines;
-        const PrivilegeVector _requiredPrivileges;
+        PrivilegeVector requiredPrivileges(bool isMongos,
+                                           bool bypassDocumentValidation) const final {
+            return requiredPrivilegesBasic(isMongos, bypassDocumentValidation);
+        };
     };
 
     static boost::intrusive_ptr<DocumentSource> createFromBson(
@@ -94,12 +115,9 @@ public:
 
     static boost::intrusive_ptr<DocumentSourceFacet> create(
         std::vector<FacetPipeline> facetPipelines,
-        const boost::intrusive_ptr<ExpressionContext>& expCtx);
-
-    /**
-     * Blocking call. Will consume all input and produces one output document.
-     */
-    GetNextResult getNext() final;
+        const boost::intrusive_ptr<ExpressionContext>& expCtx,
+        size_t bufferSizeBytes = internalQueryFacetBufferSizeBytes.load(),
+        size_t maxOutputDocBytes = internalQueryFacetMaxOutputDocSizeBytes.load());
 
     /**
      * Optimizes inner pipelines.
@@ -110,15 +128,22 @@ public:
      * Takes a union of all sub-pipelines, and adds them to 'deps'.
      */
     DepsTracker::State getDependencies(DepsTracker* deps) const final;
+    void addVariableRefs(std::set<Variables::Id>* refs) const final;
 
     const char* getSourceName() const final {
-        return "$facet";
+        return DocumentSourceFacet::kStageName.data();
+    }
+
+    static const Id& id;
+
+    Id getId() const override {
+        return id;
     }
 
     /**
      * Sets 'source' as the source of '_teeBuffer'.
      */
-    void setSource(DocumentSource* source) final;
+    void setSource(Stage* source) final;
 
     /**
      * The $facet stage must be run on the merging shard.
@@ -126,36 +151,52 @@ public:
      * TODO SERVER-24154: Should be smarter about splitting so that parts of the sub-pipelines can
      * potentially be run in parallel on multiple shards.
      */
-    boost::intrusive_ptr<DocumentSource> getShardSource() final {
-        return nullptr;
-    }
-    MergingLogic mergingLogic() final {
-        return {this};
+    boost::optional<DistributedPlanLogic> distributedPlanLogic() final {
+        // {shardsStage, mergingStage, sortPattern}
+        return DistributedPlanLogic{nullptr, this, boost::none};
     }
 
     const std::vector<FacetPipeline>& getFacetPipelines() const {
         return _facets;
     }
 
+    auto& getFacetPipelines() {
+        return _facets;
+    }
+
     // The following are overridden just to forward calls to sub-pipelines.
-    void addInvolvedCollections(std::vector<NamespaceString>* collections) const final;
+    void addInvolvedCollections(stdx::unordered_set<NamespaceString>* involvedNssSet) const final;
     void detachFromOperationContext() final;
     void reattachToOperationContext(OperationContext* opCtx) final;
+    bool validateOperationContext(const OperationContext* opCtx) const final;
     StageConstraints constraints(Pipeline::SplitState pipeState) const final;
     bool usedDisk() final;
+    const SpecificStats* getSpecificStats() const final {
+        return &_stats;
+    }
 
 protected:
+    /**
+     * Blocking call. Will consume all input and produces one output document.
+     */
+    GetNextResult doGetNext() final;
     void doDispose() final;
 
 private:
     DocumentSourceFacet(std::vector<FacetPipeline> facetPipelines,
-                        const boost::intrusive_ptr<ExpressionContext>& expCtx);
+                        const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                        size_t bufferSizeBytes,
+                        size_t maxOutputDocBytes);
 
-    Value serialize(boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final;
+    Value serialize(const SerializationOptions& opts = SerializationOptions{}) const final;
 
     boost::intrusive_ptr<TeeBuffer> _teeBuffer;
     std::vector<FacetPipeline> _facets;
 
+    const size_t _maxOutputDocSizeBytes;
+
     bool _done = false;
+
+    DocumentSourceFacetStats _stats;
 };
 }  // namespace mongo

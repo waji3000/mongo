@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -31,42 +30,35 @@
 #pragma once
 
 #include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
 #include <iosfwd>
+#include <string>
 #include <type_traits>
 #include <utility>
 
+#include "mongo/base/error_codes.h"
 #include "mongo/base/static_assert.h"
 #include "mongo/base/status.h"
+#include "mongo/bson/util/builder_fwd.h"
 #include "mongo/platform/compiler.h"
-
-#define MONGO_INCLUDE_INVARIANT_H_WHITELISTED
-#include "mongo/util/invariant.h"
-#undef MONGO_INCLUDE_INVARIANT_H_WHITELISTED
-
+#include "mongo/unittest/stringify.h"
+#include "mongo/util/assert_util_core.h"
 
 namespace mongo {
-
-// Including builder.h here would cause a cycle.
-template <typename Allocator>
-class StringBuilderImpl;
 
 template <typename T>
 class StatusWith;
 
-// Using extern constexpr to prevent the compiler from allocating storage as a poor man's c++17
-// inline constexpr variable.
-// TODO delete extern in c++17 because inline is the default for constexpr variables.
 template <typename T>
-extern constexpr bool isStatusWith = false;
+inline constexpr bool isStatusWith = false;
 template <typename T>
-extern constexpr bool isStatusWith<StatusWith<T>> = true;
+inline constexpr bool isStatusWith<StatusWith<T>> = true;
 
 template <typename T>
-extern constexpr bool isStatusOrStatusWith =
-    std::is_same<T, mongo::Status>::value || isStatusWith<T>;
+inline constexpr bool isStatusOrStatusWith = std::is_same_v<T, Status> || isStatusWith<T>;
 
 template <typename T>
-using StatusOrStatusWith = std::conditional_t<std::is_void<T>::value, Status, StatusWith<T>>;
+using StatusOrStatusWith = std::conditional_t<std::is_void_v<T>, Status, StatusWith<T>>;
 
 /**
  * StatusWith is used to return an error or a value.
@@ -86,38 +78,25 @@ using StatusOrStatusWith = std::conditional_t<std::is_void<T>::value, Status, St
  * }
  */
 template <typename T>
-class MONGO_WARN_UNUSED_RESULT_CLASS StatusWith {
+class [[nodiscard]] StatusWith {
 private:
     MONGO_STATIC_ASSERT_MSG(!isStatusOrStatusWith<T>,
                             "StatusWith<Status> and StatusWith<StatusWith<T>> are banned.");
-    // `TagTypeBase` is used as a base for the `TagType` type, to prevent it from being an
-    // aggregate.
-    struct TagTypeBase {
-    protected:
-        TagTypeBase() = default;
-    };
-    // `TagType` is used as a placeholder type in parameter lists for `enable_if` clauses.  They
-    // have to be real parameters, not template parameters, due to MSVC limitations.
-    class TagType : TagTypeBase {
-        TagType() = default;
-        friend StatusWith;
-    };
 
 public:
     using value_type = T;
 
     /**
-     * for the error case
+     * For the error case.
+     * As with the `Status` constructors, `reason` can be `std::string` or
+     * anything that can construct one (e.g. `StringData`, `str::stream`).
      */
-    MONGO_COMPILER_COLD_FUNCTION StatusWith(ErrorCodes::Error code, StringData reason)
-        : _status(code, reason) {}
     MONGO_COMPILER_COLD_FUNCTION StatusWith(ErrorCodes::Error code, std::string reason)
         : _status(code, std::move(reason)) {}
-    MONGO_COMPILER_COLD_FUNCTION StatusWith(ErrorCodes::Error code, const char* reason)
-        : _status(code, reason) {}
-    MONGO_COMPILER_COLD_FUNCTION StatusWith(ErrorCodes::Error code,
-                                            const mongoutils::str::stream& reason)
-        : _status(code, reason) {}
+    template <typename Reason,
+              std::enable_if_t<std::is_constructible_v<std::string, Reason&&>, int> = 0>
+    MONGO_COMPILER_COLD_FUNCTION StatusWith(ErrorCodes::Error code, Reason&& reason)
+        : StatusWith(code, std::string{std::forward<Reason>(reason)}) {}
 
     /**
      * for the error case
@@ -129,29 +108,34 @@ public:
     /**
      * for the OK case
      */
-    StatusWith(T t) : _status(Status::OK()), _t(std::move(t)) {}
+    constexpr StatusWith(T t) : _status(Status::OK()), _t(std::move(t)) {}
 
-    template <typename Alien>
-    StatusWith(Alien&& alien,
-               typename std::enable_if_t<std::is_convertible<Alien, T>::value, TagType> = makeTag(),
-               typename std::enable_if_t<!std::is_same<Alien, T>::value, TagType> = makeTag())
-        : StatusWith(static_cast<T>(std::forward<Alien>(alien))) {}
+    template <std::convertible_to<T> U>
+    requires(!std::is_same_v<U, T>)
+    constexpr StatusWith(U&& other) : StatusWith(static_cast<T>(std::forward<U>(other))) {}
 
-    const T& getValue() const {
+    template <std::convertible_to<T> U>
+    requires(!std::is_same_v<U, T>)
+    constexpr StatusWith(StatusWith<U> other) : _status(std::move(other.getStatus())) {
+        if (other.isOK())
+            this->_t = std::move(other.getValue());
+    }
+
+    constexpr const T& getValue() const {
         dassert(isOK());
         return *_t;
     }
 
-    T& getValue() {
+    constexpr T& getValue() {
         dassert(isOK());
         return *_t;
     }
 
-    const Status& getStatus() const {
+    constexpr const Status& getStatus() const {
         return _status;
     }
 
-    bool isOK() const {
+    constexpr bool isOK() const {
         return _status.isOK();
     }
 
@@ -170,20 +154,31 @@ public:
     void status_with_transitional_ignore() && noexcept {};
     void status_with_transitional_ignore() const& noexcept = delete;
 
-private:
-    // The `TagType` type cannot be constructed as a default function-parameter in Clang.  So we use
-    // a static member function that initializes that default parameter.
-    static TagType makeTag() {
-        return {};
+    constexpr bool operator==(const T& val) const {
+        return isOK() && getValue() == val;
     }
 
+    constexpr bool operator==(const Status& status) const {
+        return getStatus() == status;
+    }
+
+    constexpr bool operator==(ErrorCodes::Error code) const {
+        return getStatus() == code;
+    }
+
+private:
     Status _status;
-    boost::optional<T> _t;
+    // Using std::optional because boost::optional isn't constexpr-friendly.
+    std::optional<T> _t;  // NOLINT not used in public API, so no interop issues.
 };
 
-template <typename T, typename... Args>
-StatusWith<T> makeStatusWith(Args&&... args) {
-    return StatusWith<T>{T(std::forward<Args>(args)...)};
+template <typename T>
+std::string stringify_forTest(const StatusWith<T>& sw) {
+    if (sw.isOK()) {
+        return unittest::stringify::invoke(sw.getValue());
+    } else {
+        return unittest::stringify::invoke(sw.getStatus());
+    }
 }
 
 template <typename T>
@@ -204,76 +199,5 @@ auto operator<<(StringBuilderImpl<Allocator>& stream, const StatusWith<T>& sw)
     return stream << sw.getStatus();
 }
 
-//
-// EqualityComparable(StatusWith<T>, T). Intentionally not providing an ordering relation.
-//
-
-template <typename T>
-bool operator==(const StatusWith<T>& sw, const T& val) {
-    return sw.isOK() && sw.getValue() == val;
-}
-
-template <typename T>
-bool operator==(const T& val, const StatusWith<T>& sw) {
-    return sw.isOK() && val == sw.getValue();
-}
-
-template <typename T>
-bool operator!=(const StatusWith<T>& sw, const T& val) {
-    return !(sw == val);
-}
-
-template <typename T>
-bool operator!=(const T& val, const StatusWith<T>& sw) {
-    return !(val == sw);
-}
-
-//
-// EqualityComparable(StatusWith<T>, Status)
-//
-
-template <typename T>
-bool operator==(const StatusWith<T>& sw, const Status& status) {
-    return sw.getStatus() == status;
-}
-
-template <typename T>
-bool operator==(const Status& status, const StatusWith<T>& sw) {
-    return status == sw.getStatus();
-}
-
-template <typename T>
-bool operator!=(const StatusWith<T>& sw, const Status& status) {
-    return !(sw == status);
-}
-
-template <typename T>
-bool operator!=(const Status& status, const StatusWith<T>& sw) {
-    return !(status == sw);
-}
-
-//
-// EqualityComparable(StatusWith<T>, ErrorCode)
-//
-
-template <typename T>
-bool operator==(const StatusWith<T>& sw, const ErrorCodes::Error code) {
-    return sw.getStatus() == code;
-}
-
-template <typename T>
-bool operator==(const ErrorCodes::Error code, const StatusWith<T>& sw) {
-    return code == sw.getStatus();
-}
-
-template <typename T>
-bool operator!=(const StatusWith<T>& sw, const ErrorCodes::Error code) {
-    return !(sw == code);
-}
-
-template <typename T>
-bool operator!=(const ErrorCodes::Error code, const StatusWith<T>& sw) {
-    return !(code == sw);
-}
 
 }  // namespace mongo

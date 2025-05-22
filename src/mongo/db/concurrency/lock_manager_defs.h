@@ -35,8 +35,11 @@
 
 #include "mongo/base/static_assert.h"
 #include "mongo/base/string_data.h"
-#include "mongo/config.h"
-#include "mongo/platform/hash_namespace.h"
+#include "mongo/config.h"  // IWYU pragma: keep
+#include "mongo/db/database_name.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/tenant_id.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 
@@ -51,7 +54,7 @@ struct PartitionedLockHead;
  * This matrix answers the question, "Is a lock request with mode 'Requested Mode' compatible with
  * an existing lock held in mode 'Granted Mode'?"
  *
- * | Requested Mode | Granted Mode |         |          |        |          |
+ * | Requested Mode |                      Granted Mode                     |
  * |----------------|:------------:|:-------:|:--------:|:------:|:--------:|
  * |                |  MODE_NONE   | MODE_IS |  MODE_IX | MODE_S |  MODE_X  |
  * | MODE_IS        |      +       |    +    |     +    |    +   |          |
@@ -59,7 +62,7 @@ struct PartitionedLockHead;
  * | MODE_S         |      +       |    +    |          |    +   |          |
  * | MODE_X         |      +       |         |          |        |          |
  */
-enum LockMode {
+enum LockMode : uint8_t {
     /** None */
     MODE_NONE = 0,
     /** Intent shared */
@@ -98,7 +101,7 @@ bool isModeCovered(LockMode mode, LockMode coveringMode);
 /**
  * Returns whether the passed in mode is S or IS. Used for validation checks.
  */
-inline bool isSharedLockMode(LockMode mode) {
+constexpr bool isSharedLockMode(LockMode mode) {
     return (mode == MODE_IS || mode == MODE_S);
 }
 
@@ -149,18 +152,30 @@ enum LockResult {
  * ordering is consistent so deadlock cannot occur.
  */
 enum ResourceType {
-    /** Types used for special resources, use with a hash id from ResourceId::SingletonHashIds. */
     RESOURCE_INVALID = 0,
 
-    /**  Used for mode changes or global exclusive operations */
+    /**  Used for global exclusive operations */
     RESOURCE_GLOBAL,
 
-    /** Generic resources, used for multi-granularity locking, together with RESOURCE_GLOBAL */
+    /** Encompasses resources belonging to a tenant, if in multi-tenant mode.*/
+    RESOURCE_TENANT,
+
+    /** Generic resources, used for multi-granularity locking, together with the above locks */
     RESOURCE_DATABASE,
     RESOURCE_COLLECTION,
     RESOURCE_METADATA,
 
-    /** Resource type used for locking general resources not related to the storage hierarchy. */
+    /**
+     * Resource DDL types used for multi-granularity locking on DDL operations.
+     * These resources are not related to the storage hierarchy.
+     */
+    RESOURCE_DDL_DATABASE,
+    RESOURCE_DDL_COLLECTION,
+
+    /**
+     * Resource type used for locking general resources not related to the storage hierarchy. These
+     * can't be created manually, use Lock::ResourceMutex::ResourceMutex() instead.
+     */
     RESOURCE_MUTEX,
 
     /** Counts the rest. Always insert new resource types above this entry. */
@@ -168,34 +183,86 @@ enum ResourceType {
 };
 
 /**
+ * IDs for usages of RESOURCE_GLOBAL.
+ */
+enum class ResourceGlobalId : uint8_t {
+    kMultiDocumentTransactionsBarrier,
+    kReplicationStateTransitionLock,
+    kGlobal,
+
+    // The number of global resource ids. Always insert new ids above this entry.
+    kNumIds
+};
+
+/**
+ * Maps the resource id to a human-readable string.
+ */
+inline constexpr const char* ResourceTypeNames[] = {"Invalid",
+                                                    "Global",
+                                                    "Tenant",
+                                                    "Database",
+                                                    "Collection",
+                                                    "Metadata",
+                                                    "DDLDatabase",
+                                                    "DDLCollection",
+                                                    "Mutex"};
+
+/**
+ * Maps the global resource id to a human-readable string.
+ */
+inline constexpr const char* ResourceGlobalIdNames[] = {
+    "MultiDocumentTransactionsBarrier",
+    "ReplicationStateTransition",
+    "Global",
+};
+
+// Ensure we do not add new types without updating the names array.
+MONGO_STATIC_ASSERT((sizeof(ResourceTypeNames) / sizeof(ResourceTypeNames[0])) ==
+                    ResourceTypesCount);
+
+// Ensure we do not add new global resource ids without updating the names array.
+MONGO_STATIC_ASSERT((sizeof(ResourceGlobalIdNames) / sizeof(ResourceGlobalIdNames[0])) ==
+                    static_cast<uint8_t>(ResourceGlobalId::kNumIds));
+
+/**
  * Returns a human-readable name for the specified resource type.
  */
-const char* resourceTypeName(ResourceType resourceType);
+constexpr const char* resourceTypeName(ResourceType resourceType) {
+    return ResourceTypeNames[resourceType];
+}
+
+/**
+ * Returns a human-readable name for the specified global resource.
+ */
+constexpr const char* resourceGlobalIdName(ResourceGlobalId id) {
+    return ResourceGlobalIdNames[static_cast<uint8_t>(id)];
+}
 
 /**
  * Uniquely identifies a lockable resource.
  */
 class ResourceId {
-    // We only use 3 bits for the resource type in the ResourceId hash
-    enum { resourceTypeBits = 3 };
+public:
+    // We only use 4 bits for the resource type in the ResourceId hash
+    static constexpr size_t resourceTypeBits = 4;
     MONGO_STATIC_ASSERT(ResourceTypesCount <= (1 << resourceTypeBits));
 
-public:
-    /**
-     * Assign hash ids for special resources to avoid accidental reuse of ids. For ids used
-     * with the same ResourceType, the order here must be the same as the locking order.
-     */
-    enum SingletonHashIds {
-        SINGLETON_INVALID = 0,
-        SINGLETON_PARALLEL_BATCH_WRITER_MODE,
-        SINGLETON_REPLICATION_STATE_TRANSITION_LOCK,
-        SINGLETON_GLOBAL,
-    };
-
-    ResourceId() : _fullHash(0) {}
-    ResourceId(ResourceType type, StringData ns);
-    ResourceId(ResourceType type, const std::string& ns);
-    ResourceId(ResourceType type, uint64_t hashId);
+    ResourceId(ResourceType type, const NamespaceString& nss)
+        : _fullHash(fullHash(type, hashStringData(nss.toStringForResourceId()))) {
+        verifyNoResourceMutex(type);
+    }
+    ResourceId(ResourceType type, const DatabaseName& dbName)
+        : _fullHash(fullHash(type, hashStringData(dbName.toStringForResourceId()))) {
+        verifyNoResourceMutex(type);
+    }
+    ResourceId(ResourceType type, uint64_t hashId) : _fullHash(fullHash(type, hashId)) {
+        verifyNoResourceMutex(type);
+    }
+    ResourceId(ResourceType type, const TenantId& tenantId)
+        : _fullHash{fullHash(type, hashStringData(tenantId.toString()))} {
+        verifyNoResourceMutex(type);
+    }
+    constexpr ResourceId() : _fullHash(0) {}
 
     bool isValid() const {
         return getType() != RESOURCE_INVALID;
@@ -220,7 +287,22 @@ public:
 
     std::string toString() const;
 
+    template <typename H>
+    friend H AbslHashValue(H h, const ResourceId& resource) {
+        return H::combine(std::move(h), resource._fullHash);
+    }
+
 private:
+    friend class ResourceCatalog;
+
+    ResourceId(uint64_t fullHash) : _fullHash(fullHash) {}
+
+    static void verifyNoResourceMutex(ResourceType type) {
+        invariant(
+            type != RESOURCE_MUTEX,
+            "Can't create a ResourceMutex directly, use Lock::ResourceMutex::ResourceMutex().");
+    }
+
     /**
      * The top 'resourceTypeBits' bits of '_fullHash' represent the resource type,
      * while the remaining bits contain the bottom bits of the hashId. This avoids false
@@ -228,13 +310,14 @@ private:
      */
     uint64_t _fullHash;
 
-    static uint64_t fullHash(ResourceType type, uint64_t hashId);
+    static uint64_t fullHash(ResourceType type, uint64_t hashId) {
+        return (static_cast<uint64_t>(type) << (64 - resourceTypeBits)) +
+            (hashId & (std::numeric_limits<uint64_t>::max() >> resourceTypeBits));
+    }
 
-#ifdef MONGO_CONFIG_DEBUG_BUILD
-    // Keep the complete namespace name for debugging purposes (TODO: this will be
-    // removed once we are confident in the robustness of the lock manager).
-    std::string _nsCopy;
-#endif
+    static uint64_t hashStringData(StringData str) {
+        return absl::hash_internal::CityHash64(str.data(), str.size());
+    }
 };
 
 #ifndef MONGO_CONFIG_DEBUG_BUILD
@@ -243,32 +326,31 @@ private:
 MONGO_STATIC_ASSERT(sizeof(ResourceId) == sizeof(uint64_t));
 #endif
 
-
 // Type to uniquely identify a given locker object
 typedef uint64_t LockerId;
 
 // Hardcoded resource id for the oplog collection, which is special-cased both for resource
 // acquisition purposes and for statistics reporting.
 extern const ResourceId resourceIdLocalDB;
-extern const ResourceId resourceIdOplog;
 
 // Hardcoded resource id for admin db. This is to ensure direct writes to auth collections
 // are serialized (see SERVER-16092)
 extern const ResourceId resourceIdAdminDB;
 
-// Hardcoded resource id for ParallelBatchWriterMode. We use the same resource type
-// as resourceIdGlobal. This will also ensure the waits are reported as global, which
-// is appropriate. The lock will never be contended unless the parallel batch writers
-// must stop all other accesses globally. This resource must be locked before all other
-// resources (including resourceIdGlobal). Replication applier threads don't take this
-// lock.
-// TODO: Merge this with resourceIdGlobal
-extern const ResourceId resourceIdParallelBatchWriterMode;
+// Global lock. Every server operation, which uses the Locker must acquire this lock at least
+// once. See comments in the header file (begin/endTransaction) for more information.
+extern const ResourceId resourceIdGlobal;
 
-// Hardcoded resource id for the ReplicationStateTransitionLock (RSTL). We use the same resource
-// type as resourceIdGlobal. This will also ensure the waits are reported as global, which is
-// appropriate. This lock is acquired in mode X for any replication state transition and is acquired
-// by all other reads and writes in mode IX. This lock is acquired after the PBWM but before the
+// Hardcoded resource id for draining prepared transactions and avoiding a deadlock with global lock
+// acquisitions in strong mode. This lock is acquired before the RSTL and resourceIdGlobal. It is
+// acquired by operations processing transaction statements, and by operations acquiring the global
+// lock in non-intent mode; all other requests skip this acquisition. It is acquired in the same
+// mode as the requested global lock mode.
+extern const ResourceId resourceIdMultiDocumentTransactionsBarrier;
+
+// Hardcoded resource id for the ReplicationStateTransitionLock (RSTL). This lock is acquired in
+// mode X for any replication state transition and is acquired by all other reads and writes in mode
+// IX. This lock is acquired after the MultiDocumentTransactionsBarrier lock but before the
 // resourceIdGlobal.
 extern const ResourceId resourceIdReplicationStateTransitionLock;
 
@@ -290,8 +372,8 @@ public:
      * This method is invoked at most once for each lock request and indicates the outcome of
      * the lock acquisition for the specified resource id.
      *
-     * Cases where it won't be called are if a lock acquisition (be it in waiting or converting
-     * state) is cancelled through a call to unlock.
+     * Cases where it won't be called are if a pending (not-granted) lock acquisition is cancelled
+     * through a call to unlock.
      *
      * IMPORTANT: This callback runs under a spinlock for the lock manager, so the work done
      *            inside must be kept to a minimum and no locks or operations which may block
@@ -304,7 +386,6 @@ public:
     virtual void notify(ResourceId resId, LockResult result) = 0;
 };
 
-
 /**
  * There is one of those entries per each request for a lock. They hang on a linked list off
  * the LockHead or off a PartitionedLockHead and also are in a map for each Locker. This
@@ -314,11 +395,10 @@ public:
  * be deleted while on the LockManager though (see the contract for the lock/unlock methods).
  */
 struct LockRequest {
-    enum Status {
+    enum Status : uint8_t {
         STATUS_NEW,
         STATUS_GRANTED,
         STATUS_WAITING,
-        STATUS_CONVERTING,
 
         // Counts the rest. Always insert new status types above this entry.
         StatusCount
@@ -338,8 +418,8 @@ struct LockRequest {
     Locker* locker;
 
     // Notification to be invoked when the lock is granted. Pointer is not owned, just referenced.
-    // If a request is in the WAITING or CONVERTING state, must live at least until
-    // LockManager::unlock is cancelled or the notification has been invoked.
+    // If a request is in the WAITING state, it must live at least until LockManager::unlock is
+    // called or the notification has been invoked.
     //
     // Written at construction time by Locker
     // Read by LockManager
@@ -353,7 +433,7 @@ struct LockRequest {
     // Written at construction time by Locker
     // Read by LockManager on any thread
     // No synchronization
-    bool enqueueAtFront;
+    bool enqueueAtFront : 1;
 
     // When this request is granted and as long as it is on the granted queue, the particular
     // resource's policy will be changed to "compatibleFirst". This means that even if there are
@@ -363,7 +443,7 @@ struct LockRequest {
     // Written at construction time by Locker
     // Read by LockManager on any thread
     // No synchronization
-    bool compatibleFirst;
+    bool compatibleFirst : 1;
 
     // When set, an attempt is made to execute this request using partitioned lockheads. This speeds
     // up the common case where all requested locking modes are compatible with each other, at the
@@ -372,7 +452,36 @@ struct LockRequest {
     // Written at construction time by LockManager
     // Read by LockManager on any thread
     // No synchronization
-    bool partitioned;
+    bool partitioned : 1;
+
+    // The current status of this request. Always starts at STATUS_NEW.
+    //
+    // Written by LockManager on any thread
+    // Read by LockManager on any thread
+    // Protected by LockHead bucket's mutex
+    Status status;
+
+    // If this request is not granted, the mode which has been requested for this lock. If granted,
+    // the mode in which it is currently granted.
+    //
+    // Written by LockManager on any thread
+    // Read by LockManager on any thread
+    // Protected by LockHead bucket's mutex
+    // Read by Locker on Locker thread
+    // It is safe for the Locker to read this without taking the bucket mutex provided that the
+    // LockRequest status is not WAITING.
+    LockMode mode;
+
+    // This unsigned represents the number of pending unlocks for this LockRequest. It is greater
+    // than 0 when the LockRequest is participating in two-phase lock and unlock() is called on it.
+    // It can be greater than 1 if this lock is participating in two-phase-lock and unlock() has
+    // been called multiple times on the same resourceId within the same WriteUnitOfWork. So this
+    // value tracks the number of unlocks() to execute at the end of the WUOW.
+    //
+    // Written by Locker on Locker thread
+    // Read by Locker on Locker thread
+    // No synchronization
+    uint16_t unlockPending;
 
     // How many times has LockManager::lock been called for this request. Locks are released when
     // their recursive count drops to zero.
@@ -381,7 +490,7 @@ struct LockRequest {
     // Read by LockManager on Locker thread
     // Read by Locker on Locker thread
     // No synchronization
-    unsigned recursiveCount;
+    uint16_t recursiveCount;
 
     // Pointer to the lock to which this request belongs, or null if this request has not yet been
     // assigned to a lock or if it belongs to the PartitionedLockHead for locker (in which case
@@ -413,44 +522,18 @@ struct LockRequest {
     // Protected by LockHead bucket's mutex
     LockRequest* prev;
     LockRequest* next;
+};
 
-    // The current status of this request. Always starts at STATUS_NEW.
-    //
-    // Written by LockManager on any thread
-    // Read by LockManager on any thread
-    // Protected by LockHead bucket's mutex
-    Status status;
+/**
+ * Type used to fetch lock info from the LockManager for debugging purposes.
+ * Note that using a struct to fetch internal LockManager information is preferable than a BSONObj
+ * to minimize the time the LockManager mutexes are hold.
+ */
+struct LogDebugInfo {
+    LogDebugInfo(LockMode mode, const std::string& debugInfo) : mode(mode), debugInfo(debugInfo) {}
 
-    // If this request is not granted, the mode which has been requested for this lock. If granted,
-    // the mode in which it is currently granted.
-    //
-    // Written by LockManager on any thread
-    // Read by LockManager on any thread
-    // Protected by LockHead bucket's mutex
-    // Read by Locker on Locker thread
-    // It is safe for the Locker to read this without taking the bucket mutex provided that the
-    // LockRequest status is not WAITING or CONVERTING.
     LockMode mode;
-
-    // This value is different from MODE_NONE only if a conversion is requested for a lock and that
-    // conversion cannot be immediately granted.
-    //
-    // Written by LockManager on any thread
-    // Read by LockManager on any thread
-    // Protected by LockHead bucket's mutex
-    LockMode convertMode;
-
-    // This unsigned represents the number of pending unlocks for this LockRequest. It is greater
-    // than 0 when the LockRequest is participating in two-phase lock and unlock() is called on it.
-    // It can be greater than 1 if this lock is participating in two-phase-lock and has been
-    // converted to a different mode that also participates in two-phase-lock. unlock() may be
-    // called multiple times on the same resourceId within the same WriteUnitOfWork in this case, so
-    // the number of unlocks() to execute at the end of this WUOW is tracked with this unsigned.
-    //
-    // Written by Locker on Locker thread
-    // Read by Locker on Locker thread
-    // No synchronization
-    unsigned unlockPending = 0;
+    std::string debugInfo;
 };
 
 /**
@@ -459,13 +542,3 @@ struct LockRequest {
 const char* lockRequestStatusName(LockRequest::Status status);
 
 }  // namespace mongo
-
-
-MONGO_HASH_NAMESPACE_START
-template <>
-struct hash<mongo::ResourceId> {
-    size_t operator()(const mongo::ResourceId& resource) const {
-        return resource;
-    }
-};
-MONGO_HASH_NAMESPACE_END

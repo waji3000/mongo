@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,11 +27,17 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <cstdint>
 
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/db/exec/mutable_bson/algorithm.h"
+#include "mongo/db/exec/mutable_bson/document.h"
 #include "mongo/db/update/arithmetic_node.h"
-
-#include "mongo/bson/mutable/algorithm.h"
+#include "mongo/util/safe_num.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -47,17 +52,6 @@ const char* getNameForOp(ArithmeticNode::ArithmeticOp op) {
             MONGO_UNREACHABLE;
     }
 }
-
-const char* getModifierNameForOp(ArithmeticNode::ArithmeticOp op) {
-    switch (op) {
-        case ArithmeticNode::ArithmeticOp::kAdd:
-            return "$inc";
-        case ArithmeticNode::ArithmeticOp::kMultiply:
-            return "$mul";
-        default:
-            MONGO_UNREACHABLE;
-    }
-}
 }  // namespace
 
 Status ArithmeticNode::init(BSONElement modExpr,
@@ -67,9 +61,7 @@ Status ArithmeticNode::init(BSONElement modExpr,
     if (!modExpr.isNumber()) {
         return Status(ErrorCodes::TypeMismatch,
                       str::stream() << "Cannot " << getNameForOp(_op)
-                                    << " with non-numeric argument: {"
-                                    << modExpr
-                                    << "}");
+                                    << " with non-numeric argument: {" << modExpr << "}");
     }
 
     _val = modExpr;
@@ -77,17 +69,15 @@ Status ArithmeticNode::init(BSONElement modExpr,
 }
 
 ModifierNode::ModifyResult ArithmeticNode::updateExistingElement(
-    mutablebson::Element* element, std::shared_ptr<FieldRef> elementPath) const {
+    mutablebson::Element* element, const FieldRef& elementPath) const {
     if (!element->isNumeric()) {
         auto idElem = mutablebson::findFirstChildNamed(element->getDocument().root(), "_id");
         uasserted(ErrorCodes::TypeMismatch,
-                  str::stream() << "Cannot apply " << getModifierNameForOp(_op)
+                  str::stream() << "Cannot apply " << operatorName()
                                 << " to a value of non-numeric type. {"
                                 << (idElem.ok() ? idElem.toString() : "no id")
-                                << "} has the field '"
-                                << element->getFieldName()
-                                << "' of non-numeric type "
-                                << typeName(element->getType()));
+                                << "} has the field '" << element->getFieldName()
+                                << "' of non-numeric type " << typeName(element->getType()));
     }
 
     SafeNum originalValue = element->getValueSafeNum();
@@ -108,11 +98,9 @@ ModifierNode::ModifyResult ArithmeticNode::updateExistingElement(
     } else if (!valueToSet.isValid()) {
         auto idElem = mutablebson::findFirstChildNamed(element->getDocument().root(), "_id");
         uasserted(ErrorCodes::BadValue,
-                  str::stream() << "Failed to apply " << getModifierNameForOp(_op)
-                                << " operations to current value ("
-                                << originalValue.debugString()
-                                << ") for document {"
-                                << (idElem.ok() ? idElem.toString() : "no id")
+                  str::stream() << "Failed to apply " << operatorName()
+                                << " operations to current value (" << originalValue.debugString()
+                                << ") for document {" << (idElem.ok() ? idElem.toString() : "no id")
                                 << "}");
     } else {
         invariant(element->setValueSafeNum(valueToSet));

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,73 +27,47 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/exec/sort_key_generator.h"
-
+#include <memory>
+#include <utility>
 #include <vector>
 
-#include "mongo/bson/bsonobj_comparator.h"
-#include "mongo/db/catalog/collection.h"
-#include "mongo/db/exec/scoped_timer.h"
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/db/exec/document_value/document_metadata_fields.h"
+#include "mongo/db/exec/sort_key_generator.h"
 #include "mongo/db/exec/working_set.h"
-#include "mongo/db/exec/working_set_common.h"
-#include "mongo/db/exec/working_set_computed_data.h"
-#include "mongo/db/matcher/extensions_callback_noop.h"
-#include "mongo/db/query/collation/collator_interface.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/util/log.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
+
 
 namespace mongo {
 
 const char* SortKeyGeneratorStage::kStageType = "SORT_KEY_GENERATOR";
 
-SortKeyGeneratorStage::SortKeyGeneratorStage(OperationContext* opCtx,
-                                             PlanStage* child,
+SortKeyGeneratorStage::SortKeyGeneratorStage(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                             std::unique_ptr<PlanStage> child,
                                              WorkingSet* ws,
-                                             const BSONObj& sortSpecObj,
-                                             const CollatorInterface* collator)
-    : PlanStage(kStageType, opCtx), _ws(ws), _sortSpec(sortSpecObj), _collator(collator) {
-    _children.emplace_back(child);
+                                             const BSONObj& sortSpecObj)
+    : PlanStage(kStageType, expCtx.get()),
+      _ws(ws),
+      _sortKeyGen({{sortSpecObj, expCtx}, expCtx->getCollator()}) {
+    _children.emplace_back(std::move(child));
 }
 
-bool SortKeyGeneratorStage::isEOF() {
+bool SortKeyGeneratorStage::isEOF() const {
     return child()->isEOF();
 }
 
 PlanStage::StageState SortKeyGeneratorStage::doWork(WorkingSetID* out) {
-    if (!_sortKeyGen) {
-        _sortKeyGen = stdx::make_unique<SortKeyGenerator>(_sortSpec, _collator);
-        return PlanStage::NEED_TIME;
-    }
-
     auto stageState = child()->work(out);
     if (stageState == PlanStage::ADVANCED) {
         WorkingSetMember* member = _ws->get(*out);
 
-        StatusWith<BSONObj> sortKey = BSONObj();
-        if (member->hasObj()) {
-            SortKeyGenerator::Metadata metadata;
-            if (_sortKeyGen->sortHasMeta() && member->hasComputed(WSM_COMPUTED_TEXT_SCORE)) {
-                auto scoreData = static_cast<const TextScoreComputedData*>(
-                    member->getComputed(WSM_COMPUTED_TEXT_SCORE));
-                metadata.textScore = scoreData->getScore();
-            }
-            sortKey = _sortKeyGen->getSortKey(member->obj.value(), &metadata);
-        } else {
-            sortKey = getSortKeyFromIndexKey(*member);
-        }
+        auto sortKey = _sortKeyGen.computeSortKey(*member);
 
-        if (!sortKey.isOK()) {
-            *out = WorkingSetCommon::allocateStatusMember(_ws, sortKey.getStatus());
-            return PlanStage::FAILURE;
-        }
-
-        // Add the sort key to the WSM as computed data.
-        member->addComputed(new SortKeyComputedData(sortKey.getValue()));
-
+        // Add the sort key to the WSM as metadata.
+        member->metadata().setSortKey(std::move(sortKey), _sortKeyGen.isSingleElementKey());
         return PlanStage::ADVANCED;
     }
 
@@ -106,7 +79,7 @@ PlanStage::StageState SortKeyGeneratorStage::doWork(WorkingSetID* out) {
 }
 
 std::unique_ptr<PlanStageStats> SortKeyGeneratorStage::getStats() {
-    auto ret = stdx::make_unique<PlanStageStats>(_commonStats, STAGE_SORT_KEY_GENERATOR);
+    auto ret = std::make_unique<PlanStageStats>(_commonStats, STAGE_SORT_KEY_GENERATOR);
     ret->children.emplace_back(child()->getStats());
     return ret;
 }
@@ -114,22 +87,6 @@ std::unique_ptr<PlanStageStats> SortKeyGeneratorStage::getStats() {
 const SpecificStats* SortKeyGeneratorStage::getSpecificStats() const {
     // No specific stats are tracked for the sort key generation stage.
     return nullptr;
-}
-
-StatusWith<BSONObj> SortKeyGeneratorStage::getSortKeyFromIndexKey(
-    const WorkingSetMember& member) const {
-    invariant(member.getState() == WorkingSetMember::RID_AND_IDX);
-    invariant(!_sortKeyGen->sortHasMeta());
-
-    BSONObjBuilder sortKeyObj;
-    for (BSONElement specElt : _sortSpec) {
-        invariant(specElt.isNumber());
-        BSONElement sortKeyElt;
-        invariant(member.getFieldDotted(specElt.fieldName(), &sortKeyElt));
-        sortKeyObj.appendAs(sortKeyElt, "");
-    }
-
-    return sortKeyObj.obj();
 }
 
 }  // namespace mongo

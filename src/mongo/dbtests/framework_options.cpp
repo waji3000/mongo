@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,94 +27,46 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
-
-#include "mongo/platform/basic.h"
-
-
-#include "mongo/dbtests/framework_options.h"
 
 #include <boost/filesystem/operations.hpp>
 #include <iostream>
+#include <map>
+#include <utility>
 
+#include <boost/filesystem/directory.hpp>
+#include <boost/filesystem/exception.hpp>
+#include <boost/filesystem/path.hpp>
+#include <boost/iterator/iterator_facade.hpp>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+
+#include "mongo/base/error_codes.h"
 #include "mongo/base/status.h"
 #include "mongo/bson/util/builder.h"
-#include "mongo/db/query/find.h"
+#include "mongo/bson/util/builder_fwd.h"
+#include "mongo/db/admission/flow_control_parameters_gen.h"
+#include "mongo/db/server_options.h"
+#include "mongo/db/server_parameter.h"
 #include "mongo/db/storage/storage_options.h"
-#include "mongo/dbtests/dbtests.h"
+#include "mongo/db/tenant_id.h"
+#include "mongo/dbtests/dbtests.h"  // IWYU pragma: keep
+#include "mongo/dbtests/framework_options.h"
+#include "mongo/logv2/log.h"
+#include "mongo/platform/atomic_word.h"
+#include "mongo/unittest/log_test.h"
 #include "mongo/unittest/unittest.h"
-#include "mongo/util/log.h"
+#include "mongo/util/debug_util.h"
+#include "mongo/util/options_parser/environment.h"
+#include "mongo/util/options_parser/option_section.h"
 #include "mongo/util/options_parser/startup_options.h"
-#include "mongo/util/password.h"
+#include "mongo/util/options_parser/value.h"
+#include "mongo/util/str.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 namespace mongo {
 
-namespace {
-
-// This specifies default dbpath for our testing framework
-const std::string default_test_dbpath = "/tmp/unittest";
-
-}  // namespace
-
-using std::cout;
-using std::endl;
-using std::string;
-using std::vector;
-
 FrameworkGlobalParams frameworkGlobalParams;
-
-Status addTestFrameworkOptions(moe::OptionSection* options) {
-    options->addOptionChaining("help", "help,h", moe::Switch, "show this usage information");
-
-    options
-        ->addOptionChaining(
-            "dbpath",
-            "dbpath",
-            moe::String,
-            "db data path for this test run. NOTE: the contents of this directory will "
-            "be overwritten if it already exists")
-        .setDefault(moe::Value(default_test_dbpath));
-
-    options->addOptionChaining("debug", "debug", moe::Switch, "run tests with verbose output");
-
-    options->addOptionChaining("list", "list,l", moe::Switch, "list available test suites");
-
-    options->addOptionChaining(
-        "filter", "filter,f", moe::String, "string substring filter on test name");
-
-    options->addOptionChaining("verbose", "verbose,v", moe::Switch, "verbose");
-
-    options->addOptionChaining(
-        "dur", "dur", moe::Switch, "enable journaling (currently the default)");
-
-    options->addOptionChaining("nodur", "nodur", moe::Switch, "disable journaling");
-
-    options->addOptionChaining("seed", "seed", moe::UnsignedLongLong, "random number seed");
-
-    options->addOptionChaining("runs", "runs", moe::Int, "number of times to run each test");
-
-    options->addOptionChaining(
-        "perfHist", "perfHist", moe::Unsigned, "number of back runs of perf stats to display");
-
-    // If set to true, storage engine maintains the data history. Else, it won't maintain the data
-    // history. This setting applies only to 'wiredTiger' storage engine.
-    options
-        ->addOptionChaining("replication.enableMajorityReadConcern",
-                            "enableMajorityReadConcern",
-                            moe::Bool,
-                            "enables majority readConcern")
-        .setDefault(moe::Value(true));
-    options
-        ->addOptionChaining(
-            "storage.engine", "storageEngine", moe::String, "what storage engine to use")
-        .setDefault(moe::Value(std::string("wiredTiger")));
-
-    options->addOptionChaining("suites", "suites", moe::StringVector, "test suites to run")
-        .hidden()
-        .positional(1, -1);
-
-    return Status::OK();
-}
 
 std::string getTestFrameworkHelp(StringData name, const moe::OptionSection& options) {
     StringBuilder sb;
@@ -146,24 +97,11 @@ bool handlePreValidationTestFrameworkOptions(const moe::Environment& params,
 Status storeTestFrameworkOptions(const moe::Environment& params,
                                  const std::vector<std::string>& args) {
     if (params.count("dbpath")) {
-        frameworkGlobalParams.dbpathSpec = params["dbpath"].as<string>();
+        frameworkGlobalParams.dbpathSpec = params["dbpath"].as<std::string>();
     }
-
-    if (params.count("seed")) {
-        frameworkGlobalParams.seed = params["seed"].as<unsigned long long>();
-    }
-
-    if (params.count("runs")) {
-        frameworkGlobalParams.runsPerTest = params["runs"].as<int>();
-    }
-
-    if (params.count("perfHist")) {
-        frameworkGlobalParams.perfHist = params["perfHist"].as<unsigned>();
-    }
-
 
     if (params.count("debug") || params.count("verbose")) {
-        logger::globalLogDomain()->setMinimumLoggedSeverity(logger::LogSeverity::Debug(1));
+        unittest::setMinimumLoggedSeverity(logv2::LogSeverity::Debug(1));
     }
 
     boost::filesystem::path p(frameworkGlobalParams.dbpathSpec);
@@ -191,28 +129,50 @@ Status storeTestFrameworkOptions(const moe::Environment& params,
         return Status(ErrorCodes::BadValue, sb.str());
     }
 
-    DEV log() << "DEBUG build" << endl;
+    if (kDebugBuild)
+        LOGV2(22491, "DEBUG build");
 
-    string dbpathString = p.string();
+    std::string dbpathString = p.string();
     storageGlobalParams.dbpath = dbpathString.c_str();
 
-    storageGlobalParams.engine = params["storage.engine"].as<string>();
+    storageGlobalParams.engine = params["storage.engine"].as<std::string>();
+    gFlowControlEnabled.store(params["enableFlowControl"].as<bool>());
 
-    if (storageGlobalParams.engine == "wiredTiger" &&
-        params.count("replication.enableMajorityReadConcern")) {
-        serverGlobalParams.enableMajorityReadConcern =
-            params["replication.enableMajorityReadConcern"].as<bool>();
+    if (gFlowControlEnabled.load()) {
+        LOGV2(22492, "Flow Control enabled");
     }
 
-    if (params.count("suites")) {
-        frameworkGlobalParams.suites = params["suites"].as<vector<string>>();
-    }
+    if (params.count("setParameter")) {
+        std::map<std::string, std::string> parameters =
+            params["setParameter"].as<std::map<std::string, std::string>>();
+        auto* paramSet = ServerParameterSet::getNodeParameterSet();
+        for (const auto& it : parameters) {
+            auto parameter = paramSet->getIfExists(it.first);
+            if (nullptr == parameter) {
+                return {ErrorCodes::BadValue,
+                        str::stream()
+                            << "Illegal --setParameter parameter: \"" << it.first << "\""};
+            }
+            if (!parameter->allowedToChangeAtStartup()) {
+                return {ErrorCodes::BadValue,
+                        str::stream() << "Cannot use --setParameter to set \"" << it.first
+                                      << "\" at startup"};
+            }
+            Status status = parameter->setFromString(it.second, boost::none);
+            if (!status.isOK()) {
+                return {ErrorCodes::BadValue,
+                        str::stream() << "Bad value for parameter \"" << it.first
+                                      << "\": " << status.reason()};
+            }
 
-    frameworkGlobalParams.filter = "";
-    if (params.count("filter")) {
-        frameworkGlobalParams.filter = params["filter"].as<string>();
+            LOGV2(4539300,
+                  "Setting server parameter",
+                  "parameter"_attr = it.first,
+                  "value"_attr = it.second);
+        }
     }
 
     return Status::OK();
 }
-}
+
+}  // namespace mongo

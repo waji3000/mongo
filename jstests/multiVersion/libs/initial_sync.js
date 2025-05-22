@@ -1,8 +1,7 @@
 
-'use strict';
+import "jstests/multiVersion/libs/multi_rs.js";
 
-load("./jstests/multiVersion/libs/multi_rs.js");
-load("./jstests/replsets/rslib.js");
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 /**
  * Test that starts up a replica set with 2 nodes of version 'replSetVersion', inserts some data,
@@ -10,9 +9,8 @@ load("./jstests/replsets/rslib.js");
  * to complete. If the 'fcv' argument is given, sets the feature compatibility version of the
  * replica set to 'fcv' before adding the third node.
  */
-var multversionInitialSyncTest = function(
+export var multversionInitialSyncTest = function(
     name, replSetVersion, newNodeVersion, configSettings, fcv) {
-
     var nodes = {n1: {binVersion: replSetVersion}, n2: {binVersion: replSetVersion}};
 
     jsTestLog("Starting up a two-node '" + replSetVersion + "' version replica set.");
@@ -29,7 +27,8 @@ var multversionInitialSyncTest = function(
     // Set 'featureCompatibilityVersion' if given.
     if (fcv) {
         jsTestLog("Setting FCV to '" + fcv + "' on the primary.");
-        assert.commandWorked(primary.adminCommand({setFeatureCompatibilityVersion: fcv}));
+        assert.commandWorked(
+            primary.adminCommand({setFeatureCompatibilityVersion: fcv, confirm: true}));
         rst.awaitReplication();
     }
 

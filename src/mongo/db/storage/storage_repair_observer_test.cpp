@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,60 +27,52 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <boost/filesystem/operations.hpp>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
 
-#include <boost/filesystem.hpp>
+#include <boost/filesystem/path.hpp>
 
-#include "mongo/db/concurrency/d_concurrency.h"
-#include "mongo/db/dbhelpers.h"
-#include "mongo/db/operation_context_noop.h"
-#include "mongo/db/repl/replication_coordinator_mock.h"
+#include "mongo/db/client.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/service_context_d_test_fixture.h"
+#include "mongo/db/storage/storage_options.h"
 #include "mongo/db/storage/storage_repair_observer.h"
+#include "mongo/logv2/log.h"
 #include "mongo/unittest/death_test.h"
 #include "mongo/unittest/unittest.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 namespace mongo {
 namespace {
 
-static const NamespaceString kConfigNss("local.system.replset");
 static const std::string kRepairIncompleteFileName = "_repair_incomplete";
 
 using boost::filesystem::path;
 
 class StorageRepairObserverTest : public ServiceContextMongoDTest {
 public:
-    StorageRepairObserverTest() : ServiceContextMongoDTest("ephemeralForTest") {
-
-        repl::ReplicationCoordinator::set(
-            getServiceContext(),
-            stdx::make_unique<repl::ReplicationCoordinatorMock>(getServiceContext()));
-    }
-
     void assertRepairIncompleteOnTearDown() {
         _assertRepairIncompleteOnTearDown = true;
     }
 
-    void createMockReplConfig(OperationContext* opCtx) {
-        BSONObj replConfig;
-        Lock::DBLock dbLock(opCtx, "local", MODE_X);
-        Helpers::putSingleton(opCtx, "local.system.replset", replConfig);
+    void createMockReplConfig() {
+        _mockReplConfigValid = true;
     }
 
-    void assertReplConfigValid(OperationContext* opCtx, bool valid) {
-        BSONObj replConfig;
-        ASSERT(Helpers::getSingleton(opCtx, "local.system.replset", replConfig));
-        if (valid) {
-            ASSERT(!replConfig.hasField("repaired"));
-        } else {
-            ASSERT(replConfig.hasField("repaired"));
+    void assertReplConfigValid(bool valid) {
+        ASSERT(hasReplConfig() && _mockReplConfigValid == valid);
+    }
+
+    bool hasReplConfig() {
+        return _mockReplConfigValid.has_value();
+    }
+
+    void invalidateReplConfig() {
+        if (hasReplConfig()) {
+            _mockReplConfigValid = false;
         }
-    }
-
-    bool hasReplConfig(OperationContext* opCtx) {
-        BSONObj replConfig;
-        Lock::DBLock dbLock(opCtx, "local", MODE_IS);
-        return Helpers::getSingleton(opCtx, "local.system.replset", replConfig);
     }
 
     path repairFilePath() {
@@ -99,7 +90,12 @@ public:
         return StorageRepairObserver::get(getServiceContext());
     }
 
-    void tearDown() {
+    void setUp() override {
+        ServiceContextMongoDTest::setUp();
+        storageGlobalParams.repair = true;
+    }
+
+    void tearDown() override {
         auto repairObserver = getRepairObserver();
         if (_assertRepairIncompleteOnTearDown) {
             ASSERT(repairObserver->isIncomplete());
@@ -107,16 +103,20 @@ public:
             ASSERT(!repairObserver->isIncomplete());
         }
 
-        if (repairObserver->isDone() && repairObserver->isDataModified()) {
-            unittest::log() << "Modifications: ";
+        if (repairObserver->isDone() && repairObserver->isDataInvalidated()) {
+            LOGV2(22291, "Modifications: ");
             for (const auto& mod : repairObserver->getModifications()) {
-                unittest::log() << "  " << mod;
+                LOGV2(22292,
+                      "  {mod_getDescription}",
+                      "mod_getDescription"_attr = mod.getDescription());
             }
         }
+        storageGlobalParams.repair = false;
     }
 
 private:
     bool _assertRepairIncompleteOnTearDown = false;
+    boost::optional<bool> _mockReplConfigValid;
 };
 
 TEST_F(StorageRepairObserverTest, DataUnmodified) {
@@ -132,16 +132,16 @@ TEST_F(StorageRepairObserverTest, DataUnmodified) {
     ASSERT(boost::filesystem::exists(repairFile));
 
     auto opCtx = cc().makeOperationContext();
-    createMockReplConfig(opCtx.get());
+    createMockReplConfig();
 
-    repairObserver->onRepairDone(opCtx.get());
+    repairObserver->onRepairDone(opCtx.get(), [this]() { invalidateReplConfig(); });
     ASSERT(!repairObserver->isIncomplete());
     ASSERT(!boost::filesystem::exists(repairFile));
 
     ASSERT(repairObserver->isDone());
-    ASSERT(!repairObserver->isDataModified());
+    ASSERT(!repairObserver->isDataInvalidated());
 
-    assertReplConfigValid(opCtx.get(), true);
+    assertReplConfigValid(true);
 }
 
 TEST_F(StorageRepairObserverTest, DataModified) {
@@ -157,21 +157,51 @@ TEST_F(StorageRepairObserverTest, DataModified) {
     ASSERT(boost::filesystem::exists(repairFile));
 
     std::string mod("Collection mod");
-    repairObserver->onModification(mod);
+    repairObserver->invalidatingModification(mod);
 
     auto opCtx = cc().makeOperationContext();
     Lock::GlobalWrite lock(opCtx.get());
-    createMockReplConfig(opCtx.get());
+    createMockReplConfig();
 
-    repairObserver->onRepairDone(opCtx.get());
+    repairObserver->onRepairDone(opCtx.get(), [this]() { invalidateReplConfig(); });
     ASSERT(!repairObserver->isIncomplete());
     ASSERT(!boost::filesystem::exists(repairFile));
 
     ASSERT(repairObserver->isDone());
-    ASSERT(repairObserver->isDataModified());
+    ASSERT(repairObserver->isDataInvalidated());
     ASSERT_EQ(1U, repairObserver->getModifications().size());
 
-    assertReplConfigValid(opCtx.get(), false);
+    assertReplConfigValid(false);
+}
+
+TEST_F(StorageRepairObserverTest, DataValidAfterBenignModification) {
+    auto repairObserver = getRepairObserver();
+
+    auto repairFile = repairFilePath();
+    ASSERT(!boost::filesystem::exists(repairFile));
+    ASSERT(!repairObserver->isIncomplete());
+
+    repairObserver->onRepairStarted();
+
+    ASSERT(repairObserver->isIncomplete());
+    ASSERT(boost::filesystem::exists(repairFile));
+
+    std::string mod("Collection mod");
+    repairObserver->benignModification(mod);
+
+    auto opCtx = cc().makeOperationContext();
+    Lock::GlobalWrite lock(opCtx.get());
+    createMockReplConfig();
+
+    repairObserver->onRepairDone(opCtx.get(), [this]() { invalidateReplConfig(); });
+    ASSERT(!repairObserver->isIncomplete());
+    ASSERT(!boost::filesystem::exists(repairFile));
+
+    ASSERT(repairObserver->isDone());
+    ASSERT(!repairObserver->isDataInvalidated());
+    ASSERT_EQ(1U, repairObserver->getModifications().size());
+
+    assertReplConfigValid(true);
 }
 
 TEST_F(StorageRepairObserverTest, DataModifiedDoesNotCreateReplConfigOnStandalone) {
@@ -187,19 +217,19 @@ TEST_F(StorageRepairObserverTest, DataModifiedDoesNotCreateReplConfigOnStandalon
     ASSERT(boost::filesystem::exists(repairFile));
 
     std::string mod("Collection mod");
-    repairObserver->onModification(mod);
+    repairObserver->invalidatingModification(mod);
 
     auto opCtx = cc().makeOperationContext();
     Lock::GlobalWrite lock(opCtx.get());
 
-    repairObserver->onRepairDone(opCtx.get());
+    repairObserver->onRepairDone(opCtx.get(), [this]() { invalidateReplConfig(); });
     ASSERT(!repairObserver->isIncomplete());
     ASSERT(!boost::filesystem::exists(repairFile));
 
     ASSERT(repairObserver->isDone());
-    ASSERT(repairObserver->isDataModified());
+    ASSERT(repairObserver->isDataInvalidated());
     ASSERT_EQ(1U, repairObserver->getModifications().size());
-    ASSERT(!hasReplConfig(opCtx.get()));
+    ASSERT(!hasReplConfig());
 }
 
 TEST_F(StorageRepairObserverTest, RepairIsIncompleteOnFailure) {
@@ -239,21 +269,21 @@ TEST_F(StorageRepairObserverTest, RepairCompleteAfterRestart) {
     ASSERT(repairObserver->isIncomplete());
 
     std::string mod("Collection mod");
-    repairObserver->onModification(mod);
+    repairObserver->invalidatingModification(mod);
 
     auto opCtx = cc().makeOperationContext();
     Lock::GlobalWrite lock(opCtx.get());
-    createMockReplConfig(opCtx.get());
+    createMockReplConfig();
 
-    repairObserver->onRepairDone(opCtx.get());
+    repairObserver->onRepairDone(opCtx.get(), [this]() { invalidateReplConfig(); });
     ASSERT(repairObserver->isDone());
     ASSERT_EQ(1U, repairObserver->getModifications().size());
 
     repairObserver = reset();
     ASSERT(!repairObserver->isIncomplete());
-    // Done is reservered for completed operations.
+    // Done is reserved for completed operations.
     ASSERT(!repairObserver->isDone());
-    assertReplConfigValid(opCtx.get(), false);
+    assertReplConfigValid(false);
 }
 
 DEATH_TEST_F(StorageRepairObserverTest, FailsWhenDoneCalledFirst, "Invariant failure") {
@@ -261,8 +291,8 @@ DEATH_TEST_F(StorageRepairObserverTest, FailsWhenDoneCalledFirst, "Invariant fai
     ASSERT(!repairObserver->isIncomplete());
 
     auto opCtx = cc().makeOperationContext();
-    createMockReplConfig(opCtx.get());
-    repairObserver->onRepairDone(opCtx.get());
+    createMockReplConfig();
+    repairObserver->onRepairDone(opCtx.get(), [this]() { invalidateReplConfig(); });
 }
 
 DEATH_TEST_F(StorageRepairObserverTest, FailsWhenStartedCalledAfterDone, "Invariant failure") {
@@ -272,10 +302,10 @@ DEATH_TEST_F(StorageRepairObserverTest, FailsWhenStartedCalledAfterDone, "Invari
     ASSERT(repairObserver->isIncomplete());
 
     auto opCtx = cc().makeOperationContext();
-    createMockReplConfig(opCtx.get());
-    repairObserver->onRepairDone(opCtx.get());
+    createMockReplConfig();
+    repairObserver->onRepairDone(opCtx.get(), [this]() { invalidateReplConfig(); });
     ASSERT(repairObserver->isDone());
-    assertReplConfigValid(opCtx.get(), true);
+    assertReplConfigValid(true);
 
     repairObserver->onRepairStarted();
 }

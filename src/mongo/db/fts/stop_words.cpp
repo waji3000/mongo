@@ -1,6 +1,3 @@
-// stop_words.cpp
-
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,12 +27,17 @@
  *    it in the license file.
  */
 
+#include <absl/meta/type_traits.h>
+#include <memory>
 #include <set>
 #include <string>
+#include <utility>
 
+#include <absl/container/node_hash_map.h>
+
+#include "mongo/base/init.h"  // IWYU pragma: keep
+#include "mongo/base/initializer.h"
 #include "mongo/db/fts/stop_words.h"
-
-#include "mongo/base/init.h"
 #include "mongo/util/string_map.h"
 
 namespace mongo {
@@ -47,7 +49,7 @@ void loadStopWordMap(StringMap<std::set<std::string>>* m);
 namespace {
 StringMap<std::shared_ptr<StopWords>> StopWordsMap;
 StopWords empty;
-}
+}  // namespace
 
 
 StopWords::StopWords() {}
@@ -69,9 +71,8 @@ MONGO_INITIALIZER(StopWords)(InitializerContext* context) {
     StringMap<std::set<std::string>> raw;
     loadStopWordMap(&raw);
     for (StringMap<std::set<std::string>>::const_iterator i = raw.begin(); i != raw.end(); ++i) {
-        StopWordsMap[i->first].reset(new StopWords(i->second));
+        StopWordsMap[i->first] = std::make_shared<StopWords>(i->second);
     }
-    return Status::OK();
 }
-}
-}
+}  // namespace fts
+}  // namespace mongo

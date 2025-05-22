@@ -1,410 +1,177 @@
-/*-
- * Public Domain 2014-2018 MongoDB, Inc.
- * Public Domain 2008-2014 WiredTiger, Inc.
- *
- * This is free and unencumbered software released into the public domain.
- *
- * Anyone is free to copy, modify, publish, use, compile, sell, or
- * distribute this software, either in source code form or as a compiled
- * binary, for any purpose, commercial or non-commercial, and by any
- * means.
- *
- * In jurisdictions that recognize copyright laws, the author or authors
- * of this software dedicate any and all copyright interest in the
- * software to the public domain. We make this dedication for the benefit
- * of the public at large and to the detriment of our heirs and
- * successors. We intend this dedication to be an overt act of
- * relinquishment in perpetuity of all present and future rights to this
- * software under copyright law.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
- * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
- * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
- * IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY CLAIM, DAMAGES OR
- * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
- * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
- * OTHER DEALINGS IN THE SOFTWARE.
- */
+/* DO NOT EDIT: automatically built by format/config.sh. */
 
-/*
- * Configuration for the wts program is an array of string-based parameters.
- * This is the structure used to declare them.
- */
+#pragma once
+
+#define C_TYPE_MATCH(cp, type)                                                                    \
+    (!F_ISSET(cp, (C_TYPE_FIX | C_TYPE_ROW | C_TYPE_VAR)) ||                                      \
+      ((type) == FIX && F_ISSET(cp, C_TYPE_FIX)) || ((type) == ROW && F_ISSET(cp, C_TYPE_ROW)) || \
+      ((type) == VAR && F_ISSET(cp, C_TYPE_VAR)))
+
 typedef struct {
-	const char	*name;			/* Configuration item */
-	const char	*desc;			/* Configuration description */
+    const char *name; /* Configuration item */
+    const char *desc; /* Configuration description */
 
-	/* Value is a boolean, yes if roll of 1-to-100 is <= CONFIG->min. */
-#define	C_BOOL		0x01u
+#define C_BOOL 0x001u        /* Boolean (true if roll of 1-to-100 is <= CONFIG->min) */
+#define C_IGNORE 0x002u      /* Not a simple randomization, configured specially */
+#define C_POW2 0x004u        /* Value must be power of 2 */
+#define C_STRING 0x008u      /* String (rather than integral) */
+#define C_TABLE 0x010u       /* Value is per table, not global */
+#define C_TYPE_FIX 0x020u    /* Value is only relevant to FLCS */
+#define C_TYPE_ROW 0x040u    /* Value is only relevant to RS */
+#define C_TYPE_VAR 0x080u    /* Value is only relevant to VLCS */
+#define C_ZERO_NOTSET 0x100u /* Ignore zero values */
+    uint32_t flags;
 
-	/* Not a simple randomization, handle outside the main loop. */
-#define	C_IGNORE	0x02u
+    uint32_t min;     /* Minimum value */
+    uint32_t maxrand; /* Maximum value randomly chosen */
+    uint32_t maxset;  /* Maximum value explicitly set */
 
-	/* Value was set from command-line or file, ignore for all runs. */
-#define	C_PERM		0x04u
-
-	/* Value isn't random for this run, ignore just for this run. */
-#define	C_TEMP		0x08u
-
-	/* Value is a string. */
-#define	C_STRING	0x20u
-	u_int	 	flags;
-
-	uint32_t	min;		/* Minimum value */
-	uint32_t	maxrand;	/* Maximum value randomly chosen */
-	uint32_t	maxset;		/* Maximum value explicitly set */
-	uint32_t	*v;		/* Value for this run */
-	char		**vstr;		/* Value for string options */
+    u_int off; /* Value offset */
 } CONFIG;
 
-#define	COMPRESSION_LIST						\
-	"(none | lz4 | lz4-noraw | snappy | zlib | zlib-noraw | zstd)"
-
-static CONFIG c[] = {
-	{ "abort",
-	  "if timed run should drop core",			/* 0% */
-	  C_BOOL, 0, 0, 0, &g.c_abort, NULL },
-
-	{ "alter",
-	  "if altering the table is enabled",			/* 10% */
-	  C_BOOL, 10, 0, 0, &g.c_alter, NULL },
-
-	{ "auto_throttle",
-	  "if LSM inserts are throttled",			/* 90% */
-	  C_BOOL, 90, 0, 0, &g.c_auto_throttle, NULL },
-
-	{ "backups",
-	  "if backups are enabled",				/* 20% */
-	  C_BOOL, 20, 0, 0, &g.c_backups, NULL },
-
-	{ "bitcnt",
-	  "number of bits for fixed-length column-store files",
-	  0x0, 1, 8, 8, &g.c_bitcnt, NULL },
-
-	{ "bloom",
-	  "if bloom filters are configured",			/* 95% */
-	  C_BOOL, 95, 0, 0, &g.c_bloom, NULL },
-
-	{ "bloom_bit_count",
-	  "number of bits per item for LSM bloom filters",
-	  0x0, 4, 64, 1000, &g.c_bloom_bit_count, NULL },
-
-	{ "bloom_hash_count",
-	  "number of hash values per item for LSM bloom filters",
-	  0x0, 4, 32, 100, &g.c_bloom_hash_count, NULL },
-
-	{ "bloom_oldest",
-	  "if bloom_oldest=true",				/* 10% */
-	  C_BOOL, 10, 0, 0, &g.c_bloom_oldest, NULL },
-
-	{ "cache",
-	  "size of the cache in MB",
-	  0x0, 1, 100, 100 * 1024, &g.c_cache, NULL },
-
-	{ "cache_minimum",
-	  "minimum size of the cache in MB",
-	  C_IGNORE, 0, 0, 100 * 1024, &g.c_cache_minimum, NULL },
-
-	{ "checkpoints",
-	  "type of checkpoints (on | off | wiredtiger)",
-	  C_IGNORE|C_STRING, 0, 0, 0, NULL, &g.c_checkpoint},
-
-	{ "checkpoint_log_size",
-	  "MB of log to wait if wiredtiger checkpoints configured",
-	  0x0, 20, 200, 1024, &g.c_checkpoint_log_size, NULL},
-
-	{ "checkpoint_wait",
-	  "seconds to wait if wiredtiger checkpoints configured",
-	  0x0, 5, 100, 3600, &g.c_checkpoint_wait, NULL},
-
-	{ "checksum",
-	  "type of checksums (on | off | uncompressed)",
-	  C_IGNORE|C_STRING, 0, 0, 0, NULL, &g.c_checksum },
-
-	{ "chunk_size",
-	  "LSM chunk size in MB",
-	  0x0, 1, 10, 100, &g.c_chunk_size, NULL },
-
-	{ "compaction",
-	  "if compaction is running",				/* 10% */
-	  C_BOOL, 10, 0, 0, &g.c_compact, NULL },
-
-	{ "compression",
-	  "type of compression " COMPRESSION_LIST,
-	  C_IGNORE|C_STRING, 0, 0, 0, NULL, &g.c_compression },
-
-	{ "data_extend",
-	  "if data files are extended",				/* 5% */
-	  C_BOOL, 5, 0, 0, &g.c_data_extend, NULL },
-
-	{ "data_source",
-	  "data source (file | helium | kvsbdb | lsm | table)",
-	  C_IGNORE|C_STRING, 0, 0, 0, NULL, &g.c_data_source },
-
-	{ "delete_pct",
-	  "percent operations that are deletes",
-	  C_IGNORE, 0, 0, 100, &g.c_delete_pct, NULL },
-
-	{ "dictionary",
-	  "if values are dictionary compressed",		/* 20% */
-	  C_BOOL, 20, 0, 0, &g.c_dictionary, NULL },
-
-	{ "direct_io",
-	  "if direct I/O is configured for data objects",	/* 0% */
-	  C_IGNORE|C_BOOL, 0, 0, 1, &g.c_direct_io, NULL },
-
-	{ "encryption",
-	  "type of encryption (none | rotn-7)",
-	  C_IGNORE|C_STRING, 0, 0, 0, NULL, &g.c_encryption },
-
-	{ "evict_max",
-	  "the maximum number of eviction workers",
-	  0x0, 0, 5, 100, &g.c_evict_max, NULL },
-
-	{ "file_type",
-	  "type of store to create (fix | var | row)",
-	  C_IGNORE|C_STRING, 0, 0, 0, NULL, &g.c_file_type },
-
-	{ "firstfit",
-	  "if allocation is firstfit",				/* 10% */
-	  C_BOOL, 10, 0, 0, &g.c_firstfit, NULL },
-
-	{ "huffman_key",
-	  "if keys are huffman encoded",			/* 20% */
-	  C_BOOL, 20, 0, 0, &g.c_huffman_key, NULL },
-
-	{ "huffman_value",
-	  "if values are huffman encoded",			/* 20% */
-	  C_BOOL, 20, 0, 0, &g.c_huffman_value, NULL },
-
-	{ "independent_thread_rng",
-	  "if thread RNG space is independent",			/* 75% */
-	  C_BOOL, 75, 0, 0, &g.c_independent_thread_rng, NULL },
-
-	{ "in_memory",
-	  "if in-memory configured",
-	  C_IGNORE|C_BOOL, 0, 0, 1, &g.c_in_memory, NULL },
-
-	{ "insert_pct",
-	  "percent operations that are inserts",
-	  C_IGNORE, 0, 0, 100, &g.c_insert_pct, NULL },
-
-	{ "internal_key_truncation",
-	  "if internal keys are truncated",			/* 95% */
-	  C_BOOL, 95, 0, 0, &g.c_internal_key_truncation, NULL },
-
-	{ "internal_page_max",
-	  "maximum size of Btree internal nodes",
-	  0x0, 9, 17, 27, &g.c_intl_page_max, NULL },
-
-	{ "isolation",
-	  "isolation level "
-	  "(random | read-uncommitted | read-committed | snapshot)",
-	  C_IGNORE|C_STRING, 0, 0, 0, NULL, &g.c_isolation },
-
-	{ "key_gap",
-	  "gap between instantiated keys on a Btree page",
-	  0x0, 0, 20, 20, &g.c_key_gap, NULL },
-
-	{ "key_max",
-	  "maximum size of keys",
-	  0x0, 20, 128, MEGABYTE(10), &g.c_key_max, NULL },
-
-	{ "key_min",
-	  "minimum size of keys",
-	  0x0, 10, 32, 256, &g.c_key_min, NULL },
-
-	{ "leaf_page_max",
-	  "maximum size of Btree leaf nodes",
-	  0x0, 9, 17, 27, &g.c_leaf_page_max, NULL },
-
-	{ "leak_memory",
-	  "if memory should be leaked on close",
-	  C_BOOL, 0, 0, 0, &g.c_leak_memory, NULL },
-
-	{ "logging",
-	  "if logging configured",				/* 50% */
-	  C_BOOL, 50, 0, 0, &g.c_logging, NULL },
-
-	{ "logging_archive",
-	  "if log file archival configured",			/* 50% */
-	  C_BOOL, 50, 0, 0, &g.c_logging_archive, NULL },
-
-	{ "logging_compression",
-	  "type of logging compression " COMPRESSION_LIST,
-	  C_IGNORE|C_STRING, 0, 0, 0, NULL, &g.c_logging_compression },
-
-	{ "logging_file_max",
-	  "maximum log file size in KB",
-	  0x0, 100, 512000, 2097152, &g.c_logging_file_max, NULL },
-
-	{ "logging_prealloc",
-	  "if log file pre-allocation configured",		/* 50% */
-	  C_BOOL, 50, 0, 0, &g.c_logging_prealloc, NULL },
-
-	{ "long_running_txn",
-	  "if a long-running transaction configured",		/* 0% */
-	  C_BOOL, 0, 0, 0, &g.c_long_running_txn, NULL },
-
-	{ "lsm_worker_threads",
-	  "the number of LSM worker threads",
-	  0x0, 3, 4, 20, &g.c_lsm_worker_threads, NULL },
-
-	{ "memory_page_max",
-	  "maximum size of in-memory pages",
-	  0x0, 1, 10, 128, &g.c_memory_page_max, NULL },
-
-	{ "merge_max",
-	  "the maximum number of chunks to include in a merge operation",
-	  0x0, 4, 20, 100, &g.c_merge_max, NULL },
-
-	{ "mmap",
-	  "configure for mmap operations",			/* 90% */
-	  C_BOOL, 90, 0, 0, &g.c_mmap, NULL },
-
-	{ "modify_pct",
-	  "percent operations that are value modifications",
-	  C_IGNORE, 0, 0, 100, &g.c_modify_pct, NULL },
-
-	{ "ops",
-	  "the number of modification operations done per run",
-	  0x0, 0, M(2), M(100), &g.c_ops, NULL },
-
-	{ "prefix_compression",
-	  "if keys are prefix compressed",			/* 80% */
-	  C_BOOL, 80, 0, 0, &g.c_prefix_compression, NULL },
-
-	{ "prefix_compression_min",
-	  "minimum gain before prefix compression is used",
-	  0x0, 0, 8, 256, &g.c_prefix_compression_min, NULL },
-
-	{ "prepare",
-	  "configure transaction prepare",			/* 5% */
-	  C_BOOL, 5, 0, 0, &g.c_prepare, NULL },
-
-	{ "quiet",
-	  "quiet run (same as -q)",
-	  C_IGNORE|C_BOOL, 0, 0, 1, &g.c_quiet, NULL },
-
-	{ "read_pct",
-	  "percent operations that are reads",
-	  C_IGNORE, 0, 0, 100, &g.c_read_pct, NULL },
-
-	{ "rebalance",
-	  "rebalance testing",					/* 100% */
-	  C_BOOL, 100, 1, 0, &g.c_rebalance, NULL },
-
-	{ "repeat_data_pct",
-	  "percent duplicate values in row- or var-length column-stores",
-	  0x0, 0, 90, 90, &g.c_repeat_data_pct, NULL },
-
-	{ "reverse",
-	  "collate in reverse order",				/* 10% */
-	  C_BOOL, 10, 0, 0, &g.c_reverse, NULL },
-
-	{ "rows",
-	  "the number of rows to create",
-	  0x0, 10, M(1), M(100), &g.c_rows, NULL },
-
-	{ "runs",
-	  "the number of runs",
-	  C_IGNORE, 0, 0, UINT_MAX, &g.c_runs, NULL },
-
-	{ "salvage",
-	  "salvage testing",					/* 100% */
-	  C_BOOL, 100, 1, 0, &g.c_salvage, NULL },
-
-	{ "split_pct",
-	  "page split size as a percentage of the maximum page size",
-	  0x0, 50, 100, 100, &g.c_split_pct, NULL },
-
-	{ "statistics",
-	  "maintain statistics",				/* 20% */
-	  C_BOOL, 20, 0, 0, &g.c_statistics, NULL },
-
-	{ "statistics_server",
-	  "run the statistics server thread",			/* 5% */
-	  C_BOOL, 5, 0, 0, &g.c_statistics_server, NULL },
-
-	{ "threads",
-	  "the number of worker threads",
-	  0x0, 1, 32, 128, &g.c_threads, NULL },
-
-	{ "timer",
-	  "maximum time to run in minutes",
-	  C_IGNORE, 0, 0, UINT_MAX, &g.c_timer, NULL },
-
-	{ "timing_stress_checkpoint",
-	  "stress checkpoints",					/* 2% */
-	  C_BOOL, 2, 0, 0, &g.c_timing_stress_checkpoint, NULL },
-
-	{ "timing_stress_lookaside_sweep",
-	  "stress lookaside sweep",				/* 2% */
-	  C_BOOL, 2, 0, 0, &g.c_timing_stress_lookaside_sweep, NULL },
-
-	{ "timing_stress_split_1",
-	  "stress splits (#1)",					/* 2% */
-	  C_BOOL, 2, 0, 0, &g.c_timing_stress_split_1, NULL },
-
-	{ "timing_stress_split_2",
-	  "stress splits (#2)",					/* 2% */
-	  C_BOOL, 2, 0, 0, &g.c_timing_stress_split_2, NULL },
-
-	{ "timing_stress_split_3",
-	  "stress splits (#3)",					/* 2% */
-	  C_BOOL, 2, 0, 0, &g.c_timing_stress_split_3, NULL },
-
-	{ "timing_stress_split_4",
-	  "stress splits (#4)",					/* 2% */
-	  C_BOOL, 2, 0, 0, &g.c_timing_stress_split_4, NULL },
-
-	{ "timing_stress_split_5",
-	  "stress splits (#5)",					/* 2% */
-	  C_BOOL, 2, 0, 0, &g.c_timing_stress_split_5, NULL },
-
-	{ "timing_stress_split_6",
-	  "stress splits (#6)",					/* 2% */
-	  C_BOOL, 2, 0, 0, &g.c_timing_stress_split_6, NULL },
-
-	{ "timing_stress_split_7",
-	  "stress splits (#7)",					/* 2% */
-	  C_BOOL, 2, 0, 0, &g.c_timing_stress_split_7, NULL },
-
-	{ "timing_stress_split_8",
-	  "stress splits (#8)",					/* 2% */
-	  C_BOOL, 2, 0, 0, &g.c_timing_stress_split_8, NULL },
-
-	{ "transaction_timestamps",				/* 10% */
-	  "enable transaction timestamp support",
-	  C_BOOL, 10, 0, 0, &g.c_txn_timestamps, NULL },
-
-	{ "transaction-frequency",
-	  "percent operations done inside an explicit transaction",
-	  0x0, 1, 100, 100, &g.c_txn_freq, NULL },
-
-	{ "truncate",						/* 100% */
-	  "enable truncation",
-	  C_BOOL, 100, 0, 0, &g.c_truncate, NULL },
-
-	{ "value_max",
-	  "maximum size of values",
-	  0x0, 32, 4096, MEGABYTE(10), &g.c_value_max, NULL },
-
-	{ "value_min",
-	  "minimum size of values",
-	  0x0, 0, 20, 4096, &g.c_value_min, NULL },
-
-	{ "verify",
-	  "to regularly verify during a run",			/* 100% */
-	  C_BOOL, 100, 1, 0, &g.c_verify, NULL },
-
-	{ "wiredtiger_config",
-	  "configuration string used to wiredtiger_open",
-	  C_IGNORE|C_STRING, 0, 0, 0, NULL, &g.c_config_open },
-
-	{ "write_pct",
-	  "percent operations that are value updates",
-	  C_IGNORE, 0, 0, 100, &g.c_write_pct, NULL },
-
-	{ NULL, NULL, 0x0, 0, 0, 0, NULL, NULL }
-};
+#define V_MAX_TABLES_CONFIG WT_THOUSAND
+
+#define V_GLOBAL_ASSERT_READ_TIMESTAMP 0
+#define V_GLOBAL_BACKGROUND_COMPACT 1
+#define V_GLOBAL_BACKGROUND_COMPACT_FREE_SPACE_TARGET 2
+#define V_GLOBAL_BACKUP 3
+#define V_GLOBAL_BACKUP_INCREMENTAL 4
+#define V_GLOBAL_BACKUP_INCR_GRANULARITY 5
+#define V_GLOBAL_BACKUP_LIVE_RESTORE 6
+#define V_GLOBAL_BACKUP_LIVE_RESTORE_READ_SIZE 7
+#define V_GLOBAL_BACKUP_LIVE_RESTORE_THREADS 8
+#define V_GLOBAL_BLOCK_CACHE 9
+#define V_GLOBAL_BLOCK_CACHE_CACHE_ON_CHECKPOINT 10
+#define V_GLOBAL_BLOCK_CACHE_CACHE_ON_WRITES 11
+#define V_GLOBAL_BLOCK_CACHE_SIZE 12
+#define V_TABLE_BTREE_BITCNT 13
+#define V_TABLE_BTREE_COMPRESSION 14
+#define V_TABLE_BTREE_DICTIONARY 15
+#define V_TABLE_BTREE_INTERNAL_KEY_TRUNCATION 16
+#define V_TABLE_BTREE_INTERNAL_PAGE_MAX 17
+#define V_TABLE_BTREE_KEY_MAX 18
+#define V_TABLE_BTREE_KEY_MIN 19
+#define V_TABLE_BTREE_LEAF_PAGE_MAX 20
+#define V_TABLE_BTREE_MEMORY_PAGE_MAX 21
+#define V_TABLE_BTREE_PREFIX_LEN 22
+#define V_TABLE_BTREE_PREFIX_COMPRESSION 23
+#define V_TABLE_BTREE_PREFIX_COMPRESSION_MIN 24
+#define V_TABLE_BTREE_REPEAT_DATA_PCT 25
+#define V_TABLE_BTREE_REVERSE 26
+#define V_TABLE_BTREE_SPLIT_PCT 27
+#define V_TABLE_BTREE_VALUE_MAX 28
+#define V_TABLE_BTREE_VALUE_MIN 29
+#define V_GLOBAL_CACHE 30
+#define V_GLOBAL_CACHE_EVICT_MAX 31
+#define V_GLOBAL_CACHE_EVICTION_DIRTY_TARGET 32
+#define V_GLOBAL_CACHE_EVICTION_DIRTY_TRIGGER 33
+#define V_GLOBAL_CACHE_MINIMUM 34
+#define V_GLOBAL_CACHE_MAXIMUM 35
+#define V_GLOBAL_CHECKPOINT 36
+#define V_GLOBAL_CHECKPOINT_LOG_SIZE 37
+#define V_GLOBAL_CHECKPOINT_WAIT 38
+#define V_GLOBAL_CHUNK_CACHE 39
+#define V_GLOBAL_CHUNK_CACHE_CAPACITY 40
+#define V_GLOBAL_CHUNK_CACHE_CHUNK_SIZE 41
+#define V_GLOBAL_CHUNK_CACHE_STORAGE_PATH 42
+#define V_GLOBAL_CHUNK_CACHE_TYPE 43
+#define V_GLOBAL_COMPACT_FREE_SPACE_TARGET 44
+#define V_GLOBAL_DEBUG_BACKGROUND_COMPACT 45
+#define V_GLOBAL_DEBUG_CHECKPOINT_RETENTION 46
+#define V_GLOBAL_DEBUG_CURSOR_REPOSITION 47
+#define V_GLOBAL_DEBUG_EVICTION 48
+#define V_GLOBAL_DEBUG_LOG_RETENTION 49
+#define V_GLOBAL_DEBUG_REALLOC_EXACT 50
+#define V_GLOBAL_DEBUG_REALLOC_MALLOC 51
+#define V_GLOBAL_DEBUG_SLOW_CHECKPOINT 52
+#define V_GLOBAL_DEBUG_TABLE_LOGGING 53
+#define V_GLOBAL_DEBUG_UPDATE_RESTORE_EVICT 54
+#define V_TABLE_DISK_CHECKSUM 55
+#define V_GLOBAL_DISK_DATA_EXTEND 56
+#define V_GLOBAL_DISK_ENCRYPTION 57
+#define V_TABLE_DISK_FIRSTFIT 58
+#define V_GLOBAL_DISK_MMAP 59
+#define V_GLOBAL_DISK_MMAP_ALL 60
+#define V_GLOBAL_EVICTION_EVICT_USE_SOFTPTR 61
+#define V_GLOBAL_FILE_MANAGER_CLOSE_HANDLE_MINIMUM 62
+#define V_GLOBAL_FILE_MANAGER_CLOSE_IDLE_TIME 63
+#define V_GLOBAL_FILE_MANAGER_CLOSE_SCAN_INTERVAL 64
+#define V_GLOBAL_FORMAT_ABORT 65
+#define V_GLOBAL_FORMAT_INDEPENDENT_THREAD_RNG 66
+#define V_GLOBAL_FORMAT_MAJOR_TIMEOUT 67
+#define V_GLOBAL_IMPORT 68
+#define V_GLOBAL_LOGGING 69
+#define V_GLOBAL_LOGGING_COMPRESSION 70
+#define V_GLOBAL_LOGGING_FILE_MAX 71
+#define V_GLOBAL_LOGGING_PREALLOC 72
+#define V_GLOBAL_LOGGING_REMOVE 73
+#define V_GLOBAL_OBSOLETE_CLEANUP_METHOD 74
+#define V_GLOBAL_OBSOLETE_CLEANUP_WAIT 75
+#define V_GLOBAL_OPS_ALTER 76
+#define V_GLOBAL_OPS_COMPACTION 77
+#define V_GLOBAL_OPS_HS_CURSOR 78
+#define V_TABLE_OPS_PARETO 79
+#define V_TABLE_OPS_PARETO_SKEW 80
+#define V_TABLE_OPS_PCT_DELETE 81
+#define V_TABLE_OPS_PCT_INSERT 82
+#define V_TABLE_OPS_PCT_MODIFY 83
+#define V_TABLE_OPS_PCT_READ 84
+#define V_TABLE_OPS_PCT_WRITE 85
+#define V_GLOBAL_OPS_BOUND_CURSOR 86
+#define V_GLOBAL_OPS_PREPARE 87
+#define V_GLOBAL_OPS_RANDOM_CURSOR 88
+#define V_GLOBAL_OPS_SALVAGE 89
+#define V_GLOBAL_OPS_THROTTLE 90
+#define V_GLOBAL_OPS_THROTTLE_SLEEP_US 91
+#define V_TABLE_OPS_TRUNCATE 92
+#define V_GLOBAL_OPS_VERIFY 93
+#define V_GLOBAL_PREFETCH 94
+#define V_GLOBAL_QUIET 95
+#define V_GLOBAL_RANDOM_DATA_SEED 96
+#define V_GLOBAL_RANDOM_EXTRA_SEED 97
+#define V_GLOBAL_RUNS_IN_MEMORY 98
+#define V_TABLE_RUNS_MIRROR 99
+#define V_GLOBAL_RUNS_OPS 100
+#define V_GLOBAL_RUNS_PREDICTABLE_REPLAY 101
+#define V_TABLE_RUNS_ROWS 102
+#define V_TABLE_RUNS_SOURCE 103
+#define V_GLOBAL_RUNS_TABLES 104
+#define V_GLOBAL_RUNS_THREADS 105
+#define V_GLOBAL_RUNS_TIMER 106
+#define V_TABLE_RUNS_TYPE 107
+#define V_GLOBAL_RUNS_VERIFY_FAILURE_DUMP 108
+#define V_GLOBAL_STATISTICS_MODE 109
+#define V_GLOBAL_STATISTICS_LOG_SOURCES 110
+#define V_GLOBAL_STRESS_AGGRESSIVE_STASH_FREE 111
+#define V_GLOBAL_STRESS_AGGRESSIVE_SWEEP 112
+#define V_GLOBAL_STRESS_CHECKPOINT 113
+#define V_GLOBAL_STRESS_CHECKPOINT_EVICT_PAGE 114
+#define V_GLOBAL_STRESS_CHECKPOINT_PREPARE 115
+#define V_GLOBAL_STRESS_COMPACT_SLOW 116
+#define V_GLOBAL_STRESS_EVICT_REPOSITION 117
+#define V_GLOBAL_STRESS_FAILPOINT_EVICTION_SPLIT 118
+#define V_GLOBAL_STRESS_FAILPOINT_HS_DELETE_KEY_FROM_TS 119
+#define V_GLOBAL_STRESS_HS_CHECKPOINT_DELAY 120
+#define V_GLOBAL_STRESS_HS_SEARCH 121
+#define V_GLOBAL_STRESS_HS_SWEEP 122
+#define V_GLOBAL_STRESS_PREFETCH_DELAY 123
+#define V_GLOBAL_STRESS_PREPARE_RESOLUTION_1 124
+#define V_GLOBAL_STRESS_SLEEP_BEFORE_READ_OVERFLOW_ONPAGE 125
+#define V_GLOBAL_STRESS_SPLIT_1 126
+#define V_GLOBAL_STRESS_SPLIT_2 127
+#define V_GLOBAL_STRESS_SPLIT_3 128
+#define V_GLOBAL_STRESS_SPLIT_4 129
+#define V_GLOBAL_STRESS_SPLIT_5 130
+#define V_GLOBAL_STRESS_SPLIT_6 131
+#define V_GLOBAL_STRESS_SPLIT_7 132
+#define V_GLOBAL_STRESS_SPLIT_8 133
+#define V_GLOBAL_TIERED_STORAGE_FLUSH_FREQUENCY 134
+#define V_GLOBAL_TIERED_STORAGE_STORAGE_SOURCE 135
+#define V_GLOBAL_TRANSACTION_IMPLICIT 136
+#define V_GLOBAL_TRANSACTION_OPERATION_TIMEOUT_MS 137
+#define V_GLOBAL_TRANSACTION_TIMESTAMPS 138
+#define V_GLOBAL_WIREDTIGER_CONFIG 139
+#define V_GLOBAL_WIREDTIGER_RWLOCK 140
+#define V_GLOBAL_WIREDTIGER_LEAK_MEMORY 141
+
+#define V_ELEMENT_COUNT 142

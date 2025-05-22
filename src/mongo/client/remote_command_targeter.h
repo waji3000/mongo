@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,25 +29,21 @@
 
 #pragma once
 
-#include "mongo/base/disallow_copying.h"
+#include "mongo/base/status_with.h"
+#include "mongo/client/connection_string.h"
+#include "mongo/client/read_preference.h"
 #include "mongo/util/future.h"
 #include "mongo/util/net/hostandport.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
 
-class ConnectionString;
-class OperationContext;
-struct ReadPreferenceSetting;
-struct HostAndPort;
-template <typename T>
-class StatusWith;
-
 /**
  * Interface encapsulating the targeting logic for a given replica set or a standalone host.
  */
 class RemoteCommandTargeter {
-    MONGO_DISALLOW_COPYING(RemoteCommandTargeter);
+    RemoteCommandTargeter(const RemoteCommandTargeter&) = delete;
+    RemoteCommandTargeter& operator=(const RemoteCommandTargeter&) = delete;
 
 public:
     virtual ~RemoteCommandTargeter() = default;
@@ -62,11 +57,8 @@ public:
     virtual ConnectionString connectionString() = 0;
 
     /**
-     * Finds a host matching readPref blocking up to 20 seconds or until the given operation is
-     * interrupted or its deadline expires.
-     *
-     * TODO(schwerin): Once operation max-time behavior is more uniformly integrated into sharding,
-     * remove the 20-second ceiling on wait time.
+     * Finds a host matching readPref blocking up to gDefaultFindReplicaSetHostTimeoutMS
+     * milliseconds or until the given operation is interrupted or its deadline expires.
      */
     virtual StatusWith<HostAndPort> findHost(OperationContext* opCtx,
                                              const ReadPreferenceSetting& readPref) = 0;
@@ -74,33 +66,42 @@ public:
 
     /**
      * Finds a host that matches the read preference specified by readPref, blocking for up to
-     * specified maxWait milliseconds, if a match cannot be found immediately.
+     * gDefaultFindReplicaSetHostTimeoutMS milliseconds, if a match cannot be found immediately.
      *
-     * DEPRECATED. Prefer findHost(OperationContext*, const ReadPreferenceSetting&), whenever
-     * an OperationContext is available.
+     * DEPRECATED. Prefer findHost(OperationContext*, const ReadPreferenceSetting&), whenever an
+     * OperationContext is available.
      */
-    virtual Future<HostAndPort> findHostWithMaxWait(const ReadPreferenceSetting& readPref,
-                                                    Milliseconds maxWait) = 0;
+    virtual SemiFuture<HostAndPort> findHost(const ReadPreferenceSetting& readPref,
+                                             const CancellationToken& cancelToken) = 0;
+
+    virtual SemiFuture<std::vector<HostAndPort>> findHosts(
+        const ReadPreferenceSetting& readPref, const CancellationToken& cancelToken) = 0;
+
 
     /**
-     * Finds a host matching the given read preference, giving up if a match is not found promptly.
-     *
-     * This method may still engage in blocking networking calls, but will attempt contact every
-     * member of the replica set at most one time.
-     *
-     * TODO(schwerin): Change this implementation to not perform any networking, once existing
-     * callers have been shown to be safe with this behavior or changed to call findHost.
+     * Checks the given status and updates the host bookkeeping accordingly.
      */
-    StatusWith<HostAndPort> findHostNoWait(const ReadPreferenceSetting& readPref) {
-        return findHostWithMaxWait(readPref, Milliseconds::zero()).getNoThrow();
-    }
+    void updateHostWithStatus(const HostAndPort& host, const Status& status) {
+        if (status.isOK())
+            return;
+
+        if (ErrorCodes::isNotPrimaryError(status.code())) {
+            markHostNotPrimary(host, status);
+        } else if (ErrorCodes::isNetworkError(status.code())) {
+            markHostUnreachable(host, status);
+        } else if (status == ErrorCodes::NetworkInterfaceExceededTimeLimit) {
+            markHostUnreachable(host, status);
+        } else if (ErrorCodes::isShutdownError(status.code())) {
+            markHostShuttingDown(host, status);
+        }
+    };
 
     /**
-     * Reports to the targeter that a 'status' indicating a not master error was received when
+     * Reports to the targeter that a 'status' indicating a not primary error was received when
      * communicating with 'host', and so it should update its bookkeeping to avoid giving out the
      * host again on a subsequent request for the primary.
      */
-    virtual void markHostNotMaster(const HostAndPort& host, const Status& status) = 0;
+    virtual void markHostNotPrimary(const HostAndPort& host, const Status& status) = 0;
 
     /**
      * Reports to the targeter that a 'status' indicating a network error was received when trying
@@ -108,6 +109,13 @@ public:
      * host again on a subsequent request for the primary.
      */
     virtual void markHostUnreachable(const HostAndPort& host, const Status& status) = 0;
+
+    /**
+     * Reports to the targeter that a 'status' indicating a shutdown error was received when trying
+     * to communicate with 'host', and so it should update its bookkeeping to avoid giving out the
+     * host again on a subsequent request for the primary.
+     */
+    virtual void markHostShuttingDown(const HostAndPort& host, const Status& status) = 0;
 
 protected:
     RemoteCommandTargeter() = default;

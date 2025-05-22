@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,16 +27,21 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include <benchmark/benchmark.h>
+#include <boost/smart_ptr.hpp>
+#include <type_traits>
+#include <utility>
 
-#include "mongo/bson/inline_decls.h"
+#include <boost/move/utility_core.hpp>
+
+#include "mongo/platform/compiler.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/future.h"
+#include "mongo/util/future_impl.h"
 
 namespace mongo {
 
-NOINLINE_DECL int makeReadyInt() {
+MONGO_COMPILER_NOINLINE int makeReadyInt() {
     benchmark::ClobberMemory();
     return 1;
 }
@@ -48,7 +52,7 @@ void BM_plainIntReady(benchmark::State& state) {
     }
 }
 
-NOINLINE_DECL Future<int> makeReadyFut() {
+MONGO_COMPILER_NOINLINE Future<int> makeReadyFut() {
     benchmark::ClobberMemory();
     return Future<int>::makeReady(1);
 }
@@ -65,7 +69,7 @@ void BM_futureIntReadyThen(benchmark::State& state) {
     }
 }
 
-NOINLINE_DECL Future<int> makeReadyFutWithPromise() {
+MONGO_COMPILER_NOINLINE Future<int> makeReadyFutWithPromise() {
     benchmark::ClobberMemory();
     auto pf = makePromiseFuture<int>();
     pf.promise.emplaceValue(1);

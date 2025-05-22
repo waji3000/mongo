@@ -1,6 +1,3 @@
-// text.cpp
-
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,74 +27,23 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
 
 #include "mongo/util/text.h"
 
 #include <boost/integer_traits.hpp>
-#include <errno.h>
+#include <cerrno>
 #include <iostream>
 #include <memory>
-#include <sstream>
+#include <sstream>  // IWYU pragma: keep
 
 #ifdef _WIN32
 #include <io.h>
 #endif
 
-#include "mongo/platform/basic.h"
 #include "mongo/util/allocator.h"
-#include "mongo/util/mongoutils/str.h"
-
-using namespace std;
+#include "mongo/util/str.h"
 
 namespace mongo {
-
-// --- StringSplitter ----
-
-/** get next split string fragment */
-string StringSplitter::next() {
-    const char* foo = strstr(_big, _splitter);
-    if (foo) {
-        string s(_big, foo - _big);
-        _big = foo + strlen(_splitter);
-        while (*_big && strstr(_big, _splitter) == _big)
-            _big++;
-        return s;
-    }
-
-    string s = _big;
-    _big += strlen(_big);
-    return s;
-}
-
-
-void StringSplitter::split(vector<string>& l) {
-    while (more()) {
-        l.push_back(next());
-    }
-}
-
-vector<string> StringSplitter::split() {
-    vector<string> l;
-    split(l);
-    return l;
-}
-
-string StringSplitter::join(const vector<string>& l, const string& split) {
-    stringstream ss;
-    for (unsigned i = 0; i < l.size(); i++) {
-        if (i > 0)
-            ss << split;
-        ss << l[i];
-    }
-    return ss.str();
-}
-
-vector<string> StringSplitter::split(const string& big, const string& splitter) {
-    StringSplitter ss(big.c_str(), splitter.c_str());
-    return ss.split();
-}
-
 
 // --- utf8 utils ------
 
@@ -121,14 +67,9 @@ inline int leadingOnes(unsigned char c) {
     return _leadingOnes[c & 0x7f];
 }
 
-bool isValidUTF8(const std::string& s) {
-    return isValidUTF8(s.c_str());
-}
-
-bool isValidUTF8(const char* s) {
+bool isValidUTF8(StringData s) {
     int left = 0;  // how many bytes are left in the current codepoint
-    while (*s) {
-        const unsigned char c = (unsigned char)*(s++);
+    for (unsigned char c : s) {
         const int ones = leadingOnes(c);
         if (left) {
             if (ones != 1)
@@ -163,7 +104,7 @@ std::string toUtf8String(const std::wstring& wide) {
 
     // Calculate necessary buffer size
     int len = ::WideCharToMultiByte(
-        CP_UTF8, 0, wide.c_str(), static_cast<int>(wide.size()), NULL, 0, NULL, NULL);
+        CP_UTF8, 0, wide.c_str(), static_cast<int>(wide.size()), nullptr, 0, nullptr, nullptr);
 
     // Perform actual conversion
     if (len > 0) {
@@ -174,16 +115,39 @@ std::string toUtf8String(const std::wstring& wide) {
                                     static_cast<int>(wide.size()),
                                     &buffer[0],
                                     static_cast<int>(buffer.size()),
-                                    NULL,
-                                    NULL);
+                                    nullptr,
+                                    nullptr);
         if (len > 0) {
-            verify(len == static_cast<int>(buffer.size()));
+            MONGO_verify(len == static_cast<int>(buffer.size()));
             return std::string(&buffer[0], buffer.size());
         }
     }
 
-    msgasserted(16091, mongoutils::str::stream() << "can't wstring to utf8: " << ::GetLastError());
+    msgasserted(16091, str::stream() << "can't wstring to utf8: " << ::GetLastError());
     return "";
+}
+
+std::wstring toWideStringFromStringData(StringData utf8String) {
+    int bufferSize = MultiByteToWideChar(CP_UTF8,            // Code page
+                                         0,                  // Flags
+                                         utf8String.data(),  // Input string
+                                         utf8String.size(),  // Count, -1 for NUL-terminated
+                                         nullptr,            // No output buffer
+                                         0                   // Zero means "compute required size"
+    );
+    if (bufferSize == 0) {
+        return std::wstring();
+    }
+    std::unique_ptr<wchar_t[]> tempBuffer(new wchar_t[bufferSize]);
+    tempBuffer[0] = L'0';
+    MultiByteToWideChar(CP_UTF8,            // Code page
+                        0,                  // Flags
+                        utf8String.data(),  // Input string
+                        utf8String.size(),  // Count, -1 for NUL-terminated
+                        tempBuffer.get(),   // UTF-16 output buffer
+                        bufferSize          // Buffer size in wide characters
+    );
+    return std::wstring(tempBuffer.get(), bufferSize);
 }
 
 std::wstring toWideString(const char* utf8String) {
@@ -191,9 +155,9 @@ std::wstring toWideString(const char* utf8String) {
                                          0,           // Flags
                                          utf8String,  // Input string
                                          -1,          // Count, -1 for NUL-terminated
-                                         NULL,        // No output buffer
+                                         nullptr,     // No output buffer
                                          0            // Zero means "compute required size"
-                                         );
+    );
     if (bufferSize == 0) {
         return std::wstring();
     }
@@ -205,7 +169,7 @@ std::wstring toWideString(const char* utf8String) {
                         -1,                // Count, -1 for NUL-terminated
                         tempBuffer.get(),  // UTF-16 output buffer
                         bufferSize         // Buffer size in wide characters
-                        );
+    );
     return std::wstring(tempBuffer.get());
 }
 
@@ -221,9 +185,9 @@ bool writeUtf8ToWindowsConsole(const char* utf8String, unsigned int utf8StringSi
                                          0,               // Flags
                                          utf8String,      // Input string
                                          utf8StringSize,  // Input string length
-                                         NULL,            // No output buffer
+                                         nullptr,         // No output buffer
                                          0                // Zero means "compute required size"
-                                         );
+    );
     if (bufferSize == 0) {
         return true;
     }
@@ -234,7 +198,7 @@ bool writeUtf8ToWindowsConsole(const char* utf8String, unsigned int utf8StringSi
                         utf8StringSize,     // Input string length
                         utf16String.get(),  // UTF-16 output buffer
                         bufferSize          // Buffer size in wide characters
-                        );
+    );
     const wchar_t* utf16Pointer = utf16String.get();
     size_t numberOfCharactersToWrite = bufferSize;
     HANDLE consoleHandle = GetStdHandle(STD_OUTPUT_HANDLE);
@@ -249,7 +213,7 @@ bool writeUtf8ToWindowsConsole(const char* utf8String, unsigned int utf8StringSi
                                      utf16Pointer,
                                      numberOfCharactersThisPass,
                                      &numberOfCharactersWritten,
-                                     NULL);
+                                     nullptr);
         if (0 == success) {
             DWORD dosError = GetLastError();
             static bool errorMessageShown = false;
@@ -273,55 +237,29 @@ bool writeUtf8ToWindowsConsole(const char* utf8String, unsigned int utf8StringSi
     return true;
 }
 
-WindowsCommandLine::WindowsCommandLine(int argc, wchar_t* argvW[], wchar_t* envpW[])
-    : _argv(NULL), _envp(NULL) {
-    // Construct UTF-8 copy of arguments
-    vector<string> utf8args;
-    vector<size_t> utf8argLength;
-    size_t blockSize = argc * sizeof(char*);
-    size_t blockPtr = blockSize;
-    for (int i = 0; i < argc; ++i) {
-        utf8args.push_back(toUtf8String(argvW[i]));
-        size_t argLength = utf8args[i].length() + 1;
-        utf8argLength.push_back(argLength);
-        blockSize += argLength;
-    }
-    _argv = static_cast<char**>(mongoMalloc(blockSize));
-    for (int i = 0; i < argc; ++i) {
-        _argv[i] = reinterpret_cast<char*>(_argv) + blockPtr;
-        strcpy_s(_argv[i], utf8argLength[i], utf8args[i].c_str());
-        blockPtr += utf8argLength[i];
+
+class WindowsCommandLine::Impl {
+public:
+    Impl(int argc, wchar_t** argvW) : _strs(argc), _argv(argc + 1) {
+        for (int i = 0; i < argc; ++i)
+            _argv[i] = (_strs[i] = toUtf8String(argvW[i])).data();
     }
 
-    // Construct UTF-8 copy of environment strings
-    size_t envCount = 0;
-    wchar_t** envpWptr = &envpW[0];
-    while (*envpWptr++) {
-        ++envCount;
+    char** argv() {
+        return _argv.data();
     }
-    vector<string> utf8envs;
-    vector<size_t> utf8envLength;
-    blockSize = (envCount + 1) * sizeof(char*);
-    blockPtr = blockSize;
-    for (size_t i = 0; i < envCount; ++i) {
-        utf8envs.push_back(toUtf8String(envpW[i]));
-        size_t envLength = utf8envs[i].length() + 1;
-        utf8envLength.push_back(envLength);
-        blockSize += envLength;
-    }
-    _envp = static_cast<char**>(mongoMalloc(blockSize));
-    size_t i;
-    for (i = 0; i < envCount; ++i) {
-        _envp[i] = reinterpret_cast<char*>(_envp) + blockPtr;
-        strcpy_s(_envp[i], utf8envLength[i], utf8envs[i].c_str());
-        blockPtr += utf8envLength[i];
-    }
-    _envp[i] = NULL;
-}
 
-WindowsCommandLine::~WindowsCommandLine() {
-    free(_argv);
-    free(_envp);
+    std::vector<std::string> _strs;  // utf8 encoded
+    std::vector<char*> _argv;        // [_strs..., nullptr]
+};
+
+WindowsCommandLine::WindowsCommandLine(int argc, wchar_t** argvW)
+    : _impl{std::make_unique<Impl>(argc, argvW)} {}
+
+WindowsCommandLine::~WindowsCommandLine() = default;
+
+char** WindowsCommandLine::argv() const {
+    return _impl->argv();
 }
 
 #endif  // #if defined(_WIN32)
@@ -361,8 +299,8 @@ std::string constructUtf8WindowsCommandLine(const std::vector<std::string>& argv
         return "";
 
     std::ostringstream commandLine;
-    std::vector<std::string>::const_iterator iter = argv.begin();
-    std::vector<std::string>::const_iterator end = argv.end();
+    auto iter = argv.begin();
+    const auto end = argv.end();
     quoteForWindowsCommandLine(*iter, commandLine);
     ++iter;
     for (; iter != end; ++iter) {
@@ -371,4 +309,4 @@ std::string constructUtf8WindowsCommandLine(const std::vector<std::string>& argv
     }
     return commandLine.str();
 }
-}
+}  // namespace mongo

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,10 +27,14 @@
  *    it in the license file.
  */
 
+#include <memory>
+
 #include "mongo/db/fts/unicode/string.h"
 #include "mongo/shell/linenoise_utf8.h"
 #include "mongo/unittest/unittest.h"
-#include "mongo/util/text.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/ctype.h"
+#include "mongo/util/text.h"  // IWYU pragma: keep
 
 #ifdef MSC_VER
 // Microsoft VS 2013 does not handle UTF-8 strings in char literal strings, error C4566
@@ -63,7 +66,7 @@ auto kCaseSensitive = String::kCaseSensitive;
 
 auto kTurkish = CaseFoldMode::kTurkish;
 auto kNormal = CaseFoldMode::kNormal;
-}
+}  // namespace
 
 
 // Macro to preserve line numbers and arguments in error messages.
@@ -111,7 +114,7 @@ TEST(UnicodeString, CaseFolding) {
     // Test all ascii chars.
     for (unsigned char ch = 0; ch <= 0x7F; ch++) {
         const auto upper = std::string(1, ch);
-        const auto lower = std::string(1, std::tolower(ch));
+        const auto lower = std::string(1, ctype::toLower(ch));
         if (ch) {  // String's constructor doesn't handle embedded NUL bytes.
             ASSERT_EQUALS(lower, String(upper).toLowerToBuf(&buf, kNormal));
         }

@@ -1,12 +1,12 @@
-"""Additional handlers that are used as the base classes of the buildlogger handler."""
-
-from __future__ import absolute_import
+"""Additional handlers that are used as the base classes of the ???? does this even make sense anymore handler."""
 
 import json
 import logging
-import sys
+import re
 import threading
 import warnings
+from collections import deque
+from enum import Enum
 
 import requests
 import requests.adapters
@@ -20,10 +20,81 @@ except ImportError:
 
 import urllib3.util.retry as urllib3_retry
 
-from . import flush
-from .. import utils
+from buildscripts.resmokelib import utils
+from buildscripts.resmokelib.logging import flush
 
-_TIMEOUT_SECS = 10
+_TIMEOUT_SECS = 55
+MAX_EXCEPTION_LENGTH = 10
+
+
+class Truncate(Enum):
+    """Enum to specify to truncate first/last part of exceptions upon overflow."""
+
+    FIRST = "FIRST"
+    LAST = "LAST"
+
+
+class ExceptionExtractor:
+    """A class which extracts an exception based on regex."""
+
+    def __init__(self, start_regex, end_regex, truncate):
+        """Initialize the exception extractor."""
+        self.start_re = re.compile(start_regex)
+        self.end_re = re.compile(end_regex)
+
+        self.current_exception = deque([])
+        self.active = False
+
+        self.truncate = truncate
+        self.current_exception_is_truncated = False
+
+        self.exception_detected = False
+
+    def process_log_line(self, log_line):
+        """Process the log line."""
+        if self.exception_detected:
+            return
+        if not self.active and self.start_re.search(log_line):
+            self.active = True
+            self.current_exception.append(log_line)
+        elif self.active:
+            self.current_exception.append(log_line)
+            if len(self.current_exception) > MAX_EXCEPTION_LENGTH:
+                self.current_exception_is_truncated = True
+                if self.truncate == Truncate.FIRST:
+                    self.current_exception.popleft()
+                else:
+                    self.current_exception.pop()
+
+            # Finalize Exception
+            if self.end_re.search(log_line):
+                self.exception_detected = True
+                if self.current_exception_is_truncated:
+                    self.current_exception.appendleft(
+                        "[LAST Part of Exception]"
+                        if self.truncate == Truncate.FIRST
+                        else "[FIRST Part of Exception]"
+                    )
+
+    def get_exception(self):
+        """Get the exception as a list of strings if it exists."""
+        if not self.exception_detected:
+            return []
+        return list(self.current_exception)
+
+
+class ExceptionExtractionHandler(logging.Handler):
+    """A handler class that extracts exceptions using the logger."""
+
+    def __init__(self, exception_extractor):
+        """Initialize the handler with the specified regex."""
+
+        logging.Handler.__init__(self)
+        self.exception_extractor = exception_extractor
+
+    def emit(self, record):
+        """Pass the log line to the exception extractor."""
+        self.exception_extractor.process_log_line(record.getMessage())
 
 
 class BufferedHandler(logging.Handler):
@@ -60,6 +131,7 @@ class BufferedHandler(logging.Handler):
         self.__emit_buffer = []
         self.__flush_event = None  # A handle to the event that calls self.flush().
         self.__flush_scheduled_by_emit = False
+        self.__close_called = False
 
         self.__flush_lock = threading.Lock()  # Serializes callers of self.flush().
 
@@ -78,7 +150,7 @@ class BufferedHandler(logging.Handler):
         """Release."""
         pass
 
-    def process_record(self, record):  # pylint: disable=no-self-use
+    def process_record(self, record):
         """Apply a transformation to the record before it gets added to the buffer.
 
         The default implementation returns 'record' unmodified.
@@ -121,7 +193,7 @@ class BufferedHandler(logging.Handler):
         self.__flush(close_called=False)
 
         with self.__emit_lock:
-            if self.__flush_event is not None:
+            if self.__flush_event is not None and not self.__close_called:
                 # We cancel 'self.__flush_event' in case flush() was called by someone other than
                 # the flush thread to avoid having multiple flush() events scheduled.
                 flush.cancel(self.__flush_event)
@@ -144,19 +216,45 @@ class BufferedHandler(logging.Handler):
     def _flush_buffer_with_lock(self, buf, close_called):
         """Ensure all logging output has been flushed."""
 
-        raise NotImplementedError("_flush_buffer_with_lock must be implemented by BufferedHandler"
-                                  " subclasses")
+        raise NotImplementedError(
+            "_flush_buffer_with_lock must be implemented by BufferedHandler" " subclasses"
+        )
 
     def close(self):
         """Flush the buffer and tidies up any resources used by this handler."""
 
         with self.__emit_lock:
+            self.__close_called = True
+
             if self.__flush_event is not None:
                 flush.cancel(self.__flush_event)
 
         self.__flush(close_called=True)
 
         logging.Handler.close(self)
+
+
+class BufferedFileHandler(BufferedHandler):
+    """File handler with in-memory buffering."""
+
+    def __init__(self, filename, capacity=2000, interval_secs=600):
+        """Initialize the handler with the filename and buffer capacity and flush interval."""
+        super().__init__(capacity, interval_secs)
+        self.file = open(filename, "a", encoding="utf-8")
+
+    def process_record(self, record):
+        """Return the formatted record message appended with a newline."""
+        return self.format(record) + "\n"
+
+    def _flush_buffer_with_lock(self, buf, close_called):
+        """Write the buffered log lines to the destination file."""
+        self.file.writelines(buf)
+
+    def close(self):
+        """Close the handler and the file descriptor."""
+        super().close()
+
+        self.file.close()
 
 
 class HTTPHandler(object):
@@ -173,12 +271,13 @@ class HTTPHandler(object):
             retry_status = [500, 502, 503, 504]  # Retry for these statuses.
             retry = urllib3_retry.Retry(
                 backoff_factor=0.1,  # Enable backoff starting at 0.1s.
-                method_whitelist=False,  # Support all HTTP verbs.
-                status_forcelist=retry_status)
+                allowed_methods=False,  # Support all HTTP verbs.
+                status_forcelist=retry_status,
+            )
 
             adapter = requests.adapters.HTTPAdapter(max_retries=retry)
-            self.session.mount('http://', adapter)
-            self.session.mount('https://', adapter)
+            self.session.mount("http://", adapter)
+            self.session.mount("https://", adapter)
 
         self.url_root = url_root
 
@@ -193,18 +292,15 @@ class HTTPHandler(object):
         """
 
         data = utils.default_if_none(data, [])
-        data = json.dumps(data, encoding="utf-8")
+        data = json.dumps(data)
 
         headers = utils.default_if_none(headers, {})
         headers["Content-Type"] = "application/json; charset=utf-8"
 
         url = self._make_url(endpoint)
 
-        # Versions of Python earlier than 2.7.9 do not support certificate validation. So we
-        # disable certificate validation for older Python versions.
-        should_validate_certificates = sys.version_info >= (2, 7, 9)
         with warnings.catch_warnings():
-            if urllib3_exceptions is not None and not should_validate_certificates:
+            if urllib3_exceptions is not None:
                 try:
                     warnings.simplefilter("ignore", urllib3_exceptions.InsecurePlatformWarning)
                 except AttributeError:
@@ -221,9 +317,14 @@ class HTTPHandler(object):
                     # that defined InsecureRequestWarning.
                     pass
 
-            response = self.session.post(url, data=data, headers=headers, timeout=timeout_secs,
-                                         auth=self.auth_handler,
-                                         verify=should_validate_certificates)
+            response = self.session.post(
+                url,
+                data=data,
+                headers=headers,
+                timeout=timeout_secs,
+                auth=self.auth_handler,
+                verify=True,
+            )
 
         response.raise_for_status()
 

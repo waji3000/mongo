@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,8 +29,21 @@
 
 #pragma once
 
+#include <memory>
+#include <set>
+#include <vector>
+
+#include <boost/move/utility_core.hpp>
+
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
 #include "mongo/client/connection_string.h"
+#include "mongo/client/read_preference.h"
 #include "mongo/client/remote_command_targeter.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/stdx/mutex.h"
+#include "mongo/util/cancellation.h"
+#include "mongo/util/future.h"
 #include "mongo/util/net/hostandport.h"
 
 namespace mongo {
@@ -39,7 +51,7 @@ namespace mongo {
 class RemoteCommandTargeterMock final : public RemoteCommandTargeter {
 public:
     RemoteCommandTargeterMock();
-    virtual ~RemoteCommandTargeterMock();
+    ~RemoteCommandTargeterMock() override;
 
     /**
      * Shortcut for unit-tests.
@@ -56,35 +68,58 @@ public:
      * Returns the return value last set by setFindHostReturnValue.
      * Returns ErrorCodes::InternalError if setFindHostReturnValue was never called.
      */
-    Future<HostAndPort> findHostWithMaxWait(const ReadPreferenceSetting& readPref,
-                                            Milliseconds maxWait) override;
+    SemiFuture<HostAndPort> findHost(const ReadPreferenceSetting& readPref,
+                                     const CancellationToken& cancelToken) override;
+
+    SemiFuture<std::vector<HostAndPort>> findHosts(const ReadPreferenceSetting& readPref,
+                                                   const CancellationToken& cancelToken) override;
 
     StatusWith<HostAndPort> findHost(OperationContext* opCtx,
                                      const ReadPreferenceSetting& readPref) override;
 
     /**
-     * No-op for the mock.
+     * Adds host to a set of hosts marked down, otherwise a no-op.
      */
-    void markHostNotMaster(const HostAndPort& host, const Status& status) override;
+    void markHostNotPrimary(const HostAndPort& host, const Status& status) override;
 
     /**
-     * No-op for the mock.
+     * Adds host to a set of hosts marked down, otherwise a no-op.
      */
     void markHostUnreachable(const HostAndPort& host, const Status& status) override;
 
     /**
+     * Adds host to a set of hosts marked down, otherwise a no-op.
+     */
+    void markHostShuttingDown(const HostAndPort& host, const Status& status) override;
+
+    /**
      * Sets the return value for the next call to connectionString.
      */
-    void setConnectionStringReturnValue(const ConnectionString returnValue);
+    void setConnectionStringReturnValue(ConnectionString returnValue);
 
     /**
      * Sets the return value for the next call to findHost.
      */
     void setFindHostReturnValue(StatusWith<HostAndPort> returnValue);
 
+    void setFindHostsReturnValue(StatusWith<std::vector<HostAndPort>> returnValue);
+
+    /**
+     * Returns the current set of hosts marked down and resets the mock's internal list of marked
+     * down hosts.
+     */
+    std::set<HostAndPort> getAndClearMarkedDownHosts();
+
 private:
     ConnectionString _connectionStringReturnValue;
-    StatusWith<HostAndPort> _findHostReturnValue;
+    StatusWith<std::vector<HostAndPort>> _findHostReturnValue;
+
+    // Protects _hostsMarkedDown.
+    mutable stdx::mutex _mutex;
+
+    // HostAndPorts marked not primary or unreachable. Meant to verify a code path updates the
+    // RemoteCommandTargeterMock.
+    std::set<HostAndPort> _hostsMarkedDown;
 };
 
 }  // namespace mongo

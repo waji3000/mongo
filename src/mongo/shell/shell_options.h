@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -35,7 +34,8 @@
 #include <vector>
 
 #include "mongo/base/status.h"
-#include "mongo/rpc/protocol.h"
+#include "mongo/base/string_data.h"
+#include "mongo/util/duration.h"
 
 namespace mongo {
 
@@ -45,6 +45,27 @@ class Environment;
 }  // namespace optionenvironment
 
 namespace moe = mongo::optionenvironment;
+
+/**
+ * The sole purpose of this class is to avoid compilation errors with the definition of 'nokillop'
+ * field in shell_options.idl which the generated option parser requires assignment operator for the
+ * field to work but AtomicWord<T> does not support assignment operator(s).
+ */
+class AssignableAtomicBool : public AtomicWord<bool> {
+public:
+    AssignableAtomicBool() = default;
+    explicit AssignableAtomicBool(bool value) : AtomicWord<bool>(value) {}
+
+    AssignableAtomicBool(const AssignableAtomicBool&) = delete;
+    AssignableAtomicBool& operator=(const AssignableAtomicBool&) = delete;
+    AssignableAtomicBool(AssignableAtomicBool&&) = delete;
+    AssignableAtomicBool& operator=(AssignableAtomicBool&&) = delete;
+
+    AssignableAtomicBool& operator=(bool value) {
+        store(value);
+        return *this;
+    }
+};
 
 struct ShellGlobalParams {
     std::string url;
@@ -69,17 +90,23 @@ struct ShellGlobalParams {
 
     std::string script;
 
-    bool autoKillOp = false;
-    bool useWriteCommandsDefault = true;
+    std::string apiVersion;
+    bool apiStrict;
+    bool apiDeprecationErrors;
 
-    std::string writeMode = "commands";
-    std::string readMode = "compatibility";
+    bool autoKillOp = false;
+
     bool shouldRetryWrites = false;
     bool shouldUseImplicitSessions = true;
 
-    boost::optional<rpc::ProtocolSet> rpcProtocols = boost::none;
-
     int jsHeapLimitMB = 0;
+    AssignableAtomicBool nokillop{false};
+    Seconds idleSessionTimeout = Seconds{0};
+
+#ifdef MONGO_CONFIG_GRPC
+    bool gRPC = false;
+    boost::optional<std::string> gRPCAuthToken;
+#endif
 };
 
 extern ShellGlobalParams shellGlobalParams;
@@ -97,4 +124,6 @@ bool handlePreValidationMongoShellOptions(const moe::Environment& params,
 Status storeMongoShellOptions(const moe::Environment& params, const std::vector<std::string>& args);
 
 void redactPasswordOptions(int argc, char** argv);
-}
+
+std::string getApiParametersJSON();
+}  // namespace mongo

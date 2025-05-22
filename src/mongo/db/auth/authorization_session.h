@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,28 +29,43 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
 #include <memory>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authz_session_external_state.h"
 #include "mongo/db/auth/privilege.h"
+#include "mongo/db/auth/resource_pattern.h"
+#include "mongo/db/auth/role_name.h"
+#include "mongo/db/auth/user.h"
 #include "mongo/db/auth/user_name.h"
-#include "mongo/db/auth/user_set.h"
+#include "mongo/db/client.h"
+#include "mongo/db/database_name.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/query/explain_verbosity_gen.h"
+#include "mongo/db/read_write_concern_provenance_base_gen.h"
+#include "mongo/db/session/logical_session_id_gen.h"
+#include "mongo/db/tenant_id.h"
+#include "mongo/util/concurrency/with_lock.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo {
 
-namespace auth {
-
-struct CreateOrUpdateRoleArgs;
-}  // namespace auth
 class Client;
+class AuthorizationContract;
+
+class ListCollections;
 
 /**
  * Contains all the authorization logic for a single client connection.  It contains a set of
@@ -72,37 +86,7 @@ class AuthorizationSession {
     AuthorizationSession& operator=(const AuthorizationSession&) = delete;
 
 public:
-    static MONGO_DECLARE_SHIM(
-        (AuthorizationManager * authzManager)->std::unique_ptr<AuthorizationSession>) create;
-
     AuthorizationSession() = default;
-
-    /**
-     * Provides a way to swap out impersonate data for the duration of the ScopedImpersonate's
-     * lifetime.
-     */
-    class ScopedImpersonate {
-    public:
-        ScopedImpersonate(AuthorizationSession* authSession,
-                          std::vector<UserName>* users,
-                          std::vector<RoleName>* roles)
-            : _authSession(*authSession), _users(*users), _roles(*roles) {
-            swap();
-        }
-
-        ~ScopedImpersonate() {
-            this->swap();
-        }
-
-    private:
-        void swap();
-
-        AuthorizationSession& _authSession;
-        std::vector<UserName>& _users;
-        std::vector<RoleName>& _roles;
-    };
-
-    friend class ScopedImpersonate;
 
     /**
      * Gets the AuthorizationSession associated with the given "client", or nullptr.
@@ -132,9 +116,7 @@ public:
     static void set(Client* client, std::unique_ptr<AuthorizationSession> session);
 
     // Takes ownership of the externalState.
-    virtual ~AuthorizationSession() = 0;
-
-    virtual AuthorizationManager& getAuthorizationManager() = 0;
+    virtual ~AuthorizationSession() = default;
 
     // Should be called at the beginning of every new request.  This performs the checks
     // necessary to determine if localhost connections should be given full access.
@@ -142,10 +124,17 @@ public:
     virtual void startRequest(OperationContext* opCtx) = 0;
 
     /**
+     * Start tracking permissions and privileges in the authorization contract.
+     */
+    virtual void startContractTracking() = 0;
+
+    /**
      * Adds the User identified by "UserName" to the authorization session, acquiring privileges
      * for it in the process.
      */
-    virtual Status addAndAuthorizeUser(OperationContext* opCtx, const UserName& userName) = 0;
+    virtual Status addAndAuthorizeUser(OperationContext* opCtx,
+                                       std::unique_ptr<UserRequest> userRequest,
+                                       boost::optional<Date_t> expirationTime) = 0;
 
     // Returns the authenticated user with the given name.  Returns NULL
     // if no such user is found.
@@ -153,97 +142,55 @@ public:
     // and ownership of the user stays with the AuthorizationManager
     virtual User* lookupUser(const UserName& name) = 0;
 
-    // Returns the single user on this auth session. If no user is authenticated, or if
-    // multiple users are authenticated, this method will throw an exception.
-    virtual User* getSingleUser() = 0;
+    // Get the authenticated user's object handle, if any.
+    virtual boost::optional<UserHandle> getAuthenticatedUser() = 0;
+
+    // Get the authenticated user's tenant ID, if any.
+    virtual boost::optional<TenantId> getUserTenantId() const = 0;
+
+    // Is auth disabled? Returns true if auth is disabled.
+    virtual bool shouldIgnoreAuthChecks() = 0;
 
     // Is authenticated as at least one user.
     virtual bool isAuthenticated() = 0;
 
-    // Gets an iterator over the names of all authenticated users stored in this manager.
-    virtual UserNameIterator getAuthenticatedUserNames() = 0;
+    // Gets the name of the currently authenticated user (if any).
+    virtual boost::optional<UserName> getAuthenticatedUserName() = 0;
 
     // Gets an iterator over the roles of all authenticated users stored in this manager.
     virtual RoleNameIterator getAuthenticatedRoleNames() = 0;
 
-    // Returns a std::string representing all logged-in users on the current session.
-    // WARNING: this std::string will contain NUL bytes so don't call c_str()!
-    virtual std::string getAuthenticatedUserNamesToken() = 0;
+    // Removes all authenticated principals while in kSecurityToken authentication mode.
+    virtual void logoutSecurityTokenUser() = 0;
+
+    // Removes any authenticated principals and revokes any privileges that were granted via those
+    // principals. This function modifies state. Synchronizes with the Client lock.
+    virtual void logoutAllDatabases(StringData reason) = 0;
 
     // Removes any authenticated principals whose authorization credentials came from the given
-    // database, and revokes any privileges that were granted via that principal.
-    virtual void logoutDatabase(StringData dbname) = 0;
+    // database, and revokes any privileges that were granted via that principal. This function
+    // modifies state. Synchronizes with the Client lock.
+    virtual void logoutDatabase(const DatabaseName& dbname, StringData reason) = 0;
+
+    // How the active session is authenticated.
+    enum class AuthenticationMode {
+        kNone,           // Not authenticated.
+        kConnection,     // For the duration of the connection, or until logged out or
+                         // expiration.
+        kSecurityToken,  // By operation scoped security token.
+    };
+    virtual AuthenticationMode getAuthenticationMode() const = 0;
 
     // Adds the internalSecurity user to the set of authenticated users.
-    // Used to grant internal threads full access.
+    // Used to grant internal threads full access. Takes in the Client
+    // as a parameter so it can take out a lock on the client.
     virtual void grantInternalAuthorization() = 0;
 
-    // Generates a vector of default privileges that are granted to any user,
-    // regardless of which roles that user does or does not possess.
-    // If localhost exception is active, the permissions include the ability to create
-    // the first user and the ability to run the commands needed to bootstrap the system
-    // into a state where the first user can be created.
-    virtual PrivilegeVector getDefaultPrivileges() = 0;
-
-    // Checks if this connection has the privileges necessary to perform a find operation
-    // on the supplied namespace identifier.
-    virtual Status checkAuthForFind(const NamespaceString& ns, bool hasTerm) = 0;
-
-    // Checks if this connection has the privileges necessary to perform a getMore operation on
-    // the identified cursor, supposing that cursor is associated with the supplied namespace
-    // identifier.
-    virtual Status checkAuthForGetMore(const NamespaceString& ns,
-                                       long long cursorID,
-                                       bool hasTerm) = 0;
-
-    // Checks if this connection has the privileges necessary to perform the given update on the
-    // given namespace.
-    virtual Status checkAuthForUpdate(OperationContext* opCtx,
-                                      const NamespaceString& ns,
-                                      const BSONObj& query,
-                                      const BSONObj& update,
-                                      bool upsert) = 0;
-
-    // Checks if this connection has the privileges necessary to insert to the given namespace.
-    virtual Status checkAuthForInsert(OperationContext* opCtx, const NamespaceString& ns) = 0;
-
-    // Checks if this connection has the privileges necessary to perform a delete on the given
-    // namespace.
-    virtual Status checkAuthForDelete(OperationContext* opCtx,
-                                      const NamespaceString& ns,
-                                      const BSONObj& query) = 0;
-
-    // Checks if this connection has the privileges necessary to perform a killCursor on
-    // the identified cursor, supposing that cursor is associated with the supplied namespace
-    // identifier.
-    virtual Status checkAuthForKillCursors(const NamespaceString& cursorNss,
-                                           UserNameIterator cursorOwner) = 0;
-
-    // Checks if this connection has the privileges necessary to run the aggregation pipeline
-    // specified in 'cmdObj' on the namespace 'ns' either directly on mongoD or via mongoS.
-    virtual Status checkAuthForAggregate(const NamespaceString& ns,
-                                         const BSONObj& cmdObj,
-                                         bool isMongos) = 0;
-
-    // Checks if this connection has the privileges necessary to create 'ns' with the options
-    // supplied in 'cmdObj' either directly on mongoD or via mongoS.
-    virtual Status checkAuthForCreate(const NamespaceString& ns,
-                                      const BSONObj& cmdObj,
-                                      bool isMongos) = 0;
-
-    // Checks if this connection has the privileges necessary to modify 'ns' with the options
-    // supplied in 'cmdObj' either directly on mongoD or via mongoS.
-    virtual Status checkAuthForCollMod(const NamespaceString& ns,
-                                       const BSONObj& cmdObj,
-                                       bool isMongos) = 0;
-
-    // Checks if this connection has the privileges necessary to grant the given privilege
-    // to a role.
-    virtual Status checkAuthorizedToGrantPrivilege(const Privilege& privilege) = 0;
-
-    // Checks if this connection has the privileges necessary to revoke the given privilege
-    // from a role.
-    virtual Status checkAuthorizedToRevokePrivilege(const Privilege& privilege) = 0;
+    // Checks if the current session is authorized to list the collections in the given
+    // database. If it is, return a privilegeVector containing the privileges used to authorize
+    // this command.
+    virtual StatusWith<PrivilegeVector> checkAuthorizedToListCollections(
+        const ListCollections&) = 0;
 
     // Checks if this connection is using the localhost bypass
     virtual bool isUsingLocalhostBypass() = 0;
@@ -252,32 +199,16 @@ public:
     // given BSONElement.
     virtual bool isAuthorizedToParseNamespaceElement(const BSONElement& elem) = 0;
 
+    // Checks if this connection has the privileges necessary to parse a namespace from a
+    // given NamespaceOrUUID object.
+    virtual bool isAuthorizedToParseNamespaceElement(const NamespaceStringOrUUID& nss) = 0;
+
     // Checks if this connection has the privileges necessary to create a new role
-    virtual bool isAuthorizedToCreateRole(const auth::CreateOrUpdateRoleArgs& args) = 0;
-
-    // Utility function for isAuthorizedForActionsOnResource(
-    //         ResourcePattern::forDatabaseName(role.getDB()), ActionType::grantAnyRole)
-    virtual bool isAuthorizedToGrantRole(const RoleName& role) = 0;
-
-    // Utility function for isAuthorizedForActionsOnResource(
-    //         ResourcePattern::forDatabaseName(role.getDB()), ActionType::grantAnyRole)
-    virtual bool isAuthorizedToRevokeRole(const RoleName& role) = 0;
+    virtual bool isAuthorizedToCreateRole(const RoleName& roleName) = 0;
 
     // Utility function for isAuthorizedToChangeOwnPasswordAsUser and
     // isAuthorizedToChangeOwnCustomDataAsUser
     virtual bool isAuthorizedToChangeAsUser(const UserName& userName, ActionType actionType) = 0;
-
-    // Returns true if the current session is authenticated as the given user and that user
-    // is allowed to change his/her own password
-    virtual bool isAuthorizedToChangeOwnPasswordAsUser(const UserName& userName) = 0;
-
-    // Returns true if the current session is authorized to list the collections in the given
-    // database.
-    virtual bool isAuthorizedToListCollections(StringData dbname, const BSONObj& cmdObj) = 0;
-
-    // Returns true if the current session is authenticated as the given user and that user
-    // is allowed to change his/her own customData.
-    virtual bool isAuthorizedToChangeOwnCustomDataAsUser(const UserName& userName) = 0;
 
     // Returns true if any of the authenticated users on this session have the given role.
     // NOTE: this does not refresh any of the users even if they are marked as invalid.
@@ -313,51 +244,58 @@ public:
 
     // Returns true if the current session possesses a privilege which could apply to the
     // database resource, or a specific or arbitrary resource within the database.
-    virtual bool isAuthorizedForAnyActionOnAnyResourceInDB(StringData dbname) = 0;
+    virtual bool isAuthorizedForAnyActionOnAnyResourceInDB(const DatabaseName&) = 0;
 
     // Returns true if the current session possesses a privilege which applies to the resource.
     virtual bool isAuthorizedForAnyActionOnResource(const ResourcePattern& resource) = 0;
 
-    // Replaces the data for users that a system user is impersonating with new data.
-    // The auditing system adds these users and their roles to each audit record in the log.
-    virtual void setImpersonatedUserData(std::vector<UserName> usernames,
-                                         std::vector<RoleName> roles) = 0;
-
-    // Gets an iterator over the names of all users that the system user is impersonating.
-    virtual UserNameIterator getImpersonatedUserNames() = 0;
-
-    // Gets an iterator over the roles of all users that the system user is impersonating.
-    virtual RoleNameIterator getImpersonatedRoleNames() = 0;
-
-    // Clears the data for impersonated users.
-    virtual void clearImpersonatedUserData() = 0;
+    // Returns true if the current session possesses privileges on the cluster resource for the
+    // action(s) specified.
+    virtual bool isAuthorizedForClusterActions(const ActionSet& actionSet,
+                                               const boost::optional<TenantId>& tenantId) = 0;
+    bool isAuthorizedForClusterAction(ActionType action,
+                                      const boost::optional<TenantId>& tenantId) {
+        return isAuthorizedForClusterActions({action}, tenantId);
+    }
 
     // Returns true if the session and 'opClient's AuthorizationSession share an
     // authenticated user. If either object has impersonated users,
     // those users will be considered as 'authenticated' for the purpose of this check.
     //
-    // The existence of 'opClient' must be guaranteed through locks taken by the caller.
-    virtual bool isCoauthorizedWithClient(Client* opClient) = 0;
+    // The existence of 'opClient' must be guaranteed through locks taken by the caller,
+    // as demonstrated by opClientLock which must be a lock taken on opClient.
+    //
+    // Returns true if the current auth session and the opClient's auth session have users
+    // in common.
+    virtual bool isCoauthorizedWithClient(Client* opClient, WithLock opClientLock) = 0;
 
-    // Returns true if the session and 'userNameIter' share an authenticated user, or if both have
-    // no authenticated users. Impersonated users are not considered as 'authenticated' for the
-    // purpose of this check. This always returns true if auth is not enabled.
-    virtual bool isCoauthorizedWith(UserNameIterator userNameIter) = 0;
-
-    // Tells whether impersonation is active or not.  This state is set when
-    // setImpersonatedUserData is called and cleared when clearImpersonatedUserData is
-    // called.
-    virtual bool isImpersonating() const = 0;
+    // Returns true if the specified userName is the currently authenticated user,
+    // or if the session is unauthenticated and `boost::none` is specified.
+    // Impersonated users are not considered as 'authenticated' for the purpose of this check.
+    // This always returns true if auth is not enabled.
+    virtual bool isCoauthorizedWith(const boost::optional<UserName>& userName) = 0;
 
     // Returns a status encoding whether the current session in the specified `opCtx` has privilege
     // to access a cursor in the specified `cursorSessionId` parameter.  Returns `Status::OK()`,
     // when the session is accessible.  Returns a `mongo::Status` with information regarding the
     // nature of session inaccessibility when the session is not accessible.
     virtual Status checkCursorSessionPrivilege(
-        OperationContext* const opCtx, boost::optional<LogicalSessionId> cursorSessionId) = 0;
+        OperationContext* opCtx, boost::optional<LogicalSessionId> cursorSessionId) = 0;
 
-protected:
-    virtual std::tuple<std::vector<UserName>*, std::vector<RoleName>*> _getImpersonations() = 0;
+    // Verify the authorization contract. If contract == nullptr, no check is performed.
+    virtual void verifyContract(const AuthorizationContract* contract) const = 0;
+
+    // Returns true if any user has the privilege to bypass write blocking mode for the cluster
+    // resource.
+    virtual bool mayBypassWriteBlockingMode() const = 0;
+
+    // Returns true if the authorization session is expired. When this returns true,
+    // isAuthenticated() is also expected to return false.
+    virtual bool isExpired() const = 0;
+
+    // When the current authorization will expire.
+    // boost::none indicates a non-expiring session.
+    virtual const boost::optional<Date_t>& getExpiration() const = 0;
 };
 
 // Returns a status encoding whether the current session in the specified `opCtx` has privilege to

@@ -1,6 +1,3 @@
-// fts_matcher_test.cpp
-
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,9 +27,15 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <fmt/format.h>
+#include <memory>
 
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/fts/fts_matcher.h"
+#include "mongo/db/fts/fts_util.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
@@ -47,14 +50,10 @@ TEST(FTSMatcher, NegWild1) {
     q.setCaseSensitive(false);
     q.setDiacriticSensitive(false);
     ASSERT(q.parse(TEXT_INDEX_VERSION_3).isOK());
-    FTSMatcher m(q,
-                 FTSSpec(assertGet(FTSSpec::fixSpec(BSON("key" << BSON("$**"
-                                                                       << "text"))))));
+    FTSMatcher m(q, FTSSpec(assertGet(FTSSpec::fixSpec(BSON("key" << BSON("$**" << "text"))))));
 
-    ASSERT(m.hasNegativeTerm(BSON("x" << BSON("y"
-                                              << "bar"))));
-    ASSERT(m.hasNegativeTerm(BSON("x" << BSON("y"
-                                              << "bar"))));
+    ASSERT(m.hasNegativeTerm(BSON("x" << BSON("y" << "bar"))));
+    ASSERT(m.hasNegativeTerm(BSON("x" << BSON("y" << "bar"))));
 }
 
 // Regression test for SERVER-11994.
@@ -65,14 +64,10 @@ TEST(FTSMatcher, NegWild2) {
     q.setCaseSensitive(false);
     q.setDiacriticSensitive(false);
     ASSERT(q.parse(TEXT_INDEX_VERSION_3).isOK());
-    FTSMatcher m(q,
-                 FTSSpec(assertGet(FTSSpec::fixSpec(BSON("key" << BSON("$**"
-                                                                       << "text"))))));
+    FTSMatcher m(q, FTSSpec(assertGet(FTSSpec::fixSpec(BSON("key" << BSON("$**" << "text"))))));
 
-    ASSERT(m.hasNegativeTerm(BSON("x" << BSON("y"
-                                              << "pizza restaurant"))));
-    ASSERT(m.hasNegativeTerm(BSON("x" << BSON("y"
-                                              << "PIZZA RESTAURANT"))));
+    ASSERT(m.hasNegativeTerm(BSON("x" << BSON("y" << "pizza restaurant"))));
+    ASSERT(m.hasNegativeTerm(BSON("x" << BSON("y" << "PIZZA RESTAURANT"))));
 }
 
 TEST(FTSMatcher, Phrase1) {
@@ -82,23 +77,15 @@ TEST(FTSMatcher, Phrase1) {
     q.setCaseSensitive(false);
     q.setDiacriticSensitive(false);
     ASSERT(q.parse(TEXT_INDEX_VERSION_3).isOK());
-    FTSMatcher m(q,
-                 FTSSpec(assertGet(FTSSpec::fixSpec(BSON("key" << BSON("$**"
-                                                                       << "text"))))));
+    FTSMatcher m(q, FTSSpec(assertGet(FTSSpec::fixSpec(BSON("key" << BSON("$**" << "text"))))));
 
-    ASSERT(m.positivePhrasesMatch(BSON("x"
-                                       << "table top")));
-    ASSERT(m.positivePhrasesMatch(BSON("x"
-                                       << " asd table top asd")));
-    ASSERT(!m.positivePhrasesMatch(BSON("x"
-                                        << "tablz top")));
-    ASSERT(!m.positivePhrasesMatch(BSON("x"
-                                        << " asd tablz top asd")));
+    ASSERT(m.positivePhrasesMatch(BSON("x" << "table top")));
+    ASSERT(m.positivePhrasesMatch(BSON("x" << " asd table top asd")));
+    ASSERT(!m.positivePhrasesMatch(BSON("x" << "tablz top")));
+    ASSERT(!m.positivePhrasesMatch(BSON("x" << " asd tablz top asd")));
 
-    ASSERT(m.positivePhrasesMatch(BSON("x"
-                                       << "table top")));
-    ASSERT(!m.positivePhrasesMatch(BSON("x"
-                                        << "table a top")));
+    ASSERT(m.positivePhrasesMatch(BSON("x" << "table top")));
+    ASSERT(!m.positivePhrasesMatch(BSON("x" << "table a top")));
 }
 
 TEST(FTSMatcher, Phrase2) {
@@ -108,9 +95,7 @@ TEST(FTSMatcher, Phrase2) {
     q.setCaseSensitive(false);
     q.setDiacriticSensitive(false);
     ASSERT(q.parse(TEXT_INDEX_VERSION_3).isOK());
-    FTSMatcher m(q,
-                 FTSSpec(assertGet(FTSSpec::fixSpec(BSON("key" << BSON("x"
-                                                                       << "text"))))));
+    FTSMatcher m(q, FTSSpec(assertGet(FTSSpec::fixSpec(BSON("key" << BSON("x" << "text"))))));
     ASSERT(m.positivePhrasesMatch(BSON("x" << BSON_ARRAY("table top"))));
 }
 
@@ -123,14 +108,11 @@ TEST(FTSMatcher, ParsesUsingDocLanguage) {
     q.setCaseSensitive(false);
     q.setDiacriticSensitive(false);
     ASSERT(q.parse(TEXT_INDEX_VERSION_3).isOK());
-    FTSMatcher m(q,
-                 FTSSpec(assertGet(FTSSpec::fixSpec(BSON("key" << BSON("x"
-                                                                       << "text"))))));
+    FTSMatcher m(q, FTSSpec(assertGet(FTSSpec::fixSpec(BSON("key" << BSON("x" << "text"))))));
 
     // Even though the search language is "none", the document {x: "gladly"} should be
     // parsed using the English stemmer, and as such should match the negated term "glad".
-    ASSERT(m.hasNegativeTerm(BSON("x"
-                                  << "gladly")));
+    ASSERT(m.hasNegativeTerm(BSON("x" << "gladly")));
 }
 
 // Test the matcher does not filter out stop words from positive terms
@@ -141,12 +123,9 @@ TEST(FTSMatcher, MatcherDoesNotFilterStopWordsNeg) {
     q.setCaseSensitive(false);
     q.setDiacriticSensitive(false);
     ASSERT(q.parse(TEXT_INDEX_VERSION_3).isOK());
-    FTSMatcher m(q,
-                 FTSSpec(assertGet(FTSSpec::fixSpec(BSON("key" << BSON("x"
-                                                                       << "text"))))));
+    FTSMatcher m(q, FTSSpec(assertGet(FTSSpec::fixSpec(BSON("key" << BSON("x" << "text"))))));
 
-    ASSERT(m.hasNegativeTerm(BSON("x"
-                                  << "the")));
+    ASSERT(m.hasNegativeTerm(BSON("x" << "the")));
 }
 
 // Test the matcher does not filter out stop words from negative terms
@@ -157,12 +136,9 @@ TEST(FTSMatcher, MatcherDoesNotFilterStopWordsPos) {
     q.setCaseSensitive(false);
     q.setDiacriticSensitive(false);
     ASSERT(q.parse(TEXT_INDEX_VERSION_3).isOK());
-    FTSMatcher m(q,
-                 FTSSpec(assertGet(FTSSpec::fixSpec(BSON("key" << BSON("x"
-                                                                       << "text"))))));
+    FTSMatcher m(q, FTSSpec(assertGet(FTSSpec::fixSpec(BSON("key" << BSON("x" << "text"))))));
 
-    ASSERT(m.hasPositiveTerm(BSON("x"
-                                  << "the")));
+    ASSERT(m.hasPositiveTerm(BSON("x" << "the")));
 }
 
 // Returns whether a document indexed with text data 'doc' contains any positive terms from
@@ -174,9 +150,7 @@ static bool docHasPositiveTermWithCase(const std::string& doc, const std::string
     q.setCaseSensitive(true);
     q.setDiacriticSensitive(false);
     ASSERT(q.parse(TEXT_INDEX_VERSION_3).isOK());
-    FTSMatcher m(q,
-                 FTSSpec(assertGet(FTSSpec::fixSpec(BSON("key" << BSON("x"
-                                                                       << "text"))))));
+    FTSMatcher m(q, FTSSpec(assertGet(FTSSpec::fixSpec(BSON("key" << BSON("x" << "text"))))));
 
     return m.hasPositiveTerm(BSON("x" << doc));
 }
@@ -205,9 +179,7 @@ static bool docHasNegativeTermWithCase(const std::string& doc, const std::string
     q.setCaseSensitive(true);
     q.setDiacriticSensitive(false);
     ASSERT(q.parse(TEXT_INDEX_VERSION_3).isOK());
-    FTSMatcher m(q,
-                 FTSSpec(assertGet(FTSSpec::fixSpec(BSON("key" << BSON("x"
-                                                                       << "text"))))));
+    FTSMatcher m(q, FTSSpec(assertGet(FTSSpec::fixSpec(BSON("key" << BSON("x" << "text"))))));
 
     return m.hasNegativeTerm(BSON("x" << doc));
 }
@@ -236,9 +208,7 @@ static bool docPositivePhrasesMatchWithCase(const std::string& doc, const std::s
     q.setCaseSensitive(true);
     q.setDiacriticSensitive(false);
     ASSERT(q.parse(TEXT_INDEX_VERSION_3).isOK());
-    FTSMatcher m(q,
-                 FTSSpec(assertGet(FTSSpec::fixSpec(BSON("key" << BSON("x"
-                                                                       << "text"))))));
+    FTSMatcher m(q, FTSSpec(assertGet(FTSSpec::fixSpec(BSON("key" << BSON("x" << "text"))))));
 
     return m.positivePhrasesMatch(BSON("x" << doc));
 }
@@ -263,9 +233,7 @@ static bool docNegativePhrasesMatchWithCase(const std::string& doc, const std::s
     q.setCaseSensitive(true);
     q.setDiacriticSensitive(false);
     ASSERT(q.parse(TEXT_INDEX_VERSION_3).isOK());
-    FTSMatcher m(q,
-                 FTSSpec(assertGet(FTSSpec::fixSpec(BSON("key" << BSON("x"
-                                                                       << "text"))))));
+    FTSMatcher m(q, FTSSpec(assertGet(FTSSpec::fixSpec(BSON("key" << BSON("x" << "text"))))));
 
     return m.negativePhrasesMatch(BSON("x" << doc));
 }
@@ -281,5 +249,5 @@ TEST(FTSMatcher, NegativePhrasesMatchWithCase) {
     ASSERT_FALSE(docNegativePhrasesMatchWithCase("John Runs", "-\"n R\""));
     ASSERT_FALSE(docNegativePhrasesMatchWithCase("John Runs", "-\"John\" -\"Running\""));
 }
-}
-}
+}  // namespace fts
+}  // namespace mongo

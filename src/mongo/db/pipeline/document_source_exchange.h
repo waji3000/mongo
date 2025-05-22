@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,15 +29,39 @@
 
 #pragma once
 
+#include <cstddef>
+#include <cstdint>
 #include <deque>
+#include <limits>
+#include <memory>
+#include <set>
+#include <string>
 #include <vector>
 
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/bson/ordering.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/exchange_spec_gen.h"
+#include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/field_path.h"
+#include "mongo/db/pipeline/pipeline.h"
+#include "mongo/db/pipeline/stage_constraints.h"
+#include "mongo/db/pipeline/variables.h"
+#include "mongo/db/query/query_shape/serialization_options.h"
+#include "mongo/db/resource_yielder.h"
 #include "mongo/stdx/condition_variable.h"
 #include "mongo/stdx/mutex.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/intrusive_counter.h"
 
 namespace mongo {
 
@@ -72,8 +95,19 @@ class Exchange : public RefCountable {
     static std::vector<FieldPath> extractKeyPaths(const BSONObj& keyPattern);
 
 public:
+    /**
+     * Create an exchange. 'pipeline' represents the input to the exchange operator and must not be
+     * nullptr.
+     **/
     Exchange(ExchangeSpec spec, std::unique_ptr<Pipeline, PipelineDeleter> pipeline);
-    DocumentSource::GetNextResult getNext(OperationContext* opCtx, size_t consumerId);
+
+    /**
+     * Interface for retrieving the next document. 'resourceYielder' is optional, and if provided,
+     * will be used to give up resources while waiting for other threads to empty their buffers.
+     */
+    DocumentSource::GetNextResult getNext(OperationContext* opCtx,
+                                          size_t consumerId,
+                                          ResourceYielder* resourceYielder);
 
     size_t getConsumers() const {
         return _consumers.size();
@@ -181,11 +215,18 @@ private:
 
 class DocumentSourceExchange final : public DocumentSource {
 public:
-    DocumentSourceExchange(const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                           const boost::intrusive_ptr<Exchange> exchange,
-                           size_t consumerId);
+    static constexpr StringData kStageName = "$_internalExchange"_sd;
 
-    GetNextResult getNext() final;
+    /**
+     * Create an Exchange consumer. 'resourceYielder' is so the exchange may temporarily yield
+     * resources (such as the Session) while waiting for other threads to do
+     * work. 'resourceYielder' may be nullptr if there are no resources which need to be given up
+     * while waiting.
+     */
+    DocumentSourceExchange(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                           boost::intrusive_ptr<Exchange> exchange,
+                           size_t consumerId,
+                           std::unique_ptr<ResourceYielder> yielder);
 
     StageConstraints constraints(Pipeline::SplitState pipeState) const final {
         return {StreamType::kStreaming,
@@ -193,22 +234,32 @@ public:
                 HostTypeRequirement::kNone,
                 DiskUseRequirement::kNoDiskUse,
                 FacetRequirement::kAllowed,
-                TransactionRequirement::kAllowed};
+                TransactionRequirement::kAllowed,
+                LookupRequirement::kNotAllowed,
+                UnionRequirement::kNotAllowed};
+    }
+
+    boost::optional<DistributedPlanLogic> distributedPlanLogic() final {
+        return boost::none;
     }
 
     const char* getSourceName() const final;
 
-    Value serialize(boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final;
+    static const Id& id;
+
+    Id getId() const override {
+        return id;
+    }
+
+    Value serialize(const SerializationOptions& opts = SerializationOptions{}) const final;
 
     /**
      * DocumentSourceExchange does not have a direct source (it is reading through the shared
      * Exchange pipeline).
      */
-    void setSource(DocumentSource* source) final {
+    void setSource(Stage* source) final {
         invariant(!source);
     }
-
-    GetNextResult getNext(size_t consumerId);
 
     size_t getConsumers() const {
         return _exchange->getConsumers();
@@ -219,17 +270,28 @@ public:
     }
 
     void doDispose() final {
-        _exchange->dispose(pExpCtx->opCtx, _consumerId);
+        _exchange->dispose(pExpCtx->getOperationContext(), _consumerId);
     }
 
     auto getConsumerId() const {
         return _consumerId;
     }
 
+    void addVariableRefs(std::set<Variables::Id>* refs) const final {
+        // Any correlation analysis should have happened before this stage was created.
+        MONGO_UNREACHABLE;
+    }
+
 private:
+    GetNextResult doGetNext() final;
+
     boost::intrusive_ptr<Exchange> _exchange;
 
     const size_t _consumerId;
+
+    // While waiting for another thread to make room in its buffer, we may want to yield certain
+    // resources (such as the Session). Through this interface we can do that.
+    std::unique_ptr<ResourceYielder> _resourceYielder;
 };
 
 }  // namespace mongo

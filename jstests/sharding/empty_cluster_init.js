@@ -3,9 +3,15 @@
 // Starts a bunch of mongoses in parallel, and ensures that there's only a single config
 // version initialization.
 //
+// This test manually starts routers with the latest binary which can't connect to config server
+// nodes using the last-lts binary because their wire versions are incompatible.
+// @tags: [multiversion_incompatible]
+//
+
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 var configRS = new ReplSetTest({name: "configRS", nodes: 3, useHostName: true});
-configRS.startSet({configsvr: '', journal: "", storageEngine: 'wiredTiger'});
+configRS.startSet({configsvr: '', storageEngine: 'wiredTiger'});
 var replConfig = configRS.getReplSetConfig();
 replConfig.configsvr = true;
 configRS.initiate(replConfig);
@@ -78,10 +84,7 @@ for (var i = 0; i < mongoses.length; i++) {
 // Check version and that the version was only updated once
 //
 
-assert.eq(5, version.minCompatibleVersion);
-assert.eq(6, version.currentVersion);
-assert(version.clusterId);
-assert.eq(undefined, version.excluding);
+assert.hasFields(version, ['clusterId'], "Version document does not contain cluster ID");
 
 var oplog = configRS.getPrimary().getDB('local').oplog.rs;
 var updates = oplog.find({ns: "config.version"}).toArray();

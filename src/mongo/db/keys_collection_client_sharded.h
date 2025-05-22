@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,7 +29,15 @@
 
 #pragma once
 
+#include <vector>
+
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/db/keys_collection_client.h"
+#include "mongo/db/keys_collection_document_gen.h"
+#include "mongo/db/logical_time.h"
 
 namespace mongo {
 
@@ -41,18 +48,29 @@ public:
     KeysCollectionClientSharded(ShardingCatalogClient*);
 
     /**
-     * Returns keys for the given purpose and with an expiresAt value greater than newerThanThis.
+     * Returns internal keys for the given purpose and have an expiresAt value greater than
+     * newerThanThis on the config server. Uses readConcern level majority if possible.
      */
-    StatusWith<std::vector<KeysCollectionDocument>> getNewKeys(
-        OperationContext* opCtx, StringData purpose, const LogicalTime& newerThanThis) override;
+    StatusWith<std::vector<KeysCollectionDocument>> getNewInternalKeys(
+        OperationContext* opCtx,
+        StringData purpose,
+        const LogicalTime& newerThanThis,
+        bool tryUseMajority) override;
 
     /**
-    * Directly inserts a key document to the storage
-    */
+     * Returns all external (i.e. validation-only) keys for the given purpose on the config server.
+     */
+    StatusWith<std::vector<ExternalKeysCollectionDocument>> getAllExternalKeys(
+        OperationContext* opCtx, StringData purpose) override;
+
+    /**
+     * Directly inserts a key document to the storage
+     */
     Status insertNewKey(OperationContext* opCtx, const BSONObj& doc) override;
 
-    bool supportsMajorityReads() const final {
-        return true;
+    bool mustUseLocalReads() const final {
+        // Reads are always made against the config server with majority read concern.
+        return false;
     }
 
 private:

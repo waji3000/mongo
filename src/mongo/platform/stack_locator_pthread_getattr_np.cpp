@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,7 +27,6 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
 
 #include "mongo/platform/stack_locator.h"
 
@@ -39,12 +37,13 @@
 
 namespace mongo {
 
-StackLocator::StackLocator() {
+StackLocator::StackLocator(const void* capturedStackPointer)
+    : _capturedStackPointer(capturedStackPointer) {
     pthread_t self = pthread_self();
     pthread_attr_t selfAttrs;
     invariant(pthread_attr_init(&selfAttrs) == 0);
     invariant(pthread_getattr_np(self, &selfAttrs) == 0);
-    ON_BLOCK_EXIT(pthread_attr_destroy, &selfAttrs);
+    ON_BLOCK_EXIT([&] { pthread_attr_destroy(&selfAttrs); });
 
     void* base = nullptr;
     size_t size = 0;
@@ -59,7 +58,7 @@ StackLocator::StackLocator() {
     // getstack returns the stack *base*, being the bottom of the
     // stack, so we need to add size to it.
     _end = base;
-    _begin = static_cast<char*>(_end) + size;
+    _begin = static_cast<const char*>(_end) + size;
 }
 
 }  // namespace mongo

@@ -1,0 +1,176 @@
+version: 1.0.0
+filters:
+  - "*analyze_shard_key*":
+    approvers:
+      - 10gen/server-cluster-scalability
+  - "*move*collection*":
+    approvers:
+      - 10gen/server-cluster-scalability
+  - "*move*range*":
+    approvers:
+      - 10gen/server-cluster-scalability
+  - "*query_analyzer*":
+    approvers:
+      - 10gen/server-cluster-scalability
+  - "*refine_collection_shard_key*":
+    approvers:
+      - 10gen/server-cluster-scalability
+  - "*reshard*":
+    approvers:
+      - 10gen/server-cluster-scalability
+  - "session_catalog_router*":
+    approvers:
+      - 10gen/server-cluster-scalability
+  - "*transaction*":
+    approvers:
+      - 10gen/server-transactions
+  - "*txn*":
+    approvers:
+      - 10gen/server-transactions
+  - "*unshard*collection*":
+    approvers:
+      - 10gen/server-cluster-scalability
+  - "cannot_implicitly_create_collection_info.*":
+    approvers:
+      - 10gen/server-catalog-and-routing
+  - "catalog_cache*":
+    approvers:
+      - 10gen/server-catalog-and-routing
+  - "chunk*":
+    approvers:
+      - 10gen/server-catalog-and-routing
+  - "cluster_commands_helpers.*":
+    approvers:
+      - 10gen/server-catalog-and-routing
+  - "cluster_ddl.*":
+    approvers:
+      - 10gen/server-catalog-and-routing
+  - "collection_routing_info_targeter*":
+    approvers:
+      - 10gen/server-catalog-and-routing
+  - "collection_uuid_mismatch.*":
+    approvers:
+      - 10gen/server-catalog-and-routing
+  - "comparable_*":
+    approvers:
+      - 10gen/server-catalog-and-routing
+  - "*catalog_cache_loader*":
+    approvers:
+      - 10gen/server-catalog-and-routing
+  - "database_version*":
+    approvers:
+      - 10gen/server-catalog-and-routing
+  - "index_version*":
+    approvers:
+      - 10gen/server-catalog-and-routing
+  - "resource_yielders*":
+    approvers:
+      - 10gen/server-catalog-and-routing
+  - "router_role*":
+    approvers:
+      - 10gen/server-catalog-and-routing
+  - "routing_*":
+    approvers:
+      - 10gen/server-catalog-and-routing
+  - "mongos.cpp":
+    approvers:
+      - 10gen/server-programmability
+  - "mongos_main*":
+    approvers:
+      - 10gen/server-programmability
+  - "mongos_options_*":
+    approvers:
+      - 10gen/server-programmability
+  - "service_entry_point*":
+    approvers:
+      - 10gen/server-programmability
+  - "shard_cannot_refresh_due_to_locks_held_exception*":
+    approvers:
+      - 10gen/server-catalog-and-routing
+  - "shard_key_pattern*":
+    approvers:
+      - 10gen/server-catalog-and-routing
+  - "shard_version*":
+    approvers:
+      - 10gen/server-catalog-and-routing
+  - "sharding_index_catalog_cache*":
+    approvers:
+      - 10gen/server-catalog-and-routing
+  - "sharding_state*":
+    approvers:
+      - 10gen/server-catalog-and-routing
+  - "sharding_types.idl":
+    approvers:
+      - 10gen/server-catalog-and-routing
+  - "stale_exception*":
+    approvers:
+      - 10gen/server-catalog-and-routing
+  - "stale_shard_version_helpers*":
+    approvers:
+      - 10gen/server-catalog-and-routing
+  - "type_collection_common_types.idl":
+    approvers:
+      - 10gen/server-catalog-and-routing
+  - "balancer_configuration*":
+    approvers:
+      - 10gen/server-catalog-and-routing
+  - "gossiped_routing_cache.idl":
+    approvers:
+      - 10gen/server-catalog-and-routing
+  - "grid.*":
+    approvers:
+      - 10gen/server-catalog-and-routing
+  - "mongod_and_mongos_server_parameters.idl":
+    approvers:
+      - 10gen/server-catalog-and-routing
+  - "*ns_targeter*":
+    approvers:
+      - 10gen/server-catalog-and-routing
+  - "s_sharding_server_status.cpp":
+    approvers:
+      - 10gen/server-catalog-and-routing
+  - "sessions_collection_sharded*":
+    approvers:
+      - 10gen/server-catalog-and-routing
+  - "shard_util*":
+    approvers:
+      - 10gen/server-catalog-and-routing
+  - "*cluster_parameter*":
+    approvers:
+      - 10gen/server-catalog-and-routing
+  - "sharding_feature_flag*":
+    approvers:
+      - 10gen/server-catalog-and-routing
+  - "sharding_initialization*":
+    approvers:
+      - 10gen/server-catalog-and-routing
+  - "sharding_mongos_test_fixture*":
+    approvers:
+      - 10gen/server-catalog-and-routing
+  - "sharding_test_fixture_common*":
+    approvers:
+      - 10gen/server-catalog-and-routing
+  - "*metadata_consistency*":
+    approvers:
+      - 10gen/server-catalog-and-routing
+  - "cluster_cursor_stats.cpp":
+    approvers:
+      - 10gen/query-execution-router
+  - "cluster_write*":
+    approvers:
+      - 10gen/query-execution-router
+  - "shard_targeting_helpers*":
+    approvers:
+      - 10gen/query-optimization
+  - "append_raw_responses_test.cpp":
+    approvers:
+      - 10gen/server-networking-and-observability
+  - "async_requests_sender*":
+    approvers:
+      - 10gen/server-networking-and-observability
+  - "async_rpc_shard*":
+    approvers:
+      - 10gen/server-networking-and-observability
+  - "load_balancer_support*":
+    approvers:
+      - 10gen/server-networking-and-observability

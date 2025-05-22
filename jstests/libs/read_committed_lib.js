@@ -4,24 +4,24 @@
  * by a mongos instance then the associated cluster should have only a single shard. 'rst' is the
  * ReplSetTest instance associated with the replica set/shard.
  */
-function testReadCommittedLookup(db, secondary, rst) {
+
+import {restartServerReplication, stopServerReplication} from "jstests/libs/write_concern_util.js";
+
+export function testReadCommittedLookup(db, secondary, rst) {
     /**
-     * Uses the 'rsSyncApplyStop' fail point to stop application of oplog entries on the given
-     * secondary.
+     * stopServerReplication uses the 'stopReplProducer' fail point to stop server replication on
+     * the given secondary.
      */
     function pauseReplication(sec) {
-        assert.commandWorked(
-            sec.adminCommand({configureFailPoint: "rsSyncApplyStop", mode: "alwaysOn"}),
-            "failed to enable fail point on secondary");
+        stopServerReplication(sec);
     }
 
     /**
-     * Turns off the 'rsSyncApplyStop' fail point to resume application of oplog entries on the
+     * Turns off the 'stopReplProducer' fail point to resume server replication on the
      * given secondary.
      */
     function resumeReplication(sec) {
-        assert.commandWorked(sec.adminCommand({configureFailPoint: "rsSyncApplyStop", mode: "off"}),
-                             "failed to disable fail point on secondary");
+        restartServerReplication(sec);
     }
 
     const aggCmdLookupObj = {
@@ -80,11 +80,16 @@ function testReadCommittedLookup(db, secondary, rst) {
     }];
 
     // Confirm lookup/graphLookup return the matched result.
-    let result = db.runCommand(aggCmdLookupObj).cursor.firstBatch;
+    let result = assert.commandWorked(db.runCommand(aggCmdLookupObj)).cursor.firstBatch;
     assert.eq(result, expectedMatchedResult);
 
-    result = db.runCommand(aggCmdGraphLookupObj).cursor.firstBatch;
+    result = assert.commandWorked(db.runCommand(aggCmdGraphLookupObj)).cursor.firstBatch;
     assert.eq(result, expectedMatchedResult);
+
+    // Run finds on the two collections to ensure that no background tasks can trigger refreshes on
+    // the primary.
+    assert.commandWorked(db.runCommand({find: "local", $readPreference: {mode: "secondary"}}));
+    assert.commandWorked(db.runCommand({find: "foreign", $readPreference: {mode: "secondary"}}));
 
     // Stop oplog application on the secondary so that it won't acknowledge updates.
     pauseReplication(secondary);
@@ -94,10 +99,10 @@ function testReadCommittedLookup(db, secondary, rst) {
 
     // lookup/graphLookup should not see the update, since it has not been acknowledged by the
     // secondary.
-    result = db.runCommand(aggCmdLookupObj).cursor.firstBatch;
+    result = assert.commandWorked(db.runCommand(aggCmdLookupObj)).cursor.firstBatch;
     assert.eq(result, expectedMatchedResult);
 
-    result = db.runCommand(aggCmdGraphLookupObj).cursor.firstBatch;
+    result = assert.commandWorked(db.runCommand(aggCmdGraphLookupObj)).cursor.firstBatch;
     assert.eq(result, expectedMatchedResult);
 
     // Restart oplog application on the secondary and wait for it's snapshot to catch up.
@@ -105,9 +110,9 @@ function testReadCommittedLookup(db, secondary, rst) {
     rst.awaitLastOpCommitted();
 
     // Now lookup/graphLookup should report that the documents don't match.
-    result = db.runCommand(aggCmdLookupObj).cursor.firstBatch;
+    result = assert.commandWorked(db.runCommand(aggCmdLookupObj)).cursor.firstBatch;
     assert.eq(result, expectedUnmatchedResult);
 
-    result = db.runCommand(aggCmdGraphLookupObj).cursor.firstBatch;
+    result = assert.commandWorked(db.runCommand(aggCmdGraphLookupObj)).cursor.firstBatch;
     assert.eq(result, expectedUnmatchedResult);
 }

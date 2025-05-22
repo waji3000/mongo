@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,14 +27,10 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/util/net/ssl_options.h"
-
-#include <boost/filesystem/operations.hpp>
 
 #include "mongo/base/status.h"
 #include "mongo/config.h"
+#include "mongo/util/net/ssl_options.h"
 #include "mongo/util/options_parser/startup_option_init.h"
 #include "mongo/util/options_parser/startup_options.h"
 
@@ -44,144 +39,19 @@
 #endif
 
 using namespace mongo;
-namespace moe = mongo::optionenvironment;
-using std::string;
 
 namespace {
-MONGO_GENERAL_STARTUP_OPTIONS_REGISTER(SSLClientOptions)(InitializerContext*) {
-    auto& options = moe::startupOptions;
-
-    options.addOptionChaining(
-        "tls", "tls", moe::Switch, "use TLS for all connections", {"ssl"}, {"ssl"});
-
-    options
-        .addOptionChaining("tls.CAFile",
-                           "tlsCAFile",
-                           moe::String,
-                           "Certificate Authority file for TLS",
-                           {"ssl.CAFile"},
-                           {"sslCAFile"})
-        .requires("tls");
-
-    options
-        .addOptionChaining("tls.PEMKeyFile",
-                           "tlsPEMKeyFile",
-                           moe::String,
-                           "PEM certificate/key file for TLS",
-                           {"ssl.PEMKeyFile"},
-                           {"sslPEMKeyFile"})
-        .requires("tls");
-
-    options
-        .addOptionChaining("tls.PEMKeyPassword",
-                           "tlsPEMKeyPassword",
-                           moe::String,
-                           "Password for key in PEM file for TLS",
-                           {"ssl.PEMKeyPassword"},
-                           {"sslPEMKeyPassword"})
-        .requires("tls");
-
-    options
-        .addOptionChaining("tls.CRLFile",
-                           "tlsCRLFile",
-                           moe::String,
-                           "Certificate Revocation List file for TLS",
-                           {"ssl.CRLFile"},
-                           {"sslCRLFile"})
-        .requires("tls")
-        .requires("tls.CAFile");
-
-    options
-        .addOptionChaining("net.tls.allowInvalidHostnames",
-                           "tlsAllowInvalidHostnames",
-                           moe::Switch,
-                           "Allow connections to servers with non-matching hostnames",
-                           {"net.ssl.allowInvalidHostnames"},
-                           {"sslAllowInvalidHostnames"})
-        .requires("tls");
-
-    options
-        .addOptionChaining("tls.allowInvalidCertificates",
-                           "tlsAllowInvalidCertificates",
-                           moe::Switch,
-                           "Allow connections to servers with invalid certificates",
-                           {"ssl.allowInvalidCertificates"},
-                           {"sslAllowInvalidCertificates"})
-        .requires("tls");
-
-    options.addOptionChaining("tls.FIPSMode",
-                              "tlsFIPSMode",
-                              moe::Switch,
-                              "Activate FIPS 140-2 mode at startup",
-                              {"ssl.FIPSMode"},
-                              {"sslFIPSMode"});
-
-#ifdef MONGO_CONFIG_SSL_CERTIFICATE_SELECTORS
-    options
-        .addOptionChaining("tls.certificateSelector",
-                           "tlsCertificateSelector",
-                           moe::String,
-                           "TLS Certificate in system store",
-                           {"ssl.certificateSelector"},
-                           {"sslCertificateSelector"})
-        .incompatibleWith("tls.PEMKeyFile")
-        .incompatibleWith("tls.PEMKeyPassword");
-#endif
-
-    options.addOptionChaining(
-        "tls.disabledProtocols",
-        "tlsDisabledProtocols",
-        moe::String,
-        "Comma separated list of TLS protocols to disable [TLS1_0,TLS1_1,TLS1_2]",
-        {"ssl.disabledProtocols"},
-        {"sslDisabledProtocols"});
-
-    return Status::OK();
-}
 
 MONGO_STARTUP_OPTIONS_STORE(SSLClientOptions)(InitializerContext*) {
-    const auto& params = moe::startupOptionsParsed;
+    const auto& params = mongo::optionenvironment::startupOptionsParsed;
 
     if (params.count("tls") && params["tls"].as<bool>() == true) {
         sslGlobalParams.sslMode.store(SSLParams::SSLMode_requireSSL);
     }
 
-    if (params.count("tls.PEMKeyFile")) {
-        sslGlobalParams.sslPEMKeyFile = params["tls.PEMKeyFile"].as<std::string>();
-    }
-
-    if (params.count("tls.PEMKeyPassword")) {
-        sslGlobalParams.sslPEMKeyPassword = params["tls.PEMKeyPassword"].as<std::string>();
-    }
-
-    if (params.count("tls.CAFile")) {
-        sslGlobalParams.sslCAFile = params["tls.CAFile"].as<std::string>();
-    }
-
-    if (params.count("tls.CRLFile")) {
-        sslGlobalParams.sslCRLFile = params["tls.CRLFile"].as<std::string>();
-    }
-
-
-    if (params.count("net.tls.allowInvalidHostnames")) {
-        sslGlobalParams.sslAllowInvalidHostnames =
-            params["net.tls.allowInvalidHostnames"].as<bool>();
-    }
-
-    if (params.count("tls.allowInvalidCertificates")) {
-        sslGlobalParams.sslAllowInvalidCertificates = true;
-    }
-
-    if (params.count("tls.FIPSMode")) {
-        sslGlobalParams.sslFIPSMode = true;
-    }
-
     if (params.count("tls.disabledProtocols")) {
-        const auto status =
-            storeSSLDisabledProtocols(params["tls.disabledProtocols"].as<std::string>());
-        if (!status.isOK()) {
-            return status;
-        }
+        uassertStatusOK(
+            storeSSLDisabledProtocols(params["tls.disabledProtocols"].as<std::string>()));
 #if ((MONGO_CONFIG_SSL_PROVIDER != MONGO_CONFIG_SSL_PROVIDER_OPENSSL) || \
      (OPENSSL_VERSION_NUMBER >= 0x100000cf)) /* 1.0.0l */
     } else {
@@ -194,21 +64,21 @@ MONGO_STARTUP_OPTIONS_STORE(SSLClientOptions)(InitializerContext*) {
          */
         sslGlobalParams.sslDisabledProtocols.push_back(SSLParams::Protocols::TLS1_0);
 #endif
+#if (MONGO_CONFIG_SSL_PROVIDER != MONGO_CONFIG_SSL_PROVIDER_OPENSSL) || \
+    (OPENSSL_VERSION_NUMBER >= 0x1000106f) /* 1.0.1f */
+        // Disables TLS 1.1 as well for clients which support TLS 1.2 and later.
+        sslGlobalParams.sslDisabledProtocols.push_back(SSLParams::Protocols::TLS1_1);
+#endif
     }
 
 #ifdef MONGO_CONFIG_SSL_CERTIFICATE_SELECTORS
     if (params.count("tls.certificateSelector")) {
-        const auto status =
+        uassertStatusOK(
             parseCertificateSelector(&sslGlobalParams.sslCertificateSelector,
                                      "tls.certificateSelector",
-                                     params["tls.certificateSelector"].as<std::string>());
-        if (!status.isOK()) {
-            return status;
-        }
+                                     params["tls.certificateSelector"].as<std::string>()));
     }
 #endif
-
-    return Status::OK();
 }
 
 }  // namespace

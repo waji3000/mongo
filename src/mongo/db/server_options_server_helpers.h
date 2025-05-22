@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,32 +29,22 @@
 
 #pragma once
 
+#include <iosfwd>
+#include <string>
+#include <vector>
+
 #include "mongo/base/status.h"
 #include "mongo/util/options_parser/environment.h"
 #include "mongo/util/options_parser/option_section.h"
 
 namespace mongo {
 
-namespace optionenvironment {
-class OptionSection;
-class Environment;
-}  // namespace optionenvironment
-
-namespace moe = mongo::optionenvironment;
-
-/**
- * General server options for most standalone applications. Includes addBaseServerOptions.
- */
-Status addGeneralServerOptions(moe::OptionSection* options);
-
-Status addWindowsServerOptions(moe::OptionSection* options);
-
 /**
  * Handle custom validation of server options that can not currently be done by using
  * Constraints in the Environment.  See the "validate" function in the Environment class for
  * more details.
  */
-Status validateServerOptions(const moe::Environment& params);
+Status validateServerOptions(const optionenvironment::Environment& params);
 
 /**
  * Canonicalize server options for the given environment.
@@ -63,7 +52,7 @@ Status validateServerOptions(const moe::Environment& params);
  * For example, the options "objcheck", "noobjcheck", and "net.wireObjectCheck" should all be
  * merged into "net.wireObjectCheck".
  */
-Status canonicalizeServerOptions(moe::Environment* params);
+Status canonicalizeServerOptions(optionenvironment::Environment* params);
 
 /**
  * Sets up the global server state necessary to be able to store the server options, based on how
@@ -79,8 +68,11 @@ Status setupServerOptions(const std::vector<std::string>& args);
  *
  * For example, sets the serverGlobalParams.port variable based on the net.port config parameter.
  */
-Status storeServerOptions(const moe::Environment& params);
+Status storeServerOptions(const optionenvironment::Environment& params);
 
-void printCommandLineOpts();
+/**
+ * Write to `os`, or to LOGV2 if null.
+ */
+void printCommandLineOpts(std::ostream* os);
 
 }  // namespace mongo

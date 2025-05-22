@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,18 +27,20 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
 
-#include "mongo/platform/basic.h"
+#include <boost/move/utility_core.hpp>
 
-#include "mongo/db/s/chunk_move_write_concern_options.h"
-
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/replication_coordinator.h"
-#include "mongo/db/service_context.h"
+#include "mongo/db/s/chunk_move_write_concern_options.h"
 #include "mongo/s/request_types/migration_secondary_throttle_options.h"
-#include "mongo/util/log.h"
+#include "mongo/util/duration.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
+
 
 namespace mongo {
 namespace {
@@ -54,7 +55,7 @@ const WriteConcernOptions kWriteConcernLocal(1,
 
 WriteConcernOptions getDefaultWriteConcernForMigration(OperationContext* opCtx) {
     repl::ReplicationCoordinator* replCoordinator = repl::ReplicationCoordinator::get(opCtx);
-    if (replCoordinator->getReplicationMode() == mongo::repl::ReplicationCoordinator::modeReplSet) {
+    if (replCoordinator->getSettings().isReplSet()) {
         Status status =
             replCoordinator->checkIfWriteConcernCanBeSatisfied(kDefaultWriteConcernForMigration);
         if (status.isOK()) {
@@ -71,11 +72,7 @@ StatusWith<WriteConcernOptions> ChunkMoveWriteConcernOptions::getEffectiveWriteC
     OperationContext* opCtx, const MigrationSecondaryThrottleOptions& options) {
     auto secondaryThrottle = options.getSecondaryThrottle();
     if (secondaryThrottle == MigrationSecondaryThrottleOptions::kDefault) {
-        if (opCtx->getServiceContext()->getStorageEngine()->supportsDocLocking()) {
-            secondaryThrottle = MigrationSecondaryThrottleOptions::kOff;
-        } else {
-            secondaryThrottle = MigrationSecondaryThrottleOptions::kOn;
-        }
+        secondaryThrottle = MigrationSecondaryThrottleOptions::kOff;
     }
 
     if (secondaryThrottle == MigrationSecondaryThrottleOptions::kOff) {
@@ -97,10 +94,10 @@ StatusWith<WriteConcernOptions> ChunkMoveWriteConcernOptions::getEffectiveWriteC
         writeConcern = getDefaultWriteConcernForMigration(opCtx);
     }
 
-    if (writeConcern.shouldWaitForOtherNodes() &&
+    if (writeConcern.needToWaitForOtherNodes() &&
         writeConcern.wTimeout == WriteConcernOptions::kNoTimeout) {
         // Don't allow no timeout
-        writeConcern.wTimeout = durationCount<Milliseconds>(kDefaultWriteTimeoutForMigration);
+        writeConcern.wTimeout = duration_cast<Milliseconds>(kDefaultWriteTimeoutForMigration);
     }
 
     return writeConcern;

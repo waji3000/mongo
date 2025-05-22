@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -44,40 +43,66 @@ class ServiceContext;
 struct ShardingStatistics {
     // Counts how many times threads hit stale config exception (which is what triggers metadata
     // refreshes).
-    AtomicInt64 countStaleConfigErrors{0};
+    AtomicWord<long long> countStaleConfigErrors{0};
 
     // Cumulative, always-increasing counter of how many chunks this node has started to donate
     // (whether they succeeded or not).
-    AtomicInt64 countDonorMoveChunkStarted{0};
+    AtomicWord<long long> countDonorMoveChunkStarted{0};
+
+    // Cumulative, always-increasing counter of how many chunks this node successfully committed.
+    AtomicWord<long long> countDonorMoveChunkCommitted{0};
+
+    // Cumulative, always-increasing counter of how many move chunks this node aborted.
+    AtomicWord<long long> countDonorMoveChunkAborted{0};
 
     // Cumulative, always-increasing counter of how much time the entire move chunk operation took
     // (excluding range deletion).
-    AtomicInt64 totalDonorMoveChunkTimeMillis{0};
+    AtomicWord<long long> totalDonorMoveChunkTimeMillis{0};
 
     // Cumulative, always-increasing counter of how much time the clone phase took on the donor
     // node, before it was appropriate to enter the critical section.
-    AtomicInt64 totalDonorChunkCloneTimeMillis{0};
+    AtomicWord<long long> totalDonorChunkCloneTimeMillis{0};
 
     // Cumulative, always-increasing counter of how many documents have been cloned on the
     // recipient node.
-    AtomicInt64 countDocsClonedOnRecipient{0};
+    AtomicWord<long long> countDocsClonedOnRecipient{0};
+
+    // Cumulative, always-increasing counter of how many documents have been cloned on the catch up
+    // phase on the recipient node.
+    AtomicWord<long long> countDocsClonedOnCatchUpOnRecipient{0};
+
+    // Cumulative, always-increasing counter of how many bytes have been cloned on the catch up
+    // phase on the recipient node.
+    AtomicWord<long long> countBytesClonedOnCatchUpOnRecipient{0};
+
+    // Cumulative, always-increasing counter of how many bytes have been cloned on the
+    // recipient node.
+    AtomicWord<long long> countBytesClonedOnRecipient{0};
 
     // Cumulative, always-increasing counter of how many documents have been cloned on the donor
     // node.
-    AtomicInt64 countDocsClonedOnDonor{0};
+    AtomicWord<long long> countDocsClonedOnDonor{0};
 
-    // Cumulative, always-increasing counter of how many documents have been deleted on the donor
-    // node by the rangeDeleter.
-    AtomicInt64 countDocsDeletedOnDonor{0};
+    // Cumulative, always-increasing counter of how many bytes have been cloned on the donor
+    // node.
+    AtomicWord<long long> countBytesClonedOnDonor{0};
+
+    // Cumulative, always-increasing counter of how many documents have been deleted by the
+    // rangeDeleter.
+    AtomicWord<long long> countDocsDeletedByRangeDeleter{0};
+
+    // Cumulative, always-increasing counter of how many bytes have been deleted by the
+    // rangeDeleter.
+    AtomicWord<long long> countBytesDeletedByRangeDeleter{0};
 
     // Cumulative, always-increasing counter of how many chunks this node started to receive
     // (whether the receiving succeeded or not)
-    AtomicInt64 countRecipientMoveChunkStarted{0};
+    AtomicWord<long long> countRecipientMoveChunkStarted{0};
 
     // Cumulative, always-increasing counter of how much time the critical section's commit phase
     // took (this is the period of time when all operations on the collection are blocked, not just
     // the reads)
-    AtomicInt64 totalCriticalSectionCommitTimeMillis{0};
+    AtomicWord<long long> totalCriticalSectionCommitTimeMillis{0};
 
     // Cumulative, always-increasing counter of how much time the entire critical section took. It
     // includes the time the recipient took to fetch the latest modifications from the donor and
@@ -86,7 +111,42 @@ struct ShardingStatistics {
     // The value of totalCriticalSectionTimeMillis - totalCriticalSectionCommitTimeMillis gives the
     // duration of the catch-up phase of the critical section (where the last mods are transferred
     // from the donor to the recipient).
-    AtomicInt64 totalCriticalSectionTimeMillis{0};
+    AtomicWord<long long> totalCriticalSectionTimeMillis{0};
+
+    // Cumulative, always-increasing counter of the number of migrations aborted on this node
+    // after timing out waiting to acquire a lock.
+    AtomicWord<long long> countDonorMoveChunkLockTimeout{0};
+
+    // Cumulative, always-increasing counter of how much time the migration recipient critical
+    // section took (this is the period of time when write operations on the collection on the
+    // recipient are blocked).
+    AtomicWord<long long> totalRecipientCriticalSectionTimeMillis{0};
+
+    // Cumulative, always-increasing counter of the number of migrations aborted on this node
+    // due to concurrent index operations.
+    AtomicWord<long long> countDonorMoveChunkAbortConflictingIndexOperation{0};
+
+    // Total number of migrations leftover from previous primaries that needs to be run to
+    // completion. Valid only when this process is the repl set primary.
+    AtomicWord<long long> unfinishedMigrationFromPreviousPrimary{0};
+
+    // Current number for chunkMigrationConcurrency that defines concurrent fetchers and inserters
+    // used for _migrateClone(step 4) of chunk migration
+    AtomicWord<int> chunkMigrationConcurrencyCnt{1};
+
+    // Total number of commands run directly against this shard without the directShardOperations
+    // role.
+    AtomicWord<long long> unauthorizedDirectShardOperations{0};
+
+    // Total number of times the _configsvrTransitionToDedicatedConfigServer command has started.
+    AtomicWord<long long> countTransitionToDedicatedConfigServerStarted{0};
+
+    // Total number of times the _configsvrTransitionToDedicatedConfigServer command has completed.
+    AtomicWord<long long> countTransitionToDedicatedConfigServerCompleted{0};
+
+    // Total number of times the _configsvrTransitionFromDedicatedConfigServer command has
+    // completed.
+    AtomicWord<long long> countTransitionFromDedicatedConfigServerCompleted{0};
 
     /**
      * Obtains the per-process instance of the sharding statistics object.

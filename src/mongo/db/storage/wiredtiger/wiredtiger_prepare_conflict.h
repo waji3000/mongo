@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,21 +29,30 @@
 
 #pragma once
 
-#include "mongo/db/curop.h"
-#include "mongo/db/operation_context.h"
+#include <wiredtiger.h>
+
+#include "mongo/db/storage/prepare_conflict_tracker.h"
+#include "mongo/db/storage/recovery_unit.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_record_store.h"
-#include "mongo/db/storage/wiredtiger/wiredtiger_recovery_unit.h"
-#include "mongo/util/fail_point_service.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/fail_point.h"
 
 namespace mongo {
 
-// When set, returns simulates returning WT_PREPARE_CONFLICT on WT cursor read operations.
-MONGO_FAIL_POINT_DECLARE(WTPrepareConflictForReads);
+// When set, WT_ROLLBACK is returned in place of retrying on WT_PREPARE_CONFLICT errors.
+extern FailPoint WTSkipPrepareConflictRetries;
+
+extern FailPoint WTPrintPrepareConflictLog;
 
 /**
  * Logs a message with the number of prepare conflict retry attempts.
  */
 void wiredTigerPrepareConflictLog(int attempt);
+
+/**
+ * Logs a message to confirm we've hit the WTPrintPrepareConflictLog fail point.
+ */
+void wiredTigerPrepareConflictFailPointLog();
 
 /**
  * Runs the argument function f as many times as needed for f to return an error other than
@@ -53,25 +61,21 @@ void wiredTigerPrepareConflictLog(int attempt);
  * re-try f, so any required timeout behavior must be enforced within f.
  * The function f must return a WiredTiger error code.
  */
+int wiredTigerPrepareConflictRetrySlow(Interruptible& interruptible,
+                                       PrepareConflictTracker& tracker,
+                                       RecoveryUnit& ru,
+                                       std::function<int()> func);
+
 template <typename F>
-int wiredTigerPrepareConflictRetry(OperationContext* opCtx, F&& f) {
-    invariant(opCtx);
+int wiredTigerPrepareConflictRetry(Interruptible& interruptible,
+                                   PrepareConflictTracker& tracker,
+                                   RecoveryUnit& ru,
+                                   F&& f) {
+    int ret = WT_READ_CHECK(f());
+    if (ret != WT_PREPARE_CONFLICT)
+        return ret;
 
-    auto recoveryUnit = WiredTigerRecoveryUnit::get(opCtx);
-    int attempts = 0;
-    while (true) {
-        attempts++;
-        // If the failpoint is enabled, don't call the function, just simulate a conflict.
-        int ret =
-            MONGO_FAIL_POINT(WTPrepareConflictForReads) ? WT_PREPARE_CONFLICT : WT_READ_CHECK(f());
-
-        if (ret != WT_PREPARE_CONFLICT)
-            return ret;
-
-        CurOp::get(opCtx)->debug().additiveMetrics.incrementPrepareReadConflicts(1);
-        wiredTigerPrepareConflictLog(attempts);
-        // Wait on the session cache to signal that a unit of work has been committed or aborted.
-        recoveryUnit->getSessionCache()->waitUntilPreparedUnitOfWorkCommitsOrAborts(opCtx);
-    }
+    return wiredTigerPrepareConflictRetrySlow(interruptible, tracker, ru, f);
 }
+
 }  // namespace mongo

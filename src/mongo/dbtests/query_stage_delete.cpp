@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,33 +27,51 @@
  *    it in the license file.
  */
 
-/**
- * This file tests db/exec/delete.cpp.
- */
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+#include <cstddef>
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
 
-#include "mongo/platform/basic.h"
-
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/catalog/collection.h"
-#include "mongo/db/catalog/database.h"
 #include "mongo/db/client.h"
-#include "mongo/db/concurrency/write_conflict_exception.h"
-#include "mongo/db/db_raii.h"
+#include "mongo/db/concurrency/lock_manager_defs.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/exec/collection_scan.h"
-#include "mongo/db/exec/delete.h"
+#include "mongo/db/exec/collection_scan_common.h"
+#include "mongo/db/exec/delete_stage.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/plan_stage.h"
+#include "mongo/db/exec/plan_stats.h"
 #include "mongo/db/exec/queued_data_stage.h"
+#include "mongo/db/exec/working_set.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/query/canonical_query.h"
+#include "mongo/db/query/find_command.h"
+#include "mongo/db/query/plan_executor.h"
+#include "mongo/db/record_id.h"
 #include "mongo/db/service_context.h"
-#include "mongo/dbtests/dbtests.h"
-#include "mongo/stdx/memory.h"
+#include "mongo/db/shard_role.h"
+#include "mongo/db/storage/snapshot.h"
+#include "mongo/db/transaction_resources.h"
+#include "mongo/dbtests/dbtests.h"  // IWYU pragma: keep
+#include "mongo/unittest/unittest.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/intrusive_counter.h"
 
+namespace mongo {
 namespace QueryStageDelete {
 
-using std::unique_ptr;
-using std::vector;
-using stdx::make_unique;
-
-static const NamespaceString nss("unittests.QueryStageDelete");
+static const NamespaceString nss =
+    NamespaceString::createNamespaceString_forTest("unittests.QueryStageDelete");
 
 //
 // Stage-specific tests.
@@ -63,52 +80,53 @@ static const NamespaceString nss("unittests.QueryStageDelete");
 class QueryStageDeleteBase {
 public:
     QueryStageDeleteBase() : _client(&_opCtx) {
-        dbtests::WriteContextForTests ctx(&_opCtx, nss.ns());
+        dbtests::WriteContextForTests ctx(&_opCtx, nss.ns_forTest());
 
         for (size_t i = 0; i < numObj(); ++i) {
             BSONObjBuilder bob;
             bob.append("_id", static_cast<long long int>(i));
             bob.append("foo", static_cast<long long int>(i));
-            _client.insert(nss.ns(), bob.obj());
+            _client.insert(nss, bob.obj());
         }
     }
 
     virtual ~QueryStageDeleteBase() {
-        dbtests::WriteContextForTests ctx(&_opCtx, nss.ns());
-        _client.dropCollection(nss.ns());
+        dbtests::WriteContextForTests ctx(&_opCtx, nss.ns_forTest());
+        _client.dropCollection(nss);
     }
 
     void remove(const BSONObj& obj) {
-        _client.remove(nss.ns(), obj);
+        _client.remove(nss, obj);
     }
 
-    void getRecordIds(Collection* collection,
+    void getRecordIds(const CollectionPtr& collection,
                       CollectionScanParams::Direction direction,
-                      vector<RecordId>* out) {
+                      std::vector<RecordId>* out) {
         WorkingSet ws;
 
         CollectionScanParams params;
         params.direction = direction;
         params.tailable = false;
 
-        unique_ptr<CollectionScan> scan(new CollectionScan(&_opCtx, collection, params, &ws, NULL));
+        std::unique_ptr<CollectionScan> scan(
+            new CollectionScan(_expCtx.get(), &collection, params, &ws, nullptr));
         while (!scan->isEOF()) {
             WorkingSetID id = WorkingSet::INVALID_ID;
             PlanStage::StageState state = scan->work(&id);
             if (PlanStage::ADVANCED == state) {
                 WorkingSetMember* member = ws.get(id);
-                verify(member->hasRecordId());
+                MONGO_verify(member->hasRecordId());
                 out->push_back(member->recordId);
             }
         }
     }
 
-    unique_ptr<CanonicalQuery> canonicalize(const BSONObj& query) {
-        auto qr = stdx::make_unique<QueryRequest>(nss);
-        qr->setFilter(query);
-        auto statusWithCQ = CanonicalQuery::canonicalize(&_opCtx, std::move(qr));
-        ASSERT_OK(statusWithCQ.getStatus());
-        return std::move(statusWithCQ.getValue());
+    std::unique_ptr<CanonicalQuery> canonicalize(const BSONObj& query) {
+        auto findCommand = std::make_unique<FindCommandRequest>(nss);
+        findCommand->setFilter(query);
+        return std::make_unique<CanonicalQuery>(CanonicalQueryParams{
+            .expCtx = ExpressionContextBuilder{}.fromRequest(&_opCtx, *findCommand).build(),
+            .parsedFind = ParsedFindCommandParams{std::move(findCommand)}});
     }
 
     static size_t numObj() {
@@ -119,6 +137,9 @@ protected:
     const ServiceContext::UniqueOperationContext _txnPtr = cc().makeOperationContext();
     OperationContext& _opCtx = *_txnPtr;
 
+    boost::intrusive_ptr<ExpressionContext> _expCtx =
+        ExpressionContextBuilder{}.opCtx(&_opCtx).ns(nss).build();
+
 private:
     DBDirectClient _client;
 };
@@ -128,14 +149,16 @@ private:
 class QueryStageDeleteUpcomingObjectWasDeleted : public QueryStageDeleteBase {
 public:
     void run() {
-        dbtests::WriteContextForTests ctx(&_opCtx, nss.ns());
+        const auto coll = acquireCollection(
+            &_opCtx,
+            CollectionAcquisitionRequest::fromOpCtx(&_opCtx, nss, AcquisitionPrerequisites::kWrite),
+            MODE_IX);
 
-        Collection* coll = ctx.getCollection();
-        ASSERT(coll);
+        ASSERT(coll.exists());
 
         // Get the RecordIds that would be returned by an in-order scan.
-        vector<RecordId> recordIds;
-        getRecordIds(coll, CollectionScanParams::FORWARD, &recordIds);
+        std::vector<RecordId> recordIds;
+        getRecordIds(coll.getCollectionPtr(), CollectionScanParams::FORWARD, &recordIds);
 
         // Configure the scan.
         CollectionScanParams collScanParams;
@@ -143,15 +166,16 @@ public:
         collScanParams.tailable = false;
 
         // Configure the delete stage.
-        DeleteStageParams deleteStageParams;
-        deleteStageParams.isMulti = true;
+        auto deleteStageParams = std::make_unique<DeleteStageParams>();
+        deleteStageParams->isMulti = true;
 
         WorkingSet ws;
-        DeleteStage deleteStage(&_opCtx,
-                                deleteStageParams,
-                                &ws,
-                                coll,
-                                new CollectionScan(&_opCtx, coll, collScanParams, &ws, NULL));
+        DeleteStage deleteStage(
+            _expCtx.get(),
+            std::move(deleteStageParams),
+            &ws,
+            coll,
+            new CollectionScan(_expCtx.get(), coll, collScanParams, &ws, nullptr));
 
         const DeleteStats* stats = static_cast<const DeleteStats*>(deleteStage.getSpecificStats());
 
@@ -165,10 +189,11 @@ public:
 
         // Remove recordIds[targetDocIndex];
         static_cast<PlanStage*>(&deleteStage)->saveState();
-        BSONObj targetDoc = coll->docFor(&_opCtx, recordIds[targetDocIndex]).value();
+        BSONObj targetDoc =
+            coll.getCollectionPtr()->docFor(&_opCtx, recordIds[targetDocIndex]).value();
         ASSERT(!targetDoc.isEmpty());
         remove(targetDoc);
-        static_cast<PlanStage*>(&deleteStage)->restoreState();
+        static_cast<PlanStage*>(&deleteStage)->restoreState(&coll.getCollectionPtr());
 
         // Remove the rest.
         while (!deleteStage.isEOF()) {
@@ -189,36 +214,39 @@ class QueryStageDeleteReturnOldDoc : public QueryStageDeleteBase {
 public:
     void run() {
         // Various variables we'll need.
-        dbtests::WriteContextForTests ctx(&_opCtx, nss.ns());
-        Collection* coll = ctx.getCollection();
-        ASSERT(coll);
+        const auto coll = acquireCollection(
+            &_opCtx,
+            CollectionAcquisitionRequest::fromOpCtx(&_opCtx, nss, AcquisitionPrerequisites::kWrite),
+            MODE_IX);
+
+        ASSERT(coll.exists());
         const int targetDocIndex = 0;
         const BSONObj query = BSON("foo" << BSON("$gte" << targetDocIndex));
-        const auto ws = make_unique<WorkingSet>();
-        const unique_ptr<CanonicalQuery> cq(canonicalize(query));
+        const auto ws = std::make_unique<WorkingSet>();
+        const std::unique_ptr<CanonicalQuery> cq(canonicalize(query));
 
         // Get the RecordIds that would be returned by an in-order scan.
-        vector<RecordId> recordIds;
-        getRecordIds(coll, CollectionScanParams::FORWARD, &recordIds);
+        std::vector<RecordId> recordIds;
+        getRecordIds(coll.getCollectionPtr(), CollectionScanParams::FORWARD, &recordIds);
 
         // Configure a QueuedDataStage to pass the first object in the collection back in a
         // RID_AND_OBJ state.
-        auto qds = make_unique<QueuedDataStage>(&_opCtx, ws.get());
+        auto qds = std::make_unique<QueuedDataStage>(_expCtx.get(), ws.get());
         WorkingSetID id = ws->allocate();
         WorkingSetMember* member = ws->get(id);
         member->recordId = recordIds[targetDocIndex];
         const BSONObj oldDoc = BSON("_id" << targetDocIndex << "foo" << targetDocIndex);
-        member->obj = Snapshotted<BSONObj>(SnapshotId(), oldDoc);
+        member->doc = {SnapshotId(), Document{oldDoc}};
         ws->transitionToRecordIdAndObj(id);
         qds->pushBack(id);
 
         // Configure the delete.
-        DeleteStageParams deleteParams;
-        deleteParams.returnDeleted = true;
-        deleteParams.canonicalQuery = cq.get();
+        auto deleteParams = std::make_unique<DeleteStageParams>();
+        deleteParams->returnDeleted = true;
+        deleteParams->canonicalQuery = cq.get();
 
-        const auto deleteStage =
-            make_unique<DeleteStage>(&_opCtx, deleteParams, ws.get(), coll, qds.release());
+        const auto deleteStage = std::make_unique<DeleteStage>(
+            _expCtx.get(), std::move(deleteParams), ws.get(), coll, qds.release());
 
         const DeleteStats* stats = static_cast<const DeleteStats*>(deleteStage->getSpecificStats());
 
@@ -236,10 +264,10 @@ public:
         ASSERT_TRUE(resultMember->hasOwnedObj());
         ASSERT_FALSE(resultMember->hasRecordId());
         ASSERT_EQUALS(resultMember->getState(), WorkingSetMember::OWNED_OBJ);
-        ASSERT_TRUE(resultMember->obj.value().isOwned());
+        ASSERT_TRUE(resultMember->doc.value().isOwned());
 
         // Should be the old value.
-        ASSERT_BSONOBJ_EQ(resultMember->obj.value(), oldDoc);
+        ASSERT_BSONOBJ_EQ(resultMember->doc.value().toBson(), oldDoc);
 
         // Should have done the delete.
         ASSERT_EQUALS(stats->docsDeleted, 1U);
@@ -249,17 +277,18 @@ public:
     }
 };
 
-class All : public Suite {
+class All : public unittest::OldStyleSuiteSpecification {
 public:
-    All() : Suite("query_stage_delete") {}
+    All() : OldStyleSuiteSpecification("query_stage_delete") {}
 
-    void setupTests() {
+    void setupTests() override {
         // Stage-specific tests below.
         add<QueryStageDeleteUpcomingObjectWasDeleted>();
         add<QueryStageDeleteReturnOldDoc>();
     }
 };
 
-SuiteInstance<All> all;
+unittest::OldStyleSuiteInitializer<All> all;
 
 }  // namespace QueryStageDelete
+}  // namespace mongo

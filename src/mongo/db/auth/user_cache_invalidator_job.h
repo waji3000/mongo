@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -27,11 +26,17 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
+#pragma once
 
+#include <memory>
+#include <variant>
+
+#include "mongo/base/status.h"
 #include "mongo/bson/oid.h"
-#include "mongo/util/background.h"
-
-#include <string>
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/service_context.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/periodic_runner.h"
 
 namespace mongo {
 
@@ -44,20 +49,39 @@ class OperationContext;
  * AuthorizationManager to throw out its in-memory cache of User objects (which contains the
  * users' credentials, roles, privileges, etc).
  */
-class UserCacheInvalidator : public BackgroundJob {
+class UserCacheInvalidator {
 public:
+    using OIDorTimestamp = std::variant<OID, Timestamp>;
+
     UserCacheInvalidator(AuthorizationManager* authzManager);
-    ~UserCacheInvalidator();
 
-    void initialize(OperationContext* opCtx);
+    /**
+     * Create a new UserCacheInvalidator as a decorator on the service context
+     * and start the background job.
+     */
+    static void start(ServiceContext* serviceCtx, OperationContext* opCtx);
 
-protected:
-    virtual std::string name() const;
-    virtual void run();
+    /**
+     * Waits for the job to complete and stops the thread.
+     */
+    static void stop(ServiceContext* serviceCtx);
+
+    /**
+     * Set the period of the background job. This should only be used internally (by the
+     * setParameter).
+     */
+    void setPeriod(Milliseconds period);
 
 private:
-    AuthorizationManager* _authzManager;
-    OID _previousCacheGeneration;
+    void initialize(OperationContext* opCtx);
+    void run();
+
+    std::unique_ptr<PeriodicJobAnchor> _job;
+
+    AuthorizationManager* const _authzManager;
+    OIDorTimestamp _previousGeneration;
 };
+
+Status userCacheInvalidationIntervalSecsNotify(const int& newValue);
 
 }  // namespace mongo

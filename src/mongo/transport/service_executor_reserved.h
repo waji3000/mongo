@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,14 +29,21 @@
 
 #pragma once
 
+#include <cstddef>
+#include <cstdint>
 #include <deque>
+#include <memory>
+#include <string>
 
 #include "mongo/base/status.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/service_context.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/stdx/condition_variable.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/transport/service_executor.h"
-#include "mongo/transport/service_executor_task_names.h"
+#include "mongo/transport/session.h"
+#include "mongo/util/duration.h"
 
 namespace mongo {
 namespace transport {
@@ -56,24 +62,34 @@ class ServiceExecutorReserved final : public ServiceExecutor {
 public:
     explicit ServiceExecutorReserved(ServiceContext* ctx, std::string name, size_t reservedThreads);
 
-    Status start() override;
-    Status shutdown(Milliseconds timeout) override;
-    Status schedule(Task task, ScheduleFlags flags, ServiceExecutorTaskName taskName) override;
+    static ServiceExecutorReserved* get(ServiceContext* ctx);
 
-    Mode transportMode() const override {
-        return Mode::kSynchronous;
+    void start() override;
+    Status shutdown(Milliseconds timeout) override;
+
+    size_t getRunningThreads() const override {
+        return _numRunningWorkerThreads.loadRelaxed();
     }
 
     void appendStats(BSONObjBuilder* bob) const override;
 
+    std::unique_ptr<TaskRunner> makeTaskRunner() override;
+
+    StringData getName() const override {
+        return "ServiceExecutorReserved"_sd;
+    }
+
 private:
     Status _startWorker();
 
+    void _schedule(Task task);
+
+    void _runOnDataAvailable(const std::shared_ptr<Session>& session, Task task);
+
     static thread_local std::deque<Task> _localWorkQueue;
-    static thread_local int _localRecursionDepth;
     static thread_local int64_t _localThreadIdleCounter;
 
-    AtomicBool _stillRunning{false};
+    AtomicWord<bool> _stillRunning{false};
 
     mutable stdx::mutex _mutex;
     stdx::condition_variable _threadWakeup;
@@ -81,7 +97,7 @@ private:
 
     std::deque<Task> _readyTasks;
 
-    AtomicUInt32 _numRunningWorkerThreads{0};
+    AtomicWord<unsigned> _numRunningWorkerThreads{0};
     size_t _numReadyThreads{0};
     size_t _numStartingThreads{0};
 

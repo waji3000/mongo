@@ -1,4 +1,6 @@
 
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+
 function debug(str) {
     print("---\n" + str + "\n-----");
 }
@@ -11,14 +13,11 @@ var s = new ShardingTest({name: name, shards: 2, mongos: 2});
 var mongosA = s.s0;
 var mongosB = s.s1;
 
-ns = "test.coll";
-ns2 = "test.coll2";
+let ns = "test.coll";
 
-adminSA = mongosA.getDB("admin");
-adminSA.runCommand({enableSharding: "test"});
-
-adminSA.runCommand({moveprimary: "test", to: "s.shard0.shardName"});
-adminSA.runCommand({moveprimary: "test2", to: "s.shard1.shardName"});
+let adminSA = mongosA.getDB("admin");
+adminSA.runCommand({enableSharding: "test", primaryShard: s.shard0.shardName});
+adminSA.runCommand({enableSharding: "test2", primaryShard: s.shard1.shardName});
 
 adminSA.runCommand({shardCollection: ns, key: {_id: 1}});
 
@@ -34,7 +33,7 @@ var db = mongosA.getDB("test");
 var coll = db.coll;
 var coll2 = db.coll2;
 
-numDocs = 10;
+let numDocs = 10;
 for (var i = 1; i < numDocs; i++) {
     coll.insert({_id: i, control: 0});
     coll2.insert({_id: i, control: 0});

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,32 +27,38 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kControl
-
-#include "mongo/platform/basic.h"
 
 #include "mongo/util/version.h"
 
-#include "mongo/config.h"
 
 #ifdef MONGO_CONFIG_SSL
 #if MONGO_CONFIG_SSL_PROVIDER == MONGO_CONFIG_SSL_PROVIDER_OPENSSL
 #include <openssl/crypto.h>
+#include <openssl/opensslv.h>
 #endif
 #endif
 
-#include <pcrecpp.h>
-
+#include <climits>
+#include <fmt/format.h>
 #include <sstream>
 
-#include "mongo/db/jsobj.h"
-#include "mongo/util/assert_util.h"
-#include "mongo/util/log.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/json.h"
+#include "mongo/bson/oid.h"
+#include "mongo/bson/util/builder.h"
+#include "mongo/config.h"  // IWYU pragma: keep
+#include "mongo/logv2/log.h"
+#include "mongo/util/debug_util.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
+
 
 namespace mongo {
 namespace {
 
-const class : public VersionInfoInterface {
+class FallbackVersionInfo : public VersionInfoInterface {
 public:
     int majorVersion() const noexcept final {
         return 0;
@@ -95,11 +100,10 @@ public:
         return "unknown";
     }
 
-    std::vector<BuildInfoTuple> buildInfo() const final {
+    std::vector<BuildInfoField> buildInfo() const final {
         return {};
     }
-
-} kFallbackVersionInfo{};
+};
 
 const VersionInfoInterface* globalVersionInfo = nullptr;
 
@@ -110,76 +114,21 @@ void VersionInfoInterface::enable(const VersionInfoInterface* handler) {
 }
 
 const VersionInfoInterface& VersionInfoInterface::instance(NotEnabledAction action) noexcept {
-    if (globalVersionInfo)
+    if (globalVersionInfo) {
         return *globalVersionInfo;
-    if (action == NotEnabledAction::kFallback)
-        return kFallbackVersionInfo;
-    severe() << "Terminating because valid version info has not been configured";
-    fassertFailed(40278);
-}
+    }
 
-bool VersionInfoInterface::isSameMajorVersion(const char* otherVersion) const noexcept {
-    int major = -1, minor = -1;
-    pcrecpp::RE ver_regex("^(\\d+)\\.(\\d+)\\.");
-    ver_regex.PartialMatch(otherVersion, &major, &minor);
+    if (action == NotEnabledAction::kFallback) {
+        static const auto& fallbackVersionInfo = *new FallbackVersionInfo;
 
-    if (major == -1 || minor == -1)
-        return false;
+        return fallbackVersionInfo;
+    }
 
-    return (major == majorVersion() && minor == minorVersion());
+    LOGV2_FATAL(40278, "Terminating because valid version info has not been configured");
 }
 
 std::string VersionInfoInterface::makeVersionString(StringData binaryName) const {
-    std::stringstream ss;
-    ss << binaryName << " v" << version();
-    return ss.str();
-}
-
-void VersionInfoInterface::appendBuildInfo(BSONObjBuilder* result) const {
-    *result << "version" << version() << "gitVersion" << gitVersion()
-#if defined(_WIN32)
-            << "targetMinOS" << targetMinOS()
-#endif
-            << "modules" << modules() << "allocator" << allocator() << "javascriptEngine"
-            << jsEngine() << "sysInfo"
-            << "deprecated";
-
-    BSONArrayBuilder versionArray(result->subarrayStart("versionArray"));
-    versionArray << majorVersion() << minorVersion() << patchVersion() << extraVersion();
-    versionArray.done();
-
-    BSONObjBuilder opensslInfo(result->subobjStart("openssl"));
-#ifdef MONGO_CONFIG_SSL
-#if MONGO_CONFIG_SSL_PROVIDER == MONGO_CONFIG_SSL_PROVIDER_OPENSSL
-    opensslInfo << "running" << openSSLVersion() << "compiled" << OPENSSL_VERSION_TEXT;
-#elif MONGO_CONFIG_SSL_PROVIDER == MONGO_CONFIG_SSL_PROVIDER_WINDOWS
-    opensslInfo << "running"
-                << "Windows SChannel";
-#elif MONGO_CONFIG_SSL_PROVIDER == MONGO_CONFIG_SSL_PROVIDER_APPLE
-    opensslInfo << "running"
-                << "Apple Secure Transport";
-#else
-#error "Unknown SSL Provider"
-#endif  // MONGO_CONFIG_SSL_PROVIDER
-#else
-    opensslInfo << "running"
-                << "disabled"
-                << "compiled"
-                << "disabled";
-#endif
-    opensslInfo.done();
-
-    BSONObjBuilder buildvarsInfo(result->subobjStart("buildEnvironment"));
-    for (auto&& envDataEntry : buildInfo()) {
-        if (std::get<2>(envDataEntry)) {
-            buildvarsInfo << std::get<0>(envDataEntry) << std::get<1>(envDataEntry);
-        }
-    }
-    buildvarsInfo.done();
-
-    *result << "bits" << (int)sizeof(void*) * 8;
-    result->appendBool("debug", kDebugBuild);
-    result->appendNumber("maxBsonObjectSize", BSONObjMaxUserSize);
+    return fmt::format("{} v{}", binaryName, version());
 }
 
 std::string VersionInfoInterface::openSSLVersion(StringData prefix, StringData suffix) const {
@@ -191,57 +140,51 @@ std::string VersionInfoInterface::openSSLVersion(StringData prefix, StringData s
 }
 
 void VersionInfoInterface::logTargetMinOS() const {
-    log() << "targetMinOS: " << targetMinOS();
+    LOGV2(23398, "Target operating system minimum version", "targetMinOS"_attr = targetMinOS());
 }
 
-void VersionInfoInterface::logBuildInfo() const {
-    log() << "git version: " << gitVersion();
-
+void VersionInfoInterface::logBuildInfo(std::ostream* os) const {
+    BSONObjBuilder bob;
+    bob.append("version", version());
+    bob.append("gitVersion", gitVersion());
 #if defined(MONGO_CONFIG_SSL) && MONGO_CONFIG_SSL_PROVIDER == MONGO_CONFIG_SSL_PROVIDER_OPENSSL
-    log() << openSSLVersion("OpenSSL version: ");
+    bob.append("openSSLVersion", openSSLVersion());
 #endif
-
-    log() << "allocator: " << allocator();
-
-    std::stringstream ss;
-    ss << "modules: ";
-    auto modules_list = modules();
-    if (modules_list.size() == 0) {
-        ss << "none";
+    bob.append("modules", modules());
+    bob.append("allocator", allocator());
+    {
+        auto envObj = BSONObjBuilder(bob.subobjStart("environment"));
+        for (auto&& bi : buildInfo())
+            if (bi.inVersion && !bi.value.empty())
+                envObj.append(bi.key, bi.value);
+    }
+    BSONObj obj = bob.done();
+    if (os) {
+        // If printing to ostream, print a json object with a single "buildInfo" element.
+        *os << "Build Info: " << tojson(obj, ExtendedRelaxedV2_0_0, true) << std::endl;
     } else {
-        for (const auto& m : modules_list) {
-            ss << m << " ";
-        }
+        LOGV2(23403, "Build Info", "buildInfo"_attr = obj);
     }
-    log() << ss.str();
+}
 
-    log() << "build environment:";
-    for (auto&& envDataEntry : buildInfo()) {
-        if (std::get<3>(envDataEntry)) {
-            auto val = std::get<1>(envDataEntry);
-            if (val.size() == 0)
-                continue;
-            log() << "    " << std::get<0>(envDataEntry) << ": " << std::get<1>(envDataEntry);
-        }
-    }
+std::string formatVersionString(StringData versioned, const VersionInfoInterface& provider) {
+    return fmt::format("{} version v{}", versioned, provider.version());
 }
 
 std::string mongoShellVersion(const VersionInfoInterface& provider) {
-    std::stringstream ss;
-    ss << "MongoDB shell version v" << provider.version();
-    return ss.str();
+    return formatVersionString("MongoDB shell", provider);
 }
 
 std::string mongosVersion(const VersionInfoInterface& provider) {
-    std::stringstream ss;
-    ss << "mongos version v" << provider.version();
-    return ss.str();
+    return formatVersionString("mongos", provider);
+}
+
+std::string mongocryptVersion(const VersionInfoInterface& provider) {
+    return formatVersionString("mongocrypt", provider);
 }
 
 std::string mongodVersion(const VersionInfoInterface& provider) {
-    std::stringstream ss;
-    ss << "db version v" << provider.version();
-    return ss.str();
+    return formatVersionString("db", provider);
 }
 
 }  // namespace mongo

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -31,7 +30,6 @@
 #pragma once
 
 #include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/mutex.h"
 #include "mongo/util/clock_source.h"
 #include "mongo/util/time_support.h"
 
@@ -42,20 +40,24 @@ namespace mongo {
  * work while the condvar 'waits'.
  *
  * It handles this dance by using a special hook that condvar provides to register itself (as a
- * notifyable, which it inherits from) during calls to wait.  Then, rather than actually waiting on
+ * notifiable, which it inherits from) during calls to wait.  Then, rather than actually waiting on
  * the condvar, it invokes its run/run_until methods.
  *
  * The current implementer of Waitable is the transport layer baton type, which performs delayed IO
  * when it would otherwise block.
+ *
+ * Note that every Waitable should be level-triggered like its base class, Notifiable. See
+ * mongo/stdx/condition_variable.h for more details.
  */
-class Waitable : public Notifyable {
+class Waitable : public Notifiable {
 public:
+    template <typename LockT>
     static void wait(Waitable* waitable,
                      ClockSource* clkSource,
                      stdx::condition_variable& cv,
-                     stdx::unique_lock<stdx::mutex>& lk) {
+                     LockT& lk) {
         if (waitable) {
-            cv._runWithNotifyable(*waitable, [&]() noexcept {
+            cv.waitWithNotifiable(*waitable, [&]() noexcept {
                 lk.unlock();
                 waitable->run(clkSource);
                 lk.lock();
@@ -65,27 +67,28 @@ public:
         }
     }
 
-    template <typename Predicate>
+    template <typename LockT, typename PredicateT>
     static void wait(Waitable* waitable,
                      ClockSource* clkSource,
                      stdx::condition_variable& cv,
-                     stdx::unique_lock<stdx::mutex>& lk,
-                     Predicate pred) {
+                     LockT& lk,
+                     PredicateT pred) {
         while (!pred()) {
             wait(waitable, clkSource, cv, lk);
         }
     }
 
+    template <typename LockT>
     static stdx::cv_status wait_until(
         Waitable* waitable,
         ClockSource* clkSource,
         stdx::condition_variable& cv,
-        stdx::unique_lock<stdx::mutex>& lk,
+        LockT& lk,
         const stdx::chrono::time_point<stdx::chrono::system_clock>& timeout_time) {
         if (waitable) {
             auto rval = stdx::cv_status::no_timeout;
 
-            cv._runWithNotifyable(*waitable, [&]() noexcept {
+            cv.waitWithNotifiable(*waitable, [&]() noexcept {
                 lk.unlock();
                 if (waitable->run_until(clkSource, Date_t(timeout_time)) == TimeoutState::Timeout) {
                     rval = stdx::cv_status::timeout;
@@ -99,13 +102,13 @@ public:
         }
     }
 
-    template <typename Predicate>
+    template <typename LockT, typename PredicateT>
     static bool wait_until(Waitable* waitable,
                            ClockSource* clkSource,
                            stdx::condition_variable& cv,
-                           stdx::unique_lock<stdx::mutex>& lk,
+                           LockT& lk,
                            const stdx::chrono::time_point<stdx::chrono::system_clock>& timeout_time,
-                           Predicate pred) {
+                           PredicateT pred) {
         while (!pred()) {
             if (wait_until(waitable, clkSource, cv, lk, timeout_time) == stdx::cv_status::timeout) {
                 return pred();
@@ -114,9 +117,6 @@ public:
 
         return true;
     }
-
-protected:
-    ~Waitable() noexcept {}
 
     enum class TimeoutState {
         NoTimeout,
@@ -138,6 +138,9 @@ protected:
      * Like run, but only until the passed deadline has passed.
      */
     virtual TimeoutState run_until(ClockSource* clkSource, Date_t deadline) noexcept = 0;
+
+protected:
+    ~Waitable() = default;
 };
 
 }  // namespace mongo

@@ -1,5 +1,3 @@
-// fts_element_iterator.cpp
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,12 +28,17 @@
  */
 
 #include "mongo/db/fts/fts_element_iterator.h"
-#include "mongo/db/fts/fts_spec.h"
-#include "mongo/db/fts/fts_util.h"
-#include "mongo/util/mongoutils/str.h"
-#include "mongo/util/stringutils.h"
 
+#include <map>
+#include <ostream>
 #include <stack>
+#include <utility>
+
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/db/fts/fts_spec.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -65,9 +68,9 @@ inline bool _matchPrefix(const string& dottedName, const string& weight) {
     if (weight == dottedName) {
         return true;
     }
-    return mongoutils::str::startsWith(weight, dottedName + '.');
+    return str::startsWith(weight, dottedName + '.');
 }
-}
+}  // namespace
 
 bool FTSElementIterator::more() {
     //_currentValue = advance();
@@ -112,13 +115,18 @@ FTSIteratorValue FTSElementIterator::advance() {
             continue;
         }
 
+        // SERVER-78238: fields whose name contains a dot or starts with a '$' are not indexable.
+        if (fieldName.find_first_of('.') != string::npos || fieldName.starts_with('$')) {
+            continue;
+        }
+
         // Compose the dotted name of the current field:
         // 1. parent path empty (top level): use the current field name
         // 2. parent path non-empty and obj is an array: use the parent path
         // 3. parent path non-empty and obj is a sub-doc: append field name to parent path
-        string dottedName = (_frame._parentPath.empty() ? fieldName : _frame._isArray
-                                     ? _frame._parentPath
-                                     : _frame._parentPath + '.' + fieldName);
+        string dottedName = (_frame._parentPath.empty() ? fieldName
+                                 : _frame._isArray      ? _frame._parentPath
+                                                        : _frame._parentPath + '.' + fieldName);
 
         // Find lower bound of dottedName in _weights.  lower_bound leaves us at the first
         // weight that could possibly match or be a prefix of dottedName.  And if this
@@ -145,13 +153,14 @@ FTSIteratorValue FTSElementIterator::advance() {
 
         // Is the current field an exact match on a weight?
         bool exactMatch = (possibleWeightMatch && i->first == dottedName);
-        double weight = (possibleWeightMatch ? i->second : DEFAULT_WEIGHT);
+        double weight = (exactMatch ? i->second : DEFAULT_WEIGHT);
 
         switch (elem.type()) {
             case String:
                 // Only index strings on exact match or wildcard.
                 if (exactMatch || _spec.wildcard()) {
-                    return FTSIteratorValue(elem.valuestr(), _frame._language, weight);
+                    return FTSIteratorValue(
+                        elem.valueStringData().data(), _frame._language, weight);
                 }
                 break;
 

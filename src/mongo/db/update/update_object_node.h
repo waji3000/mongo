@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -31,14 +30,17 @@
 #pragma once
 
 #include <map>
+#include <memory>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "mongo/base/clonable_ptr.h"
 #include "mongo/bson/bsonelement.h"
 #include "mongo/db/matcher/expression_with_placeholder.h"
 #include "mongo/db/update/modifier_table.h"
+#include "mongo/db/update/path_support.h"
 #include "mongo/db/update/update_internal_node.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/stdx/unordered_map.h"
 
 namespace mongo {
@@ -81,7 +83,7 @@ public:
     UpdateObjectNode() : UpdateInternalNode(Type::Object) {}
 
     std::unique_ptr<UpdateNode> clone() const final {
-        return stdx::make_unique<UpdateObjectNode>(*this);
+        return std::make_unique<UpdateObjectNode>(*this);
     }
 
     void setCollator(const CollatorInterface* collator) final {
@@ -93,14 +95,44 @@ public:
         }
     }
 
-    ApplyResult apply(ApplyParams applyParams) const final;
+    ApplyResult apply(ApplyParams applyParams,
+                      UpdateNodeApplyParams updateNodeApplyParams) const final;
 
     UpdateNode* getChild(const std::string& field) const final;
 
     void setChild(std::string field, std::unique_ptr<UpdateNode> child) final;
 
+    /**
+     * Gather all update operators in the subtree rooted from this into a BSONObj in the format of
+     * the update command's update parameter.
+     */
+    BSONObj serialize() const;
+
+    void produceSerializationMap(
+        FieldRef* currentPath,
+        std::map<std::string, std::vector<std::pair<std::string, BSONObj>>>*
+            operatorOrientedUpdates) const final {
+        for (const auto& [pathSuffix, child] : _children) {
+            FieldRef::FieldRefTempAppend tempAppend(*currentPath, pathSuffix);
+            child->produceSerializationMap(currentPath, operatorOrientedUpdates);
+        }
+        // Object nodes have a positional child that must be accounted for.
+        if (_positionalChild) {
+            FieldRef::FieldRefTempAppend tempAppend(*currentPath, "$");
+            _positionalChild->produceSerializationMap(currentPath, operatorOrientedUpdates);
+        }
+    }
+
+    void acceptVisitor(UpdateNodeVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    const auto& getChildren() const {
+        return _children;
+    }
+
 private:
-    std::map<std::string, clonable_ptr<UpdateNode>> _children;
+    std::map<std::string, clonable_ptr<UpdateNode>, pathsupport::cmpPathsAndArrayIndexes> _children;
     clonable_ptr<UpdateNode> _positionalChild;
 
     // When calling apply() causes us to merge an element of '_children' with '_positionalChild', we

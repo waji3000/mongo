@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,335 +27,54 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kControl
 
 #include "mongo/db/server_options_server_helpers.h"
 
-#include <algorithm>
-#include <boost/algorithm/string/classification.hpp>
+#include <boost/algorithm/string/constants.hpp>
 #include <boost/algorithm/string/split.hpp>
 #include <boost/algorithm/string/trim.hpp>
-#include <boost/filesystem.hpp>
+#include <boost/core/addressof.hpp>
 #include <boost/filesystem/operations.hpp>
-#include <ios>
+#include <boost/filesystem/path.hpp>
+#include <boost/function/function_base.hpp>
+#include <boost/iterator/iterator_facade.hpp>
+#include <fmt/format.h>
+// IWYU pragma: no_include "boost/system/detail/error_code.hpp"
+#include <boost/type_index/type_index_facade.hpp>
+// IWYU pragma: no_include "ext/alloc_traits.h"
+#include <cstdlib>
 #include <iostream>
+#include <map>
+#include <type_traits>
+#include <utility>
+#include <variant>
 
+#include "mongo/base/error_codes.h"
 #include "mongo/base/status.h"
-#include "mongo/bson/util/builder.h"
-#include "mongo/config.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/json.h"
+#include "mongo/bson/oid.h"
+#include "mongo/config.h"  // IWYU pragma: keep
+#include "mongo/db/auth/cluster_auth_mode.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/server_options_helpers.h"
-#include "mongo/db/server_parameters.h"
-#include "mongo/logger/log_component.h"
-#include "mongo/logger/message_event_utf8_encoder.h"
+#include "mongo/logv2/log.h"
 #include "mongo/transport/message_compressor_registry.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/cmdline_utils/censor_cmdline.h"
-#include "mongo/util/fail_point_service.h"
-#include "mongo/util/log.h"
-#include "mongo/util/map_util.h"
-#include "mongo/util/mongoutils/str.h"
-#include "mongo/util/net/sock.h"
+#include "mongo/util/net/cidr.h"
 #include "mongo/util/net/socket_utils.h"
-#include "mongo/util/net/ssl_options.h"
-#include "mongo/util/options_parser/options_parser.h"
-#include "mongo/util/options_parser/startup_options.h"
+#include "mongo/util/options_parser/value.h"
+#include "mongo/util/str.h"
 
-using std::endl;
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
+
+
 using std::string;
 
 namespace mongo {
-
-Status addGeneralServerOptions(moe::OptionSection* options) {
-    auto baseResult = addBaseServerOptions(options);
-    if (!baseResult.isOK()) {
-        return baseResult;
-    }
-
-    StringBuilder maxConnInfoBuilder;
-    std::stringstream unixSockPermsBuilder;
-
-    maxConnInfoBuilder << "max number of simultaneous connections - " << DEFAULT_MAX_CONN
-                       << " by default";
-    unixSockPermsBuilder << "permissions to set on UNIX domain socket file - "
-                         << "0" << std::oct << DEFAULT_UNIX_PERMS << " by default";
-
-    options->addOptionChaining("help", "help,h", moe::Switch, "show this usage information")
-        .setSources(moe::SourceAllLegacy);
-
-    options->addOptionChaining("version", "version", moe::Switch, "show version information")
-        .setSources(moe::SourceAllLegacy);
-
-    options
-        ->addOptionChaining(
-            "config", "config,f", moe::String, "configuration file specifying additional options")
-        .setSources(moe::SourceAllLegacy);
-
-    options
-        ->addOptionChaining("outputConfig",
-                            "outputConfig",
-                            moe::Switch,
-                            "Display the resolved configuration and exit")
-        .setSources(moe::SourceCommandLine)
-        .hidden();
-
-    options
-        ->addOptionChaining("configExpand",
-                            "configExpand",
-                            moe::String,
-                            "Process expansion directives in config file (none, exec, rest)")
-        .setSources(moe::SourceCommandLine);
-
-    options
-        ->addOptionChaining(
-            "configExpandTimeoutSecs",
-            "configExpandTimeoutSecs",
-            moe::Int,
-            str::stream() << "Maximum number of seconds to wait for a single "
-                             "configuration expansion to resolve (default: "
-                          << durationCount<Seconds>(optionenvironment::kDefaultConfigExpandTimeout)
-                          << " secs)")
-        .setSources(moe::SourceCommandLine)
-        .hidden();
-
-    options->addOptionChaining(
-        "net.bindIp",
-        "bind_ip",
-        moe::String,
-        "comma separated list of ip addresses to listen on - localhost by default");
-
-    options
-        ->addOptionChaining("net.bindIpAll", "bind_ip_all", moe::Switch, "bind to all ip addresses")
-        .canonicalize([](moe::Environment* env) {
-            bool all = (*env)["net.bindIpAll"].as<bool>();
-            auto status = env->remove("net.bindIpAll");
-            if (!status.isOK()) {
-                return status;
-            }
-            return all ? env->set("net.bindIp", moe::Value("*")) : Status::OK();
-        });
-
-    options->addOptionChaining(
-        "net.ipv6", "ipv6", moe::Switch, "enable IPv6 support (disabled by default)");
-
-    options
-        ->addOptionChaining(
-            "net.listenBacklog", "listenBacklog", moe::Int, "set socket listen backlog size")
-        .setDefault(moe::Value(SOMAXCONN));
-
-    options->addOptionChaining(
-        "net.maxIncomingConnections", "maxConns", moe::Int, maxConnInfoBuilder.str().c_str());
-
-    options
-        ->addOptionChaining(
-            "net.maxIncomingConnectionsOverride",
-            "",
-            moe::StringVector,
-            "CIDR ranges that do not count towards the maxIncomingConnections limit")
-        .hidden()
-        .setSources(moe::SourceYAMLConfig);
-
-    options
-        ->addOptionChaining(
-            "net.reservedAdminThreads",
-            "",
-            moe::Int,
-            "number of worker threads to reserve for admin and internal connections")
-        .hidden()
-        .setSources(moe::SourceYAMLConfig);
-
-    options
-        ->addOptionChaining("net.transportLayer",
-                            "transportLayer",
-                            moe::String,
-                            "sets the ingress transport layer implementation")
-        .hidden()
-        .setDefault(moe::Value("asio"));
-
-    options
-        ->addOptionChaining("net.serviceExecutor",
-                            "serviceExecutor",
-                            moe::String,
-                            "sets the service executor implementation")
-        .hidden()
-        .setDefault(moe::Value("synchronous"));
-
-#if MONGO_ENTERPRISE_VERSION
-    options->addOptionChaining("security.redactClientLogData",
-                               "redactClientLogData",
-                               moe::Switch,
-                               "Redact client data written to the diagnostics log");
-#endif
-
-    options->addOptionChaining("processManagement.pidFilePath",
-                               "pidfilepath",
-                               moe::String,
-                               "full path to pidfile (if not set, no pidfile is created)");
-
-    options->addOptionChaining("processManagement.timeZoneInfo",
-                               "timeZoneInfo",
-                               moe::String,
-                               "full path to time zone info directory, e.g. /usr/share/zoneinfo");
-
-    options
-        ->addOptionChaining(
-            "security.keyFile", "keyFile", moe::String, "private key for cluster authentication")
-        .incompatibleWith("noauth");
-
-    options->addOptionChaining("noauth", "noauth", moe::Switch, "run without security")
-        .setSources(moe::SourceAllLegacy)
-        .incompatibleWith("auth")
-        .incompatibleWith("keyFile")
-        .incompatibleWith("transitionToAuth")
-        .incompatibleWith("clusterAuthMode");
-
-    options
-        ->addOptionChaining(
-            "security.transitionToAuth",
-            "transitionToAuth",
-            moe::Switch,
-            "For rolling access control upgrade. Attempt to authenticate over outgoing "
-            "connections and proceed regardless of success. Accept incoming connections "
-            "with or without authentication.")
-        .incompatibleWith("noauth");
-
-    options
-        ->addOptionChaining("security.clusterAuthMode",
-                            "clusterAuthMode",
-                            moe::String,
-                            "Authentication mode used for cluster authentication. Alternatives are "
-                            "(keyFile|sendKeyFile|sendX509|x509)")
-        .format("(:?keyFile)|(:?sendKeyFile)|(:?sendX509)|(:?x509)",
-                "(keyFile/sendKeyFile/sendX509/x509)");
-
-#ifndef _WIN32
-    options
-        ->addOptionChaining(
-            "nounixsocket", "nounixsocket", moe::Switch, "disable listening on unix sockets")
-        .setSources(moe::SourceAllLegacy);
-
-    options
-        ->addOptionChaining(
-            "net.unixDomainSocket.enabled", "", moe::Bool, "disable listening on unix sockets")
-        .setSources(moe::SourceYAMLConfig);
-
-    options->addOptionChaining("net.unixDomainSocket.pathPrefix",
-                               "unixSocketPrefix",
-                               moe::String,
-                               "alternative directory for UNIX domain sockets (defaults to /tmp)");
-
-    options->addOptionChaining("net.unixDomainSocket.filePermissions",
-                               "filePermissions",
-                               moe::Int,
-                               unixSockPermsBuilder.str());
-
-    options->addOptionChaining(
-        "processManagement.fork", "fork", moe::Switch, "fork server process");
-
-#endif
-
-    options
-        ->addOptionChaining("objcheck",
-                            "objcheck",
-                            moe::Switch,
-                            "inspect client data for validity on receipt (DEFAULT)")
-        .hidden()
-        .setSources(moe::SourceAllLegacy)
-        .incompatibleWith("noobjcheck");
-
-    options
-        ->addOptionChaining("noobjcheck",
-                            "noobjcheck",
-                            moe::Switch,
-                            "do NOT inspect client data for validity on receipt")
-        .hidden()
-        .setSources(moe::SourceAllLegacy)
-        .incompatibleWith("objcheck");
-
-    options
-        ->addOptionChaining("net.wireObjectCheck",
-                            "",
-                            moe::Bool,
-                            "inspect client data for validity on receipt (DEFAULT)")
-        .hidden()
-        .setSources(moe::SourceYAMLConfig);
-
-    options
-        ->addOptionChaining("enableExperimentalStorageDetailsCmd",
-                            "enableExperimentalStorageDetailsCmd",
-                            moe::Switch,
-                            "EXPERIMENTAL (UNSUPPORTED). "
-                            "Enable command computing aggregate statistics on storage.")
-        .hidden()
-        .setSources(moe::SourceAllLegacy);
-
-    options
-        ->addOptionChaining("operationProfiling.slowOpThresholdMs",
-                            "slowms",
-                            moe::Int,
-                            "value of slow for profile and console log")
-        .setDefault(moe::Value(100));
-
-    options
-        ->addOptionChaining("operationProfiling.slowOpSampleRate",
-                            "slowOpSampleRate",
-                            moe::Double,
-                            "fraction of slow ops to include in the profile and console log")
-        .setDefault(moe::Value(1.0));
-
-    auto ret = addMessageCompressionOptions(options, false);
-    if (!ret.isOK()) {
-        return ret;
-    }
-
-    return Status::OK();
-}
-
-Status addWindowsServerOptions(moe::OptionSection* options) {
-    options->addOptionChaining("install", "install", moe::Switch, "install Windows service")
-        .setSources(moe::SourceAllLegacy);
-
-    options->addOptionChaining("remove", "remove", moe::Switch, "remove Windows service")
-        .setSources(moe::SourceAllLegacy);
-
-    options
-        ->addOptionChaining(
-            "reinstall",
-            "reinstall",
-            moe::Switch,
-            "reinstall Windows service (equivalent to --remove followed by --install)")
-        .setSources(moe::SourceAllLegacy);
-
-    options->addOptionChaining("processManagement.windowsService.serviceName",
-                               "serviceName",
-                               moe::String,
-                               "Windows service name");
-
-    options->addOptionChaining("processManagement.windowsService.displayName",
-                               "serviceDisplayName",
-                               moe::String,
-                               "Windows service display name");
-
-    options->addOptionChaining("processManagement.windowsService.description",
-                               "serviceDescription",
-                               moe::String,
-                               "Windows service description");
-
-    options->addOptionChaining("processManagement.windowsService.serviceUser",
-                               "serviceUser",
-                               moe::String,
-                               "account for service execution");
-
-    options->addOptionChaining("processManagement.windowsService.servicePassword",
-                               "servicePassword",
-                               moe::String,
-                               "password used to authenticate serviceUser");
-
-    options->addOptionChaining("service", "service", moe::Switch, "start mongodb service")
-        .hidden()
-        .setSources(moe::SourceAllLegacy);
-
-    return Status::OK();
-}
 
 namespace {
 // Helpers for option storage
@@ -402,10 +120,44 @@ Status setParsedOpts(const moe::Environment& params) {
     cmdline_utils::censorBSONObj(&serverGlobalParams.parsedOpts);
     return Status::OK();
 }
+
+bool shouldFork(const moe::Environment& params) {
+    auto paramYes = [](const moe::Environment& params, const std::string& key) {
+        return params.count(key) && params[key].as<bool>();
+    };
+
+    auto envVarYes = [](const std::string& envKey) {
+        auto envVal = getenv(envKey.c_str());
+        return envVal && std::string{envVal} == "1";
+    };
+
+    if (paramYes(params, "shutdown")) {
+        return false;
+    }
+
+    if (envVarYes("MONGODB_CONFIG_OVERRIDE_NOFORK")) {
+        LOGV2(7484500,
+              "Environment variable MONGODB_CONFIG_OVERRIDE_NOFORK == 1, "
+              "overriding \"processManagement.fork\" to false");
+        return false;
+    }
+
+    if (paramYes(params, "processManagement.fork")) {
+        return true;
+    }
+
+    return false;
+}
 }  // namespace
 
-void printCommandLineOpts() {
-    log() << "options: " << serverGlobalParams.parsedOpts << endl;
+void printCommandLineOpts(std::ostream* os) {
+    if (os) {
+        *os << fmt::format("Options set by command line: {}",
+                           tojson(serverGlobalParams.parsedOpts, ExtendedRelaxedV2_0_0, true))
+            << std::endl;
+    } else {
+        LOGV2(21951, "Options set by command line", "options"_attr = serverGlobalParams.parsedOpts);
+    }
 }
 
 Status validateServerOptions(const moe::Environment& params) {
@@ -456,14 +208,22 @@ Status validateServerOptions(const moe::Environment& params) {
             haveAuthenticationMechanisms = false;
         }
 
-        if (parameters.find("internalValidateFeaturesAsMaster") != parameters.end()) {
-            // Command line options that are disallowed when internalValidateFeaturesAsMaster is
-            // specified.
+        bool internalValidateFeaturesAsPrimaryUsed =
+            parameters.find("internalValidateFeaturesAsPrimary") != parameters.end();
+        bool internalValidateFeaturesAsMasterUsed =
+            parameters.find("internalValidateFeaturesAsMaster") != parameters.end();
+
+        if (internalValidateFeaturesAsPrimaryUsed || internalValidateFeaturesAsMasterUsed) {
+            // Command line options that are disallowed when internalValidateFeaturesAsPrimary or
+            // internalValidateFeaturesAsMaster, the deprecated alias, is specified.
+            std::string parameterName = internalValidateFeaturesAsPrimaryUsed
+                ? "internalValidateFeaturesAsPrimary"
+                : "internalValidateFeaturesAsMaster";
             if (params.count("replication.replSet")) {
                 return Status(ErrorCodes::BadValue,
                               str::stream() <<  //
-                                  "Cannot specify both internalValidateFeaturesAsMaster and "
-                                  "replication.replSet");
+                                  "Cannot specify both " + parameterName +
+                                      " and replication.replSet");
             }
         }
     }
@@ -536,6 +296,7 @@ Status canonicalizeServerOptions(moe::Environment* params) {
             return ret;
         }
     }
+
     return Status::OK();
 }
 
@@ -577,47 +338,15 @@ Status storeServerOptions(const moe::Environment& params) {
         serverGlobalParams.listenBacklog = params["net.listenBacklog"].as<int>();
     }
 
-    if (params.count("net.transportLayer")) {
-        serverGlobalParams.transportLayer = params["net.transportLayer"].as<std::string>();
-        if (serverGlobalParams.transportLayer != "asio") {
-            return {ErrorCodes::BadValue, "Unsupported value for transportLayer. Must be \"asio\""};
-        }
-    }
-
-    if (params.count("net.serviceExecutor")) {
-        auto value = params["net.serviceExecutor"].as<std::string>();
-        const auto valid = {"synchronous"_sd, "adaptive"_sd};
-        if (std::find(valid.begin(), valid.end(), value) == valid.end()) {
-            return {ErrorCodes::BadValue, "Unsupported value for serviceExecutor"};
-        }
-        serverGlobalParams.serviceExecutor = value;
-    } else {
-        serverGlobalParams.serviceExecutor = "synchronous";
-    }
-
     if (params.count("security.transitionToAuth")) {
         serverGlobalParams.transitionToAuth = params["security.transitionToAuth"].as<bool>();
     }
 
     if (params.count("security.clusterAuthMode")) {
-        std::string clusterAuthMode = params["security.clusterAuthMode"].as<std::string>();
-
-        if (clusterAuthMode == "keyFile") {
-            serverGlobalParams.clusterAuthMode.store(ServerGlobalParams::ClusterAuthMode_keyFile);
-        } else if (clusterAuthMode == "sendKeyFile") {
-            serverGlobalParams.clusterAuthMode.store(
-                ServerGlobalParams::ClusterAuthMode_sendKeyFile);
-        } else if (clusterAuthMode == "sendX509") {
-            serverGlobalParams.clusterAuthMode.store(ServerGlobalParams::ClusterAuthMode_sendX509);
-        } else if (clusterAuthMode == "x509") {
-            serverGlobalParams.clusterAuthMode.store(ServerGlobalParams::ClusterAuthMode_x509);
-        } else {
-            return Status(ErrorCodes::BadValue,
-                          "unsupported value for clusterAuthMode " + clusterAuthMode);
-        }
+        const auto modeStr = params["security.clusterAuthMode"].as<std::string>();
+        serverGlobalParams.startupClusterAuthMode =
+            uassertStatusOK(ClusterAuthMode::parse(modeStr));
         serverGlobalParams.authState = ServerGlobalParams::AuthState::kEnabled;
-    } else {
-        serverGlobalParams.clusterAuthMode.store(ServerGlobalParams::ClusterAuthMode_undefined);
     }
 
     if (params.count("net.maxIncomingConnections")) {
@@ -629,15 +358,19 @@ Status storeServerOptions(const moe::Environment& params) {
     }
 
     if (params.count("net.maxIncomingConnectionsOverride")) {
+        std::vector<std::variant<CIDR, std::string>> maxIncomingConnsOverride;
         auto ranges = params["net.maxIncomingConnectionsOverride"].as<std::vector<std::string>>();
         for (const auto& range : ranges) {
             auto swr = CIDR::parse(range);
             if (!swr.isOK()) {
-                serverGlobalParams.maxConnsOverride.push_back(range);
+                maxIncomingConnsOverride.push_back(range);
             } else {
-                serverGlobalParams.maxConnsOverride.push_back(std::move(swr.getValue()));
+                maxIncomingConnsOverride.push_back(std::move(swr.getValue()));
             }
         }
+        serverGlobalParams.maxIncomingConnsOverride.update(
+            std::make_shared<decltype(maxIncomingConnsOverride)>(
+                std::move(maxIncomingConnsOverride)));
     }
 
     if (params.count("net.reservedAdminThreads")) {
@@ -656,10 +389,11 @@ Status storeServerOptions(const moe::Environment& params) {
                 serverGlobalParams.bind_ips.emplace_back("::");
             }
         } else {
-            boost::split(serverGlobalParams.bind_ips,
-                         bind_ip,
-                         [](char c) { return c == ','; },
-                         boost::token_compress_on);
+            boost::split(
+                serverGlobalParams.bind_ips,
+                bind_ip,
+                [](char c) { return c == ','; },
+                boost::token_compress_on);
         }
     }
 
@@ -679,13 +413,18 @@ Status storeServerOptions(const moe::Environment& params) {
         serverGlobalParams.unixSocketPermissions =
             params["net.unixDomainSocket.filePermissions"].as<int>();
     }
-
-    if ((params.count("processManagement.fork") &&
-         params["processManagement.fork"].as<bool>() == true) &&
-        (!params.count("shutdown") || params["shutdown"].as<bool>() == false)) {
+    if (shouldFork(params)) {
         serverGlobalParams.doFork = true;
     }
 #endif  // _WIN32
+
+#ifdef __APPLE__
+    if (serverGlobalParams.doFork) {
+        return Status(ErrorCodes::BadValue,
+                      "Server fork+exec via `--fork` or `processManagement.fork` "
+                      "is incompatible with macOS");
+    }
+#endif  // Apple
 
     if (serverGlobalParams.doFork && serverGlobalParams.logpath.empty() &&
         !serverGlobalParams.logWithSyslog) {
@@ -716,18 +455,20 @@ Status storeServerOptions(const moe::Environment& params) {
     }
 
     if (!params.count("security.clusterAuthMode") && params.count("security.keyFile")) {
-        serverGlobalParams.clusterAuthMode.store(ServerGlobalParams::ClusterAuthMode_keyFile);
+        serverGlobalParams.startupClusterAuthMode = ClusterAuthMode::keyFile();
     }
-    int clusterAuthMode = serverGlobalParams.clusterAuthMode.load();
+
+    const bool hasClusterAuthMode = serverGlobalParams.startupClusterAuthMode.isDefined();
     if (serverGlobalParams.transitionToAuth &&
-        (clusterAuthMode != ServerGlobalParams::ClusterAuthMode_keyFile &&
-         clusterAuthMode != ServerGlobalParams::ClusterAuthMode_x509)) {
+        !(hasClusterAuthMode &&
+          (serverGlobalParams.startupClusterAuthMode.x509Only() ||
+           serverGlobalParams.startupClusterAuthMode.keyFileOnly()))) {
         return Status(ErrorCodes::BadValue,
                       "--transitionToAuth must be used with keyFile or x509 authentication");
     }
 
     if (params.count("net.compression.compressors")) {
-        const auto ret =
+        auto ret =
             storeMessageCompressionOptions(params["net.compression.compressors"].as<string>());
         if (!ret.isOK()) {
             return ret;

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,19 +29,89 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <memory>
+#include <string>
+#include <utility>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/error_extra_info.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/s/chunk_version.h"
-#include "mongo/s/database_version_gen.h"
+#include "mongo/db/shard_id.h"
+#include "mongo/s/database_version.h"
+#include "mongo/s/shard_version.h"
+#include "mongo/util/concurrency/notification.h"
+#include "mongo/util/future.h"
 
 namespace mongo {
 
 class StaleConfigInfo final : public ErrorExtraInfo {
 public:
     static constexpr auto code = ErrorCodes::StaleConfig;
+    enum class OperationType { kRead, kWrite };
 
     StaleConfigInfo(NamespaceString nss,
-                    ChunkVersion received,
-                    boost::optional<ChunkVersion> wanted)
+                    ShardVersion received,
+                    boost::optional<ShardVersion> wanted,
+                    ShardId shardId,
+                    boost::optional<SharedSemiFuture<void>> criticalSectionSignal = boost::none,
+                    boost::optional<OperationType> duringOperationType = boost::none)
+        : _nss(std::move(nss)),
+          _received(received),
+          _wanted(wanted),
+          _shardId(shardId),
+          _criticalSectionSignal(std::move(criticalSectionSignal)),
+          _duringOperationType{duringOperationType} {}
+
+    const auto& getNss() const {
+        return _nss;
+    }
+
+    const auto& getVersionReceived() const {
+        return _received;
+    }
+
+    const auto& getVersionWanted() const {
+        return _wanted;
+    }
+
+    const auto& getShardId() const {
+        return _shardId;
+    }
+
+    auto getCriticalSectionSignal() const {
+        return _criticalSectionSignal;
+    }
+
+    const auto& getDuringOperationType() const {
+        return _duringOperationType;
+    }
+
+    void serialize(BSONObjBuilder* bob) const override;
+    static std::shared_ptr<const ErrorExtraInfo> parse(const BSONObj& obj);
+
+private:
+    NamespaceString _nss;
+    ShardVersion _received;
+    boost::optional<ShardVersion> _wanted;
+    ShardId _shardId;
+
+    // The following fields are not serialized and therefore do not get propagated to the router.
+    boost::optional<SharedSemiFuture<void>> _criticalSectionSignal;
+    boost::optional<OperationType> _duringOperationType;
+};
+
+// TODO (SERVER-75888): Rename the StaleEpoch code to StaleUpstreamRouter and the info to
+// StaleUpstreamRouterInfo
+class StaleEpochInfo final : public ErrorExtraInfo {
+public:
+    static constexpr auto code = ErrorCodes::StaleEpoch;
+
+    StaleEpochInfo(NamespaceString nss, ShardVersion received, ShardVersion wanted)
         : _nss(std::move(nss)), _received(received), _wanted(wanted) {}
 
     const auto& getNss() const {
@@ -58,24 +127,28 @@ public:
     }
 
     void serialize(BSONObjBuilder* bob) const override;
-    static std::shared_ptr<const ErrorExtraInfo> parse(const BSONObj&);
-    static StaleConfigInfo parseFromCommandError(const BSONObj& commandError);
+    static std::shared_ptr<const ErrorExtraInfo> parse(const BSONObj& obj);
 
 private:
     NamespaceString _nss;
-    ChunkVersion _received;
-    boost::optional<ChunkVersion> _wanted;
+
+    ShardVersion _received;
+    ShardVersion _wanted;
 };
-using StaleConfigException = ExceptionFor<ErrorCodes::StaleConfig>;
 
 class StaleDbRoutingVersion final : public ErrorExtraInfo {
 public:
     static constexpr auto code = ErrorCodes::StaleDbVersion;
 
-    StaleDbRoutingVersion(std::string db,
-                          DatabaseVersion received,
-                          boost::optional<DatabaseVersion> wanted)
-        : _db(std::move(db)), _received(received), _wanted(wanted) {}
+    StaleDbRoutingVersion(
+        const DatabaseName& db,
+        DatabaseVersion received,
+        boost::optional<DatabaseVersion> wanted,
+        boost::optional<SharedSemiFuture<void>> criticalSectionSignal = boost::none)
+        : _db(std::move(db)),
+          _received(received),
+          _wanted(wanted),
+          _criticalSectionSignal(std::move(criticalSectionSignal)) {}
 
     const auto& getDb() const {
         return _db;
@@ -89,14 +162,20 @@ public:
         return _wanted;
     }
 
+    auto getCriticalSectionSignal() const {
+        return _criticalSectionSignal;
+    }
+
     void serialize(BSONObjBuilder* bob) const override;
     static std::shared_ptr<const ErrorExtraInfo> parse(const BSONObj&);
-    static StaleDbRoutingVersion parseFromCommandError(const BSONObj& commandError);
 
 private:
-    std::string _db;
+    DatabaseName _db;
     DatabaseVersion _received;
     boost::optional<DatabaseVersion> _wanted;
+
+    // This signal does not get serialized and therefore does not get propagated to the router
+    boost::optional<SharedSemiFuture<void>> _criticalSectionSignal;
 };
 
 }  // namespace mongo

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,15 +29,21 @@
 
 #pragma once
 
+#include <compare>
+#include <cstddef>
 #include <cstdint>
 #include <string>
 
 #include "mongo/base/status.h"
-#include "mongo/bson/mutable/element.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/db/exec/mutable_bson/element.h"
 #include "mongo/db/field_ref.h"
 #include "mongo/db/field_ref_set.h"
 #include "mongo/db/matcher/expression.h"
 #include "mongo/db/matcher/expression_leaf.h"
+#include "mongo/util/ctype.h"
+#include "mongo/util/string_map.h"
 
 namespace mongo {
 
@@ -49,7 +54,47 @@ namespace pathsupport {
 static const size_t kMaxPaddingAllowed = 1500000;
 
 // Convenience type to hold equality matches at particular paths from a MatchExpression
-typedef std::map<StringData, const EqualityMatchExpression*> EqualityMatches;
+using EqualityMatches = StringDataMap<const EqualityMatchExpression*>;
+
+struct cmpPathsAndArrayIndexes {
+    // While there is a string to number parser in the codebase, we use this for performance
+    // reasons. This code allows us to only look at the characters/digits that are relevant for our
+    // comparisons.
+    bool operator()(const std::string& a, const std::string& b) const {
+        auto aLength = a.size();
+        auto bLength = b.size();
+        // If these are not numbers, do a normal string comparison. Treat zero padded numbers as
+        // strings.
+        if (aLength == 0 || bLength == 0 || !ctype::isDigit(a[0]) || !ctype::isDigit(b[0]) ||
+            (a[0] == '0' && aLength > 1) || (b[0] == '0' && bLength > 1)) {
+            return a < b;
+        }
+
+        // At this point we are only seeing strings that are prefixed with at least one digit. If
+        // they are numbers, the longer one is bigger because it has a larger order of magnitude.
+        // If they are not numbers (ex: 123qyz) we would not be able to distinguish which is larger
+        // without inspecting every character. To avoid this work we choose to order by length
+        // because the actual order is not important but needs to be consistent.
+        if (aLength != bLength) {
+            return aLength < bLength;
+        }
+        // Find the larger number. Return immediately if a high order digit doesnt match, or we find
+        // a non-number.
+        size_t aIndex = 0;
+        size_t bIndex = 0;
+        while (ctype::isDigit(a[aIndex]) && ctype::isDigit(b[bIndex]) && aIndex < aLength &&
+               bIndex < bLength) {
+            if (a[aIndex] == b[bIndex]) {
+                ++aIndex;
+                ++bIndex;
+                continue;
+            }
+            return a[aIndex] < b[bIndex];
+        }
+        // We found a non-number, perform normal string comparison.
+        return a < b;
+    }
+};
 
 /**
  * Finds the longest portion of 'prefix' that exists in document rooted at 'root' and is
@@ -82,10 +127,10 @@ typedef std::map<StringData, const EqualityMatchExpression*> EqualityMatches;
  *   'a.0.b' is NOT a viable path in {a: 1}, because a would have changed types
  *   'a.5.b' is a viable path in in {a: []} (padding would occur)
  */
-Status findLongestPrefix(const FieldRef& prefix,
-                         mutablebson::Element root,
-                         size_t* idxFound,
-                         mutablebson::Element* elemFound);
+StatusWith<bool> findLongestPrefix(const FieldRef& prefix,
+                                   mutablebson::Element root,
+                                   FieldIndex* idxFound,
+                                   mutablebson::Element* elemFound);
 
 /**
  * Creates the parts 'prefix[idxRoot]', 'prefix[idxRoot+1]', ..., 'prefix[<numParts>-1]' under
@@ -97,7 +142,7 @@ Status findLongestPrefix(const FieldRef& prefix,
  * to the element in the doc that is the parent of prefix[idxRoot].
  */
 StatusWith<mutablebson::Element> createPathAt(const FieldRef& prefix,
-                                              size_t idxRoot,
+                                              FieldIndex idxRoot,
                                               mutablebson::Element elemFound,
                                               mutablebson::Element newElem);
 

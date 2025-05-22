@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,12 +29,18 @@
 
 #pragma once
 
-#include <string>
+#include <functional>
+#include <utility>
 
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/repl/oplog_interface.h"
 #include "mongo/db/repl/oplog_interface_remote.h"
 #include "mongo/db/repl/rollback_source.h"
-#include "mongo/stdx/functional.h"
 #include "mongo/util/net/hostandport.h"
+#include "mongo/util/uuid.h"
 
 namespace mongo {
 
@@ -52,12 +57,9 @@ public:
     /**
      * Type of function to return a connection to the sync source.
      */
-    using GetConnectionFn = stdx::function<DBClientBase*()>;
+    using GetConnectionFn = std::function<DBClientBase*()>;
 
-    RollbackSourceImpl(GetConnectionFn getConnection,
-                       const HostAndPort& source,
-                       const std::string& collectionName,
-                       int batchSize);
+    RollbackSourceImpl(GetConnectionFn getConnection, const HostAndPort& source, int batchSize);
 
     const OplogInterface& getOplog() const override;
 
@@ -69,14 +71,11 @@ public:
 
     BSONObj findOne(const NamespaceString& nss, const BSONObj& filter) const override;
 
-    std::pair<BSONObj, NamespaceString> findOneByUUID(const std::string& db,
+    std::pair<BSONObj, NamespaceString> findOneByUUID(const DatabaseName& db,
                                                       UUID uuid,
                                                       const BSONObj& filter) const override;
 
-    void copyCollectionFromRemote(OperationContext* opCtx,
-                                  const NamespaceString& nss) const override;
-
-    StatusWith<BSONObj> getCollectionInfoByUUID(const std::string& db,
+    StatusWith<BSONObj> getCollectionInfoByUUID(const DatabaseName& dbName,
                                                 const UUID& uuid) const override;
 
     StatusWith<BSONObj> getCollectionInfo(const NamespaceString& nss) const override;
@@ -84,7 +83,6 @@ public:
 private:
     GetConnectionFn _getConnection;
     HostAndPort _source;
-    std::string _collectionName;
     OplogInterfaceRemote _oplog;
 };
 

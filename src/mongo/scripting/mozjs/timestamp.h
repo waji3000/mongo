@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,6 +29,12 @@
 
 #pragma once
 
+#include <js/CallArgs.h>
+#include <js/PropertySpec.h>
+#include <js/TypeDecls.h>
+
+#include "mongo/bson/timestamp.h"
+#include "mongo/scripting/mozjs/base.h"
 #include "mongo/scripting/mozjs/wraptype.h"
 
 namespace mongo {
@@ -55,6 +60,8 @@ struct TimestampInfo : public BaseInfo {
     static const JSFunctionSpec methods[2];
 
     static const char* const className;
+
+    static Timestamp getValidatedValue(JSContext* cx, JS::HandleObject obj);
 };
 
 }  // namespace mozjs

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -33,43 +32,58 @@
  */
 
 #include "mongo/db/auth/action_set.h"
+
+#include <memory>
+
 #include "mongo/db/auth/action_type.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
 namespace {
 
-TEST(ActionSetTest, ParseActionSetFromString) {
-    ActionSet result;
-    ASSERT_OK(ActionSet::parseActionSetFromString("find,insert,update,remove", &result));
-    ASSERT_TRUE(result.contains(ActionType::find));
-    ASSERT_TRUE(result.contains(ActionType::insert));
-    ASSERT_TRUE(result.contains(ActionType::update));
-    ASSERT_TRUE(result.contains(ActionType::remove));
+TEST(ActionSetTest, ParseActionSetFromStringVector) {
+    const std::vector<StringData> actions1 = {"find"_sd, "insert"_sd, "update"_sd, "remove"_sd};
+    const std::vector<StringData> actions2 = {"update"_sd, "find"_sd, "remove"_sd, "insert"_sd};
+    std::vector<std::string> unrecognized;
+
+    auto set1 = ActionSet::parseFromStringVector(actions1, &unrecognized);
+    ASSERT_TRUE(set1.contains(ActionType::find));
+    ASSERT_TRUE(set1.contains(ActionType::insert));
+    ASSERT_TRUE(set1.contains(ActionType::update));
+    ASSERT_TRUE(set1.contains(ActionType::remove));
+    ASSERT_TRUE(unrecognized.empty());
 
     // Order of the strings doesn't matter
-    ASSERT_OK(ActionSet::parseActionSetFromString("update,find,remove,insert", &result));
-    ASSERT_TRUE(result.contains(ActionType::find));
-    ASSERT_TRUE(result.contains(ActionType::insert));
-    ASSERT_TRUE(result.contains(ActionType::update));
-    ASSERT_TRUE(result.contains(ActionType::remove));
+    auto set2 = ActionSet::parseFromStringVector(actions2, &unrecognized);
+    ASSERT_TRUE(set2.contains(ActionType::find));
+    ASSERT_TRUE(set2.contains(ActionType::insert));
+    ASSERT_TRUE(set2.contains(ActionType::update));
+    ASSERT_TRUE(set2.contains(ActionType::remove));
+    ASSERT_TRUE(unrecognized.empty());
 
-    ASSERT_OK(ActionSet::parseActionSetFromString("find", &result));
+    // Only one ActionType
+    auto findSet = ActionSet::parseFromStringVector({"find"}, &unrecognized);
+    ASSERT_TRUE(findSet.contains(ActionType::find));
+    ASSERT_FALSE(findSet.contains(ActionType::insert));
+    ASSERT_FALSE(findSet.contains(ActionType::update));
+    ASSERT_FALSE(findSet.contains(ActionType::remove));
+    ASSERT_TRUE(unrecognized.empty());
 
-    ASSERT_TRUE(result.contains(ActionType::find));
-    ASSERT_FALSE(result.contains(ActionType::insert));
-    ASSERT_FALSE(result.contains(ActionType::update));
-    ASSERT_FALSE(result.contains(ActionType::remove));
+    // Empty string as an ActionType
+    auto nonEmptyBlankSet = ActionSet::parseFromStringVector({""}, &unrecognized);
+    ASSERT_FALSE(nonEmptyBlankSet.contains(ActionType::find));
+    ASSERT_FALSE(nonEmptyBlankSet.contains(ActionType::insert));
+    ASSERT_FALSE(nonEmptyBlankSet.contains(ActionType::update));
+    ASSERT_FALSE(nonEmptyBlankSet.contains(ActionType::remove));
+    ASSERT_TRUE(unrecognized.size() == 1);
+    ASSERT_TRUE(unrecognized.front().empty());
+    unrecognized.clear();
 
-    ASSERT_OK(ActionSet::parseActionSetFromString("", &result));
-
-    ASSERT_FALSE(result.contains(ActionType::find));
-    ASSERT_FALSE(result.contains(ActionType::insert));
-    ASSERT_FALSE(result.contains(ActionType::update));
-    ASSERT_FALSE(result.contains(ActionType::remove));
-
-    ASSERT_EQUALS(ErrorCodes::FailedToParse,
-                  ActionSet::parseActionSetFromString("INVALID INPUT", &result).code());
+    // Unknown ActionType
+    auto unknownSet = ActionSet::parseFromStringVector({"INVALID INPUT"}, &unrecognized);
+    ASSERT_TRUE(unknownSet.empty());
+    ASSERT_EQ(unrecognized.size(), 1UL);
+    ASSERT_TRUE(unrecognized.front() == "INVALID INPUT");
 }
 
 TEST(ActionSetTest, ToString) {
@@ -99,10 +113,9 @@ TEST(ActionSetTest, ToString) {
 }
 
 TEST(ActionSetTest, IsSupersetOf) {
-    ActionSet set1, set2, set3;
-    ASSERT_OK(ActionSet::parseActionSetFromString("find,update,insert", &set1));
-    ASSERT_OK(ActionSet::parseActionSetFromString("find,update,remove", &set2));
-    ASSERT_OK(ActionSet::parseActionSetFromString("find,update", &set3));
+    ActionSet set1({ActionType::find, ActionType::update, ActionType::insert});
+    ActionSet set2({ActionType::find, ActionType::update, ActionType::remove});
+    ActionSet set3({ActionType::find, ActionType::update});
 
     ASSERT_FALSE(set1.isSupersetOf(set2));
     ASSERT_TRUE(set1.isSupersetOf(set3));
@@ -115,9 +128,7 @@ TEST(ActionSetTest, IsSupersetOf) {
 }
 
 TEST(ActionSetTest, anyAction) {
-    ActionSet set;
-
-    ASSERT_OK(ActionSet::parseActionSetFromString("anyAction", &set));
+    ActionSet set{ActionType::anyAction};
     ASSERT_TRUE(set.contains(ActionType::find));
     ASSERT_TRUE(set.contains(ActionType::insert));
     ASSERT_TRUE(set.contains(ActionType::anyAction));
@@ -169,6 +180,16 @@ TEST(ActionSetTest, constructor) {
     ActionSet set3{ActionType::find, ActionType::insert};
     ASSERT_TRUE(set3.contains(ActionType::find));
     ASSERT_TRUE(set3.contains(ActionType::insert));
+}
+
+TEST(ActionSetTest, DuplicateActions) {
+    auto fromString = ActionSet::parseFromStringVector({"find"_sd, "find"_sd, "insert"_sd});
+    ASSERT_TRUE(fromString.contains(ActionType::find));
+    ASSERT_TRUE(fromString.contains(ActionType::insert));
+
+    ActionSet fromEnum({ActionType::find, ActionType::find, ActionType::insert});
+    ASSERT_TRUE(fromEnum.contains(ActionType::find));
+    ASSERT_TRUE(fromEnum.contains(ActionType::insert));
 }
 
 }  // namespace

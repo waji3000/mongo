@@ -1,5 +1,5 @@
 /*-
- * Public Domain 2014-2018 MongoDB, Inc.
+ * Public Domain 2014-present MongoDB, Inc.
  * Public Domain 2008-2014 WiredTiger, Inc.
  *
  * This is free and unencumbered software released into the public domain.
@@ -25,6 +25,9 @@
  * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
  * OTHER DEALINGS IN THE SOFTWARE.
  */
+
+#pragma once
+
 #define	THOUSAND	(1000ULL)
 #define	MILLION		(1000000ULL)
 #define	BILLION		(1000000000ULL)
@@ -198,4 +201,10 @@ inline uint64_t
 ts_us(const timespec &ts)
 {
     return (ns_to_us(ts.tv_nsec) + sec_to_us(ts.tv_sec));
+}
+
+inline uint64_t
+secs_us(double secs)
+{
+    return (secs * USEC_PER_SEC);
 }

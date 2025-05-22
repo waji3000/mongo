@@ -29,7 +29,15 @@
 
 #pragma once
 
+#include <memory>
+
+#include "mongo/db/exec/plan_stage.h"
+#include "mongo/db/exec/plan_stats.h"
 #include "mongo/db/exec/requires_collection_stage.h"
+#include "mongo/db/exec/working_set.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/query/plan_executor.h"
+#include "mongo/db/query/stage_types.h"
 
 namespace mongo {
 
@@ -42,12 +50,12 @@ class RecordStoreFastCountStage final : public RequiresCollectionStage {
 public:
     static const char* kStageType;
 
-    RecordStoreFastCountStage(OperationContext* opCtx,
-                              Collection* collection,
+    RecordStoreFastCountStage(ExpressionContext* expCtx,
+                              VariantCollectionPtrOrAcquisition collection,
                               long long skip,
                               long long limit);
 
-    bool isEOF() override {
+    bool isEOF() const override {
         return _commonStats.isEOF;
     }
 
@@ -64,9 +72,9 @@ public:
     }
 
 protected:
-    void saveState(RequiresCollTag) override {}
+    void doSaveStateRequiresCollection() override {}
 
-    void restoreState(RequiresCollTag) override {}
+    void doRestoreStateRequiresCollection() override {}
 
 private:
     long long _skip = 0;
@@ -75,4 +83,4 @@ private:
     CountStats _specificStats;
 };
 
-}  // namepace mongo
+}  // namespace mongo

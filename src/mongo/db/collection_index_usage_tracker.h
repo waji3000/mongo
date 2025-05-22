@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,54 +29,90 @@
 
 #pragma once
 
-#include "mongo/base/disallow_copying.h"
+#include <boost/intrusive_ptr.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+#include <memory>
+
 #include "mongo/base/string_data.h"
 #include "mongo/bson/bsonobj.h"
+#include "mongo/db/aggregated_index_usage_tracker.h"
 #include "mongo/platform/atomic_word.h"
+#include "mongo/util/intrusive_counter.h"
 #include "mongo/util/string_map.h"
 #include "mongo/util/time_support.h"
+
+#include <boost/smart_ptr/intrusive_ref_counter.hpp>
 
 namespace mongo {
 
 class ClockSource;
+class ServiceContext;
 
 /**
  * CollectionIndexUsageTracker tracks index usage statistics for a collection.  An index is
  * considered "used" when it appears as part of a winning plan for an operation that uses the
  * query system.
  *
+ * It also tracks non-usage of indexes. I.e. it collects information about collection scans that
+ * occur on a collection.
+ *
  * Indexes must be registered and deregistered on creation/destruction.
  */
-class CollectionIndexUsageTracker {
-    MONGO_DISALLOW_COPYING(CollectionIndexUsageTracker);
+class CollectionIndexUsageTracker
+    // intrusive_ref_counter is copyable while RefCountable is move-only.
+    : public boost::intrusive_ref_counter<CollectionIndexUsageTracker> {
+
+    // Statistics that are shared among versions of the same logical collection.
+    struct CollectionScanStatsStorage : public RefCountable {
+        AtomicWord<unsigned long long> _collectionScans{0};
+        AtomicWord<unsigned long long> _collectionScansNonTailable{0};
+    };
 
 public:
-    struct IndexUsageStats {
+    struct CollectionScanStats {
+        unsigned long long collectionScans{0};
+        unsigned long long collectionScansNonTailable{0};
+    };
+
+    struct IndexUsageStats : public RefCountable {
         IndexUsageStats() = default;
-        explicit IndexUsageStats(Date_t now, const BSONObj& key)
-            : trackerStartTime(now), indexKey(key.getOwned()) {}
+        explicit IndexUsageStats(Date_t now, const BSONObj& key, const IndexFeatures& idxFeatures)
+            : trackerStartTime(now), indexKey(key.getOwned()), features(idxFeatures) {}
 
         IndexUsageStats(const IndexUsageStats& other)
             : accesses(other.accesses.load()),
               trackerStartTime(other.trackerStartTime),
-              indexKey(other.indexKey) {}
+              indexKey(other.indexKey),
+              features(other.features) {}
 
         IndexUsageStats& operator=(const IndexUsageStats& other) {
             accesses.store(other.accesses.load());
             trackerStartTime = other.trackerStartTime;
             indexKey = other.indexKey;
+            features = other.features;
             return *this;
         }
 
         // Number of operations that have used this index.
-        AtomicInt64 accesses;
+        AtomicWord<long long> accesses;
 
         // Date/Time that we started tracking index usage.
         Date_t trackerStartTime;
 
         // An owned copy of the associated IndexDescriptor's index key.
         BSONObj indexKey;
+
+        // Features in use by this index for global feature usage tracking.
+        IndexFeatures features;
     };
+
+    /**
+     * The IndexUsageStats entries are stored in the map as pointers so that concurrent updates to
+     * an entry's internal values are retained across map copies rather than lost. intrusive_ptrs
+     * are used rather than shared_ptrs because: intrusive_ptrs are more performant when copies are
+     * made; and the usage is encapsulated by this class and not externally exposed.
+     */
+    using CollectionIndexUsageMap = StringMap<boost::intrusive_ptr<IndexUsageStats>>;
 
     /**
      * Constructs a CollectionIndexUsageTracker.
@@ -85,42 +120,78 @@ public:
      * Does not take ownership of 'clockSource'. 'clockSource' must refer to a non-null clock
      * source that is valid for the lifetime of the constructed CollectionIndexUsageTracker.
      */
-    explicit CollectionIndexUsageTracker(ClockSource* clockSource);
+    explicit CollectionIndexUsageTracker(AggregatedIndexUsageTracker* aggregatedIndexUsageTracker,
+                                         ClockSource* clockSource);
 
     /**
      * Record that an operation used index 'indexName'. Safe to be called by multiple threads
      * concurrently.
      */
-    void recordIndexAccess(StringData indexName);
+    void recordIndexAccess(StringData indexName) const;
 
     /**
-     * Add map entry for 'indexName' stats collection. Must be called under exclusive collection
-     * lock.
+     * Add map entry for 'indexName' stats collection.
+     *
+     * Must be called under an exclusive collection lock in order to serialize calls to
+     * registerIndex() and unregisterIndex().
      */
-    void registerIndex(StringData indexName, const BSONObj& indexKey);
+    void registerIndex(StringData indexName,
+                       const BSONObj& indexKey,
+                       const IndexFeatures& features);
 
     /**
-     * Erase statistics for index 'indexName'. Must be called under exclusive collection lock.
-     * Can be called even if indexName is not registered. This is possible under certain failure
-     * scenarios.
+     * Erase statistics for index 'indexName'. Can be safely called even if indexName is not
+     * registered, which is possible under certain failure scenarios.
+     *
+     * Must be called under an exclusive collection lock in order to serialize calls to
+     * registerIndex() and unregisterIndex().
      */
     void unregisterIndex(StringData indexName);
 
     /**
      * Get the current state of the usage statistics map. This map will only include indexes that
-     * exist at the time of calling. Must be called while holding the collection lock in any mode.
+     * exist at the time of calling.
      */
-    StringMap<CollectionIndexUsageTracker::IndexUsageStats> getUsageStats() const;
+    const CollectionIndexUsageMap& getUsageStats() const;
+
+    /**
+     * Get the current state of the usage of collection scans. This struct will only include
+     * information about the collection scans that have occured at the time of calling.
+     *
+     * Can be safely called by multiple threads concurrently.
+     */
+    CollectionScanStats getCollectionScanStats() const;
+
+    /**
+     * Records that an operation did a collection scan.
+     *
+     * Can be safely called by multiple threads concurrently.
+     */
+    void recordCollectionScans(unsigned long long collectionScans) const;
+    void recordCollectionScansNonTailable(unsigned long long collectionScansNonTailable) const;
+
+    /**
+     * Helper method to notify all metrics of a collection in a single call.
+     */
+    void recordCollectionIndexUsage(long long collectionScans,
+                                    long long collectionScansNonTailable,
+                                    const std::set<std::string>& indexesUsed) const;
 
 private:
-    // Map from index name to usage statistics.
-    StringMap<CollectionIndexUsageTracker::IndexUsageStats> _indexUsageMap;
+    // Maps index name to index usage statistics.
+    CollectionIndexUsageMap _indexUsageStatsMap;
 
     // Clock source. Used when the 'trackerStartTime' time for an IndexUsageStats object needs to
     // be set.
     ClockSource* _clockSource;
-};
 
-typedef StringMap<CollectionIndexUsageTracker::IndexUsageStats> CollectionIndexUsageMap;
+    // All CollectionIndexUsageTrackers also update the AggregatedIndexUsageTracker to report
+    // globally aggregated index statistics for the server.
+    AggregatedIndexUsageTracker* _aggregatedIndexUsageTracker;
+
+    // Statistics shared among all versions of the Collection. Needs to be synchronized separately
+    // using atomics or mutexes.
+    boost::intrusive_ptr<CollectionScanStatsStorage> _sharedStats;
+};
 
 }  // namespace mongo

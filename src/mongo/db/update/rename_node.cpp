@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,20 +27,32 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <boost/container/small_vector.hpp>
+// IWYU pragma: no_include "boost/intrusive/detail/iterator.hpp"
+#include <cstddef>
 
-#include "mongo/db/update/rename_node.h"
+#include <boost/smart_ptr/intrusive_ptr.hpp>
 
-#include "mongo/bson/mutable/algorithm.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/db/exec/mutable_bson/algorithm.h"
+#include "mongo/db/exec/mutable_bson/const_element.h"
+#include "mongo/db/exec/mutable_bson/document.h"
+#include "mongo/db/exec/mutable_bson/element.h"
+#include "mongo/db/field_ref_set.h"
 #include "mongo/db/update/field_checker.h"
 #include "mongo/db/update/modifier_node.h"
 #include "mongo/db/update/path_support.h"
-#include "mongo/db/update/storage_validation.h"
+#include "mongo/db/update/rename_node.h"
+#include "mongo/db/update/runtime_update_path.h"
 #include "mongo/db/update/unset_node.h"
+#include "mongo/db/update/update_executor.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
-
-namespace {
 
 /**
  * The SetElementNode class provides the $set functionality for $rename. A $rename from a source
@@ -61,18 +72,31 @@ public:
     SetElementNode(mutablebson::Element elemToSet) : _elemToSet(elemToSet) {}
 
     std::unique_ptr<UpdateNode> clone() const final {
-        return stdx::make_unique<SetElementNode>(*this);
+        return std::make_unique<SetElementNode>(*this);
     }
 
     void setCollator(const CollatorInterface* collator) final {}
 
-    Status init(BSONElement modExpr, const boost::intrusive_ptr<ExpressionContext>& expCtx) {
+    Status init(BSONElement modExpr,
+                const boost::intrusive_ptr<ExpressionContext>& expCtx) override {
         return Status::OK();
     }
 
+    /**
+     * These internally-generated nodes do not need to be serialized.
+     */
+    void produceSerializationMap(
+        FieldRef* currentPath,
+        std::map<std::string, std::vector<std::pair<std::string, BSONObj>>>*
+            operatorOrientedUpdates) const final {}
+
+    void acceptVisitor(UpdateNodeVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
 protected:
-    ModifierNode::ModifyResult updateExistingElement(
-        mutablebson::Element* element, std::shared_ptr<FieldRef> elementPath) const final {
+    ModifierNode::ModifyResult updateExistingElement(mutablebson::Element* element,
+                                                     const FieldRef& elementPath) const final {
         invariant(element->setValueElement(_elemToSet));
         return ModifyResult::kNormalUpdate;
     }
@@ -90,10 +114,16 @@ protected:
     }
 
 private:
+    StringData operatorName() const final {
+        return "$set";
+    }
+
+    BSONObj operatorValue() const final {
+        return BSON("" << _elemToSet.getValue());
+    }
+
     mutablebson::Element _elemToSet;
 };
-
-}  // namespace
 
 Status RenameNode::init(BSONElement modExpr,
                         const boost::intrusive_ptr<ExpressionContext>& expCtx) {
@@ -103,22 +133,21 @@ Status RenameNode::init(BSONElement modExpr,
     FieldRef fromFieldRef(modExpr.fieldName());
     FieldRef toFieldRef(modExpr.String());
 
-    if (modExpr.valueStringData().find('\0') != std::string::npos) {
-        return Status(ErrorCodes::BadValue,
-                      "The 'to' field for $rename cannot contain an embedded null byte");
-    }
+    tassert(9867601,
+            "The 'to' field for $rename cannot contain an embedded null byte",
+            modExpr.valueStringData().find('\0') == std::string::npos);
 
     // Parsing {$rename: {'from': 'to'}} places nodes in the UpdateNode tree for both the "from" and
     // "to" paths via UpdateObjectNode::parseAndMerge(), which will enforce this isUpdatable
     // property.
-    dassert(fieldchecker::isUpdatable(fromFieldRef).isOK());
-    dassert(fieldchecker::isUpdatable(toFieldRef).isOK());
+    dassert(fieldchecker::isUpdatable(fromFieldRef));
+    dassert(fieldchecker::isUpdatable(toFieldRef));
 
     // Though we could treat this as a no-op, it is illegal in the current implementation.
     if (fromFieldRef == toFieldRef) {
         return Status(ErrorCodes::BadValue,
-                      str::stream() << "The source and target field for $rename must differ: "
-                                    << modExpr);
+                      str::stream()
+                          << "The source and target field for $rename must differ: " << modExpr);
     }
 
     if (fromFieldRef.isPrefixOf(toFieldRef) || toFieldRef.isPrefixOf(fromFieldRef)) {
@@ -146,20 +175,21 @@ Status RenameNode::init(BSONElement modExpr,
     return Status::OK();
 }
 
-UpdateNode::ApplyResult RenameNode::apply(ApplyParams applyParams) const {
+UpdateExecutor::ApplyResult RenameNode::apply(ApplyParams applyParams,
+                                              UpdateNodeApplyParams updateNodeApplyParams) const {
     // It would make sense to store fromFieldRef and toFieldRef as members during
     // RenameNode::init(), but FieldRef is not copyable.
-    auto fromFieldRef = std::make_shared<FieldRef>(_val.fieldName());
+    FieldRef fromFieldRef(_val.fieldName());
     FieldRef toFieldRef(_val.valueStringData());
 
     mutablebson::Document& document = applyParams.element.getDocument();
 
-    size_t fromIdxFound;
+    FieldIndex fromIdxFound;
     mutablebson::Element fromElement(document.end());
     auto status =
-        pathsupport::findLongestPrefix(*fromFieldRef, document.root(), &fromIdxFound, &fromElement);
+        pathsupport::findLongestPrefix(fromFieldRef, document.root(), &fromIdxFound, &fromElement);
 
-    if (!status.isOK() || !fromElement.ok() || fromIdxFound != (fromFieldRef->numParts() - 1)) {
+    if (!status.isOK() || !fromElement.ok() || fromIdxFound != (fromFieldRef.numParts() - 1)) {
         // We could safely remove this restriction (thereby treating a rename with a non-viable
         // source path as a no-op), but most updates fail on an attempt to update a non-viable path,
         // so we throw an error for consistency.
@@ -169,7 +199,11 @@ UpdateNode::ApplyResult RenameNode::apply(ApplyParams applyParams) const {
         }
 
         // The element we want to rename does not exist. When that happens, we treat the operation
-        // as a no-op.
+        // as a no-op. The attempted from/to paths are still considered modified.
+        if (applyParams.modifiedPaths) {
+            applyParams.modifiedPaths->keepShortest(fromFieldRef);
+            applyParams.modifiedPaths->keepShortest(toFieldRef);
+        }
         return ApplyResult::noopResult();
     }
 
@@ -182,20 +216,19 @@ UpdateNode::ApplyResult RenameNode::apply(ApplyParams applyParams) const {
             auto idElem = mutablebson::findFirstChildNamed(document.root(), "_id");
             uasserted(ErrorCodes::BadValue,
                       str::stream() << "The source field cannot be an array element, '"
-                                    << fromFieldRef->dottedField()
-                                    << "' in doc with "
+                                    << fromFieldRef.dottedField() << "' in doc with "
                                     << (idElem.ok() ? idElem.toString() : "no id")
                                     << " has an array field called '"
-                                    << currentElement.getFieldName()
-                                    << "'");
+                                    << currentElement.getFieldName() << "'");
         }
     }
 
     // Check that our destination path does not contain an array. (If the rename will overwrite an
     // existing element, that element may be an array. Iff pathToCreate is empty, "element"
     // represents an element that we are going to overwrite.)
-    for (auto currentElement = applyParams.pathToCreate->empty() ? applyParams.element.parent()
-                                                                 : applyParams.element;
+    for (auto currentElement = updateNodeApplyParams.pathToCreate->empty()
+             ? applyParams.element.parent()
+             : applyParams.element;
          currentElement != document.root();
          currentElement = currentElement.parent()) {
         invariant(currentElement.ok());
@@ -203,12 +236,10 @@ UpdateNode::ApplyResult RenameNode::apply(ApplyParams applyParams) const {
             auto idElem = mutablebson::findFirstChildNamed(document.root(), "_id");
             uasserted(ErrorCodes::BadValue,
                       str::stream() << "The destination field cannot be an array element, '"
-                                    << toFieldRef.dottedField()
-                                    << "' in doc with "
+                                    << toFieldRef.dottedField() << "' in doc with "
                                     << (idElem.ok() ? idElem.toString() : "no id")
                                     << " has an array field called '"
-                                    << currentElement.getFieldName()
-                                    << "'");
+                                    << currentElement.getFieldName() << "'");
         }
     }
 
@@ -217,26 +248,32 @@ UpdateNode::ApplyResult RenameNode::apply(ApplyParams applyParams) const {
     // should call the init() method of a ModifierNode before calling its apply() method, but the
     // init() methods of SetElementNode and UnsetNode don't do anything, so we can skip them.
     SetElementNode setElement(fromElement);
-    auto setElementApplyResult = setElement.apply(applyParams);
+    auto setElementApplyResult = setElement.apply(applyParams, updateNodeApplyParams);
 
     ApplyParams unsetParams(applyParams);
     unsetParams.element = fromElement;
-    unsetParams.pathToCreate = std::make_shared<FieldRef>();
-    unsetParams.pathTaken = fromFieldRef;
+
+    // Renames never "go through" arrays, so we're guaranteed all of the parts of the path are
+    // of type kFieldName.
+    auto pathTaken = std::make_shared<RuntimeUpdatePath>(
+        fromFieldRef,
+        std::vector<RuntimeUpdatePath::ComponentType>(
+            fromFieldRef.numParts(), RuntimeUpdatePath::ComponentType::kFieldName));
+
+    UpdateNodeApplyParams unsetUpdateNodeApplyParams{
+        std::make_shared<FieldRef>(),
+        pathTaken,
+        updateNodeApplyParams.logBuilder,
+    };
 
     UnsetNode unsetElement;
-    auto unsetElementApplyResult = unsetElement.apply(unsetParams);
-
-    // Determine the final result based on the results of the $set and $unset.
-    ApplyResult applyResult;
-    applyResult.indexesAffected =
-        setElementApplyResult.indexesAffected || unsetElementApplyResult.indexesAffected;
+    auto unsetElementApplyResult = unsetElement.apply(unsetParams, unsetUpdateNodeApplyParams);
 
     // The $unset would only be a no-op if the source element did not exist, in which case we would
     // have exited early with a no-op result.
     invariant(!unsetElementApplyResult.noop);
 
-    return applyResult;
+    return {};
 }
 
 }  // namespace mongo

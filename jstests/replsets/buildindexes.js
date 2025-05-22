@@ -1,68 +1,74 @@
 // Check that buildIndexes config option is working
 
-(function() {
-    // Skip db hash check because secondary will have different number of indexes due to
-    // buildIndexes=false on the secondary.
-    TestData.skipCheckDBHashes = true;
-    var name = "buildIndexes";
-    var host = getHostName();
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
-    var replTest = new ReplSetTest({name: name, nodes: 3});
+// Skip db hash check because secondary will have different number of indexes due to
+// buildIndexes=false on the secondary.
+TestData.skipCheckDBHashes = true;
+var name = "buildIndexes";
+var host = getHostName();
 
-    var nodes = replTest.startSet();
+var replTest = new ReplSetTest({name: name, nodes: 3});
 
-    var config = replTest.getReplSetConfig();
-    config.members[2].priority = 0;
-    config.members[2].buildIndexes = false;
+var nodes = replTest.startSet();
 
-    replTest.initiate(config);
+var config = replTest.getReplSetConfig();
+config.members[2].priority = 0;
+config.members[2].buildIndexes = false;
 
-    var master = replTest.getPrimary().getDB(name);
-    var slaveConns = replTest._slaves;
-    var slave = [];
-    for (var i in slaveConns) {
-        slaveConns[i].setSlaveOk();
-        slave.push(slaveConns[i].getDB(name));
+replTest.initiate(config);
+
+var primary = replTest.getPrimary().getDB(name);
+var secondaryConns = replTest.getSecondaries();
+var secondaries = [];
+for (var i in secondaryConns) {
+    secondaryConns[i].setSecondaryOk();
+    secondaries.push(secondaryConns[i].getDB(name));
+}
+replTest.awaitReplication();
+
+// Need to use a commitQuorum of 2 rather than the default of 'votingMembers', which includes the
+// buildIndexes:false node. The index build will otherwise fail early.
+assert.commandWorked(primary.runCommand({
+    createIndexes: 'x',
+    indexes: [{key: {y: 1}, name: 'y_1'}],
+    commitQuorum: 2,
+}));
+
+for (i = 0; i < 100; i++) {
+    primary.x.insert({x: 1, y: "abc", c: 1});
+}
+
+replTest.awaitReplication();
+
+assert.commandWorked(secondaries[0].runCommand({count: "x"}));
+
+var indexes = secondaries[0].stats().indexes;
+assert.eq(indexes, 2, 'number of indexes');
+
+indexes = secondaries[1].stats().indexes;
+assert.eq(indexes, 1);
+
+indexes = secondaries[0].x.stats().indexSizes;
+
+var count = 0;
+for (i in indexes) {
+    count++;
+    if (i == "_id_") {
+        continue;
     }
-    replTest.awaitReplication();
+    assert(i.match(/y_/));
+}
 
-    master.x.ensureIndex({y: 1});
+assert.eq(count, 2);
 
-    for (i = 0; i < 100; i++) {
-        master.x.insert({x: 1, y: "abc", c: 1});
-    }
+indexes = secondaries[1].x.stats().indexSizes;
 
-    replTest.awaitReplication();
+count = 0;
+for (i in indexes) {
+    count++;
+}
 
-    assert.commandWorked(slave[0].runCommand({count: "x"}));
+assert.eq(count, 1);
 
-    var indexes = slave[0].stats().indexes;
-    assert.eq(indexes, 2, 'number of indexes');
-
-    indexes = slave[1].stats().indexes;
-    assert.eq(indexes, 1);
-
-    indexes = slave[0].x.stats().indexSizes;
-
-    var count = 0;
-    for (i in indexes) {
-        count++;
-        if (i == "_id_") {
-            continue;
-        }
-        assert(i.match(/y_/));
-    }
-
-    assert.eq(count, 2);
-
-    indexes = slave[1].x.stats().indexSizes;
-
-    count = 0;
-    for (i in indexes) {
-        count++;
-    }
-
-    assert.eq(count, 1);
-
-    replTest.stopSet();
-}());
+replTest.stopSet();

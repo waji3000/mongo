@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Public Domain 2014-2018 MongoDB, Inc.
+# Public Domain 2014-present MongoDB, Inc.
 # Public Domain 2008-2014 WiredTiger, Inc.
 #
 # This is free and unencumbered software released into the public domain.
@@ -206,6 +206,3 @@ class test_colmax(wttest.WiredTigerTestCase):
         self.assertEqual(cursor.remove(), 0)
         cursor.set_key(simple_key(cursor, recno))
         self.assertEqual(cursor.search(), wiredtiger.WT_NOTFOUND)
-
-if __name__ == '__main__':
-    wttest.run()

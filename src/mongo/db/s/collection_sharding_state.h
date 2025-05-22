@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,111 +29,184 @@
 
 #pragma once
 
-#include "mongo/base/disallow_copying.h"
-#include "mongo/db/logical_time.h"
+#include <memory>
+#include <shared_mutex>
+#include <vector>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/concurrency/lock_manager_defs.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/s/scoped_collection_metadata.h"
-#include "mongo/db/s/sharding_migration_critical_section.h"
+#include "mongo/db/service_context.h"
+#include "mongo/s/index_version.h"
+#include "mongo/s/shard_version.h"
+#include "mongo/s/sharding_index_catalog_cache.h"
 
 namespace mongo {
 
 /**
- * Each collection on a mongod instance is dynamically assigned two pieces of information for the
- * duration of its lifetime:
- *  CollectionShardingState - this is a passive data-only state, which represents what is the
- * shard's knowledge of its the shard version and the set of chunks that it owns.
- *  CollectionShardingRuntime (missing from the embedded mongod) - this is the heavyweight machinery
- * which implements the sharding protocol functions and is what controls the data-only state.
+ * Each shard node process (primary or secondary) has one instance of this object for each
+ * collection residing on that shard. It sits on the second level of the hierarchy of the Shard Role
+ * runtime-authoritative caches (along with DatabaseShardingState) and represents the shard's
+ * knowledge of that collection's shard version and the set of chunks that it owns, as well as
+ * functions for tracking this state.
  *
- * The CollectionShardingStateFactory class below is used in order to allow for the collection
- * runtime to be instantiated separately from the sharding state.
+ * This is the only interface that non-sharding consumers should be interfacing with.
  *
- * Synchronization rule: In order to obtain an instance of this object, the caller must have some
- * lock on the respective collection.
+ * On shard servers, the implementation used is CollectionShardingRuntime.
+ *
+ * On embedded or non-shard servers, the implementation used is CollectionShardingStateStandalone,
+ * which is a mostly empty implementation.
+ *
+ * The CollectionShardingStateFactory class below is used to instantiate the correct subclass of
+ * CollectionShardingState at runtime.
+ *
+ * SYNCHRONISATION: In order to obtain an instance of this object, the caller must have some lock on
+ * the respective collection. Different functions require different lock levels though, so be sure
+ * to check the function-level comments for details.
  */
 class CollectionShardingState {
-    MONGO_DISALLOW_COPYING(CollectionShardingState);
-
 public:
+    CollectionShardingState() = default;
     virtual ~CollectionShardingState() = default;
 
+    CollectionShardingState(const CollectionShardingState&) = delete;
+    CollectionShardingState& operator=(const CollectionShardingState&) = delete;
+
     /**
-     * Obtains the sharding state for the specified collection. If it does not exist, it will be
-     * created and will remain in memory until the collection is dropped.
-     *
-     * Must be called with some lock held on the specific collection being looked up and the
-     * returned pointer must not be stored.
+     * Obtains the sharding state for the specified collection, along with a lock protecting it from
+     * concurrent modifications, which will be held util the object goes out of scope.
      */
-    static CollectionShardingState* get(OperationContext* opCtx, const NamespaceString& nss);
+    class ScopedCollectionShardingState {
+        // This used to be a ResourceMutex, we use a shared_mutex instead to keep similar semantics.
+        using LockType = std::variant<std::shared_lock<std::shared_mutex>,   // NOLINT
+                                      std::unique_lock<std::shared_mutex>>;  // NOLINT
+
+    public:
+        ScopedCollectionShardingState(ScopedCollectionShardingState&&);
+
+        ~ScopedCollectionShardingState();
+
+        CollectionShardingState* operator->() const {
+            return _css;
+        }
+        CollectionShardingState& operator*() const {
+            return *_css;
+        }
+
+    private:
+        friend class CollectionShardingState;
+        friend class CollectionShardingRuntime;
+
+        ScopedCollectionShardingState(LockType lock, CollectionShardingState* css);
+
+        // Constructor without the lock.
+        // Important: Only for use in non-shard servers!
+        ScopedCollectionShardingState(CollectionShardingState* css);
+
+        static ScopedCollectionShardingState acquireScopedCollectionShardingState(
+            OperationContext* opCtx, const NamespaceString& nss, LockMode mode);
+
+        boost::optional<LockType> _lock;
+        CollectionShardingState* _css;
+    };
+    static ScopedCollectionShardingState assertCollectionLockedAndAcquire(
+        OperationContext* opCtx, const NamespaceString& nss);
+    static ScopedCollectionShardingState acquire(OperationContext* opCtx,
+                                                 const NamespaceString& nss);
+
+    /**
+     * Returns the names of the collections that have a CollectionShardingState.
+     */
+    static std::vector<NamespaceString> getCollectionNames(OperationContext* opCtx);
 
     /**
      * Reports all collections which have filtering information associated.
      */
-    static void report(OperationContext* opCtx, BSONObjBuilder* builder);
+    static void appendInfoForShardingStateCommand(OperationContext* opCtx, BSONObjBuilder* builder);
 
     /**
-     * Returns the chunk filtering metadata that the current operation should be using for that
-     * collection or otherwise throws if it has not been loaded yet. If the operation does not
-     * require a specific shard version, returns an UNSHARDED metadata. The returned object is safe
-     * to access outside of collection lock.
+     * If the shard currently doesn't know whether the collection is sharded or not, it will throw a
+     * StaleConfig error.
      *
-     * If the operation context contains an 'atClusterTime' property, the returned filtering
-     * metadata will be tied to a specific point in time. Otherwise it will reference the latest
-     * time available.
+     * If the request doesn't have a shard version all collections will be treated as UNSHARDED.
      */
-    ScopedCollectionMetadata getMetadataForOperation(OperationContext* opCtx);
-    ScopedCollectionMetadata getCurrentMetadata();
+    virtual ScopedCollectionDescription getCollectionDescription(OperationContext* opCtx) const = 0;
+
+    virtual ScopedCollectionDescription getCollectionDescription(
+        OperationContext* opCtx, bool operationIsVersioned) const = 0;
 
     /**
-     * Returns boost::none if the filtering metadata for the collection is not known yet. Otherwise
-     * returns the most recently refreshed from the config server metadata or shard version.
+     * This method must be called with an OperationShardingState, which specifies an expected shard
+     * version for the collection and it will invariant otherwise.
      *
-     * These methods do not check for the shard version that the operation requires and should only
-     * be used for cases such as checking whether a particular config server update has taken
-     * effect.
+     * If the shard currently doesn't know whether the collection is sharded or not, or if the
+     * expected shard version doesn't match with the one in the OperationShardingState, it will
+     * throw a StaleConfig error.
+     *
+     * If the operation context contains an 'atClusterTime', the returned filtering object will be
+     * tied to a specific point in time. Otherwise, it will reference the latest cluster time
+     * available.
+     *
+     * If 'kDisallowOrphanCleanup' is passed as 'OrphanCleanupPolicy', the range deleter won't
+     * delete any orphan chunk associated with this ScopedCollectionFilter until the object is
+     * destroyed. The intended users of this mode are read operations, which need to yield the
+     * collection lock, but still perform filtering.
+     *
+     * The 'supportNonVersionedOperations' parameter states whether this function should consider
+     * operations that don't have a shard version.
+     * If the request doesn't have a shard version:
+     *    - this function will invariant if !supportNonVersionedOperations (default value)
+     *    - the collection will be treated as UNSHARDED otherwise.
+     *
+     * Use 'getCollectionDescription' for other cases, like obtaining information about
+     * sharding-related properties of the collection are necessary that won't change under
+     * collection IX/IS lock (e.g., isSharded or the shard key).
      */
-    boost::optional<ScopedCollectionMetadata> getCurrentMetadataIfKnown();
-    boost::optional<ChunkVersion> getCurrentShardVersionIfKnown();
+    enum class OrphanCleanupPolicy { kDisallowOrphanCleanup, kAllowOrphanCleanup };
+    virtual ScopedCollectionFilter getOwnershipFilter(
+        OperationContext* opCtx,
+        OrphanCleanupPolicy orphanCleanupPolicy,
+        bool supportNonVersionedOperations = false) const = 0;
+
+    virtual ScopedCollectionFilter getOwnershipFilter(
+        OperationContext* opCtx,
+        OrphanCleanupPolicy orphanCleanupPolicy,
+        const ShardVersion& receivedShardVersion) const = 0;
+
+    /**
+     * Gets the shard's index version.
+     */
+    virtual boost::optional<CollectionIndexes> getCollectionIndexes(
+        OperationContext* opCtx) const = 0;
+
+    /**
+     * Gets the shard's index cache.
+     *
+     */
+    virtual boost::optional<ShardingIndexesCatalogCache> getIndexes(
+        OperationContext* opCtx) const = 0;
 
     /**
      * Checks whether the shard version in the operation context is compatible with the shard
-     * version of the collection and if not, throws StaleConfigException populated with the received
+     * version of the collection and if not, throws StaleConfig error populated with the received
      * and wanted versions.
+     *
+     * If the request is not versioned all collections will be treated as UNSHARDED.
      */
-    void checkShardVersionOrThrow(OperationContext* opCtx);
+    virtual void checkShardVersionOrThrow(OperationContext* opCtx) const = 0;
+
+    virtual void checkShardVersionOrThrow(OperationContext* opCtx,
+                                          const ShardVersion& receivedShardVersion) const = 0;
 
     /**
-     * Methods to control the collection's critical section. Must be called with the collection X
-     * lock held.
+     * Appends information about the shard version of the collection.
      */
-    void enterCriticalSectionCatchUpPhase(OperationContext* opCtx);
-    void enterCriticalSectionCommitPhase(OperationContext* opCtx);
-    void exitCriticalSection(OperationContext* opCtx);
-
-    /**
-     * If the collection is currently in a critical section, returns the critical section signal to
-     * be waited on. Otherwise, returns nullptr.
-     */
-    auto getCriticalSectionSignal(ShardingMigrationCriticalSection::Operation op) const {
-        return _critSec.getSignal(op);
-    }
-
-protected:
-    CollectionShardingState(NamespaceString nss);
-
-private:
-    // Namespace this state belongs to.
-    const NamespaceString _nss;
-
-    // Tracks the migration critical section state for this collection.
-    ShardingMigrationCriticalSection _critSec;
-
-    /**
-     * Obtains the current metadata for the collection or boost::none if the metadata is not yet
-     * known
-     */
-    virtual boost::optional<ScopedCollectionMetadata> _getMetadata(
-        const boost::optional<mongo::LogicalTime>& atClusterTime) = 0;
+    virtual void appendShardVersion(BSONObjBuilder* builder) const = 0;
 };
 
 /**
@@ -142,7 +214,8 @@ private:
  * which is running.
  */
 class CollectionShardingStateFactory {
-    MONGO_DISALLOW_COPYING(CollectionShardingStateFactory);
+    CollectionShardingStateFactory(const CollectionShardingStateFactory&) = delete;
+    CollectionShardingStateFactory& operator=(const CollectionShardingStateFactory&) = delete;
 
 public:
     static void set(ServiceContext* service,
@@ -152,7 +225,7 @@ public:
     virtual ~CollectionShardingStateFactory() = default;
 
     /**
-     * Called by the CollectionShardingState::get method once per newly cached namespace. It is
+     * Called by the CollectionShardingState::acquire method once per newly cached namespace. It is
      * invoked under a mutex and must not acquire any locks or do blocking work.
      *
      * Implementations must be thread-safe when called from multiple threads.
@@ -160,11 +233,7 @@ public:
     virtual std::unique_ptr<CollectionShardingState> make(const NamespaceString& nss) = 0;
 
 protected:
-    CollectionShardingStateFactory(ServiceContext* serviceContext)
-        : _serviceContext(serviceContext) {}
-
-    // The service context which owns this factory
-    ServiceContext* const _serviceContext;
+    CollectionShardingStateFactory() = default;
 };
 
 }  // namespace mongo

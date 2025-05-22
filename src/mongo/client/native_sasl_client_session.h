@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -29,6 +28,11 @@
  */
 
 
+#include <memory>
+#include <string>
+
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
 #include "mongo/client/sasl_client_session.h"
 
 namespace mongo {
@@ -40,26 +44,27 @@ class SaslClientConversation;
  * native SASL implementation.
  */
 class NativeSaslClientSession : public SaslClientSession {
-    MONGO_DISALLOW_COPYING(NativeSaslClientSession);
+    NativeSaslClientSession(const NativeSaslClientSession&) = delete;
+    NativeSaslClientSession& operator=(const NativeSaslClientSession&) = delete;
 
 public:
     NativeSaslClientSession();
-    ~NativeSaslClientSession();
+    ~NativeSaslClientSession() override;
 
-    virtual Status initialize();
+    Status initialize() override;
 
-    virtual Status step(StringData inputData, std::string* outputData);
+    Status step(StringData inputData, std::string* outputData) override;
 
-    virtual bool isDone() const {
-        return _done;
+    bool isSuccess() const override {
+        return _success;
     }
 
 private:
     /// Number of successfully completed conversation steps.
     int _step;
 
-    /// See isDone().
-    bool _done;
+    /// See isSuccess().
+    bool _success;
 
     /// The client side of a SASL authentication conversation.
     std::unique_ptr<SaslClientConversation> _saslConversation;

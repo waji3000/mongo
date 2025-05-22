@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,23 +27,27 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/client/sasl_scram_client_conversation.h"
-
 #include <boost/algorithm/string/replace.hpp>
+#include <cstdint>
+#include <deque>
+#include <memory>
 
+#include <absl/strings/str_split.h>
+#include <boost/iterator/iterator_traits.hpp>
+#include <boost/move/utility_core.hpp>
+
+#include "mongo/base/error_codes.h"
 #include "mongo/base/parse_number.h"
-#include "mongo/client/scram_client_cache.h"
+#include "mongo/base/status.h"
+#include "mongo/bson/util/builder.h"
+#include "mongo/bson/util/builder_fwd.h"
+#include "mongo/client/sasl_scram_client_conversation.h"
 #include "mongo/platform/random.h"
 #include "mongo/util/base64.h"
-#include "mongo/util/mongoutils/str.h"
-#include "mongo/util/password_digest.h"
-#include "mongo/util/text.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
-using std::unique_ptr;
 using std::string;
 
 StatusWith<bool> SaslSCRAMClientConversation::step(StringData inputData, std::string* outputData) {
@@ -58,9 +61,9 @@ StatusWith<bool> SaslSCRAMClientConversation::step(StringData inputData, std::st
         case 3:
             return _thirdStep(inputData, outputData);
         default:
-            return StatusWith<bool>(
-                ErrorCodes::AuthenticationFailed,
-                mongoutils::str::stream() << "Invalid SCRAM authentication step: " << _step);
+            return StatusWith<bool>(ErrorCodes::AuthenticationFailed,
+                                    str::stream()
+                                        << "Invalid SCRAM authentication step: " << _step);
     }
 }
 
@@ -83,20 +86,17 @@ StatusWith<bool> SaslSCRAMClientConversation::_firstStep(std::string* outputData
     }
 
     // Create text-based nonce as base64 encoding of a binary blob of length multiple of 3
-    const int nonceLenQWords = 3;
+    static constexpr size_t nonceLenQWords = 3;
     uint64_t binaryNonce[nonceLenQWords];
 
-    unique_ptr<SecureRandom> sr(SecureRandom::create());
-
-    binaryNonce[0] = sr->nextInt64();
-    binaryNonce[1] = sr->nextInt64();
-    binaryNonce[2] = sr->nextInt64();
+    SecureRandom().fill(binaryNonce, sizeof(binaryNonce));
 
     std::string user =
         _saslClientSession->getParameter(SaslClientSession::parameterUser).toString();
 
     encodeSCRAMUsername(user);
-    _clientNonce = base64::encode(reinterpret_cast<char*>(binaryNonce), sizeof(binaryNonce));
+    _clientNonce =
+        base64::encode(StringData(reinterpret_cast<char*>(binaryNonce), sizeof(binaryNonce)));
 
     // Append client-first-message-bare to authMessage
     _authMessage = "n=" + user + ",r=" + _clientNonce;
@@ -118,17 +118,17 @@ StatusWith<bool> SaslSCRAMClientConversation::_firstStep(std::string* outputData
  **/
 StatusWith<bool> SaslSCRAMClientConversation::_secondStep(StringData inputData,
                                                           std::string* outputData) {
-    if (inputData.startsWith("m=")) {
+    if (inputData.starts_with("m=")) {
         return Status(ErrorCodes::BadValue, "SCRAM required extensions not supported");
     }
-    const auto input = StringSplitter::split(inputData.toString(), ",");
+    const std::vector<std::string> input =
+        absl::StrSplit(toStdStringViewForInterop(inputData), ",", absl::SkipEmpty());
 
     if (input.size() < 3) {
         return Status(ErrorCodes::BadValue,
                       str::stream()
                           << "Incorrect number of arguments for first SCRAM server message, got "
-                          << input.size()
-                          << " expected at least 3");
+                          << input.size() << " expected at least 3");
     }
 
     if (!str::startsWith(input[0], "r=") || input[0].size() < 3) {
@@ -152,7 +152,7 @@ StatusWith<bool> SaslSCRAMClientConversation::_secondStep(StringData inputData,
                       str::stream() << "Incorrect SCRAM iteration count: " << input[2]);
     }
     size_t iterationCount;
-    Status status = parseNumberFromStringWithBase(input[2].substr(2), 10, &iterationCount);
+    Status status = NumberParser().base(10)(input[2].substr(2), &iterationCount);
     if (!status.isOK()) {
         return Status(ErrorCodes::BadValue,
                       str::stream() << "Failed to parse SCRAM iteration count: " << input[2]);
@@ -186,7 +186,8 @@ StatusWith<bool> SaslSCRAMClientConversation::_secondStep(StringData inputData,
  **/
 StatusWith<bool> SaslSCRAMClientConversation::_thirdStep(StringData inputData,
                                                          std::string* outputData) {
-    const auto input = StringSplitter::split(inputData.toString(), ",");
+    const std::vector<std::string> input =
+        absl::StrSplit(toStdStringViewForInterop(inputData), ",", absl::SkipEmpty());
 
     if (input.empty()) {
         return Status(

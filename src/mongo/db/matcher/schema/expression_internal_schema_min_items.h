@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,6 +29,16 @@
 
 #pragma once
 
+#include <memory>
+#include <utility>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/clonable_ptr.h"
+#include "mongo/base/string_data.h"
+#include "mongo/db/matcher/expression.h"
+#include "mongo/db/matcher/expression_visitor.h"
 #include "mongo/db/matcher/schema/expression_internal_schema_num_array_items.h"
 
 namespace mongo {
@@ -41,21 +50,31 @@ namespace mongo {
 class InternalSchemaMinItemsMatchExpression final
     : public InternalSchemaNumArrayItemsMatchExpression {
 public:
-    InternalSchemaMinItemsMatchExpression(StringData path, long long numItems)
-        : InternalSchemaNumArrayItemsMatchExpression(
-              INTERNAL_SCHEMA_MIN_ITEMS, path, numItems, "$_internalSchemaMinItems"_sd) {}
+    InternalSchemaMinItemsMatchExpression(boost::optional<StringData> path,
+                                          long long numItems,
+                                          clonable_ptr<ErrorAnnotation> annotation = nullptr)
+        : InternalSchemaNumArrayItemsMatchExpression(INTERNAL_SCHEMA_MIN_ITEMS,
+                                                     path,
+                                                     numItems,
+                                                     "$_internalSchemaMinItems"_sd,
+                                                     std::move(annotation)) {}
 
-    bool matchesArray(const BSONObj& anArray, MatchDetails* details) const final {
-        return (anArray.nFields() >= numItems());
-    }
-
-    std::unique_ptr<MatchExpression> shallowClone() const final {
+    std::unique_ptr<MatchExpression> clone() const final {
         std::unique_ptr<InternalSchemaMinItemsMatchExpression> minItems =
-            stdx::make_unique<InternalSchemaMinItemsMatchExpression>(path(), numItems());
+            std::make_unique<InternalSchemaMinItemsMatchExpression>(
+                path(), numItems(), _errorAnnotation);
         if (getTag()) {
             minItems->setTag(getTag()->clone());
         }
-        return std::move(minItems);
+        return minItems;
+    }
+
+    void acceptVisitor(MatchExpressionMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(MatchExpressionConstVisitor* visitor) const final {
+        visitor->visit(this);
     }
 };
 }  // namespace mongo

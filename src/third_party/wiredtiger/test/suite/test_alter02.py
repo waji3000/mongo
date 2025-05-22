@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Public Domain 2014-2018 MongoDB, Inc.
+# Public Domain 2014-present MongoDB, Inc.
 # Public Domain 2008-2014 WiredTiger, Inc.
 #
 # This is free and unencumbered software released into the public domain.
@@ -27,11 +27,12 @@
 # OTHER DEALINGS IN THE SOFTWARE.
 
 import sys, wiredtiger, wttest
+from helper_tiered import TieredConfigMixin, gen_tiered_storage_sources
 from wtscenario import make_scenarios
 
 # test_alter02.py
 #    Smoke-test the session alter operations.
-class test_alter02(wttest.WiredTigerTestCase):
+class test_alter02(TieredConfigMixin, wttest.WiredTigerTestCase):
     entries = 500
     # Binary values.
     value = u'\u0001\u0002abcd\u0003\u0004'
@@ -46,7 +47,6 @@ class test_alter02(wttest.WiredTigerTestCase):
 
     types = [
         ('file', dict(uri='file:', use_cg=False, use_index=False)),
-        ('lsm', dict(uri='lsm:', use_cg=False, use_index=False)),
         ('table-cg', dict(uri='table:', use_cg=True, use_index=False)),
         ('table-index', dict(uri='table:', use_cg=False, use_index=True)),
         ('table-simple', dict(uri='table:', use_cg=False, use_index=False)),
@@ -63,7 +63,8 @@ class test_alter02(wttest.WiredTigerTestCase):
         ('no-reopen', dict(reopen=False)),
         ('reopen', dict(reopen=True)),
     ]
-    scenarios = make_scenarios(conn_log, types, tables, reopen)
+    tiered_storage_sources = gen_tiered_storage_sources()
+    scenarios = make_scenarios(tiered_storage_sources, conn_log, types, tables, reopen)
 
     # This test varies the log setting.  Override the standard methods.
     def setUpConnectionOpen(self, dir):
@@ -73,12 +74,19 @@ class test_alter02(wttest.WiredTigerTestCase):
     def ConnectionOpen(self):
         self.home = '.'
 
-        conn_params = 'create,log=(archive=false,file_max=100K,%s)' % self.uselog
+        tiered_config = self.conn_config()
+        tiered_config += self.extensionsConfig()
+        # In case the open starts additional threads, flush first to avoid confusion.
+        sys.stdout.flush()
+
+        conn_params = 'create,log=(file_max=100K,remove=false,%s)' % self.uselog
+        if tiered_config != '':
+            conn_params += ',' + tiered_config
 
         try:
             self.conn = wiredtiger.wiredtiger_open(self.home, conn_params)
         except wiredtiger.WiredTigerError as e:
-            print "Failed conn at '%s' with config '%s'" % (dir, conn_params)
+            print("Failed conn at '%s' with config '%s'" % (dir, conn_params))
         self.session = self.conn.open_session()
 
     # Verify the metadata string for this URI and that its setting in the
@@ -97,8 +105,7 @@ class test_alter02(wttest.WiredTigerTestCase):
             if ret != 0:
                 break
             key = cursor.get_key()
-            check_meta = ((key.find("lsm:") != -1 or key.find("file:") != -1) \
-                and key.find(self.name) != -1)
+            check_meta = key.find("file:") != -1 and key.find(self.name) != -1
             if check_meta:
                 value = cursor[key]
                 found = True
@@ -116,17 +123,22 @@ class test_alter02(wttest.WiredTigerTestCase):
             keys = c.get_key()
             # txnid, rectype, optype, fileid, logrec_key, logrec_value
             values = c.get_value()
-            try:
-                if self.value in str(values[5]):     # logrec_value
-                    count += 1
-                self.assertFalse(value2 in str(values[5]))
-            except:
-                pass
+            if self.value.encode() in values[5]:     # logrec_value
+                count += 1
+            self.assertFalse(self.value2.encode() in values[5])
         c.close()
-        self.assertEqual(count, expected_keys)
+        #
+        # We check that we saw the expected keys at twice the rate because
+        # the log cursor, for each commit record, will first return the entire,
+        # full record, and then return the individual operation. We will detect
+        # the string in both records.
+        self.assertEqual(count, expected_keys * 2)
 
     # Alter: Change the log setting after creation
     def test_alter02_log(self):
+        if self.is_tiered_scenario() and (self.uri == 'file:'):
+            self.skipTest('Tiered storage does not support file URIs.')
+
         uri = self.uri + self.name
         create_params = 'key_format=i,value_format=S,'
         complex_params = ''
@@ -229,6 +241,3 @@ class test_alter02(wttest.WiredTigerTestCase):
         if self.conncreate or (self.connreopen and self.reopen):
             self.pr("EXPECTED KEYS 2: " + str(expected_keys))
             self.verify_logrecs(expected_keys)
-
-if __name__ == '__main__':
-    wttest.run()

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,7 +29,7 @@
 
 #pragma once
 
-#include "mongo/base/string_data_comparator_interface.h"
+#include "mongo/base/string_data_comparator.h"
 #include "mongo/bson/bsonobj_comparator_interface.h"
 
 namespace mongo {
@@ -58,7 +57,7 @@ public:
      */
     BSONObjComparator(BSONObj ordering,
                       FieldNamesMode fieldNamesMode,
-                      const StringData::ComparatorInterface* stringComparator)
+                      const StringDataComparator* stringComparator)
         : _ordering(std::move(ordering)),
           _stringComparator(stringComparator),
           _rules((fieldNamesMode == FieldNamesMode::kConsider) ? ComparisonRules::kConsiderFieldName
@@ -74,7 +73,7 @@ public:
 
 private:
     BSONObj _ordering;
-    const StringData::ComparatorInterface* _stringComparator;
+    const StringDataComparator* _stringComparator;
     ComparisonRulesSet _rules;
 };
 

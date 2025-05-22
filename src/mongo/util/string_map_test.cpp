@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,20 +27,24 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
 
+#include <cstdio>
+#include <utility>
+
+#include <absl/container/node_hash_map.h>
+
+#include "mongo/stdx/type_traits.h"
 #include "mongo/unittest/unittest.h"
-
-#include "mongo/platform/random.h"
-#include "mongo/util/log.h"
 #include "mongo/util/string_map.h"
-#include "mongo/util/timer.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
+
 
 namespace {
 using namespace mongo;
 
 TEST(StringMapTest, Hash1) {
-    auto hash = StringMapTraits::hash;
+    StringSet::hasher hash;
     ASSERT_EQUALS(hash(""), hash(""));
     ASSERT_EQUALS(hash("a"), hash("a"));
     ASSERT_EQUALS(hash("abc"), hash("abc"));
@@ -61,7 +64,7 @@ TEST(StringMapTest, Hash1) {
     ASSERT_FALSE(equals((b), (a)));
 
 TEST(StringMapTest, Equals1) {
-    auto equals = StringMapTraits::equals;
+    StringSet::key_equal equals;
 
     equalsBothWays("", "");
     equalsBothWays("a", "a");
@@ -213,11 +216,14 @@ TEST(StringMapTest, Assign) {
 
 TEST(StringMapTest, InitWithInitializerList) {
     StringMap<int> smap{
-        {"q", 1}, {"coollog", 2}, {"mango", 3}, {"mango", 4},
+        {"q", 1},
+        {"coollog", 2},
+        {"mango", 3},
+        {"mango", 4},
     };
 
     ASSERT_EQ(1, smap["q"]);
     ASSERT_EQ(2, smap["coollog"]);
     ASSERT_EQ(3, smap["mango"]);
 }
-}
+}  // namespace

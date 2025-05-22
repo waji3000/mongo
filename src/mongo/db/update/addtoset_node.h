@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,8 +29,25 @@
 
 #pragma once
 
+#include <memory>
+#include <vector>
+
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/exec/mutable_bson/algorithm.h"
+#include "mongo/db/exec/mutable_bson/element.h"
+#include "mongo/db/field_ref.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/query/collation/collator_interface.h"
 #include "mongo/db/update/modifier_node.h"
-#include "mongo/stdx/memory.h"
+#include "mongo/db/update/update_node.h"
+#include "mongo/db/update/update_node_visitor.h"
 
 namespace mongo {
 
@@ -43,21 +59,51 @@ public:
     Status init(BSONElement modExpr, const boost::intrusive_ptr<ExpressionContext>& expCtx) final;
 
     std::unique_ptr<UpdateNode> clone() const final {
-        return stdx::make_unique<AddToSetNode>(*this);
+        return std::make_unique<AddToSetNode>(*this);
     }
 
     void setCollator(const CollatorInterface* collator) final;
 
+    void acceptVisitor(UpdateNodeVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
 protected:
     ModifyResult updateExistingElement(mutablebson::Element* element,
-                                       std::shared_ptr<FieldRef> elementPath) const final;
+                                       const FieldRef& elementPath) const final;
     void setValueForNewElement(mutablebson::Element* element) const final;
+    void logUpdate(LogBuilderInterface* logBuilder,
+                   const RuntimeUpdatePath& pathTaken,
+                   mutablebson::Element element,
+                   ModifyResult modifyResult,
+                   boost::optional<int> createdFieldIdx) const final;
 
     bool allowCreation() const final {
         return true;
     }
 
 private:
+    StringData operatorName() const final {
+        return "$addToSet";
+    }
+
+    BSONObj operatorValue() const final {
+        if (_elements.size() == 1) {
+            return BSON("" << _elements[0]);
+        } else {
+            BSONObjBuilder bob;
+            {
+                BSONObjBuilder subBuilder(bob.subobjStart(""));
+                {
+                    BSONObjBuilder eachBuilder(subBuilder.subarrayStart("$each"));
+                    for (const auto& element : _elements)
+                        eachBuilder << element;
+                }
+            }
+            return bob.obj();
+        }
+    }
+
     // The array of elements to be added.
     std::vector<BSONElement> _elements;
 

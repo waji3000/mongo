@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,9 +29,9 @@
 
 #pragma once
 
-#include <string>
-
 #include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+#include <string>
 
 #include "mongo/bson/bsonobj.h"
 

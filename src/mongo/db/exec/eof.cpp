@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,27 +27,23 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <memory>
 
 #include "mongo/db/exec/eof.h"
-
-#include "mongo/db/exec/scoped_timer.h"
-#include "mongo/stdx/memory.h"
 
 namespace mongo {
 
 using std::unique_ptr;
-using std::vector;
-using stdx::make_unique;
 
 // static
 const char* EOFStage::kStageType = "EOF";
 
-EOFStage::EOFStage(OperationContext* opCtx) : PlanStage(kStageType, opCtx) {}
+EOFStage::EOFStage(ExpressionContext* expCtx, eof_node::EOFType type)
+    : PlanStage(kStageType, expCtx), _specificStats(EofStats(type)) {}
 
 EOFStage::~EOFStage() {}
 
-bool EOFStage::isEOF() {
+bool EOFStage::isEOF() const {
     return true;
 }
 
@@ -58,11 +53,13 @@ PlanStage::StageState EOFStage::doWork(WorkingSetID* out) {
 
 unique_ptr<PlanStageStats> EOFStage::getStats() {
     _commonStats.isEOF = isEOF();
-    return make_unique<PlanStageStats>(_commonStats, STAGE_EOF);
+    unique_ptr<PlanStageStats> ret = std::make_unique<PlanStageStats>(_commonStats, STAGE_EOF);
+    ret->specific = std::make_unique<EofStats>(_specificStats);
+    return ret;
 }
 
 const SpecificStats* EOFStage::getSpecificStats() const {
-    return nullptr;
+    return &_specificStats;
 }
 
 }  // namespace mongo

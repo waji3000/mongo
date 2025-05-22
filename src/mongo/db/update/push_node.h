@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,25 +29,38 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
 #include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
 #include <limits>
+#include <memory>
 #include <vector>
 
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/exec/mutable_bson/element.h"
+#include "mongo/db/field_ref.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/query/collation/collator_interface.h"
+#include "mongo/db/update/log_builder_interface.h"
 #include "mongo/db/update/modifier_node.h"
-#include "mongo/db/update/push_sorter.h"
-#include "mongo/stdx/memory.h"
+#include "mongo/db/update/pattern_cmp.h"
+#include "mongo/db/update/runtime_update_path.h"
+#include "mongo/db/update/update_node.h"
+#include "mongo/db/update/update_node_visitor.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 
 class PushNode final : public ModifierNode {
 public:
-    PushNode()
-        : _slice(std::numeric_limits<long long>::max()),
-          _position(std::numeric_limits<long long>::max()) {}
     Status init(BSONElement modExpr, const boost::intrusive_ptr<ExpressionContext>& expCtx) final;
 
     std::unique_ptr<UpdateNode> clone() const final {
-        return stdx::make_unique<PushNode>(*this);
+        return std::make_unique<PushNode>(*this);
     }
 
     void setCollator(const CollatorInterface* collator) final {
@@ -58,14 +70,19 @@ public:
         }
     }
 
+    void acceptVisitor(UpdateNodeVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
 protected:
     ModifyResult updateExistingElement(mutablebson::Element* element,
-                                       std::shared_ptr<FieldRef> elementPath) const final;
+                                       const FieldRef& elementPath) const final;
     void setValueForNewElement(mutablebson::Element* element) const final;
-    void logUpdate(LogBuilder* logBuilder,
-                   StringData pathTaken,
+    void logUpdate(LogBuilderInterface* logBuilder,
+                   const RuntimeUpdatePath& pathTaken,
                    mutablebson::Element element,
-                   ModifyResult modifyResult) const final;
+                   ModifyResult modifyResult,
+                   boost::optional<int> createdFieldIdx) const final;
 
     bool allowCreation() const final {
         return true;
@@ -73,9 +90,15 @@ protected:
 
 
 private:
+    StringData operatorName() const final {
+        return "$push";
+    }
+
+    BSONObj operatorValue() const final;
+
     // A helper for performPush().
     static ModifyResult insertElementsWithPosition(mutablebson::Element* array,
-                                                   long long position,
+                                                   boost::optional<long long> position,
                                                    const std::vector<BSONElement>& valuesToPush);
 
     /**
@@ -92,7 +115,7 @@ private:
      *     inserted at the beginning or in the middle of the array, or a slice or sort gets
      *     performed.
      */
-    ModifyResult performPush(mutablebson::Element* element, FieldRef* elementPath) const;
+    ModifyResult performPush(mutablebson::Element* element, const FieldRef* elementPath) const;
 
     static const StringData kEachClauseName;
     static const StringData kSliceClauseName;
@@ -100,8 +123,8 @@ private:
     static const StringData kPositionClauseName;
 
     std::vector<BSONElement> _valuesToPush;
-    long long _slice;
-    long long _position;
+    boost::optional<long long> _slice;
+    boost::optional<long long> _position;
     boost::optional<PatternElementCmp> _sort;
 };
 

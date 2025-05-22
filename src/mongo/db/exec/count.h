@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,24 +29,15 @@
 
 #pragma once
 
+#include <memory>
+
 #include "mongo/db/exec/plan_stage.h"
-#include "mongo/db/query/count_request.h"
+#include "mongo/db/exec/plan_stats.h"
+#include "mongo/db/exec/working_set.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/query/stage_types.h"
 
 namespace mongo {
-
-struct CountStageParams {
-    CountStageParams(const CountRequest& request)
-        : nss(request.getNs()), limit(request.getLimit()), skip(request.getSkip()) {}
-
-    // Namespace to operate on (e.g. "foo.bar").
-    NamespaceString nss;
-
-    // An integer limiting the number of documents to count. 0 means no limit.
-    long long limit;
-
-    // An integer indicating to not include the first n documents in the count. 0 means no skip.
-    long long skip;
-};
 
 /**
  * Stage used by the count command. This stage sits at the root of a plan tree and counts the number
@@ -62,27 +52,31 @@ struct CountStageParams {
  */
 class CountStage final : public PlanStage {
 public:
-    CountStage(OperationContext* opCtx,
-               Collection* collection,
-               CountStageParams params,
+    CountStage(ExpressionContext* expCtx,
+               long long limit,
+               long long skip,
                WorkingSet* ws,
                PlanStage* child);
 
-    bool isEOF() final;
+    bool isEOF() const final;
     StageState doWork(WorkingSetID* out) final;
 
     StageType stageType() const final {
         return STAGE_COUNT;
     }
 
-    std::unique_ptr<PlanStageStats> getStats();
+    std::unique_ptr<PlanStageStats> getStats() override;
 
     const SpecificStats* getSpecificStats() const final;
 
     static const char* kStageType;
 
 private:
-    CountStageParams _params;
+    // An integer limiting the number of documents to count. 0 means no limit.
+    long long _limit;
+
+    // An integer indicating to not include the first n documents in the count. 0 means no skip.
+    long long _skip;
 
     // The number of documents that we still need to skip.
     long long _leftToSkip;

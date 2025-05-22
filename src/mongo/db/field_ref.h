@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,34 +29,80 @@
 
 #pragma once
 
+#include <boost/container/small_vector.hpp>
 #include <boost/optional.hpp>
+// IWYU pragma: no_include "boost/intrusive/detail/iterator.hpp"
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <cstddef>
+#include <cstdint>
 #include <iosfwd>
 #include <set>
 #include <string>
 #include <vector>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/string_data.h"
+#include "mongo/bson/bson_depth.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/container_size_helper.h"
 
 namespace mongo {
 
 /**
  * A FieldPath represents a path in a document, starting from the root. The path
  * is made of "field parts" separated by dots. The class provides an efficient means to
- * "split" the dotted fields in its parts, but no validation is done.
+ * "split" the dotted fields in its parts. It does not do UTF-8 validation but it does throw a
+ * uassert() upon an attempt to construct a FieldRef in which any field path component contains an
+ * embedded null byte.
  *
  * Any field part may be replaced, after the "original" field reference was parsed. Any
  * part can be accessed through a StringData object.
  *
  * The class is not thread safe.
  */
+using FieldIndex = BSONDepthIndex;
 class FieldRef {
 public:
+    /**
+     * Helper class for appending to a FieldRef for the duration of the current scope and then
+     * restoring the FieldRef at the end of the scope.
+     */
+    class FieldRefTempAppend {
+    public:
+        FieldRefTempAppend(FieldRef& fieldRef, StringData part) : _fieldRef(fieldRef) {
+            _fieldRef.appendPart(part);
+        }
+
+        ~FieldRefTempAppend() {
+            _fieldRef.removeLastPart();
+        }
+
+    private:
+        FieldRef& _fieldRef;
+    };
+
     /**
      * Returns true if the argument is a numeric string which is eligible to act as the key name for
      * an element in a BSON array; in other words, the string matches the regex ^(0|[1-9]+[0-9]*)$.
      */
     static bool isNumericPathComponentStrict(StringData component);
+
+    /**
+     * Checks whether document path 'path' overlaps with a path of an indexed field 'indexedPath'.
+     */
+    static bool pathOverlaps(const FieldRef& path, const FieldRef& indexedPath);
+
+    /**
+     * Returns the canonicalized index form for 'path', removing numerical path components as well
+     * as '$' path components.
+     */
+    static FieldRef getCanonicalIndexField(const FieldRef& path);
+
+    /**
+     * Returns whether the provided path component can be included in the canonicalized index form
+     * of a path.
+     */
+    static bool isComponentPartOfCanonicalizedIndexPath(StringData pathComponent);
 
     /**
      * Similar to the function above except strings that contain leading zero's are considered
@@ -71,21 +116,15 @@ public:
     explicit FieldRef(StringData path);
 
     /**
-     * Field parts accessed through getPart() calls no longer would be valid, after the
-     * destructor ran.
-     */
-    ~FieldRef() {}
-
-    /**
      * Builds a field path out of each field part in 'dottedField'.
      */
     void parse(StringData dottedField);
 
     /**
-     * Sets the 'i-th' field part to point to 'part'. Assumes i < size(). Behavior is
-     * undefined otherwise.
+     * Sets the 'i-th' field part to point to 'part'. Assumes i < size(). Behavior is undefined
+     * otherwise.
      */
-    void setPart(size_t i, StringData part);
+    void setPart(FieldIndex i, StringData part);
 
     /**
      * Adds a new field to the end of the path, increasing its size by 1.
@@ -93,15 +132,21 @@ public:
     void appendPart(StringData part);
 
     /**
-     * Removes the last part from the path, decreasing its size by 1. Has no effect on a
-     * FieldRef with size 0.
+     * Removes the last part from the path, decreasing its size by 1. Has no effect on a FieldRef
+     * with size 0.
      */
     void removeLastPart();
 
     /**
+     * Removes the first part from the path, decreasing its size by 1. Has no effect on a FielRef
+     * with size 0.
+     */
+    void removeFirstPart();
+
+    /**
      * Returns the 'i-th' field part. Assumes i < size(). Behavior is undefined otherwise.
      */
-    StringData getPart(size_t i) const;
+    StringData getPart(FieldIndex i) const;
 
     /**
      * Returns true when 'this' FieldRef is a prefix of 'other'. Equality is not considered
@@ -115,16 +160,27 @@ public:
     bool isPrefixOfOrEqualTo(const FieldRef& other) const;
 
     /**
+     * Returns true if 'this' is a prefix of, or equal to, 'other', or vice versa.
+     */
+    bool fullyOverlapsWith(const FieldRef& other) const;
+
+    /**
      * Returns the number of field parts in the prefix that 'this' and 'other' share.
      */
-    size_t commonPrefixSize(const FieldRef& other) const;
+    FieldIndex commonPrefixSize(const FieldRef& other) const;
 
     /**
      * Returns true if the specified path component is a numeric string which is eligible to act as
      * the key name for an element in a BSON array; in other words, the fieldname matches the regex
      * ^(0|[1-9]+[0-9]*)$.
      */
-    bool isNumericPathComponentStrict(size_t i) const;
+    bool isNumericPathComponentStrict(FieldIndex i) const;
+
+    /**
+     * Similar to isNumericPathComponentStrict, but returns true for 0-prefixed indices, such as
+     * "00" and "01".
+     */
+    bool isNumericPathComponentLenient(FieldIndex i) const;
 
     /**
      * Returns true if this FieldRef has any numeric path components.
@@ -134,19 +190,19 @@ public:
     /**
      * Returns the positions of all numeric path components, starting from the given position.
      */
-    std::set<size_t> getNumericPathComponents(size_t startPart = 0) const;
+    std::set<FieldIndex> getNumericPathComponents(FieldIndex startPart = 0) const;
 
     /**
-     * Returns a StringData of the full dotted field in its current state (i.e., some parts may
-     * have been replaced since the parse() call).
+     * Returns a StringData of the full dotted field in its current state (i.e., some parts may have
+     * been replaced since the parse() call).
      */
-    StringData dottedField(size_t offsetFromStart = 0) const;
+    StringData dottedField(FieldIndex offsetFromStart = 0) const;
 
     /**
-     * Returns a StringData of parts of the dotted field from startPart to endPart in its
-     * current state (i.e., some parts may have been replaced since the parse() call).
+     * Returns a StringData of parts of the dotted field from startPart to endPart in its current
+     * state (i.e., some parts may have been replaced since the parse() call).
      */
-    StringData dottedSubstring(size_t startPart, size_t endPart) const;
+    StringData dottedSubstring(FieldIndex startPart, FieldIndex endPart) const;
 
     /**
      * Compares the full dotted path represented by this FieldRef to other
@@ -154,8 +210,8 @@ public:
     bool equalsDottedField(StringData other) const;
 
     /**
-     * Return 0 if 'this' is equal to 'other' lexicographically, -1 if is it less than or
-     * +1 if it is greater than.
+     * Return 0 if 'this' is equal to 'other' lexicographically, -1 if is it less than or +1 if it
+     * is greater than.
      */
     int compare(const FieldRef& other) const;
 
@@ -171,20 +227,63 @@ public:
     /**
      * Returns the number of parts in this FieldRef.
      */
-    size_t numParts() const {
-        return _size;
+    FieldIndex numParts() const {
+        return _parts.size();
     }
 
     bool empty() const {
         return numParts() == 0;
     }
 
+    StringData operator[](int index) const {
+        return getPart(index);
+    }
+
+    uint64_t estimateObjectSizeInBytes() const {
+        return  // Add size of each element in '_replacements' vector.
+            container_size_helper::estimateObjectSizeInBytes(
+                _replacements,
+                [](const ValidatedPathString& s) { return s.get().capacity(); },
+                true) +
+            // Add size of each element in '_parts' vector.
+            container_size_helper::estimateObjectSizeInBytes(_parts) +
+            // Add runtime size of '_dotted' string.
+            _dotted.get().capacity() +
+            // Add size of the object.
+            sizeof(*this);
+    }
+
 private:
+    /**
+     * Represents a string that has been validated to not contain embedded null bytes.
+     */
+    class ValidatedPathString {
+    public:
+        ValidatedPathString() = default;
+
+        explicit ValidatedPathString(std::string value) : _value(std::move(value)) {
+            uassert(9867600,
+                    "Field name can't contain null bytes",
+                    _value.find('\0') == std::string::npos);
+        }
+
+        void clear() {
+            _value.clear();
+        }
+
+        const std::string& get() const {
+            return _value;
+        }
+
+    private:
+        std::string _value;
+    };
+
     // Dotted fields are most often not longer than four parts. We use a mixed structure
     // here that will not require any extra memory allocation when that is the case. And
     // handle larger dotted fields if it is. The idea is not to penalize the common case
     // with allocations.
-    static const size_t kReserveAhead = 4;
+    static constexpr size_t kFewDottedFieldParts = 4;
 
     // In order to make FieldRef copyable, we use a StringData-like type that stores an offset and
     // length into the backing string. StringData, in constrast, holds const char* pointers that
@@ -193,7 +292,7 @@ private:
         // Constructs an empty StringView.
         StringView() = default;
 
-        StringView(std::size_t offset, std::size_t len) : offset(offset), len(len){};
+        StringView(std::size_t offset, std::size_t len) : offset(offset), len(len) {};
 
         StringData toStringData(const std::string& viewInto) const {
             return {viewInto.c_str() + offset, len};
@@ -203,11 +302,6 @@ private:
         std::size_t len = 0;
     };
 
-    /** Converts the field part index to the variable part equivalent */
-    size_t getIndex(size_t i) const {
-        return i - kReserveAhead;
-    }
-
     /**
      * Returns the new number of parts after appending 'part' to this field path. This is
      * private, because it is only intended for use by the parse function.
@@ -216,39 +310,33 @@ private:
 
     /**
      * Re-assemble _dotted from components, including any replacements in _replacements,
-     * and update the StringData components in _fixed and _variable to refer to the parts
+     * and update the StringData components in _parts to refer to the parts
      * of the new _dotted. This is used to make the storage for the current value of this
      * FieldRef contiguous so it can be returned as a StringData from the dottedField
      * method above.
      */
     void reserialize() const;
 
-    // number of field parts stored
-    size_t _size = 0u;
-
     // Number of field parts in the cached dotted name (_dotted).
-    mutable size_t _cachedSize = 0u;
+    mutable FieldIndex _cachedSize = 0u;
 
-    // First 'kReservedAhead' field components. Each component is either a StringView backed by the
+    // Field components. Each component is either a StringView backed by the
     // _dotted string or boost::none to indicate that getPart() should read the string from the
     // _replacements list.
-    mutable boost::optional<StringView> _fixed[kReserveAhead];
-
-    // Remaining field components. Each non-none element is a view backed by '_dotted'. (See comment
-    // above _fixed.)
-    mutable std::vector<boost::optional<StringView>> _variable;
+    mutable boost::container::small_vector<boost::optional<StringView>, kFewDottedFieldParts>
+        _parts;
 
     /**
-     * Cached copy of the complete dotted name string. The StringView objects in "_fixed" and
-     * "_variable" reference this string.
+     * Cached copy of the complete dotted name string. The StringView objects in "_parts" reference
+     * this string.
      */
-    mutable std::string _dotted;
+    mutable ValidatedPathString _dotted;
 
     /**
      * String storage for path parts that have been replaced with setPart() or added with
      * appendPart() since the lasted time "_dotted" was materialized.
      */
-    mutable std::vector<std::string> _replacements;
+    mutable std::vector<ValidatedPathString> _replacements;
 };
 
 inline bool operator==(const FieldRef& lhs, const FieldRef& rhs) {
@@ -273,6 +361,14 @@ inline bool operator>(const FieldRef& lhs, const FieldRef& rhs) {
 
 inline bool operator>=(const FieldRef& lhs, const FieldRef& rhs) {
     return lhs.compare(rhs) >= 0;
+}
+
+inline FieldRef operator+(const FieldRef& lhs, const FieldRef& rhs) {
+    FieldRef result = lhs;
+    for (size_t i = 0; i < rhs.numParts(); ++i) {
+        result.appendPart(rhs.getPart(i));
+    }
+    return result;
 }
 
 std::ostream& operator<<(std::ostream& stream, const FieldRef& value);

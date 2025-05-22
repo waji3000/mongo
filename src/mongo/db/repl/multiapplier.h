@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,23 +29,21 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
+#include <functional>
 #include <iosfwd>
-#include <memory>
-#include <string>
-#include <utility>
 #include <vector>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
-#include "mongo/db/jsobj.h"
-#include "mongo/db/multi_key_path_tracker.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/repl/oplog_entry.h"
+#include "mongo/db/repl/optime.h"
 #include "mongo/db/service_context.h"
 #include "mongo/executor/task_executor.h"
 #include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/functional.h"
 #include "mongo/stdx/mutex.h"
+#include "mongo/util/functional.h"
 
 namespace mongo {
 namespace repl {
@@ -54,23 +51,17 @@ namespace repl {
 class OpTime;
 
 class MultiApplier {
-    MONGO_DISALLOW_COPYING(MultiApplier);
+    MultiApplier(const MultiApplier&) = delete;
+    MultiApplier& operator=(const MultiApplier&) = delete;
 
 public:
-    /**
-     * Operations sorted by timestamp in ascending order.
-     */
-    using Operations = std::vector<OplogEntry>;
-
-    using OperationPtrs = std::vector<const OplogEntry*>;
-
     /**
      * Callback function to report final status of applying operations.
      */
     using CallbackFn = unique_function<void(const Status&)>;
 
     using MultiApplyFn =
-        stdx::function<StatusWith<OpTime>(OperationContext*, MultiApplier::Operations)>;
+        std::function<StatusWith<OpTime>(OperationContext*, std::vector<OplogEntry>)>;
 
     /**
      * Creates MultiApplier in inactive state.
@@ -86,7 +77,7 @@ public:
      * contained in 'operations' are not validated.
      */
     MultiApplier(executor::TaskExecutor* executor,
-                 const Operations& operations,
+                 const std::vector<OplogEntry>& operations,
                  const MultiApplyFn& multiApply,
                  CallbackFn onCompletion);
 
@@ -134,7 +125,7 @@ public:
     State getState_forTest() const;
 
 private:
-    bool _isActive_inlock() const;
+    bool _isActive(WithLock lk) const;
 
     /**
      * DB worker callback function - applies all operations.
@@ -145,7 +136,7 @@ private:
     // Not owned by us.
     executor::TaskExecutor* _executor;
 
-    Operations _operations;
+    std::vector<OplogEntry> _operations;
     MultiApplyFn _multiApply;
     CallbackFn _onCompletion;
 

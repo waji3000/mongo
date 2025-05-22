@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,11 +29,18 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
 #include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+#include <string>
 
+#include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
+#include "mongo/bson/bson_field.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/client/connection_string.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 
@@ -53,7 +59,6 @@ public:
     static const BSONField<std::string> mongosAddShardDeprecated;
     static const BSONField<std::string> configsvrAddShard;
     static const BSONField<std::string> shardName;
-    static const BSONField<long long> maxSizeMB;
 
     /**
      * Parses the provided BSON content as the external addShard command, and if it is correct,
@@ -94,15 +99,6 @@ public:
         return *_name;
     }
 
-    bool hasMaxSize() const {
-        return _maxSizeMB.is_initialized();
-    }
-
-    long long getMaxSize() const {
-        invariant(_maxSizeMB.is_initialized());
-        return *_maxSizeMB;
-    }
-
 private:
     explicit AddShardRequest(ConnectionString connString);
 
@@ -118,9 +114,6 @@ private:
 
     // A name for the shard. If not specified, a unique name is automatically generated.
     boost::optional<std::string> _name;
-
-    // The maximum size in megabytes of the shard. If set to 0, the size is not limited.
-    boost::optional<long long> _maxSizeMB;
 };
 
 }  // namespace mongo

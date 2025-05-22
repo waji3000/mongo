@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Public Domain 2014-2018 MongoDB, Inc.
+# Public Domain 2014-present MongoDB, Inc.
 # Public Domain 2008-2014 WiredTiger, Inc.
 #
 # This is free and unencumbered software released into the public domain.
@@ -33,6 +33,7 @@ import wiredtiger, wttest
 #    Test privileged operations.
 #    This is a variant of test_config02.py.  This test should be run as both
 # normal and privileged (e.g. root) user, and should pass in both cases.
+@wttest.skip_for_hook("tiered", "using environment variable to set WT home")
 class test_priv01(wttest.WiredTigerTestCase):
     """
     This tests privileged operations.
@@ -126,7 +127,7 @@ class test_priv01(wttest.WiredTigerTestCase):
         edir = 'envdir'
         os.mkdir(edir)
         if os.getuid() != os.geteuid():
-            print 'Running ' + str(self) + ' as privileged user'
+            print('Running ' + str(self) + ' as privileged user')
             self.assertRaisesWithMessage(wiredtiger.WiredTigerError,
                 lambda: self.common_test(None, edir, None),
                 '/WIREDTIGER_HOME environment variable set but\
@@ -137,7 +138,7 @@ class test_priv01(wttest.WiredTigerTestCase):
         os.mkdir(edir)
         privarg = 'use_environment_priv=true'
         if os.getuid() != os.geteuid():
-            print 'Running ' + str(self) + ' as privileged user'
+            print('Running ' + str(self) + ' as privileged user')
             self.common_test(None, edir, privarg)
             self.checkfiles(edir)
             self.checknofiles(".")
@@ -163,6 +164,3 @@ class test_priv01(wttest.WiredTigerTestCase):
         self.common_test(None, edir, 'use_environment=false')
         self.checknofiles(edir)
         self.checkfiles('.')
-
-if __name__ == '__main__':
-    wttest.run()

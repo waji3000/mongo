@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,37 +29,167 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+#include <cstdint>
+#include <exception>
+#include <memory>
+#include <set>
+#include <string>
+#include <system_error>
+#include <utility>
+#include <vector>
+
+#include "mongo/base/data_type_endian.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/util/builder.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/document_metadata_fields.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/exec/plan_stats.h"
+#include "mongo/db/exec/sort_executor.h"
 #include "mongo/db/index/sort_key_generator.h"
+#include "mongo/db/pipeline/dependencies.h"
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/document_source_limit.h"
 #include "mongo/db/pipeline/expression.h"
-#include "mongo/db/query/query_knobs.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/pipeline.h"
+#include "mongo/db/pipeline/stage_constraints.h"
+#include "mongo/db/pipeline/variables.h"
+#include "mongo/db/query/query_knobs_gen.h"
+#include "mongo/db/query/query_shape/serialization_options.h"
+#include "mongo/db/query/sort_pattern.h"
 #include "mongo/db/sorter/sorter.h"
+#include "mongo/db/sorter/sorter_stats.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/bufreader.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo {
 
-class DocumentSourceSort final : public DocumentSource, public NeedsMergerDocumentSource {
+class DocumentSourceSort final : public DocumentSource {
 public:
-    static constexpr StringData kStageName = "$sort"_sd;
-    enum class SortKeySerialization {
-        kForExplain,
-        kForPipelineSerialization,
-        kForSortKeyMerging,
+    static constexpr StringData kMin = "min"_sd;
+    static constexpr StringData kMax = "max"_sd;
+    static constexpr StringData kOffset = "offsetSeconds"_sd;
+    static constexpr StringData kInternalLimit = "$_internalLimit"_sd;
+    static constexpr StringData kInternalOutputSortKey = "$_internalOutputSortKeyMetadata"_sd;
+
+    struct SortStageOptions {
+        uint64_t limit = 0;
+        boost::optional<uint64_t> maxMemoryUsageBytes = boost::none;
+        bool outputSortKeyMetadata = false;
     };
 
-    GetNextResult getNext() final;
+    static const SortStageOptions kDefaultOptions;
 
-    const char* getSourceName() const final {
-        return kStageName.rawData();
+    struct SortableDate {
+        Date_t date;
+
+        struct SorterDeserializeSettings {};  // unused
+        void serializeForSorter(BufBuilder& buf) const {
+            buf.appendNum(date.toMillisSinceEpoch());
+        }
+        static SortableDate deserializeForSorter(BufReader& buf, const SorterDeserializeSettings&) {
+            return {Date_t::fromMillisSinceEpoch(buf.read<LittleEndian<long long>>().value)};
+        }
+        int memUsageForSorter() const {
+            return sizeof(SortableDate);
+        }
+        std::string toString() const {
+            return date.toString();
+        }
+    };
+
+    static constexpr StringData kStageName = "$sort"_sd;
+
+    /**
+     * Parses a $sort stage from the user-supplied BSON.
+     */
+    static boost::intrusive_ptr<DocumentSource> createFromBson(
+        BSONElement, const boost::intrusive_ptr<ExpressionContext>&);
+
+    /**
+     * Creates a $sort stage. If maxMemoryUsageBytes is boost::none, then it will actually use the
+     * value of 'internalQueryMaxBlockingSortMemoryUsageBytes'.
+     */
+    static boost::intrusive_ptr<DocumentSourceSort> create(
+        const boost::intrusive_ptr<ExpressionContext>&,
+        const SortPattern&,
+        SortStageOptions options = kDefaultOptions);
+
+    /**
+     * Convenience to create a $sort stage from BSON with no limit and the default memory limit.
+     */
+    static boost::intrusive_ptr<DocumentSourceSort> create(
+        const boost::intrusive_ptr<ExpressionContext>& expCtx, const BSONObj& sortOrder) {
+        return create(expCtx, {sortOrder, expCtx}, kDefaultOptions);
     }
 
-    void serializeToArray(
-        std::vector<Value>& array,
-        boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final;
+    static boost::intrusive_ptr<DocumentSourceSort> createBoundedSort(
+        SortPattern pat,
+        StringData boundBase,
+        long long boundOffset,
+        boost::optional<long long> limit,
+        const boost::intrusive_ptr<ExpressionContext>& expCtx);
+
+    /**
+     * Parse a stage that uses BoundedSorter.
+     */
+    static boost::intrusive_ptr<DocumentSourceSort> parseBoundedSort(
+        BSONElement, const boost::intrusive_ptr<ExpressionContext>&);
+
+    /**
+     * The constructor.
+     */
+    DocumentSourceSort(const boost::intrusive_ptr<ExpressionContext>&,
+                       const SortPattern&,
+                       SortStageOptions);
+
+    const char* getSourceName() const final {
+        return kStageName.data();
+    }
+
+    static const Id& id;
+
+    Id getId() const override {
+        return id;
+    }
+
+    void serializeToArray(std::vector<Value>& array,
+                          const SerializationOptions& opts = SerializationOptions{}) const final;
 
     GetModPathsReturn getModifiedPaths() const final {
         // A $sort does not modify any paths.
-        return {GetModPathsReturn::Type::kFiniteSet, std::set<std::string>{}, {}};
+        return {GetModPathsReturn::Type::kFiniteSet, OrderedPathSet{}, {}};
+    }
+
+    /**
+     * Requests that this stage should output the sort key metadata with each result.
+     */
+    void pleaseOutputSortKeyMetadata() {
+        _outputSortKeyMetadata = true;
+    }
+
+    /**
+     * Returns true if the output documents of this $sort stage are supposed to have the sort key
+     * metadata field populated.
+     */
+    bool shouldSetSortKeyMetadata() const {
+        // TODO SERVER-98624 It would be preferable to just set '_outputSortKeyMetadata' based on
+        // 'getNeedsMerge()' in the constructor or some earlier time. Sadly, we can't do this right
+        // now without adding complexity elsewhere to account for mixed-version clusters. If you set
+        // '_outputSortKeyMetadata' to true, then it will possibly mean serializing a new field when
+        // sending a $sort to another node in the cluster (as of the time of this writing). This is
+        // OK today because the callers who set this option during construction first must check the
+        // FCV (and/or a feature flag), which guards against mixed-version scenarios.
+        return _outputSortKeyMetadata || pExpCtx->getNeedsMerge();
     }
 
     StageConstraints constraints(Pipeline::SplitState) const final {
@@ -70,49 +199,44 @@ public:
                                      DiskUseRequirement::kWritesTmpData,
                                      FacetRequirement::kAllowed,
                                      TransactionRequirement::kAllowed,
-                                     ChangeStreamRequirement::kBlacklist);
+                                     LookupRequirement::kAllowed,
+                                     UnionRequirement::kAllowed,
+                                     ChangeStreamRequirement::kDenylist);
 
         // Can't swap with a $match if a limit has been absorbed, as $match can't swap with $limit.
-        constraints.canSwapWithMatch = !_limitSrc;
+        constraints.canSwapWithMatch = !_sortExecutor->hasLimit();
+        constraints.noFieldModifications = true;
         return constraints;
-    }
-
-    BSONObjSet getOutputSorts() final {
-        return allPrefixes(_rawSort);
     }
 
     DepsTracker::State getDependencies(DepsTracker* deps) const final;
 
-    boost::intrusive_ptr<DocumentSource> getShardSource() final;
-    MergingLogic mergingLogic() final;
-    bool canRunInParallelBeforeOut(
-        const std::set<std::string>& nameOfShardKeyFieldsUponEntryToStage) const final;
+    void addVariableRefs(std::set<Variables::Id>* refs) const final;
+
+    boost::optional<DistributedPlanLogic> distributedPlanLogic() final;
+    bool canRunInParallelBeforeWriteStage(
+        const OrderedPathSet& nameOfShardKeyFieldsUponEntryToStage) const final;
+
+    SortExecutor<Document>* getSortExecutor() {
+        return _sortExecutor.get_ptr();
+    }
+
+    SortKeyGenerator* getSortKeyGenerator() {
+        return _sortKeyGen.get_ptr();
+    }
 
     /**
-     * Write out a Document whose contents are the sort key pattern.
+     * Returns the sort key pattern.
      */
-    Document sortKeyPattern(SortKeySerialization) const;
+    const SortPattern& getSortKeyPattern() const {
+        return _sortExecutor->sortPattern();
+    }
 
     /**
-     * Parses a $sort stage from the user-supplied BSON.
+     * Returns the the limit, if a subsequent $limit stage has been coalesced with this $sort stage.
+     * Otherwise, returns boost::none.
      */
-    static boost::intrusive_ptr<DocumentSource> createFromBson(
-        BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
-
-    /**
-     * Convenience method for creating a $sort stage. If maxMemoryUsageBytes is boost::none,
-     * then it will actually use the value of internalDocumentSourceSortMaxBlockingSortBytes.
-     */
-    static boost::intrusive_ptr<DocumentSourceSort> create(
-        const boost::intrusive_ptr<ExpressionContext>& pExpCtx,
-        BSONObj sortOrder,
-        long long limit = -1,
-        boost::optional<uint64_t> maxMemoryUsageBytes = boost::none);
-
-    /**
-     * Returns -1 for no limit.
-     */
-    long long getLimit() const;
+    boost::optional<long long> getLimit() const;
 
     /**
      * Loads a document to be sorted. This can be used to sort a stream of documents that are not
@@ -132,58 +256,46 @@ public:
      */
     bool usedDisk() final;
 
-    /**
-     * Instructs the sort stage to use the given set of cursors as inputs, to merge documents that
-     * have already been sorted.
-     */
-    void populateFromCursors(const std::vector<DBClientCursor*>& cursors);
-
     bool isPopulated() {
         return _populated;
     };
 
-    boost::intrusive_ptr<DocumentSourceLimit> getLimitSrc() const {
-        return _limitSrc;
+    bool isBoundedSortStage() const {
+        return (_timeSorter) ? true : false;
+    }
+
+    bool hasLimit() const {
+        return _sortExecutor->hasLimit();
+    }
+
+    const SpecificStats* getSpecificStats() const final {
+        return isBoundedSortStage() ? &_timeSorterStats : &_sortExecutor->stats();
     }
 
 protected:
+    GetNextResult doGetNext() final;
     /**
-     * Attempts to absorb a subsequent $limit stage so that it an perform a top-k sort.
+     * Attempts to absorb a subsequent $limit stage so that it can perform a top-k sort.
      */
     Pipeline::SourceContainer::iterator doOptimizeAt(Pipeline::SourceContainer::iterator itr,
                                                      Pipeline::SourceContainer* container) final;
-    void doDispose() final;
+
+    void doForceSpill() final;
 
 private:
-    using MySorter = Sorter<Value, Document>;
+    Value serialize(const SerializationOptions& opts) const final {
+        MONGO_UNREACHABLE_TASSERT(7484302);  // Should call serializeToArray instead.
+    }
 
-    // For MySorter.
-    class Comparator {
-    public:
-        explicit Comparator(const DocumentSourceSort& source) : _source(source) {}
-        int operator()(const MySorter::Data& lhs, const MySorter::Data& rhs) const {
-            return _source.compare(lhs.first, rhs.first);
-        }
+    /**
+     * Helper functions used by serializeToArray() to serialize this stage.
+     */
+    void serializeForBoundedSort(std::vector<Value>& array, const SerializationOptions& opts) const;
+    void serializeWithVerbosity(std::vector<Value>& array, const SerializationOptions& opts) const;
+    void serializeForCloning(std::vector<Value>& array, const SerializationOptions& opts) const;
 
-    private:
-        const DocumentSourceSort& _source;
-    };
-
-    // Represents one of the components in a compound sort pattern. Each component is either the
-    // field path by which we are sorting, or an Expression which can be used to retrieve the sort
-    // value in the case of a $meta-sort (but not both).
-    struct SortPatternPart {
-        bool isAscending = true;
-        boost::optional<FieldPath> fieldPath;
-        boost::intrusive_ptr<Expression> expression;
-    };
-
-    using SortPattern = std::vector<SortPatternPart>;
-
-    explicit DocumentSourceSort(const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
-
-    Value serialize(boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final {
-        MONGO_UNREACHABLE;  // Should call serializeToArray instead.
+    SorterFileStats* getSorterFileStats() const {
+        return _sortExecutor->getSorterFileStats();
     }
 
     /**
@@ -196,74 +308,74 @@ private:
      */
     GetNextResult populate();
 
-    SortOptions makeSortOptions() const;
-
     /**
      * Returns the sort key for 'doc', as well as the document that should be entered into the
      * sorter to eventually be returned. If we will need to later merge the sorted results with
      * other results, this method adds the sort key as metadata onto 'doc' to speed up the merge
      * later.
-     *
-     * Attempts to generate the key using a fast path that does not handle arrays. If an array is
-     * encountered, falls back on extractKeyWithArray().
      */
     std::pair<Value, Document> extractSortKey(Document&& doc) const;
 
     /**
-     * Returns the sort key for 'doc' based on the SortPattern, or ErrorCodes::InternalError if an
-     * array is encountered during sort key generation.
+     * Returns the time value used to sort 'doc', as well as the document that should be entered
+     * into the sorter to eventually be returned. If we will need to later merge the sorted results
+     * with other results, this method adds the full sort key as metadata onto 'doc' to speed up the
+     * merge later.
      */
-    StatusWith<Value> extractKeyFast(const Document& doc) const;
+    std::pair<Date_t, Document> extractTime(Document&& doc) const;
 
     /**
-     * Extracts the sort key component described by 'keyPart' from 'doc' and returns it. Returns
-     * ErrorCodes::Internal error if the path for 'keyPart' contains an array in 'doc'.
+     * Peeks at the next document in the input. The next document is cached in _timeSorterNextDoc
+     * to support peeking without advancing.
      */
-    StatusWith<Value> extractKeyPart(const Document& doc, const SortPatternPart& keyPart) const;
+    GetNextResult::ReturnStatus timeSorterPeek();
 
     /**
-     * Returns the sort key for 'doc' based on the SortPattern. Note this is in the BSONObj format -
-     * with empty field names.
+     * Peeks at the next document in the input, but ignores documents whose partition key differs
+     * from the current partition key (if there is one).
      */
-    BSONObj extractKeyWithArray(const Document& doc) const;
+    GetNextResult::ReturnStatus timeSorterPeekSamePartition();
 
     /**
-     * Returns the comparison key used to sort 'val' with the collation of the ExpressionContext.
-     * Note that these comparison keys should always be sorted with the simple (i.e. binary)
-     * collation.
+     * Gets the next document from the input. Caller must call timeSorterPeek() first, and it's
+     * only valid to call timeSorterGetNext() if peek returned kAdvanced.
      */
-    Value getCollationComparisonKey(const Value& val) const;
-
-    int compare(const Value& lhs, const Value& rhs) const;
+    Document timeSorterGetNext();
 
     /**
-     * Absorbs 'limit', enabling a top-k sort. It is safe to call this multiple times, it will keep
-     * the smallest limit.
+     * Populates this stage specific stats using data from _timeSorter. Should be called atleast
+     * once after _timeSorter is exhausted. Can be called before to provide "online" stats during
+     * cursor lifetime.
      */
-    void setLimitSrc(boost::intrusive_ptr<DocumentSourceLimit> limit) {
-        if (!_limitSrc || limit->getLimit() < _limitSrc->getLimit()) {
-            _limitSrc = limit;
-        }
-    }
+    void updateTimeSorterStats();
 
     bool _populated = false;
 
-    BSONObj _rawSort;
+    boost::optional<SortExecutor<Document>> _sortExecutor;
 
     boost::optional<SortKeyGenerator> _sortKeyGen;
 
-    SortPattern _sortPattern;
+    // Whether to include metadata including the sort key in the output documents from this stage.
+    bool _outputSortKeyMetadata = false;
 
-    // The set of paths on which we're sorting.
-    std::set<std::string> _paths;
+    using TimeSorterInterface = BoundedSorterInterface<SortableDate, Document>;
+    std::unique_ptr<TimeSorterInterface> _timeSorter;
+    boost::optional<SortKeyGenerator> _timeSorterPartitionKeyGen;
+    // The next document that will be returned by timeSorterGetNext().
+    // timeSorterPeek() fills it in, and timeSorterGetNext() empties it.
+    boost::optional<Document> _timeSorterNextDoc;
+    // The current partition key.
+    // If _timeSorterNextDoc has a document then this represents the partition key of
+    // that document.
+    // If _timeSorterNextDoc is empty then this represents the partition key of
+    // the document last returned by timeSorterGetNext().
+    boost::optional<Value> _timeSorterCurrentPartition;
+    // Used in timeSorterPeek() to avoid calling getNext() on an exhausted pSource.
+    bool _timeSorterInputEOF = false;
+    // Used only if _timeSorter is present.
+    SortStats _timeSorterStats;
 
-    boost::intrusive_ptr<DocumentSourceLimit> _limitSrc;
-
-    uint64_t _maxMemoryUsageBytes;
-    bool _done;
-    std::unique_ptr<MySorter> _sorter;
-    std::unique_ptr<MySorter::Iterator> _output;
-    bool _usedDisk = false;
+    QueryMetadataBitSet _requiredMetadata;
 };
 
 }  // namespace mongo

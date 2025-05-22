@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,29 +29,33 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
 #include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
 #include <wiredtiger.h>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/bson/timestamp.h"
+#include "mongo/db/storage/recovery_unit.h"
 #include "mongo/db/storage/snapshot_manager.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_begin_transaction_block.h"
 #include "mongo/stdx/mutex.h"
 
 namespace mongo {
 
-class WiredTigerOplogManager;
+class WiredTigerSession;
+using RoundUpPreparedTimestamps = WiredTigerBeginTxnBlock::RoundUpPreparedTimestamps;
 
 class WiredTigerSnapshotManager final : public SnapshotManager {
-    MONGO_DISALLOW_COPYING(WiredTigerSnapshotManager);
+    WiredTigerSnapshotManager(const WiredTigerSnapshotManager&) = delete;
+    WiredTigerSnapshotManager& operator=(const WiredTigerSnapshotManager&) = delete;
 
 public:
     WiredTigerSnapshotManager() = default;
 
     void setCommittedSnapshot(const Timestamp& timestamp) final;
-    void setLocalSnapshot(const Timestamp& timestamp) final;
-    boost::optional<Timestamp> getLocalSnapshot() final;
-    void dropAllSnapshots() final;
+    void setLastApplied(const Timestamp& timestamp) final;
+    boost::optional<Timestamp> getLastApplied() final;
+    void clearCommittedSnapshot() final;
 
     //
     // WT-specific methods
@@ -64,15 +67,10 @@ public:
      * Throws if there is currently no committed snapshot.
      */
     Timestamp beginTransactionOnCommittedSnapshot(
-        WT_SESSION* session, WiredTigerBeginTxnBlock::IgnorePrepared ignorePrepared) const;
-
-    /**
-     * Starts a transaction on the last stable local timestamp, set by setLocalSnapshot.
-     *
-     * Throws if no local snapshot has been set.
-     */
-    Timestamp beginTransactionOnLocalSnapshot(
-        WT_SESSION* session, WiredTigerBeginTxnBlock::IgnorePrepared ignorePrepared) const;
+        WiredTigerSession* session,
+        PrepareConflictBehavior prepareConflictBehavior,
+        bool roundUpPreparedTimestamps,
+        RecoveryUnit::UntimestampedWriteAssertionLevel untimestampedWriteAssertion) const;
 
     /**
      * Returns lowest SnapshotName that could possibly be used by a future call to
@@ -89,8 +87,8 @@ private:
     mutable stdx::mutex _committedSnapshotMutex;  // Guards _committedSnapshot.
     boost::optional<Timestamp> _committedSnapshot;
 
-    // Snapshot to use for reads at a local stable timestamp.
-    mutable stdx::mutex _localSnapshotMutex;  // Guards _localSnapshot.
-    boost::optional<Timestamp> _localSnapshot;
+    // Timestamp to use for reads at a the lastApplied timestamp.
+    mutable stdx::mutex _lastAppliedMutex;  // Guards _lastApplied.
+    boost::optional<Timestamp> _lastApplied;
 };
-}
+}  // namespace mongo

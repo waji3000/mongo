@@ -1,6 +1,3 @@
-// sorted_data_interface_test_isempty.cpp
-
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,11 +27,11 @@
  *    it in the license file.
  */
 
-#include "mongo/db/storage/sorted_data_interface_test_harness.h"
-
-#include <memory>
+#include <boost/move/utility_core.hpp>
 
 #include "mongo/db/storage/sorted_data_interface.h"
+#include "mongo/db/storage/sorted_data_interface_test_assert.h"
+#include "mongo/db/storage/sorted_data_interface_test_harness.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
@@ -43,43 +40,35 @@ namespace {
 // Verify that isEmpty() returns true when the index is empty,
 // returns false when a key is inserted, and returns true again
 // when that is unindex.
-TEST(SortedDataInterface, IsEmpty) {
-    const auto harnessHelper(newSortedDataInterfaceHarnessHelper());
-    const std::unique_ptr<SortedDataInterface> sorted(harnessHelper->newSortedDataInterface(true));
+TEST_F(SortedDataInterfaceTest, IsEmpty) {
+    const auto sorted(
+        harnessHelper()->newSortedDataInterface(opCtx(), /*unique=*/true, /*partial=*/false));
+
+    ASSERT(sorted->isEmpty(opCtx()));
 
     {
-        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
-        ASSERT(sorted->isEmpty(opCtx.get()));
+        StorageWriteTransaction txn(recoveryUnit());
+        ASSERT_SDI_INSERT_OK(
+            sorted->insert(opCtx(), makeKeyString(sorted.get(), key1, loc1), false));
+        ASSERT_SDI_INSERT_OK(
+            sorted->insert(opCtx(), makeKeyString(sorted.get(), key2, loc2), false));
+        ASSERT_SDI_INSERT_OK(
+            sorted->insert(opCtx(), makeKeyString(sorted.get(), key3, loc3), false));
+        txn.commit();
     }
 
-    {
-        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
-        {
-            WriteUnitOfWork uow(opCtx.get());
-            ASSERT_OK(sorted->insert(opCtx.get(), key1, loc1, false));
-            uow.commit();
-        }
-    }
+    ASSERT(!sorted->isEmpty(opCtx()));
 
     {
-        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
-        ASSERT(!sorted->isEmpty(opCtx.get()));
+        StorageWriteTransaction txn(recoveryUnit());
+        sorted->unindex(opCtx(), makeKeyString(sorted.get(), key1, loc1), false);
+        sorted->unindex(opCtx(), makeKeyString(sorted.get(), key2, loc2), false);
+        sorted->unindex(opCtx(), makeKeyString(sorted.get(), key3, loc3), false);
+        ASSERT(sorted->isEmpty(opCtx()));
+        txn.commit();
     }
 
-    {
-        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
-        {
-            WriteUnitOfWork uow(opCtx.get());
-            sorted->unindex(opCtx.get(), key1, loc1, false);
-            ASSERT(sorted->isEmpty(opCtx.get()));
-            uow.commit();
-        }
-    }
-
-    {
-        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
-        ASSERT(sorted->isEmpty(opCtx.get()));
-    }
+    ASSERT(sorted->isEmpty(opCtx()));
 }
 
 }  // namespace

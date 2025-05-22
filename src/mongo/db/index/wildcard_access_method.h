@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,10 +29,23 @@
 
 #pragma once
 
+#include <boost/optional/optional.hpp>
+#include <cstddef>
+#include <memory>
+
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/ordering.h"
+#include "mongo/db/catalog/index_catalog_entry.h"
+#include "mongo/db/exec/index_path_projection.h"
 #include "mongo/db/index/index_access_method.h"
+#include "mongo/db/index/multikey_paths.h"
 #include "mongo/db/index/wildcard_key_generator.h"
-#include "mongo/db/jsobj.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/query/index_bounds.h"
+#include "mongo/db/record_id.h"
+#include "mongo/db/storage/key_string/key_string.h"
+#include "mongo/db/storage/sorted_data_interface.h"
+#include "mongo/util/shared_buffer_fragment.h"
 
 namespace mongo {
 
@@ -44,63 +56,47 @@ namespace mongo {
  * $** indexes store a special metadata key for each path in the index that is multikey. This class
  * provides an interface to access the multikey metadata: see getMultikeyPaths().
  */
-class WildcardAccessMethod final : public AbstractIndexAccessMethod {
+class WildcardAccessMethod final : public SortedDataIndexAccessMethod {
 public:
-    /**
-     * Returns an exact set or super-set of the bounds required to fetch the multikey metadata keys
-     * relevant to 'field'.
-     */
-    static std::vector<Interval> getMultikeyPathIndexIntervalsForField(FieldRef field);
-
-    /**
-     * Extracts the multikey path from a metadata key stored within a wildcard index.
-     */
-    static FieldRef extractMultikeyPathFromIndexKey(const IndexKeyEntry& entry);
-
-    WildcardAccessMethod(IndexCatalogEntry* wildcardState, SortedDataInterface* btree);
+    WildcardAccessMethod(IndexCatalogEntry* wildcardState,
+                         std::unique_ptr<SortedDataInterface> btree);
 
     /**
      * Returns 'true' if the index should become multikey on the basis of the passed arguments.
      * Because it is possible for a $** index to generate multiple keys per document without any of
      * them lying along a multikey (i.e. array) path, this method will only return 'true' if one or
      * more multikey metadata keys have been generated; that is, if the 'multikeyMetadataKeys'
-     * BSONObjSet is non-empty.
+     * vector is non-empty.
      */
-    bool shouldMarkIndexAsMultikey(const BSONObjSet& keys,
-                                   const BSONObjSet& multikeyMetadataKeys,
+    bool shouldMarkIndexAsMultikey(size_t numberOfKeys,
+                                   const KeyStringSet& multikeyMetadataKeys,
                                    const MultikeyPaths& multikeyPaths) const final;
 
     /**
-     * Returns a pointer to the ProjectionExecAgg owned by the underlying WildcardKeyGenerator.
+     * Returns a pointer to the WildcardProjection owned by the underlying WildcardKeyGenerator.
      */
-    const ProjectionExecAgg* getProjectionExec() const {
-        return _keyGen.getProjectionExec();
+    const WildcardProjection* getWildcardProjection() const {
+        return _keyGen.getWildcardProjection();
     }
 
-    /**
-     * Returns the intersection of 'fieldSet' and the set of paths for which the $** has multikey
-     * metadata keys.
+    /*
+     * We should make a new Ordering for wildcard key generator because the index keys generated for
+     * wildcard indexes include a "$_path" field prior to the wildcard field and the Ordering passed
+     * in does not account for the "$_path" field.
      */
-    std::set<FieldRef> getMultikeyPathSet(OperationContext*,
-                                          const stdx::unordered_set<std::string>& fieldSet,
-                                          MultikeyMetadataAccessStats* stats) const final;
-
-
-    /**
-     * Returns the entire set of paths for which the $** has multikey metadata keys.
-     */
-    std::set<FieldRef> getMultikeyPathSet(OperationContext* opCtx,
-                                          MultikeyMetadataAccessStats* stats) const final;
+    static Ordering makeOrdering(const BSONObj& pattern);
 
 private:
-    void doGetKeys(const BSONObj& obj,
-                   BSONObjSet* keys,
-                   BSONObjSet* multikeyMetadataKeys,
-                   MultikeyPaths* multikeyPaths) const final;
-
-    std::set<FieldRef> _getMultikeyPathSet(OperationContext* opCtx,
-                                           const IndexBounds& indexBounds,
-                                           MultikeyMetadataAccessStats* stats) const;
+    void doGetKeys(OperationContext* opCtx,
+                   const CollectionPtr& collection,
+                   const IndexCatalogEntry* entry,
+                   SharedBufferFragmentBuilder& pooledBufferBuilder,
+                   const BSONObj& obj,
+                   GetKeysContext context,
+                   KeyStringSet* keys,
+                   KeyStringSet* multikeyMetadataKeys,
+                   MultikeyPaths* multikeyPaths,
+                   const boost::optional<RecordId>& id) const final;
 
     const WildcardKeyGenerator _keyGen;
 };

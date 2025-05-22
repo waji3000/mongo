@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,11 +27,11 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include "mongo/scripting/jsexception.h"
-
-#include "mongo/base/init.h"
+#include "mongo/base/init.h"  // IWYU pragma: keep
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
 
 namespace mongo {
@@ -43,11 +42,13 @@ constexpr auto kCodeNameFieldName = "codeName"_sd;
 constexpr auto kOriginalErrorFieldName = "originalError"_sd;
 constexpr auto kReasonFieldName = "errmsg"_sd;
 constexpr auto kStackFieldName = "stack"_sd;
+constexpr auto kExtraAttrFieldName = "extraAttr"_sd;
 
 }  // namespace
 
 void JSExceptionInfo::serialize(BSONObjBuilder* builder) const {
     builder->append(kStackFieldName, this->stack);
+    builder->append(kExtraAttrFieldName, this->extraAttr);
 
     {
         BSONObjBuilder originalErrorBuilder(builder->subobjStart(kOriginalErrorFieldName));
@@ -63,13 +64,15 @@ void JSExceptionInfo::serialize(BSONObjBuilder* builder) const {
 
 std::shared_ptr<const ErrorExtraInfo> JSExceptionInfo::parse(const BSONObj& obj) {
     auto stack = obj[kStackFieldName].String();
+    auto extraAttr = obj[kExtraAttrFieldName].Obj();
 
     auto originalErrorObj = obj[kOriginalErrorFieldName].Obj();
     auto code = originalErrorObj[kCodeFieldName].Int();
     auto reason = originalErrorObj[kReasonFieldName].checkAndGetStringData();
     Status status(ErrorCodes::Error(code), reason, originalErrorObj);
 
-    return std::make_shared<JSExceptionInfo>(std::move(stack), std::move(status));
+    return std::make_shared<JSExceptionInfo>(
+        std::move(stack), std::move(status), extraAttr.getOwned());
 }
 
 MONGO_INIT_REGISTER_ERROR_EXTRA_INFO(JSExceptionInfo);

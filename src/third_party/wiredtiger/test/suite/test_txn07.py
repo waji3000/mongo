@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Public Domain 2014-2018 MongoDB, Inc.
+# Public Domain 2014-present MongoDB, Inc.
 # Public Domain 2008-2014 WiredTiger, Inc.
 #
 # This is free and unencumbered software released into the public domain.
@@ -30,7 +30,7 @@
 # Transactions: commits and rollbacks
 #
 
-import fnmatch, os, shutil, run, time
+import os
 from suite_subprocess import suite_subprocess
 from wiredtiger import stat
 from wtscenario import make_scenarios
@@ -40,7 +40,7 @@ class test_txn07(wttest.WiredTigerTestCase, suite_subprocess):
     logmax = "100K"
     tablename = 'test_txn07'
     uri = 'table:' + tablename
-    archive_list = ['true', 'false']
+    remove_list = ['true', 'false']
     sync_list = [
         '(method=dsync,enabled)',
         '(method=fsync,enabled)',
@@ -49,12 +49,9 @@ class test_txn07(wttest.WiredTigerTestCase, suite_subprocess):
     ]
 
     types = [
-        ('row', dict(tabletype='row',
-                    create_params = 'key_format=i,value_format=S')),
-        ('var', dict(tabletype='var',
-                    create_params = 'key_format=r,value_format=S')),
-        ('fix', dict(tabletype='fix',
-                    create_params = 'key_format=r,value_format=8t')),
+        ('row', dict(tabletype='row', create_params = 'key_format=i,value_format=S')),
+        ('var', dict(tabletype='var', create_params = 'key_format=r,value_format=S')),
+        ('fix', dict(tabletype='fix', create_params = 'key_format=r,value_format=8t')),
     ]
     op1s = [
         ('trunc-all', dict(op1=('all', 0))),
@@ -74,8 +71,8 @@ class test_txn07(wttest.WiredTigerTestCase, suite_subprocess):
                                prune=30, prunelong=1000)
 
     def conn_config(self):
-        return 'log=(archive=false,enabled,file_max=%s,' % self.logmax + \
-        'compressor=%s)' % self.compress + \
+        return 'log=(enabled,file_max=%s,' % self.logmax + \
+        'compressor=%s,remove=false)' % self.compress + \
         ',create,error_prefix="%s",' % self.shortid() + \
         "statistics=(fast)," + \
         'transaction_sync="%s",' % \
@@ -93,7 +90,7 @@ class test_txn07(wttest.WiredTigerTestCase, suite_subprocess):
         c = session.open_cursor(self.uri, None)
         actual = dict((k, v) for k, v in c if v != 0)
         # Search for the expected items as well as iterating
-        for k, v in expected.iteritems():
+        for k, v in expected.items():
             self.assertEqual(c[k], v)
         c.close()
         if txn_config:
@@ -200,14 +197,9 @@ class test_txn07(wttest.WiredTigerTestCase, suite_subprocess):
 
             # Check the state after each commit/rollback.
             self.check_all(current, committed)
-        #
-        # Run printlog and make sure it exits with zero status. This should be
-        # run as soon as we can after the crash to try and conflict with the
-        # journal file read.
-        #
 
-        self.runWt(['-h', self.backup_dir, 'printlog'], outfilename='printlog.out')
-
+        # Gather statistics - this needs to be done before the connection is
+        # closed or statistics would be reset.
         stat_cursor = self.session.open_cursor('statistics:', None, None)
         clen = stat_cursor[stat.conn.log_compress_len][2]
         cmem = stat_cursor[stat.conn.log_compress_mem][2]
@@ -229,5 +221,9 @@ class test_txn07(wttest.WiredTigerTestCase, suite_subprocess):
             self.assertEqual(cwrites > 0, True)
             self.assertEqual((cfails > 0 or csmall > 0), True)
 
-if __name__ == '__main__':
-    wttest.run()
+        #
+        # Run printlog and make sure it exits with zero status. This should be
+        # run as soon as we can after the crash to try and conflict with the
+        # journal file read.
+        #
+        self.runWt(['-h', self.backup_dir, 'printlog'], outfilename='printlog.out')

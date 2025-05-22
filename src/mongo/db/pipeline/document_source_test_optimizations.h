@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -40,12 +39,22 @@ namespace mongo {
  */
 class DocumentSourceTestOptimizations : public DocumentSource {
 public:
-    DocumentSourceTestOptimizations() : DocumentSource(new ExpressionContextForTest()) {}
-    virtual ~DocumentSourceTestOptimizations() = default;
-    virtual GetNextResult getNext() override {
+    static constexpr StringData kStageName = "$_internalTestOptimizations"_sd;
+    DocumentSourceTestOptimizations(const boost::intrusive_ptr<ExpressionContext>& expCtx)
+        : DocumentSource(DocumentSourceTestOptimizations::kStageName, expCtx) {}
+    ~DocumentSourceTestOptimizations() override = default;
+    const char* getSourceName() const override {
+        return DocumentSourceTestOptimizations::kStageName.data();
+    }
+
+    Id getId() const override {
+        return kUnallocatedId;
+    }
+
+    GetNextResult doGetNext() override {
         MONGO_UNREACHABLE;
     }
-    virtual StageConstraints constraints(Pipeline::SplitState) const override {
+    StageConstraints constraints(Pipeline::SplitState) const override {
         // Return the default constraints so that this can be used in test pipelines. Constructing a
         // pipeline needs to do some validation that depends on this.
         return StageConstraints{StreamType::kStreaming,
@@ -53,16 +62,24 @@ public:
                                 HostTypeRequirement::kNone,
                                 DiskUseRequirement::kNoDiskUse,
                                 FacetRequirement::kAllowed,
-                                TransactionRequirement::kNotAllowed};
+                                TransactionRequirement::kNotAllowed,
+                                LookupRequirement::kAllowed,
+                                UnionRequirement::kAllowed};
     }
 
-    virtual GetModPathsReturn getModifiedPaths() const override {
+    boost::optional<DistributedPlanLogic> distributedPlanLogic() override {
+        return boost::none;
+    }
+
+    GetModPathsReturn getModifiedPaths() const override {
         MONGO_UNREACHABLE;
     }
+
+    void addVariableRefs(std::set<Variables::Id>* refs) const final {}
 
 private:
-    virtual Value serialize(boost::optional<ExplainOptions::Verbosity>) const override {
-        MONGO_UNREACHABLE;
+    Value serialize(const SerializationOptions& opts = SerializationOptions{}) const final {
+        MONGO_UNREACHABLE_TASSERT(7484301);
     }
 };
 

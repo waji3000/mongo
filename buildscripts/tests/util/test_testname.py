@@ -1,12 +1,8 @@
 """Unit test for the util.testname module."""
 
-from __future__ import absolute_import
-
 import unittest
 
-import util.testname as testname_utils
-
-# pylint: disable=missing-docstring
+import buildscripts.util.testname as testname_utils
 
 
 class IsResmokeHookTest(unittest.TestCase):
@@ -50,13 +46,37 @@ class NormalizeTestFileTest(unittest.TestCase):
     def test_windows_file_is_normalized(self):
         windows_file = "test\\found\\under\\windows.exe"
         self.assertEqual(
-            testname_utils.normalize_test_file(windows_file), "test/found/under/windows")
+            testname_utils.normalize_test_file(windows_file), "test/found/under/windows"
+        )
 
     def test_windows_file_with_non_exe_ext(self):
         windows_file = "test\\found\\under\\windows.sh"
         self.assertEqual(
-            testname_utils.normalize_test_file(windows_file), "test/found/under/windows.sh")
+            testname_utils.normalize_test_file(windows_file), "test/found/under/windows.sh"
+        )
 
     def test_unix_files_are_not_changed(self):
         unix_file = "test/found/under/unix"
         self.assertEqual(testname_utils.normalize_test_file(unix_file), unix_file)
+
+
+class DenormalizeTestFileTest(unittest.TestCase):
+    def test_windows_file_is_denormalized(self):
+        windows_file = "test\\found\\under\\windows.exe"
+        expected = ["test/found/under/windows", windows_file]
+        self.assertEqual(expected, testname_utils.denormalize_test_file(windows_file))
+
+    def test_windows_file_with_non_exe_ext(self):
+        windows_file = "test\\found\\under\\windows.sh"
+        expected = ["test/found/under/windows.sh", windows_file]
+        self.assertEqual(expected, testname_utils.denormalize_test_file(windows_file))
+
+    def test_unix_file_is_denormalized(self):
+        unix_file = "test/found/under/unix"
+        expected = [unix_file, "test\\found\\under\\unix.exe"]
+        self.assertEqual(expected, testname_utils.denormalize_test_file(unix_file))
+
+    def test_unix_file_with_ext(self):
+        unix_file = "test/found/under/unix.sh"
+        expected = [unix_file, "test\\found\\under\\unix.sh"]
+        self.assertEqual(expected, testname_utils.denormalize_test_file(unix_file))

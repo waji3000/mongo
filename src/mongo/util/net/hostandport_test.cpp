@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,7 +27,8 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+
+#include <fmt/format.h>
 
 #include "mongo/db/server_options.h"
 #include "mongo/unittest/unittest.h"
@@ -122,6 +122,27 @@ TEST(HostAndPort, CanIdentifyDefaultRoutes) {
     ASSERT_TRUE(HostAndPort("[0:0:0:0:0:0:0:0]").isDefaultRoute());
     ASSERT_TRUE(HostAndPort("[0:0:0::0:0:0]").isDefaultRoute());
     ASSERT_TRUE(HostAndPort("[0:0:0::00:0:0]").isDefaultRoute());
+}
+
+TEST(HostAndPort, Fmt) {
+    const std::string specs[] = {
+        "1.2.3.4",           //
+        "1.2.3.4:123",       //
+        "[1:2:3:4]",         //
+        "[1:2:3:4]:123",     //
+        "/dev/mongod.sock",  //
+    };
+    for (const auto& spec : specs) {
+        const HostAndPort hp(spec);
+        const std::string hps = hp.toString();
+        ASSERT_EQUALS(fmt::format("{}", hp), hps);
+        ASSERT_EQUALS(fmt::format("<{}>", hp), "<" + hps + ">");
+        ASSERT_EQUALS(fmt::format("{}", hp), hps);
+        ASSERT_EQUALS(fmt::format("{1:} says {0:}", "hello", hp), hps + " says hello");
+        // Reject garbage modifiers, but an empty modifier should be okay.
+        ASSERT_THROWS(fmt::format(fmt::runtime("{:x}"), hp), fmt::format_error);
+        ASSERT_EQUALS(fmt::format("{:}", hp), hps);
+    }
 }
 
 }  // namespace

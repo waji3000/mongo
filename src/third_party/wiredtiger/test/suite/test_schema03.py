@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Public Domain 2014-2018 MongoDB, Inc.
+# Public Domain 2014-present MongoDB, Inc.
 # Public Domain 2008-2014 WiredTiger, Inc.
 #
 # This is free and unencumbered software released into the public domain.
@@ -25,11 +25,16 @@
 # OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
 # ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
 # OTHER DEALINGS IN THE SOFTWARE.
+#
+# [TEST_TAGS]
+# schema_api
+# indexes
+# [END_TAGS]
 
 import os
 import suite_random
-import wiredtiger, wtscenario, wttest
-from wtscenario import make_scenarios
+from helper_tiered import TieredConfigMixin, gen_tiered_storage_sources
+import wtscenario, wttest
 
 try:
     # Windows does not getrlimit/setrlimit so we must catch the resource
@@ -79,7 +84,7 @@ class tabconfig:
             elif format == 'i':
                 keys.append(rev)
             elif format == 'r':
-                keys.append(long(i+1))
+                keys.append(self.recno(i+1))
         return keys
 
     def gen_values(self, i):
@@ -191,7 +196,7 @@ class idxconfig:
             colpos += 1
         return keys
 
-class test_schema03(wttest.WiredTigerTestCase):
+class test_schema03(TieredConfigMixin, wttest.WiredTigerTestCase):
     """
     Test schemas - a 'predictably random' assortment of columns,
     column groups and indices are created within tables, and are
@@ -219,7 +224,7 @@ class test_schema03(wttest.WiredTigerTestCase):
     """
 
     # Boost cache size and number of sessions for this test
-    conn_config = 'cache_size=100m,session_max=1000'
+    conn_config_string = 'cache_size=100m,session_max=1000,'
 
     ################################################################
     # These three variables can be altered to help generate
@@ -267,14 +272,15 @@ class test_schema03(wttest.WiredTigerTestCase):
     nindex_scenarios = wtscenario.quick_scenarios('s_index',
         [[1,1,1],[3,2,1],[5,1,3]], [1.0,0.5,1.0])
     idx_args_scenarios = wtscenario.quick_scenarios('s_index_args',
-        ['', ',type=file', ',type=lsm'], [0.5, 0.3, 0.2])
+        ['', ',type=file'], [0.5, 0.5])
     table_args_scenarios = wtscenario.quick_scenarios('s_extra_table_args',
-        ['', ',type=file', ',type=lsm'], [0.5, 0.3, 0.2])
+        ['', ',type=file'], [0.5, 0.5])
 
+    tiered_storage_sources = gen_tiered_storage_sources()
     scenarios = wtscenario.make_scenarios(
-        restart_scenarios, ntable_scenarios, ncolgroup_scenarios,
-        nindex_scenarios, idx_args_scenarios, table_args_scenarios,
-        prune=30)
+        tiered_storage_sources, restart_scenarios, ntable_scenarios,
+        ncolgroup_scenarios, nindex_scenarios, idx_args_scenarios,
+        table_args_scenarios, prune=30)
 
     # Note: the set can be reduced here for debugging, e.g.
     # scenarios = scenarios[40:44]
@@ -298,6 +304,10 @@ class test_schema03(wttest.WiredTigerTestCase):
         resource.setrlimit(resource.RLIMIT_NOFILE, newlimit)
         super(test_schema03, self).setUp()
 
+    # Set up connection config.
+    def conn_config(self):
+        return self.conn_config_string + self.tiered_conn_config()
+
     def tearDown(self):
         super(test_schema03, self).tearDown()
         resource.setrlimit(resource.RLIMIT_NOFILE, self.origFileLimit)
@@ -315,7 +325,7 @@ class test_schema03(wttest.WiredTigerTestCase):
         if self.SHOW_PYTHON:
             if self.SHOW_PYTHON_ONLY_TABLE == None or self.current_table in self.SHOW_PYTHON_ONLY_TABLE:
                 if self.SHOW_PYTHON_ONLY_SCEN == None or self.scenario_number in self.SHOW_PYTHON_ONLY_SCEN:
-                    print '        ' + s
+                    print('        ' + s)
 
     def join_names(self, sep, prefix, list):
         return sep.join([prefix + str(val) for val in list])
@@ -330,14 +340,14 @@ class test_schema03(wttest.WiredTigerTestCase):
 
     def finished_step(self, name):
         if self.s_restart == name:
-            print "  # Reopening connection at step: " + name
+            print("  # Reopening connection at step: " + name)
             self.reopen_conn()
 
     def test_schema(self):
         rand = suite_random.suite_random()
         if self.SHOW_PYTHON:
-            print '  ################################################'
-            print '  # Running scenario ' + str(self.scenario_number)
+            print('  ################################################')
+            print('  # Running scenario ' + str(self.scenario_number))
 
         ntables = self.s_ntable
 
@@ -431,8 +441,8 @@ class test_schema03(wttest.WiredTigerTestCase):
             self.show_python("self.session.create('table:" + tc.tablename + "', '" + config + "')")
             self.session.create("table:" + tc.tablename, config)
 
-            tc.columns_for_groups(range(tc.nkeys, tc.nkeys + tc.nvalues))
-            tc.columns_for_indices(range(0, tc.nkeys + tc.nvalues))
+            tc.columns_for_groups(list(range(tc.nkeys, tc.nkeys + tc.nvalues)))
+            tc.columns_for_indices(list(range(0, tc.nkeys + tc.nvalues)))
 
         self.finished_step('table')
 
@@ -461,7 +471,7 @@ class test_schema03(wttest.WiredTigerTestCase):
         for tc in tabconfigs:
             self.current_table = tc.tableidx
             max = rand.rand_range(0, self.nentries)
-            self.populate(tc, xrange(0, max))
+            self.populate(tc, list(range(0, max)))
 
         self.finished_step('populate0')
 
@@ -476,7 +486,7 @@ class test_schema03(wttest.WiredTigerTestCase):
         # populate second batch
         for tc in tabconfigs:
             self.current_table = tc.tableidx
-            self.populate(tc, xrange(tc.nentries, self.nentries))
+            self.populate(tc, list(range(tc.nentries, self.nentries)))
 
         self.finished_step('populate1')
 
@@ -554,5 +564,3 @@ class test_schema03(wttest.WiredTigerTestCase):
                 self.check_one(full_idxname, cursor, key, val)
             cursor.close()
             self.show_python("cursor.close()")
-if __name__ == '__main__':
-    wttest.run()

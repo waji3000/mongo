@@ -30,7 +30,7 @@ DBCollection.prototype.addIdIfNeeded = function(obj) {
     if (typeof obj !== "object") {
         throw new Error('argument passed to addIdIfNeeded is not an object');
     }
-    if (typeof(obj._id) == "undefined" && !Array.isArray(obj)) {
+    if (typeof (obj._id) == "undefined" && !Array.isArray(obj)) {
         var tmp = obj;  // don't want to modify input
         obj = {_id: new ObjectId()};
 
@@ -45,32 +45,32 @@ DBCollection.prototype.addIdIfNeeded = function(obj) {
 };
 
 /**
-* Perform a bulkWrite operation without a fluent API
-*
-* Legal operation types are
-*
-*  { insertOne: { document: { a: 1 } } }
-*
-*  { updateOne: { filter: {a:2}, update: {$set: {"a.$[i]":2}}, upsert:true, collation: {locale:
-* "fr"}, arrayFilters: [{i: 0}] } }
-*
-*  { updateMany: { filter: {a:2}, update: {$set: {"a.$[i]":2}}, upsert:true collation: {locale:
-* "fr"}, arrayFilters: [{i: 0}] } }
-*
-*  { deleteOne: { filter: {c:1}, collation: {locale: "fr"} } }
-*
-*  { deleteMany: { filter: {c:1}, collation: {locale: "fr"} } }
-*
-*  { replaceOne: { filter: {c:3}, replacement: {c:4}, upsert:true, collation: {locale: "fr"} } }
-*
-* @method
-* @param {object[]} operations Bulk operations to perform.
-* @param {object} [options=null] Optional settings.
-* @param {(number|string)} [options.w=null] The write concern.
-* @param {number} [options.wtimeout=null] The write concern timeout.
-* @param {boolean} [options.j=false] Specify a journal write concern.
-* @return {object}
-*/
+ * Perform a bulkWrite operation without a fluent API
+ *
+ * Legal operation types are
+ *
+ *  { insertOne: { document: { a: 1 } } }
+ *
+ *  { updateOne: { filter: {a:2}, update: {$set: {"a.$[i]":2}}, upsert:true, collation: {locale:
+ * "fr"}, arrayFilters: [{i: 0}] } }
+ *
+ *  { updateMany: { filter: {a:2}, update: {$set: {"a.$[i]":2}}, upsert:true collation: {locale:
+ * "fr"}, arrayFilters: [{i: 0}] } }
+ *
+ *  { deleteOne: { filter: {c:1}, collation: {locale: "fr"} } }
+ *
+ *  { deleteMany: { filter: {c:1}, collation: {locale: "fr"} } }
+ *
+ *  { replaceOne: { filter: {c:3}, replacement: {c:4}, upsert:true, collation: {locale: "fr"} } }
+ *
+ * @method
+ * @param {object[]} operations Bulk operations to perform.
+ * @param {object} [options=null] Optional settings.
+ * @param {(number|string)} [options.w=null] The write concern.
+ * @param {number} [options.wtimeout=null] The write concern timeout.
+ * @param {boolean} [options.j=false] Specify a journal write concern.
+ * @return {object}
+ */
 DBCollection.prototype.bulkWrite = function(operations, options) {
     var opts = Object.extend({}, options || {});
     opts.ordered = (typeof opts.ordered == 'boolean') ? opts.ordered : true;
@@ -83,6 +83,10 @@ DBCollection.prototype.bulkWrite = function(operations, options) {
 
     // Use bulk operation API already in the shell
     var bulkOp = opts.ordered ? this.initializeOrderedBulkOp() : this.initializeUnorderedBulkOp();
+
+    if (opts.rawData) {
+        bulkOp.setRawData();
+    }
 
     // Contains all inserted _ids
     var insertedIds = {};
@@ -111,8 +115,16 @@ DBCollection.prototype.bulkWrite = function(operations, options) {
 
             // Translate operation to bulk operation
             var operation = bulkOp.find(op.updateOne.filter);
+            if (op.updateOne.sort) {
+                operation.sort(op.updateOne.sort);
+            }
+
             if (op.updateOne.upsert) {
                 operation = operation.upsert();
+            }
+
+            if (op.updateOne.hint) {
+                operation = operation.hint(op.updateOne.hint);
             }
 
             if (op.updateOne.collation) {
@@ -133,10 +145,19 @@ DBCollection.prototype.bulkWrite = function(operations, options) {
                 throw new Error('updateMany bulkWrite operation expects the update field');
             }
 
+            if (op.updateMany.sort) {
+                throw new Error(
+                    "This sort will not do anything. Please call update without a sort or defer to calling updateOne with a sort.");
+            }
+
             // Translate operation to bulk operation
             var operation = bulkOp.find(op.updateMany.filter);
             if (op.updateMany.upsert) {
                 operation = operation.upsert();
+            }
+
+            if (op.updateMany.hint) {
+                operation = operation.hint(op.updateMany.hint);
             }
 
             if (op.updateMany.collation) {
@@ -165,6 +186,10 @@ DBCollection.prototype.bulkWrite = function(operations, options) {
 
             if (op.replaceOne.collation) {
                 operation.collation(op.replaceOne.collation);
+            }
+
+            if (op.replaceOne.hint) {
+                operation.hint(op.replaceOne.hint);
             }
 
             operation.replaceOne(op.replaceOne.replacement);
@@ -221,16 +246,16 @@ DBCollection.prototype.bulkWrite = function(operations, options) {
 };
 
 /**
-* Inserts a single document into MongoDB.
-*
-* @method
-* @param {object} doc Document to insert.
-* @param {object} [options=null] Optional settings.
-* @param {(number|string)} [options.w=null] The write concern.
-* @param {number} [options.wtimeout=null] The write concern timeout.
-* @param {boolean} [options.j=false] Specify a journal write concern.
-* @return {object}
-*/
+ * Inserts a single document into MongoDB.
+ *
+ * @method
+ * @param {object} doc Document to insert.
+ * @param {object} [options=null] Optional settings.
+ * @param {(number|string)} [options.w=null] The write concern.
+ * @param {number} [options.wtimeout=null] The write concern timeout.
+ * @param {boolean} [options.j=false] Specify a journal write concern.
+ * @return {object}
+ */
 DBCollection.prototype.insertOne = function(document, options) {
     var opts = Object.extend({}, options || {});
 
@@ -245,6 +270,10 @@ DBCollection.prototype.insertOne = function(document, options) {
 
     // Use bulk operation API already in the shell
     var bulk = this.initializeOrderedBulkOp();
+
+    if (opts.rawData)
+        bulk.setRawData(opts.rawData);
+
     bulk.insert(document);
 
     try {
@@ -276,17 +305,17 @@ DBCollection.prototype.insertOne = function(document, options) {
 };
 
 /**
-* Inserts an array of documents into MongoDB.
-*
-* @method
-* @param {object[]} docs Documents to insert.
-* @param {object} [options=null] Optional settings.
-* @param {(number|string)} [options.w=null] The write concern.
-* @param {number} [options.wtimeout=null] The write concern timeout.
-* @param {boolean} [options.j=false] Specify a journal write concern.
-* @param {boolean} [options.ordered=true] Execute inserts in ordered or unordered fashion.
-* @return {object}
-*/
+ * Inserts an array of documents into MongoDB.
+ *
+ * @method
+ * @param {object[]} docs Documents to insert.
+ * @param {object} [options=null] Optional settings.
+ * @param {(number|string)} [options.w=null] The write concern.
+ * @param {number} [options.wtimeout=null] The write concern timeout.
+ * @param {boolean} [options.j=false] Specify a journal write concern.
+ * @param {boolean} [options.ordered=true] Execute inserts in ordered or unordered fashion.
+ * @return {object}
+ */
 DBCollection.prototype.insertMany = function(documents, options) {
     var opts = Object.extend({}, options || {});
     opts.ordered = (typeof opts.ordered == 'boolean') ? opts.ordered : true;
@@ -304,6 +333,9 @@ DBCollection.prototype.insertMany = function(documents, options) {
 
     // Use bulk operation API already in the shell
     var bulk = opts.ordered ? this.initializeOrderedBulkOp() : this.initializeUnorderedBulkOp();
+
+    if (opts.rawData)
+        bulk.setRawData(opts.rawData);
 
     // Add all operations to the bulk operation
     documents.forEach(function(doc) {
@@ -327,16 +359,16 @@ DBCollection.prototype.insertMany = function(documents, options) {
 };
 
 /**
-* Delete a document on MongoDB
-*
-* @method
-* @param {object} filter The filter used to select the document to remove
-* @param {object} [options=null] Optional settings.
-* @param {(number|string)} [options.w=null] The write concern.
-* @param {number} [options.wtimeout=null] The write concern timeout.
-* @param {boolean} [options.j=false] Specify a journal write concern.
-* @return {object}
-*/
+ * Delete a document on MongoDB
+ *
+ * @method
+ * @param {object} filter The filter used to select the document to remove
+ * @param {object} [options=null] Optional settings.
+ * @param {(number|string)} [options.w=null] The write concern.
+ * @param {number} [options.wtimeout=null] The write concern timeout.
+ * @param {boolean} [options.j=false] Specify a journal write concern.
+ * @return {object}
+ */
 DBCollection.prototype.deleteOne = function(filter, options) {
     var opts = Object.extend({}, options || {});
 
@@ -353,6 +385,10 @@ DBCollection.prototype.deleteOne = function(filter, options) {
     // Add the collation, if there is one.
     if (opts.collation) {
         removeOp.collation(opts.collation);
+    }
+
+    if (opts.rawData) {
+        bulk.setRawData(opts.rawData);
     }
 
     // Add the deleteOne operation.
@@ -384,16 +420,16 @@ DBCollection.prototype.deleteOne = function(filter, options) {
 };
 
 /**
-* Delete multiple documents on MongoDB
-*
-* @method
-* @param {object} filter The Filter used to select the documents to remove
-* @param {object} [options=null] Optional settings.
-* @param {(number|string)} [options.w=null] The write concern.
-* @param {number} [options.wtimeout=null] The write concern timeout.
-* @param {boolean} [options.j=false] Specify a journal write concern.
-* @return {object}
-*/
+ * Delete multiple documents on MongoDB
+ *
+ * @method
+ * @param {object} filter The Filter used to select the documents to remove
+ * @param {object} [options=null] Optional settings.
+ * @param {(number|string)} [options.w=null] The write concern.
+ * @param {number} [options.wtimeout=null] The write concern timeout.
+ * @param {boolean} [options.j=false] Specify a journal write concern.
+ * @return {object}
+ */
 DBCollection.prototype.deleteMany = function(filter, options) {
     var opts = Object.extend({}, options || {});
 
@@ -410,6 +446,10 @@ DBCollection.prototype.deleteMany = function(filter, options) {
     // Add the collation, if there is one.
     if (opts.collation) {
         removeOp.collation(opts.collation);
+    }
+
+    if (opts.rawData) {
+        bulk.setRawData(opts.rawData);
     }
 
     // Add the deleteOne operation.
@@ -441,20 +481,25 @@ DBCollection.prototype.deleteMany = function(filter, options) {
 };
 
 /**
-* Replace a document on MongoDB
-*
-* @method
-* @param {object} filter The Filter used to select the document to update
-* @param {object} doc The Document that replaces the matching document
-* @param {object} [options=null] Optional settings.
-* @param {boolean} [options.upsert=false] Update operation is an upsert.
-* @param {(number|string)} [options.w=null] The write concern.
-* @param {number} [options.wtimeout=null] The write concern timeout.
-* @param {boolean} [options.j=false] Specify a journal write concern.
-* @return {object}
-*/
+ * Replace a document on MongoDB
+ *
+ * @method
+ * @param {object} filter The Filter used to select the document to update
+ * @param {object} doc The Document that replaces the matching document
+ * @param {object} [options=null] Optional settings.
+ * @param {boolean} [options.upsert=false] Update operation is an upsert.
+ * @param {(number|string)} [options.w=null] The write concern.
+ * @param {number} [options.wtimeout=null] The write concern timeout.
+ * @param {boolean} [options.j=false] Specify a journal write concern.
+ * @return {object}
+ */
 DBCollection.prototype.replaceOne = function(filter, replacement, options) {
     var opts = Object.extend({}, options || {});
+
+    // Cannot use pipeline-style updates in a replacement operation.
+    if (Array.isArray(replacement)) {
+        throw new Error('Cannot use pipeline-style updates in a replacement operation');
+    }
 
     // Check if first key in update statement contains a $
     var keys = Object.keys(replacement);
@@ -480,6 +525,14 @@ DBCollection.prototype.replaceOne = function(filter, replacement, options) {
 
     if (opts.collation) {
         op.collation(opts.collation);
+    }
+
+    if (opts.hint) {
+        op.hint(opts.hint);
+    }
+
+    if (opts.rawData) {
+        bulk.setRawData(opts.rawData);
     }
 
     op.replaceOne(replacement);
@@ -516,30 +569,33 @@ DBCollection.prototype.replaceOne = function(filter, replacement, options) {
 };
 
 /**
-* Update a single document on MongoDB
-*
-* @method
-* @param {object} filter The Filter used to select the document to update
-* @param {object} update The update operations to be applied to the document
-* @param {object} [options=null] Optional settings.
-* @param {boolean} [options.upsert=false] Update operation is an upsert.
-* @param {(number|string)} [options.w=null] The write concern.
-* @param {number} [options.wtimeout=null] The write concern timeout.
-* @param {boolean} [options.j=false] Specify a journal write concern.
-* @return {object}
-*/
+ * Update a single document on MongoDB
+ *
+ * @method
+ * @param {object} filter The Filter used to select the document to update
+ * @param {object} update The update operations to be applied to the document
+ * @param {object} [options=null] Optional settings.
+ * @param {boolean} [options.upsert=false] Update operation is an upsert.
+ * @param {(number|string)} [options.w=null] The write concern.
+ * @param {number} [options.wtimeout=null] The write concern timeout.
+ * @param {boolean} [options.j=false] Specify a journal write concern.
+ * @return {object}
+ */
 DBCollection.prototype.updateOne = function(filter, update, options) {
     var opts = Object.extend({}, options || {});
 
-    // Check if first key in update statement contains a $
-    var keys = Object.keys(update);
-    if (keys.length == 0) {
-        throw new Error("the update operation document must contain at least one atomic operator");
-    }
-
-    // Check if first key does not have the $
-    if (keys[0][0] != "$") {
-        throw new Error('the update operation document must contain atomic operators');
+    // Pipeline updates are always permitted. Otherwise, we validate the update object.
+    if (!Array.isArray(update)) {
+        // Check if first key in update statement contains a $
+        var keys = Object.keys(update);
+        if (keys.length == 0) {
+            throw new Error(
+                "the update operation document must contain at least one atomic operator");
+        }
+        // Check if first key does not have the $
+        if (keys[0][0] != "$") {
+            throw new Error('the update operation document must contain atomic operators');
+        }
     }
 
     // Get the write concern
@@ -553,8 +609,15 @@ DBCollection.prototype.updateOne = function(filter, update, options) {
 
     // Add the updateOne operation
     var op = bulk.find(filter);
+    if (opts.sort) {
+        op.sort(opts.sort);
+    }
     if (opts.upsert) {
         op = op.upsert();
+    }
+
+    if (opts.hint) {
+        op.hint(opts.hint);
     }
 
     if (opts.collation) {
@@ -563,6 +626,10 @@ DBCollection.prototype.updateOne = function(filter, update, options) {
 
     if (opts.arrayFilters) {
         op.arrayFilters(opts.arrayFilters);
+    }
+
+    if (opts.rawData) {
+        bulk.setRawData(opts.rawData);
     }
 
     op.updateOne(update);
@@ -599,30 +666,33 @@ DBCollection.prototype.updateOne = function(filter, update, options) {
 };
 
 /**
-* Update multiple documents on MongoDB
-*
-* @method
-* @param {object} filter The Filter used to select the document to update
-* @param {object} update The update operations to be applied to the document
-* @param {object} [options=null] Optional settings.
-* @param {boolean} [options.upsert=false] Update operation is an upsert.
-* @param {(number|string)} [options.w=null] The write concern.
-* @param {number} [options.wtimeout=null] The write concern timeout.
-* @param {boolean} [options.j=false] Specify a journal write concern.
-* @return {object}
-*/
+ * Update multiple documents on MongoDB
+ *
+ * @method
+ * @param {object} filter The Filter used to select the document to update
+ * @param {object} update The update operations to be applied to the document
+ * @param {object} [options=null] Optional settings.
+ * @param {boolean} [options.upsert=false] Update operation is an upsert.
+ * @param {(number|string)} [options.w=null] The write concern.
+ * @param {number} [options.wtimeout=null] The write concern timeout.
+ * @param {boolean} [options.j=false] Specify a journal write concern.
+ * @return {object}
+ */
 DBCollection.prototype.updateMany = function(filter, update, options) {
     var opts = Object.extend({}, options || {});
 
-    // Check if first key in update statement contains a $
-    var keys = Object.keys(update);
-    if (keys.length == 0) {
-        throw new Error("the update operation document must contain at least one atomic operator");
-    }
-
-    // Check if first key does not have the $
-    if (keys[0][0] != "$") {
-        throw new Error('the update operation document must contain atomic operators');
+    // Pipeline updates are always permitted. Otherwise, we validate the update object.
+    if (!Array.isArray(update)) {
+        // Check if first key in update statement contains a $
+        var keys = Object.keys(update);
+        if (keys.length == 0) {
+            throw new Error(
+                "the update operation document must contain at least one atomic operator");
+        }
+        // Check if first key does not have the $
+        if (keys[0][0] != "$") {
+            throw new Error('the update operation document must contain atomic operators');
+        }
     }
 
     // Get the write concern
@@ -636,8 +706,18 @@ DBCollection.prototype.updateMany = function(filter, update, options) {
 
     // Add the updateMany operation
     var op = bulk.find(filter);
+
+    if (opts.sort) {
+        throw new Error(
+            "This sort will not do anything. Please call update without a sort or defer to calling updateOne with a sort.");
+    }
+
     if (opts.upsert) {
         op = op.upsert();
+    }
+
+    if (opts.hint) {
+        op.hint(opts.hint);
     }
 
     if (opts.collation) {
@@ -646,6 +726,10 @@ DBCollection.prototype.updateMany = function(filter, update, options) {
 
     if (opts.arrayFilters) {
         op.arrayFilters(opts.arrayFilters);
+    }
+
+    if (opts.rawData) {
+        bulk.setRawData(opts.rawData);
     }
 
     op.update(update);
@@ -682,22 +766,22 @@ DBCollection.prototype.updateMany = function(filter, update, options) {
 };
 
 /**
-* Find a document and delete it in one atomic operation,
-* requires a write lock for the duration of the operation.
-*
-* @method
-* @param {object} filter Document selection filter.
-* @param {object} [options=null] Optional settings.
-* @param {object} [options.projection=null] Limits the fields to return for all matching documents.
-* @param {object} [options.sort=null] Determines which document the operation modifies if the query
-*selects multiple documents.
-* @param {number} [options.maxTimeMS=null] The maximum amount of time to allow the query to run.
-* @return {object}
-*/
+ * Find a document and delete it in one atomic operation,
+ * requires a write lock for the duration of the operation.
+ *
+ * @method
+ * @param {object} filter Document selection filter.
+ * @param {object} [options=null] Optional settings.
+ * @param {object} [options.projection=null] Limits the fields to return for all matching documents.
+ * @param {object} [options.sort=null] Determines which document the operation modifies if the query
+ *selects multiple documents.
+ * @param {number} [options.maxTimeMS=null] The maximum amount of time to allow the query to run.
+ * @return {object}
+ */
 DBCollection.prototype.findOneAndDelete = function(filter, options) {
     var opts = Object.extend({}, options || {});
     // Set up the command
-    var cmd = {query: filter, remove: true};
+    var cmd = {query: filter || {}, remove: true};
 
     if (opts.sort) {
         cmd.sort = opts.sort;
@@ -713,6 +797,10 @@ DBCollection.prototype.findOneAndDelete = function(filter, options) {
 
     if (opts.collation) {
         cmd.collation = opts.collation;
+    }
+
+    if (opts.rawData) {
+        cmd.rawData = opts.rawData;
     }
 
     // Get the write concern
@@ -728,24 +816,30 @@ DBCollection.prototype.findOneAndDelete = function(filter, options) {
 };
 
 /**
-* Find a document and replace it in one atomic operation, requires a write lock for the duration of
-*the operation.
-*
-* @method
-* @param {object} filter Document selection filter.
-* @param {object} replacement Document replacing the matching document.
-* @param {object} [options=null] Optional settings.
-* @param {object} [options.projection=null] Limits the fields to return for all matching documents.
-* @param {object} [options.sort=null] Determines which document the operation modifies if the query
-*selects multiple documents.
-* @param {number} [options.maxTimeMS=null] The maximum amount of time to allow the query to run.
-* @param {boolean} [options.upsert=false] Upsert the document if it does not exist.
-* @param {boolean} [options.returnNewDocument=false] When true, returns the updated document rather
-*than the original. The default is false.
-* @return {object}
-*/
+ * Find a document and replace it in one atomic operation, requires a write lock for the duration of
+ *the operation.
+ *
+ * @method
+ * @param {object} filter Document selection filter.
+ * @param {object} replacement Document replacing the matching document.
+ * @param {object} [options=null] Optional settings.
+ * @param {object} [options.projection=null] Limits the fields to return for all matching documents.
+ * @param {object} [options.sort=null] Determines which document the operation modifies if the query
+ *selects multiple documents.
+ * @param {object|string} [options.hint=null] Force a particular index to be used for the query.
+ * @param {number} [options.maxTimeMS=null] The maximum amount of time to allow the query to run.
+ * @param {boolean} [options.upsert=false] Upsert the document if it does not exist.
+ * @param {boolean} [options.returnNewDocument=false] When true, returns the updated document rather
+ *than the original. The default is false.
+ * @return {object}
+ */
 DBCollection.prototype.findOneAndReplace = function(filter, replacement, options) {
     var opts = Object.extend({}, options || {});
+
+    // Cannot use pipeline-style updates in a replacement operation.
+    if (Array.isArray(replacement)) {
+        throw new Error('Cannot use pipeline-style updates in a replacement operation');
+    }
 
     // Check if first key in update statement contains a $
     var keys = Object.keys(replacement);
@@ -755,7 +849,7 @@ DBCollection.prototype.findOneAndReplace = function(filter, replacement, options
     }
 
     // Set up the command
-    var cmd = {query: filter, update: replacement};
+    var cmd = {query: filter || {}, update: replacement};
     if (opts.sort) {
         cmd.sort = opts.sort;
     }
@@ -770,6 +864,14 @@ DBCollection.prototype.findOneAndReplace = function(filter, replacement, options
 
     if (opts.collation) {
         cmd.collation = opts.collation;
+    }
+
+    if (opts.hint) {
+        cmd.hint = opts.hint;
+    }
+
+    if (opts.rawData) {
+        cmd.rawData = opts.rawData;
     }
 
     // Set flags
@@ -789,38 +891,42 @@ DBCollection.prototype.findOneAndReplace = function(filter, replacement, options
 };
 
 /**
-* Find a document and update it in one atomic operation, requires a write lock for the duration of
-*the operation.
-*
-* @method
-* @param {object} filter Document selection filter.
-* @param {object} update Update operations to be performed on the document
-* @param {object} [options=null] Optional settings.
-* @param {object} [options.projection=null] Limits the fields to return for all matching documents.
-* @param {object} [options.sort=null] Determines which document the operation modifies if the query
-*selects multiple documents.
-* @param {number} [options.maxTimeMS=null] The maximum amount of time to allow the query to run.
-* @param {boolean} [options.upsert=false] Upsert the document if it does not exist.
-* @param {boolean} [options.returnNewDocument=false] When true, returns the updated document rather
-*than the original. The default is false.
-* @return {object}
-*/
+ * Find a document and update it in one atomic operation, requires a write lock for the duration of
+ *the operation.
+ *
+ * @method
+ * @param {object} filter Document selection filter.
+ * @param {object} update Update operations to be performed on the document
+ * @param {object} [options=null] Optional settings.
+ * @param {object} [options.projection=null] Limits the fields to return for all matching documents.
+ * @param {object} [options.sort=null] Determines which document the operation modifies if the query
+ *selects multiple documents.
+ * @param {object|string} [options.hint=null] Force a particular index to be used for the query.
+ * @param {number} [options.maxTimeMS=null] The maximum amount of time to allow the query to run.
+ * @param {boolean} [options.upsert=false] Upsert the document if it does not exist.
+ * @param {boolean} [options.returnNewDocument=false] When true, returns the updated document rather
+ *than the original. The default is false.
+ * @return {object}
+ */
 DBCollection.prototype.findOneAndUpdate = function(filter, update, options) {
     var opts = Object.extend({}, options || {});
 
-    // Check if first key in update statement contains a $
-    var keys = Object.keys(update);
-    if (keys.length == 0) {
-        throw new Error("the update operation document must contain at least one atomic operator");
-    }
-
-    // Check if first key does not have the $
-    if (keys[0][0] != "$") {
-        throw new Error("the update operation document must contain atomic operators");
+    // Pipeline updates are always permitted. Otherwise, we validate the update object.
+    if (!Array.isArray(update)) {
+        // Check if first key in update statement contains a $
+        var keys = Object.keys(update);
+        if (keys.length == 0) {
+            throw new Error(
+                "the update operation document must contain at least one atomic operator");
+        }
+        // Check if first key does not have the $
+        if (keys[0][0] != "$") {
+            throw new Error("the update operation document must contain atomic operators");
+        }
     }
 
     // Set up the command
-    var cmd = {query: filter, update: update};
+    var cmd = {query: filter || {}, update: update};
     if (opts.sort) {
         cmd.sort = opts.sort;
     }
@@ -839,6 +945,14 @@ DBCollection.prototype.findOneAndUpdate = function(filter, update, options) {
 
     if (opts.arrayFilters) {
         cmd.arrayFilters = opts.arrayFilters;
+    }
+
+    if (opts.hint) {
+        cmd.hint = opts.hint;
+    }
+
+    if (opts.rawData) {
+        cmd.rawData = opts.rawData;
     }
 
     // Set flags

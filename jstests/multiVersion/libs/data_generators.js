@@ -300,7 +300,7 @@ function DataGenerator() {
     }
 
     // Data we are using as a source for our testing
-    testData = [
+    let testData = [
         GenFlatObjectAllTypesHardCoded(),
         GenFlatObjectAllTypes(0),
         GenFlatObjectAllTypes(2),
@@ -350,7 +350,7 @@ function DataGenerator() {
 //     var nextIndexDocument = generator.next();
 //     var nextIndexSpec = nextIndexDocument["spec"];
 //     var nextIndexOptions = nextIndexDocument["options"];
-//     db.ensureIndex(nextIndexSpec, nextIndexOptions);
+//     db.createIndex(nextIndexSpec, nextIndexOptions);
 // }
 //
 function IndexDataGenerator(options) {
@@ -398,7 +398,7 @@ function IndexDataGenerator(options) {
 
             // Find the character (index into keyChars) that we currently have at this position, set
             // this position to the next character in the keyChars sequence
-            keyCharsIndex = keyChars.search(currentKey[currentKeyIndex]);
+            var keyCharsIndex = keyChars.search(currentKey[currentKeyIndex]);
             currentKey = setCharAt(
                 currentKey, currentKeyIndex, keyChars[(keyCharsIndex + 1) % keyChars.length]);
             currentKeyIndex = currentKeyIndex + 1;
@@ -450,14 +450,6 @@ function IndexDataGenerator(options) {
     function Gen2dIndex(seed) {
         var index = {};
         index[getNextUniqueKey()] = "2d";
-        return index;
-    }
-
-    function GenHaystackIndex(seed) {
-        var index = {};
-        index[getNextUniqueKey()] = "geoHaystack";
-        // Haystack indexes need a non geo field, and the geo field must be first
-        index[getNextUniqueKey()] = (seed % 2) == 1 ? 1 : -1;
         return index;
     }
 
@@ -519,14 +511,6 @@ function IndexDataGenerator(options) {
         return attributes;
     }
 
-    function GenHaystackIndexOptions(seed) {
-        var attributes = GenIndexOptions(seed);
-        // When using a haystack index, the following additional index properties are required:
-        // { "bucketSize" : <bucket value> }
-        attributes["bucketSize"] = (seed * 10000) % 100 + 10;
-        return attributes;
-    }
-
     function GenTextIndexOptions(seed) {
         return GenIndexOptions(seed);
     }
@@ -535,7 +519,7 @@ function IndexDataGenerator(options) {
         return GenIndexOptions(seed);
     }
 
-    testIndexes = [
+    let testIndexes = [
         // Single Field Indexes
         {"spec": GenSingleFieldIndex(1), "options": GenIndexOptions(0)},
         {"spec": GenSingleFieldIndex(0), "options": GenIndexOptions(1)},
@@ -562,8 +546,6 @@ function IndexDataGenerator(options) {
         {"spec": Gen2dsphereIndex(7), "options": Gen2dSphereIndexOptions(12)},
         //   2d
         {"spec": Gen2dIndex(8), "options": Gen2dIndexOptions(13)},
-        //   Haystack
-        {"spec": GenHaystackIndex(9), "options": GenHaystackIndexOptions(13)},
 
         // Text Indexes
         {"spec": GenTextIndex(10), "options": GenTextIndexOptions(14)},
@@ -612,7 +594,7 @@ function CollectionMetadataGenerator(options) {
     for (var option in options) {
         if (options.hasOwnProperty(option)) {
             if (option === 'capped') {
-                if (typeof(options['capped']) !== 'boolean') {
+                if (typeof (options['capped']) !== 'boolean') {
                     throw Error(
                         "\"capped\" options must be boolean in CollectionMetadataGenerator");
                 }
@@ -625,8 +607,7 @@ function CollectionMetadataGenerator(options) {
     }
 
     // Collection metadata we are using as a source for testing
-    // db.createCollection(name, {capped: <Boolean>, autoIndexId: <Boolean>, size: <number>, max
-    // <number>} )
+    // db.createCollection(name, {capped: <Boolean>, size: <number>, max <number>} )
     var cappedCollectionMetadata = {
         "capped": true,
         "size": 100000,

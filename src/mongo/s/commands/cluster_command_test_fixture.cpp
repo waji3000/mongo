@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,45 +27,85 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
 
-#include "mongo/platform/basic.h"
+#include <boost/move/utility_core.hpp>
+// IWYU pragma: no_include "cxxabi.h"
+#include <system_error>
+#include <utility>
 
-#include "mongo/s/commands/cluster_command_test_fixture.h"
-
+#include "mongo/base/initializer.h"
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/db/client.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/commands/test_commands_enabled.h"
+#include "mongo/db/commands/txn_cmds_gen.h"
 #include "mongo/db/keys_collection_client_sharded.h"
 #include "mongo/db/keys_collection_manager.h"
-#include "mongo/db/logical_clock.h"
-#include "mongo/db/logical_session_cache_noop.h"
+#include "mongo/db/keys_collection_manager_gen.h"
 #include "mongo/db/logical_time_validator.h"
-#include "mongo/s/cluster_last_error_info.h"
-#include "mongo/util/log.h"
+#include "mongo/db/read_write_concern_defaults.h"
+#include "mongo/db/repl/read_concern_args.h"
+#include "mongo/db/request_execution_context.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/session/logical_session_cache.h"
+#include "mongo/db/session/logical_session_cache_noop.h"
+#include "mongo/db/session/logical_session_id.h"
+#include "mongo/db/session/logical_session_id_gen.h"
+#include "mongo/db/vector_clock.h"
+#include "mongo/executor/network_test_env.h"
+#include "mongo/idl/server_parameter_test_util.h"
+#include "mongo/rpc/op_msg.h"
+#include "mongo/s/catalog_cache.h"
+#include "mongo/s/commands/cluster_command_test_fixture.h"
+#include "mongo/s/commands/strategy.h"
+#include "mongo/s/grid.h"
+#include "mongo/s/mongod_and_mongos_server_parameters_gen.h"
+#include "mongo/transport/service_executor.h"
+#include "mongo/unittest/unittest.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/future.h"
+#include "mongo/util/tick_source.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
+
 
 namespace mongo {
 
 void ClusterCommandTestFixture::setUp() {
-    CatalogCacheTestFixture::setUp();
-    CatalogCacheTestFixture::setupNShards(numShards);
+    RouterCatalogCacheTestFixture::setUp();
+    RouterCatalogCacheTestFixture::setupNShards(numShards);
 
-    // Set up a logical clock with an initial time.
-    auto logicalClock = stdx::make_unique<LogicalClock>(getServiceContext());
-    logicalClock->setClusterTimeFromTrustedSource(kInMemoryLogicalTime);
-    LogicalClock::set(getServiceContext(), std::move(logicalClock));
+    Grid::get(getServiceContext())->setShardingInitialized();
 
-    auto keysCollectionClient = stdx::make_unique<KeysCollectionClientSharded>(
+    // Set the initial clusterTime.
+    VectorClock::get(getServiceContext())->advanceClusterTime_forTest(kInMemoryLogicalTime);
+
+    auto keysCollectionClient = std::make_unique<KeysCollectionClientSharded>(
         Grid::get(operationContext())->catalogClient());
 
     auto keyManager = std::make_shared<KeysCollectionManager>(
         "dummy", std::move(keysCollectionClient), Seconds(KeysRotationIntervalSec));
 
-    auto validator = stdx::make_unique<LogicalTimeValidator>(keyManager);
+    auto validator = std::make_unique<LogicalTimeValidator>(keyManager);
     LogicalTimeValidator::set(getServiceContext(), std::move(validator));
 
-    LogicalSessionCache::set(getServiceContext(), stdx::make_unique<LogicalSessionCacheNoop>());
+    LogicalSessionCache::set(getServiceContext(), std::make_unique<LogicalSessionCacheNoop>());
+
+    // Set up a tick source for transaction metrics.
+    auto tickSource =
+        checked_cast<TickSourceMock<Microseconds>*>(getServiceContext()->getTickSource());
+    tickSource->reset(1);
 
     loadRoutingTableWithTwoChunksAndTwoShards(kNss);
+
+    _staleVersionAndSnapshotRetriesBlock = std::make_unique<FailPointEnableBlock>(
+        "enableStaleVersionAndSnapshotRetriesWithinTransactions");
+
+    // The ReadWriteConcernDefaults decoration on the service context won't always be created,
+    // so we should manually instantiate it to ensure it exists in our tests.
+    ReadWriteConcernDefaults::create(getService(), _lookupMock.getFetchDefaultsFn());
 }
 
 BSONObj ClusterCommandTestFixture::_makeCmd(BSONObj cmdObj, bool includeAfterClusterTime) {
@@ -97,27 +136,38 @@ void ClusterCommandTestFixture::expectReturnsError(ErrorCodes::Error code) {
 
 DbResponse ClusterCommandTestFixture::runCommand(BSONObj cmd) {
     // Create a new client/operation context per command
-    auto client = getServiceContext()->makeClient("ClusterCmdClient");
+    auto client = getServiceContext()->getService()->makeClient("ClusterCmdClient");
     auto opCtx = client->makeOperationContext();
 
-    const auto opMsgRequest = OpMsgRequest::fromDBAndBody(kNss.db(), cmd);
+    {
+        // Have the new client use the dedicated threading model. This ensures the synchronous
+        // execution of the command by the client thread.
+        stdx::lock_guard lk(*client.get());
+        auto seCtx = std::make_unique<transport::ServiceExecutorContext>();
+        seCtx->setThreadModel(seCtx->kSynchronous);
+        transport::ServiceExecutorContext::set(client.get(), std::move(seCtx));
+    }
 
-    // Ensure the clusterGLE on the Client has not yet been initialized.
-    ASSERT(!ClusterLastErrorInfo::get(client.get()));
+    OpMsgRequest opMsgRequest;
 
-    // Initialize the cluster last error info for the client with a new request.
-    ClusterLastErrorInfo::get(client.get()) = std::make_shared<ClusterLastErrorInfo>();
-    ASSERT(ClusterLastErrorInfo::get(client.get()));
-    auto clusterGLE = ClusterLastErrorInfo::get(client.get());
-    clusterGLE->newRequest();
+    // If bulkWrite then append adminDB.
+    if (cmd.firstElementFieldNameStringData() == "bulkWrite") {
+        opMsgRequest = OpMsgRequestBuilder::create(
+            auth::ValidatedTenancyScope::kNotRequired, DatabaseName::kAdmin, cmd);
+    } else {
+        opMsgRequest = OpMsgRequestBuilder::create(
+            auth::ValidatedTenancyScope::get(opCtx.get()), kNss.dbName(), cmd);
+    }
 
-    return Strategy::clientCommand(opCtx.get(), opMsgRequest.serialize());
+    AlternativeClientRegion acr(client);
+    auto rec = RequestExecutionContext(opCtx.get(), opMsgRequest.serialize());
+    return Strategy::clientCommand(&rec);
 }
 
-void ClusterCommandTestFixture::runCommandSuccessful(BSONObj cmd, bool isTargeted) {
+DbResponse ClusterCommandTestFixture::runCommandSuccessful(BSONObj cmd, bool isTargeted) {
     auto future = launchAsync([&] {
         // Shouldn't throw.
-        runCommand(cmd);
+        return runCommand(cmd);
     });
 
     size_t numMocks = isTargeted ? 1 : numShards;
@@ -125,12 +175,12 @@ void ClusterCommandTestFixture::runCommandSuccessful(BSONObj cmd, bool isTargete
         expectReturnsSuccess(i % numShards);
     }
 
-    future.timed_get(kFutureTimeout);
+    return future.default_timed_get();
 }
 
-void ClusterCommandTestFixture::runCommandOneError(BSONObj cmd,
-                                                   ErrorCodes::Error code,
-                                                   bool isTargeted) {
+void ClusterCommandTestFixture::runTxnCommandOneError(BSONObj cmd,
+                                                      ErrorCodes::Error code,
+                                                      bool isTargeted) {
     auto future = launchAsync([&] {
         // Shouldn't throw.
         runCommand(cmd);
@@ -140,11 +190,18 @@ void ClusterCommandTestFixture::runCommandOneError(BSONObj cmd,
     for (size_t i = 0; i < numMocks; i++) {
         expectReturnsError(code);
     }
+
+    // In a transaction, when the router encounters a retryable error it sends abortTransaction to
+    // each pending participant shard before retrying.
+    for (size_t i = 0; i < numMocks; i++) {
+        expectAbortTransaction();
+    }
+
     for (size_t i = 0; i < numMocks; i++) {
         expectReturnsSuccess(i % numShards);
     }
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 void ClusterCommandTestFixture::runCommandInspectRequests(BSONObj cmd,
@@ -157,14 +214,18 @@ void ClusterCommandTestFixture::runCommandInspectRequests(BSONObj cmd,
         expectInspectRequest(i % numShards, cb);
     }
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 void ClusterCommandTestFixture::expectAbortTransaction() {
-    onCommandForPoolExecutor([](const executor::RemoteCommandRequest& request) {
+    onCommandForPoolExecutor([this](const executor::RemoteCommandRequest& request) {
         auto cmdName = request.cmdObj.firstElement().fieldNameStringData();
         ASSERT_EQ(cmdName, "abortTransaction");
-        return BSON("ok" << 1);
+
+        BSONObjBuilder bob;
+        bob.append("ok", 1);
+        appendTxnResponseMetadata(bob);
+        return bob.obj();
     });
 }
 
@@ -173,43 +234,71 @@ void ClusterCommandTestFixture::runTxnCommandMaxErrors(BSONObj cmd,
                                                        bool isTargeted) {
     auto future = launchAsync([&] { runCommand(cmd); });
 
-    size_t numRetries =
-        isTargeted ? kMaxNumStaleVersionRetries : kMaxNumStaleVersionRetries * numShards;
-    for (size_t i = 0; i < numRetries; i++) {
+    size_t numTargetedShards = isTargeted ? 1 : numShards;
+    for (int i = 0; i < gMaxNumStaleVersionRetries.load() - 1; i++) {
+        for (size_t j = 0; j < numTargetedShards; j++) {
+            expectReturnsError(code);
+        }
+
+        // In a transaction, when the router encounters a retryable error it sends
+        // abortTransaction to each pending participant shard before retrying.
+        for (size_t j = 0; j < numTargetedShards; j++) {
+            expectAbortTransaction();
+        }
+    }
+
+    // The router should exhaust its retries here.
+    for (size_t j = 0; j < numTargetedShards; j++) {
         expectReturnsError(code);
     }
 
     // In a transaction, each targeted shard is sent abortTransaction when the router exhausts its
     // retries.
-    size_t numTargetedShards = isTargeted ? 1 : 2;
     for (size_t i = 0; i < numTargetedShards; i++) {
         expectAbortTransaction();
     }
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
-void ClusterCommandTestFixture::testNoErrors(BSONObj targetedCmd, BSONObj scatterGatherCmd) {
+std::vector<DbResponse> ClusterCommandTestFixture::testNoErrors(BSONObj targetedCmd,
+                                                                BSONObj scatterGatherCmd) {
 
+    std::vector<DbResponse> commandResponses;
     // Target one shard.
-    runCommandSuccessful(_makeCmd(targetedCmd), true);
+    commandResponses.emplace_back(runCommandSuccessful(_makeCmd(targetedCmd), true));
 
     // Target all shards.
     if (!scatterGatherCmd.isEmpty()) {
-        runCommandSuccessful(_makeCmd(scatterGatherCmd), false);
+        commandResponses.emplace_back(runCommandSuccessful(_makeCmd(scatterGatherCmd), false));
     }
+    return commandResponses;
+}
+
+std::vector<DbResponse> ClusterCommandTestFixture::testNoErrorsOutsideTransaction(
+    BSONObj targetedCmd, BSONObj scatterGatherCmd) {
+
+    std::vector<DbResponse> commandResponses;
+    // Target one shard.
+    commandResponses.emplace_back(runCommandSuccessful(targetedCmd, true));
+
+    // Target all shards.
+    if (!scatterGatherCmd.isEmpty()) {
+        commandResponses.emplace_back(runCommandSuccessful(scatterGatherCmd, false));
+    }
+    return commandResponses;
 }
 
 void ClusterCommandTestFixture::testRetryOnSnapshotError(BSONObj targetedCmd,
                                                          BSONObj scatterGatherCmd) {
     // Target one shard.
-    runCommandOneError(_makeCmd(targetedCmd), ErrorCodes::SnapshotUnavailable, true);
-    runCommandOneError(_makeCmd(targetedCmd), ErrorCodes::SnapshotTooOld, true);
+    runTxnCommandOneError(_makeCmd(targetedCmd), ErrorCodes::SnapshotUnavailable, true);
+    runTxnCommandOneError(_makeCmd(targetedCmd), ErrorCodes::SnapshotTooOld, true);
 
     // Target all shards
     if (!scatterGatherCmd.isEmpty()) {
-        runCommandOneError(_makeCmd(scatterGatherCmd), ErrorCodes::SnapshotUnavailable, false);
-        runCommandOneError(_makeCmd(scatterGatherCmd), ErrorCodes::SnapshotTooOld, false);
+        runTxnCommandOneError(_makeCmd(scatterGatherCmd), ErrorCodes::SnapshotUnavailable, false);
+        runTxnCommandOneError(_makeCmd(scatterGatherCmd), ErrorCodes::SnapshotTooOld, false);
     }
 }
 
@@ -265,6 +354,62 @@ void ClusterCommandTestFixture::testSnapshotReadConcernWithAfterClusterTime(
         runCommandInspectRequests(
             _makeCmd(scatterGatherCmd, true), containsAtClusterTimeNoAfterClusterTime, false);
     }
+}
+
+void ClusterCommandTestFixture::testIncludeQueryStatsMetrics(BSONObj cmd, bool isTargeted) {
+    const std::string fieldName = "includeQueryStatsMetrics";
+
+    // The given command should not set includeQueryStatsMetrics.
+    ASSERT(cmd[fieldName].eoo());
+
+    BSONObj cmdIncludeTrue = cmd.addField(BSON(fieldName << true).firstElement());
+    BSONObj cmdIncludeFalse = cmd.addField(BSON(fieldName << false).firstElement());
+
+    auto expectFieldIs = [&](bool value) {
+        return [value, &fieldName](const executor::RemoteCommandRequest& request) {
+            auto elt = request.cmdObj[fieldName];
+            ASSERT(!elt.eoo());
+            ASSERT_EQ(elt.boolean(), value);
+        };
+    };
+
+    auto expectNoField = [&](const executor::RemoteCommandRequest& request) {
+        ASSERT(request.cmdObj[fieldName].eoo());
+    };
+
+    {
+        // No rate limit i.e., no requests are rate limited and each one is allowed to gather
+        // stats. We'll always request metrics, even if the user set includeQueryStatsMetrics
+        // to false.
+        RAIIServerParameterControllerForTest rateLimit("internalQueryStatsRateLimit", -1);
+
+        runCommandInspectRequests(cmd, expectFieldIs(true), isTargeted);
+        runCommandInspectRequests(cmdIncludeTrue, expectFieldIs(true), isTargeted);
+        runCommandInspectRequests(cmdIncludeFalse, expectFieldIs(true), isTargeted);
+    }
+
+    {
+        // Rate limit is 0 i.e., every request is rate-limited.
+        RAIIServerParameterControllerForTest rateLimit("internalQueryStatsRateLimit", 0);
+
+        // If the user doesn't give includeQueryStatsMetrics, we won't insert the field.
+        runCommandInspectRequests(cmd, expectNoField, isTargeted);
+
+        // If the user passed us includeQueryStatsMetrics, we'll pass it through.
+        runCommandInspectRequests(cmdIncludeTrue, expectFieldIs(true), isTargeted);
+        runCommandInspectRequests(cmdIncludeFalse, expectFieldIs(false), isTargeted);
+    }
+}
+
+void ClusterCommandTestFixture::testOpcountersAreCorrect(BSONObj cmd, BSONObj expectedMetrics) {
+    serviceOpCounters(ClusterRole::RouterServer).resetForTest();
+    testNoErrors(cmd);
+    ASSERT_BSONOBJ_EQ(serviceOpCounters(ClusterRole::RouterServer).getObj(), expectedMetrics);
+}
+
+void ClusterCommandTestFixture::appendTxnResponseMetadata(BSONObjBuilder& bob) {
+    // Set readOnly to false to avoid opting in to the read-only optimization.
+    bob.append(TxnResponseMetadata::kReadOnlyFieldName, false);
 }
 
 }  // namespace mongo

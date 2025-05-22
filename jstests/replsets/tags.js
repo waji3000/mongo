@@ -1,8 +1,4 @@
-(function() {
-    'use strict';
+import {TagsTest} from "jstests/replsets/libs/tags.js";
 
-    load("jstests/replsets/libs/tags.js");
-
-    let nodes = [{}, {}, {}, {}, {}];
-    new TagsTest({nodes: nodes}).run();
-}());
+let nodes = [{}, {}, {}, {}, {}];
+new TagsTest({nodes: nodes}).run();

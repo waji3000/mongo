@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -32,6 +31,12 @@
 
 #include <string>
 
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/repl/optime.h"
+#include "mongo/db/repl/repl_set_config.h"
 #include "mongo/util/net/hostandport.h"
 
 namespace mongo {
@@ -62,6 +67,20 @@ public:
      */
     long long getConfigVersion() const {
         return _configVersion;
+    }
+
+    /**
+     * Gets the ReplSetConfig term number of the sender.
+     */
+    long long getConfigTerm() const {
+        return _configTerm;
+    }
+
+    /**
+     * Gets the ReplSetConfig (version, term) pair of the sender.
+     */
+    ConfigVersionAndTerm getConfigVersionAndTerm() const {
+        return ConfigVersionAndTerm(_configVersion, _configTerm);
     }
 
     /**
@@ -101,6 +120,13 @@ public:
     }
 
     /**
+     * Gets the id of the node the sender believes to be primary or -1 if it is not known.
+     */
+    long long getPrimaryId() const {
+        return _primaryId;
+    }
+
+    /**
      * Returns whether or not the sender is checking for emptiness.
      */
     bool hasCheckEmpty() const {
@@ -125,11 +151,13 @@ public:
      * The below methods set the value in the method name to 'newVal'.
      */
     void setConfigVersion(long long newVal);
+    void setConfigTerm(long long newVal);
     void setHeartbeatVersion(long long newVal);
     void setSenderId(long long newVal);
     void setSenderHost(const HostAndPort& newVal);
-    void setSetName(const std::string& newVal);
+    void setSetName(StringData newVal);
     void setTerm(long long newVal);
+    void setPrimaryId(long long primaryId);
     void setCheckEmpty();
 
     /**
@@ -142,11 +170,15 @@ public:
     void addToBSON(BSONObjBuilder* builder) const;
 
 private:
+    static const long long kEmptyPrimaryId = -1;
+
     // look at the body of the isInitialized() function to see which fields are mandatory
     long long _configVersion = -1;
+    long long _configTerm = OpTime::kUninitializedTerm;
     long long _heartbeatVersion = -1;
     long long _senderId = -1;
     long long _term = -1;
+    long long _primaryId = kEmptyPrimaryId;
     bool _checkEmpty = false;
     bool _hasSender = false;
     bool _hasHeartbeatVersion = false;

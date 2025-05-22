@@ -1,6 +1,3 @@
-// stemmer.cpp
-
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,41 +27,54 @@
  *    it in the license file.
  */
 
-#include <cstdlib>
-
 #include "mongo/db/fts/stemmer.h"
-#include "mongo/util/mongoutils/str.h"
 
-namespace mongo {
+#include <cstdlib>
+#include <libstemmer.h>
+#include <string>
 
-namespace fts {
 
-Stemmer::Stemmer(const FTSLanguage* language) {
-    _stemmer = NULL;
-    if (language->str() != "none")
-        _stemmer = sb_stemmer_new(language->str().c_str(), "UTF_8");
-}
+#include "mongo/util/assert_util.h"
 
-Stemmer::~Stemmer() {
-    if (_stemmer) {
-        sb_stemmer_delete(_stemmer);
-        _stemmer = NULL;
+namespace mongo::fts {
+
+class Stemmer::Impl {
+public:
+    explicit Impl(const FTSLanguage* language) : _stemmer{_makeStemmer(language->str())} {}
+
+    StringData stem(StringData word) const {
+        auto st = _stemmer.get();
+        if (!st)
+            return word;
+        auto sym =
+            sb_stemmer_stem(st, reinterpret_cast<const sb_symbol*>(word.data()), word.size());
+        invariant(sym);
+        return StringData{reinterpret_cast<const char*>(sym),
+                          static_cast<size_t>(sb_stemmer_length(st))};
     }
-}
+
+private:
+    struct SbStemmerDeleter {
+        void operator()(sb_stemmer* p) const {
+            sb_stemmer_delete(p);
+        }
+    };
+
+    static std::unique_ptr<sb_stemmer, SbStemmerDeleter> _makeStemmer(const std::string& lang) {
+        if (lang == "none")
+            return nullptr;
+        return {sb_stemmer_new(lang.c_str(), "UTF_8"), {}};
+    }
+
+    std::unique_ptr<sb_stemmer, SbStemmerDeleter> _stemmer;
+};
+
+Stemmer::Stemmer(const FTSLanguage* language) : _impl{std::make_unique<Impl>(language)} {}
+
+Stemmer::~Stemmer() = default;
 
 StringData Stemmer::stem(StringData word) const {
-    if (!_stemmer)
-        return word;
-
-    const sb_symbol* sb_sym =
-        sb_stemmer_stem(_stemmer, (const sb_symbol*)word.rawData(), word.size());
-
-    if (sb_sym == NULL) {
-        // out of memory
-        MONGO_UNREACHABLE;
-    }
-
-    return StringData((const char*)(sb_sym), sb_stemmer_length(_stemmer));
+    return _impl->stem(word);
 }
-}
-}
+
+}  // namespace mongo::fts

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,28 +29,28 @@
 
 #pragma once
 
+#include <boost/optional/optional.hpp>
 #include <string>
 #include <vector>
 
 #include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/oid.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/database_name.h"
 #include "mongo/s/chunk_version.h"
 
 namespace mongo {
 
 class ChunkType;
-class CollectionMetadata;
 class NamespaceString;
 class OperationContext;
+
 class ShardCollectionType;
 class ShardDatabaseType;
-template <typename T>
-class StatusWith;
 
-/**
- * Function helpers to locally, using a DBDirectClient, read and write sharding metadata on a shard.
- */
 namespace shardmetadatautil {
 
 /**
@@ -60,25 +59,6 @@ namespace shardmetadatautil {
 struct QueryAndSort {
     const BSONObj query;
     const BSONObj sort;
-};
-
-/**
- * Subset of the shard's collections collection document that relates to refresh state.
- */
-struct RefreshState {
-    bool operator==(const RefreshState& other) const;
-
-    std::string toString() const;
-
-    // The current epoch of the collection metadata.
-    OID epoch;
-
-    // Whether a refresh is currently in progress.
-    bool refreshing;
-
-    // The collection version after the last complete refresh. Indicates change if refreshing has
-    // started and finished since last loaded.
-    ChunkVersion lastRefreshedCollectionVersion;
 };
 
 /**
@@ -96,17 +76,17 @@ struct RefreshState {
  * due to the yield described above. If updates are applied in ascending version order, the newer
  * update is applied last.
  */
-QueryAndSort createShardChunkDiffQuery(const ChunkVersion& collectionVersion);
+QueryAndSort createShardChunkDiffQuery(const ChunkVersion& collectionPlacementVersion);
 
 /**
  * Writes a persisted signal to indicate that it is once again safe to read from the chunks
- * collection for 'nss' and updates the collection's collection version to 'refreshedVersion'. It is
- * essential to call this after updating the chunks collection so that secondaries know they can
- * safely use the chunk metadata again.
+ * collection for 'nss' and updates the collection's collection placement version to
+ * 'refreshedVersion'. It is essential to call this after updating the chunks collection so that
+ * secondaries know they can safely use the chunk metadata again.
  *
  * It is safe to call this multiple times: it's an idempotent action.
  *
- * refreshedVersion - the new collection version for the completed refresh.
+ * refreshedVersion - the new collection placement version for the completed refresh.
  *
  * Note: if there is no document present in the collections collection for 'nss', nothing is
  * updated.
@@ -114,6 +94,26 @@ QueryAndSort createShardChunkDiffQuery(const ChunkVersion& collectionVersion);
 Status unsetPersistedRefreshFlags(OperationContext* opCtx,
                                   const NamespaceString& nss,
                                   const ChunkVersion& refreshedVersion);
+
+/**
+ * Represents a subset of a collection's config.cache.collections entry that relates to refresh
+ * state.
+ */
+struct RefreshState {
+    bool operator==(const RefreshState& other) const;
+
+    std::string toString() const;
+
+    // The current generation of the collection.
+    CollectionGeneration generation;
+
+    // Whether a refresh is currently in progress.
+    bool refreshing;
+
+    // The collection placement version after the last complete refresh. Indicates change if
+    // refreshing has started and finished since last loaded.
+    ChunkVersion lastRefreshedCollectionPlacementVersion;
+};
 
 /**
  * Reads the persisted refresh signal for 'nss' and returns those settings.
@@ -130,25 +130,20 @@ StatusWith<ShardCollectionType> readShardCollectionsEntry(OperationContext* opCt
 /**
  * Reads the shard server's databases collection entry identified by 'dbName'.
  */
-StatusWith<ShardDatabaseType> readShardDatabasesEntry(OperationContext* opCtx, StringData dbName);
+StatusWith<ShardDatabaseType> readShardDatabasesEntry(OperationContext* opCtx,
+                                                      const DatabaseName& dbName);
 
 /**
  * Updates the collections collection entry matching 'query' with 'update' using local write
  * concern.
  *
- * Uses the $set operator on the update so that updates can be applied without resetting everything.
- * 'inc' can be used to specify fields and their increments: it will be assigned to the $inc
- * operator.
- *
- * If 'upsert' is true, expects 'lastRefreshedCollectionVersion' to be absent in the update:
- * these refreshing fields should only be added to an existing document.
- * Similarly, 'inc' should not specify 'upsert' true.
+ * If 'upsert' is true, expects 'lastRefreshedCollectionPlacementVersion' to be absent in the
+ * update: these refreshing fields should only be added to an existing document.
  */
 Status updateShardCollectionsEntry(OperationContext* opCtx,
                                    const BSONObj& query,
                                    const BSONObj& update,
-                                   const BSONObj& inc,
-                                   const bool upsert);
+                                   bool upsert);
 
 /**
  * Updates the databases collection entry matching 'query' with 'update' using local write
@@ -164,36 +159,37 @@ Status updateShardDatabasesEntry(OperationContext* opCtx,
                                  const BSONObj& query,
                                  const BSONObj& update,
                                  const BSONObj& inc,
-                                 const bool upsert);
+                                 bool upsert);
 
 /**
  * Reads the shard server's chunks collection corresponding to 'nss' for chunks matching 'query',
  * returning at most 'limit' chunks in 'sort' order. 'epoch' populates the returned chunks' version
- * fields, because we do not yet have UUIDs to replace epoches nor UUIDs associated with namespaces.
+ * fields, because we do not yet have UUIDs to replace epochs nor UUIDs associated with namespaces.
  */
 StatusWith<std::vector<ChunkType>> readShardChunks(OperationContext* opCtx,
                                                    const NamespaceString& nss,
                                                    const BSONObj& query,
                                                    const BSONObj& sort,
                                                    boost::optional<long long> limit,
-                                                   const OID& epoch);
+                                                   const OID& epoch,
+                                                   const Timestamp& timestamp);
 
 /**
  * Takes a vector of 'chunks' and updates the shard's chunks collection for 'nss'. Any chunk
- * documents in config.chunks.ns that overlap with a chunk in 'chunks' is removed as the updated
- * chunk document is inserted. If the epoch of a chunk in 'chunks' does not match 'currEpoch',
- * a ConflictingOperationInProgress error is returned and no more updates are applied.
+ * documents in config.cache.chunks.<ns> that overlap with a chunk in 'chunks' is removed as the
+ * updated chunk document is inserted. If the epoch of a chunk in 'chunks' does not match
+ * 'currEpoch', a ConflictingOperationInProgress error is returned and no more updates are applied.
  *
  * Note: two threads running this function in parallel for the same collection can corrupt the
  * collection data!
  *
- * nss - the regular collection namespace for which chunk metadata is being updated.
- * chunks - chunks retrieved from the config server, sorted in ascending chunk version order
+ * nss - the collection namespace for which chunk metadata is being updated.
+ * chunks - chunks retrieved from the config server, sorted in ascending chunk version order.
  * currEpoch - what this shard server expects the collection epoch to be.
  *
  * Returns:
  * - ConflictingOperationInProgress if the chunk version epoch of any chunk in 'chunks' is different
- *   than 'currEpoch'
+ *   than 'currEpoch'.
  * - Other errors if unable to do local writes/reads to the config.chunks.ns collection.
  */
 Status updateShardChunks(OperationContext* opCtx,
@@ -212,10 +208,15 @@ Status updateShardChunks(OperationContext* opCtx,
 Status dropChunksAndDeleteCollectionsEntry(OperationContext* opCtx, const NamespaceString& nss);
 
 /**
+ * Drops locally persisted chunk metadata associated with 'nss': only drops the chunks collection.
+ */
+void dropChunks(OperationContext* opCtx, const NamespaceString& nss);
+
+/**
  * Deletes locally persisted database metadata associated with 'dbName': removes the databases
  * collection entry.
  */
-Status deleteDatabasesEntry(OperationContext* opCtx, StringData dbName);
+Status deleteDatabasesEntry(OperationContext* opCtx, const DatabaseName& dbName);
 
 }  // namespace shardmetadatautil
 }  // namespace mongo

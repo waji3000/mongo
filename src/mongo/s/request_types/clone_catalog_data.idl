@@ -32,12 +32,14 @@ global:
     cpp_namespace: "mongo"
 
 imports:
-    - "mongo/idl/basic_types.idl"
+    - "mongo/db/basic_types.idl"
 
 commands:
     cloneCatalogData:
         description: "The internal cloneCatalogData command on a shard"
+        command_name: cloneCatalogData
         namespace: type
+        api_version: ""
         type: namespacestring
         strict: false
         fields:

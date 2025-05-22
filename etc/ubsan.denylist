@@ -1,0 +1,31 @@
+# Don't UBSAN most of third_party, but do ubsan WT
+src:src/third_party/IntelRDFPMathLib20U1/*
+src:src/third_party/mozjs/*
+src:src/third_party/snappy-*/*
+src:src/third_party/icu4c-*/*
+
+# TODO SERVER-97033 Remove immer suppressions if and when the UB is fixed upstream.
+fun:_ZN5immer6detail3csl10member_two*type*get*
+fun:_ZN5immer6detail3csl3get*
+fun:_ZN5immer6detail5hamts4node*make_inner_n*
+fun:_ZN5immer6detail5hamts4node*make_merged*
+fun:_ZN5immer6detail5hamts4node*ownee*
+src:src/third_party/immer/dist/immer/detail/hamts/node.hpp
+
+# s2 compatibility
+fun:_ZN8S2CellId14FromFaceIJWrapEiii
+
+# TODO SERVER-88345 Remove simple8b from the denylist.
+# This is a temporary change. 
+# Simple8b has known ubsan crashes that is hurting development of the decoder API.
+src:src/mongo/bson/column/simple8b*
+src:src/mongo/bson/column/bsoncolumn_helpers.h
+src:src/third_party/abseil-cpp/dist/absl/numeric/int128_have_intrinsic.inc
+
+# SERVER-62972
+# libunwind has some UB when doing stack unwinding
+[alignment]
+fun:access_mem
+
+# TODO SERVER-102630 warns of unaligned access on code whose purpose is to prevent unaligned access.
+src:src/third_party/gperftools/dist/src/base/basictypes.h

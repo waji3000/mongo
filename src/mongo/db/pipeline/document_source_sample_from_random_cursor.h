@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,8 +29,23 @@
 
 #pragma once
 
+#include <set>
+#include <string>
+
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/base/string_data.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/exec/document_value/value_comparator.h"
+#include "mongo/db/pipeline/dependencies.h"
 #include "mongo/db/pipeline/document_source.h"
-#include "mongo/db/pipeline/value_comparator.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/pipeline.h"
+#include "mongo/db/pipeline/stage_constraints.h"
+#include "mongo/db/pipeline/variables.h"
+#include "mongo/db/query/query_shape/serialization_options.h"
 
 namespace mongo {
 
@@ -41,10 +55,16 @@ namespace mongo {
  */
 class DocumentSourceSampleFromRandomCursor final : public DocumentSource {
 public:
-    GetNextResult getNext() final;
+    static constexpr StringData kStageName = "$sampleFromRandomCursor"_sd;
     const char* getSourceName() const final;
-    Value serialize(boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final;
+    Value serialize(const SerializationOptions& opts = SerializationOptions{}) const final;
     DepsTracker::State getDependencies(DepsTracker* deps) const final;
+
+    static const Id& id;
+
+    Id getId() const override {
+        return id;
+    }
 
     StageConstraints constraints(Pipeline::SplitState pipeState) const final {
         return {StreamType::kStreaming,
@@ -52,7 +72,13 @@ public:
                 HostTypeRequirement::kAnyShard,
                 DiskUseRequirement::kNoDiskUse,
                 FacetRequirement::kNotAllowed,
-                TransactionRequirement::kAllowed};
+                TransactionRequirement::kAllowed,
+                LookupRequirement::kAllowed,
+                UnionRequirement::kAllowed};
+    }
+
+    boost::optional<DistributedPlanLogic> distributedPlanLogic() final {
+        return boost::none;
     }
 
     static boost::intrusive_ptr<DocumentSourceSampleFromRandomCursor> create(
@@ -61,11 +87,15 @@ public:
         std::string idField,
         long long collectionSize);
 
+    void addVariableRefs(std::set<Variables::Id>* refs) const final {}
+
 private:
     DocumentSourceSampleFromRandomCursor(const boost::intrusive_ptr<ExpressionContext>& expCtx,
                                          long long size,
                                          std::string idField,
                                          long long collectionSize);
+
+    GetNextResult doGetNext() final;
 
     /**
      * Keep asking for documents from the random cursor until it yields a new document. Errors if a
@@ -81,7 +111,7 @@ private:
 
     // Keeps track of the documents that have been returned, since a random cursor is allowed to
     // return duplicates.
-    ValueUnorderedSet _seenDocs;
+    ValueFlatUnorderedSet _seenDocs;
 
     // The approximate number of documents in the collection (includes orphans).
     const long long _nDocsInColl;

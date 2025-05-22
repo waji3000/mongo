@@ -1,6 +1,3 @@
-// path_test.cpp
-
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,19 +27,21 @@
  *    it in the license file.
  */
 
-#include "mongo/unittest/unittest.h"
+#include <initializer_list>
 
-#include "mongo/db/jsobj.h"
-#include "mongo/db/json.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/bson/json.h"
 #include "mongo/db/matcher/path.h"
+#include "mongo/unittest/unittest.h"
 
 namespace mongo {
 
 using std::string;
 
 TEST(Path, Root1) {
-    ElementPath p;
-    p.init("a");
+    ElementPath p{"a"};
 
     BSONObj doc = BSON("x" << 4 << "a" << 5);
 
@@ -55,8 +54,7 @@ TEST(Path, Root1) {
 }
 
 TEST(Path, RootArray1) {
-    ElementPath p;
-    p.init("a");
+    ElementPath p{"a"};
 
     BSONObj doc = BSON("x" << 4 << "a" << BSON_ARRAY(5 << 6));
 
@@ -78,8 +76,7 @@ TEST(Path, RootArray1) {
 }
 
 TEST(Path, RootArray2) {
-    ElementPath p;
-    p.init("a");
+    ElementPath p{"a"};
     p.setLeafArrayBehavior(ElementPath::LeafArrayBehavior::kNoTraversal);
 
     BSONObj doc = BSON("x" << 4 << "a" << BSON_ARRAY(5 << 6));
@@ -94,8 +91,7 @@ TEST(Path, RootArray2) {
 }
 
 TEST(Path, Nested1) {
-    ElementPath p;
-    p.init("a.b");
+    ElementPath p{"a.b"};
 
     BSONObj doc =
         BSON("a" << BSON_ARRAY(BSON("b" << 5) << 3 << BSONObj() << BSON("b" << BSON_ARRAY(9 << 11))
@@ -133,8 +129,7 @@ TEST(Path, Nested1) {
 }
 
 TEST(Path, NestedPartialMatchScalar) {
-    ElementPath p;
-    p.init("a.b");
+    ElementPath p{"a.b"};
 
     BSONObj doc = BSON("a" << 4);
 
@@ -152,8 +147,7 @@ TEST(Path, NestedPartialMatchScalar) {
 // the iteration logic does not return an EOO.
 // what we want ideally.
 TEST(Path, NestedPartialMatchArray) {
-    ElementPath p;
-    p.init("a.b");
+    ElementPath p{"a.b"};
 
     BSONObj doc = BSON("a" << BSON_ARRAY(4));
 
@@ -164,8 +158,7 @@ TEST(Path, NestedPartialMatchArray) {
 
 // Note that this describes existing behavior and not necessarily
 TEST(Path, NestedEmptyArray) {
-    ElementPath p;
-    p.init("a.b");
+    ElementPath p{"a.b"};
 
     BSONObj doc = BSON("a" << BSON("b" << BSONArray()));
 
@@ -180,8 +173,7 @@ TEST(Path, NestedEmptyArray) {
 }
 
 TEST(Path, NestedNoLeaf1) {
-    ElementPath p;
-    p.init("a.b");
+    ElementPath p{"a.b"};
     p.setLeafArrayBehavior(ElementPath::LeafArrayBehavior::kNoTraversal);
 
     BSONObj doc =
@@ -212,8 +204,7 @@ TEST(Path, NestedNoLeaf1) {
 }
 
 TEST(Path, MatchSubpathReturnsArrayOnSubpath) {
-    ElementPath path;
-    path.init("a.b.c");
+    ElementPath path{"a.b.c"};
     path.setLeafArrayBehavior(ElementPath::LeafArrayBehavior::kNoTraversal);
     path.setNonLeafArrayBehavior(ElementPath::NonLeafArrayBehavior::kMatchSubpath);
 
@@ -229,8 +220,7 @@ TEST(Path, MatchSubpathReturnsArrayOnSubpath) {
 }
 
 TEST(Path, MatchSubpathWithTraverseLeafFalseReturnsLeafArrayOnPath) {
-    ElementPath path;
-    path.init("a.b.c");
+    ElementPath path{"a.b.c"};
     path.setLeafArrayBehavior(ElementPath::LeafArrayBehavior::kNoTraversal);
     path.setNonLeafArrayBehavior(ElementPath::NonLeafArrayBehavior::kMatchSubpath);
 
@@ -246,8 +236,7 @@ TEST(Path, MatchSubpathWithTraverseLeafFalseReturnsLeafArrayOnPath) {
 }
 
 TEST(Path, MatchSubpathWithTraverseLeafTrueReturnsLeafArrayAndValuesOnPath) {
-    ElementPath path;
-    path.init("a.b.c");
+    ElementPath path{"a.b.c"};
     path.setLeafArrayBehavior(ElementPath::LeafArrayBehavior::kTraverse);
     path.setNonLeafArrayBehavior(ElementPath::NonLeafArrayBehavior::kMatchSubpath);
 
@@ -271,8 +260,7 @@ TEST(Path, MatchSubpathWithTraverseLeafTrueReturnsLeafArrayAndValuesOnPath) {
 }
 
 TEST(Path, MatchSubpathWithMultipleArraysReturnsOutermostArray) {
-    ElementPath path;
-    path.init("a.b.c");
+    ElementPath path{"a.b.c"};
     path.setLeafArrayBehavior(ElementPath::LeafArrayBehavior::kTraverse);
     path.setNonLeafArrayBehavior(ElementPath::NonLeafArrayBehavior::kMatchSubpath);
 
@@ -288,8 +276,7 @@ TEST(Path, MatchSubpathWithMultipleArraysReturnsOutermostArray) {
 }
 
 TEST(Path, NoTraversalOfNonLeafArrayReturnsNothingWithNonLeafArrayInDoc) {
-    ElementPath path;
-    path.init("a.b");
+    ElementPath path{"a.b"};
     path.setLeafArrayBehavior(ElementPath::LeafArrayBehavior::kTraverse);
     path.setNonLeafArrayBehavior(ElementPath::NonLeafArrayBehavior::kNoTraversal);
 
@@ -300,8 +287,7 @@ TEST(Path, NoTraversalOfNonLeafArrayReturnsNothingWithNonLeafArrayInDoc) {
 }
 
 TEST(Path, MatchSubpathWithNumericalPathComponentReturnsEntireArray) {
-    ElementPath path;
-    path.init("a.0.b");
+    ElementPath path{"a.0.b"};
     path.setLeafArrayBehavior(ElementPath::LeafArrayBehavior::kTraverse);
     path.setNonLeafArrayBehavior(ElementPath::NonLeafArrayBehavior::kMatchSubpath);
 
@@ -317,8 +303,7 @@ TEST(Path, MatchSubpathWithNumericalPathComponentReturnsEntireArray) {
 }
 
 TEST(Path, ArrayIndex1) {
-    ElementPath p;
-    p.init("a.1");
+    ElementPath p{"a.1"};
 
     BSONObj doc = BSON("a" << BSON_ARRAY(5 << 7 << 3));
 
@@ -332,8 +317,7 @@ TEST(Path, ArrayIndex1) {
 }
 
 TEST(Path, ArrayIndex2) {
-    ElementPath p;
-    p.init("a.1");
+    ElementPath p{"a.1"};
 
     BSONObj doc = BSON("a" << BSON_ARRAY(5 << BSON_ARRAY(2 << 4) << 3));
 
@@ -347,8 +331,7 @@ TEST(Path, ArrayIndex2) {
 }
 
 TEST(Path, ArrayIndex3) {
-    ElementPath p;
-    p.init("a.1");
+    ElementPath p{"a.1"};
 
     BSONObj doc = BSON("a" << BSON_ARRAY(5 << BSON("1" << 4) << 3));
 
@@ -366,8 +349,7 @@ TEST(Path, ArrayIndex3) {
 }
 
 TEST(Path, ArrayIndexNested1) {
-    ElementPath p;
-    p.init("a.1.b");
+    ElementPath p{"a.1.b"};
 
     BSONObj doc = BSON("a" << BSON_ARRAY(5 << BSON("b" << 4) << 3));
 
@@ -386,8 +368,7 @@ TEST(Path, ArrayIndexNested1) {
 }
 
 TEST(Path, ArrayIndexNested2) {
-    ElementPath p;
-    p.init("a.1.b");
+    ElementPath p{"a.1.b"};
 
     BSONObj doc = BSON("a" << BSON_ARRAY(5 << BSON_ARRAY(BSON("b" << 4)) << 3));
 
@@ -404,8 +385,7 @@ TEST(Path, ArrayIndexNested2) {
 // SERVER-15899: test iteration using a path that generates no elements, but traverses a long
 // array containing subdocuments with nested arrays.
 TEST(Path, NonMatchingLongArrayOfSubdocumentsWithNestedArrays) {
-    ElementPath p;
-    p.init("a.b.x");
+    ElementPath p{"a.b.x"};
 
     // Build the document {a: [{b: []}, {b: []}, {b: []}, ...]}.
     BSONObj subdoc = BSON("b" << BSONArray());
@@ -425,8 +405,7 @@ TEST(Path, NonMatchingLongArrayOfSubdocumentsWithNestedArrays) {
 // ElementIterator::Context::arrayOffset() should always refer to the current offset of the
 // outermost array that is implicitly traversed.
 TEST(Path, NestedArrayImplicitTraversal) {
-    ElementPath p;
-    p.init("a.b");
+    ElementPath p{"a.b"};
     BSONObj doc = fromjson("{a: [{b: [2, 3]}, {b: [4, 5]}]}");
     BSONElementIterator cursor(&p, doc);
 
@@ -473,8 +452,7 @@ TEST(Path, NestedArrayImplicitTraversal) {
 // is being traversed implicitly, ElementIterator::Context::arrayOffset() should return the
 // current offset of the array being implicitly traversed.
 TEST(Path, ArrayOffsetWithImplicitAndExplicitTraversal) {
-    ElementPath p;
-    p.init("a.0.b");
+    ElementPath p{"a.0.b"};
     BSONObj doc = fromjson("{a: [{b: [2, 3]}, {b: [4, 5]}]}");
     BSONElementIterator cursor(&p, doc);
 
@@ -507,6 +485,55 @@ TEST(Path, ArrayOffsetWithImplicitAndExplicitTraversal) {
     ASSERT_EQUALS("1", e.arrayOffset().fieldNameStringData());  // Second elt of outer array.
 
     ASSERT(!cursor.more());
+}
+
+TEST(Path, LeafArrayBehaviorTraverseOmitArrayWithNonEmptyArray) {
+    ElementPath path{"a", ElementPath::LeafArrayBehavior::kTraverseOmitArray};
+    BSONObj doc = fromjson("{a: [1, 2]}");
+    BSONElementIterator cursor(&path, doc);
+
+    // Verifies that only array elements are returned by the iterator, that is the array [1, 2] is
+    // not returned.
+    ASSERT_TRUE(cursor.more());
+    ElementIterator::Context context = cursor.next();
+    ASSERT_EQUALS(1, context.element().Int());
+
+    ASSERT_TRUE(cursor.more());
+    context = cursor.next();
+    ASSERT_EQUALS(2, context.element().Int());
+
+    ASSERT_FALSE(cursor.more());
+}
+
+TEST(Path, LeafArrayBehaviorTraverseOmitArrayWithEmptyArray) {
+    ElementPath path{"a", ElementPath::LeafArrayBehavior::kTraverseOmitArray};
+    BSONObj doc = fromjson("{a: []}");
+    BSONElementIterator cursor(&path, doc);
+
+    // Verifies that no elements are returned by the iterator since the array is empty.
+    ASSERT_FALSE(cursor.more());
+}
+
+TEST(Path, LeafArrayBehaviorTraverseOmitArrayNested) {
+    ElementPath path{"a.b", ElementPath::LeafArrayBehavior::kTraverseOmitArray};
+    BSONObj doc = fromjson("{a: [{b: [1]}, {b: []}, {b: [2, 3]}]}");
+    BSONElementIterator cursor(&path, doc);
+
+    // Verifies that all elements of nested arrays are returned.
+    for (auto&& element : {1, 2, 3}) {
+        ASSERT_TRUE(cursor.more());
+        ASSERT_EQUALS(element, cursor.next().element().Int());
+    }
+    ASSERT_FALSE(cursor.more());
+}
+
+TEST(Path, LeafArrayBehaviorTraverseOmitArrayNestedEmptyArray) {
+    ElementPath path{"a.b", ElementPath::LeafArrayBehavior::kTraverseOmitArray};
+    BSONObj doc = fromjson("{a: [{b: []}, {b: []}]}");
+    BSONElementIterator cursor(&path, doc);
+
+    // Verifies that no elements are returned.
+    ASSERT_FALSE(cursor.more());
 }
 
 TEST(SimpleArrayElementIterator, SimpleNoArrayLast1) {
@@ -569,4 +596,4 @@ TEST(SingleElementElementIterator, Simple1) {
 
     ASSERT(!i.more());
 }
-}
+}  // namespace mongo

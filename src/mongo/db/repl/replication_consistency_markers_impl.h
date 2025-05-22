@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,10 +29,20 @@
 
 #pragma once
 
-#include "mongo/base/disallow_copying.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/status.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/auth/validated_tenancy_scope.h"
+#include "mongo/db/catalog/collection.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/record_id.h"
+#include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/replication_consistency_markers.h"
 #include "mongo/db/repl/replication_consistency_markers_gen.h"
+#include "mongo/stdx/mutex.h"
 
 namespace mongo {
 
@@ -48,17 +57,15 @@ class StorageInterface;
 struct TimestampedBSONObj;
 
 class ReplicationConsistencyMarkersImpl : public ReplicationConsistencyMarkers {
-    MONGO_DISALLOW_COPYING(ReplicationConsistencyMarkersImpl);
+    ReplicationConsistencyMarkersImpl(const ReplicationConsistencyMarkersImpl&) = delete;
+    ReplicationConsistencyMarkersImpl& operator=(const ReplicationConsistencyMarkersImpl&) = delete;
 
 public:
-    static constexpr StringData kDefaultMinValidNamespace = "local.replset.minvalid"_sd;
-    static constexpr StringData kDefaultOplogTruncateAfterPointNamespace =
-        "local.replset.oplogTruncateAfterPoint"_sd;
-
     explicit ReplicationConsistencyMarkersImpl(StorageInterface* storageInterface);
     ReplicationConsistencyMarkersImpl(StorageInterface* storageInterface,
                                       NamespaceString minValidNss,
-                                      NamespaceString oplogTruncateAfterNss);
+                                      NamespaceString oplogTruncateAfterNss,
+                                      NamespaceString initialSyncIdNss);
 
     void initializeMinValidDocument(OperationContext* opCtx) override;
 
@@ -66,18 +73,29 @@ public:
     void setInitialSyncFlag(OperationContext* opCtx) override;
     void clearInitialSyncFlag(OperationContext* opCtx) override;
 
-    OpTime getMinValid(OperationContext* opCtx) const override;
-    void setMinValid(OperationContext* opCtx, const OpTime& minValid) override;
-    void setMinValidToAtLeast(OperationContext* opCtx, const OpTime& minValid) override;
+    void ensureFastCountOnOplogTruncateAfterPoint(OperationContext* opCtx) override;
 
     void setOplogTruncateAfterPoint(OperationContext* opCtx, const Timestamp& timestamp) override;
     Timestamp getOplogTruncateAfterPoint(OperationContext* opCtx) const override;
 
+    void startUsingOplogTruncateAfterPointForPrimary() override;
+    void stopUsingOplogTruncateAfterPointForPrimary() override;
+    bool isOplogTruncateAfterPointBeingUsedForPrimary() const override;
+
+    void setOplogTruncateAfterPointToTopOfOplog(OperationContext* opCtx) override;
+
+    boost::optional<OpTimeAndWallTime> refreshOplogTruncateAfterPointIfPrimary(
+        OperationContext* opCtx) override;
+
     void setAppliedThrough(OperationContext* opCtx, const OpTime& optime) override;
-    void clearAppliedThrough(OperationContext* opCtx, const Timestamp& writeTimestamp) override;
+    void clearAppliedThrough(OperationContext* opCtx) override;
     OpTime getAppliedThrough(OperationContext* opCtx) const override;
 
-    Status createInternalCollections(OperationContext* opCtx);
+    Status createInternalCollections(OperationContext* opCtx) override;
+
+    void setInitialSyncIdIfNotSet(OperationContext* opCtx) override;
+    void clearInitialSyncId(OperationContext* opCtx) override;
+    BSONObj getInitialSyncId(OperationContext* opCtx) override;
 
 private:
     /**
@@ -92,7 +110,7 @@ private:
      *
      * This fasserts on failure.
      */
-    void _updateMinValidDocument(OperationContext* opCtx, const TimestampedBSONObj& updateSpec);
+    void _updateMinValidDocument(OperationContext* opCtx, const BSONObj& updateSpec);
 
     /**
      * Reads the OplogTruncateAfterPoint document from disk.
@@ -102,16 +120,58 @@ private:
         OperationContext* opCtx) const;
 
     /**
+     * Updates the oplogTruncateAfterPoint with 'timestamp'. Callers should use this codepath when
+     * expecting write interruption errors.
+     */
+    Status _setOplogTruncateAfterPoint(const CollectionPtr& collection,
+                                       OperationContext* opCtx,
+                                       const Timestamp& timestamp);
+
+    /**
      * Upserts the OplogTruncateAfterPoint document according to the provided update spec. The
      * collection must already exist. See `createInternalCollections`.
-     *
-     * This fasserts on failure.
      */
-    void _upsertOplogTruncateAfterPointDocument(OperationContext* opCtx, const BSONObj& updateSpec);
+    Status _upsertOplogTruncateAfterPointDocument(const CollectionPtr& collection,
+                                                  OperationContext* opCtx,
+                                                  const BSONObj& updateSpec);
 
     StorageInterface* _storageInterface;
     const NamespaceString _minValidNss;
     const NamespaceString _oplogTruncateAfterPointNss;
+    const NamespaceString _initialSyncIdNss;
+
+    // Protects modifying and reading _isPrimary below.
+    mutable stdx::mutex _truncatePointIsPrimaryMutex;
+
+    // Tracks whether or not the node is primary. Avoids potential deadlocks taking the replication
+    // coordinator's mutex to check replication state. Also remains false for standalones that do
+    // not use timestamps.
+    bool _isPrimary = false;
+
+    // Locks around fetching the 'all_durable' timestamp from the storage engine and updating the
+    // oplogTruncateAfterPoint. This prevents the oplogTruncateAfterPoint from going backwards in
+    // time in case of multiple callers to refreshOplogTruncateAfterPointIfPrimary.
+    mutable stdx::mutex _refreshOplogTruncateAfterPointMutex;
+
+    // In-memory cache of the of the oplog entry LTE to the oplogTruncateAfterPoint timestamp.
+    // Eventually matches the oplogTruncateAfterPoint timestamp when parallel writes finish. Avoids
+    // repeatedly writing the same oplogTruncateAfterPoint timestamp to disk, which creates noise in
+    // a silent system. Only set in state PRIMARY.
+    //
+    // Reset whenever setOplogTruncateAfterPoint() manually resets the truncate point: this could
+    // push the durable truncate point forwards or backwards in time, reflecting changes in the
+    // oplog. The truncate point is manually set in non-PRIMARY states.
+    //
+    // Note: these values lack their own specific concurrency control, instead depending on the
+    // serialization that exists in setting the oplog truncate after point.
+    boost::optional<Timestamp> _lastNoHolesOplogTimestamp;
+    boost::optional<OpTimeAndWallTime> _lastNoHolesOplogOpTimeAndWallTime;
+
+    // Cached initialSyncId from last initial sync. Will only be set on startup or initial sync.
+    BSONObj _initialSyncId;
+
+    // Cached recordId of the oplogTruncateAfterPoint to speed up subsequent updates
+    boost::optional<RecordId> _oplogTruncateRecordId;
 };
 
 }  // namespace repl

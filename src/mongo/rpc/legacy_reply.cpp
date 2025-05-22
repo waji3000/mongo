@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,19 +27,20 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <memory>
 
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/error_extra_info.h"
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/dbmessage.h"
 #include "mongo/rpc/legacy_reply.h"
-
-#include <tuple>
-#include <utility>
-
-#include "mongo/bson/bson_validate.h"
-#include "mongo/rpc/legacy_reply_builder.h"
-#include "mongo/rpc/metadata.h"
-#include "mongo/rpc/object_check.h"
+#include "mongo/rpc/object_check.h"  // IWYU pragma: keep
 #include "mongo/util/assert_util.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 namespace rpc {
@@ -55,20 +55,17 @@ LegacyReply::LegacyReply(const Message* message) {
 
     uassert(ErrorCodes::BadValue,
             str::stream() << "Got legacy command reply with a bad cursorId field,"
-                          << " expected a value of 0 but got "
-                          << qr.getCursorId(),
+                          << " expected a value of 0 but got " << qr.getCursorId(),
             qr.getCursorId() == 0);
 
     uassert(ErrorCodes::BadValue,
             str::stream() << "Got legacy command reply with a bad nReturned field,"
-                          << " expected a value of 1 but got "
-                          << qr.getNReturned(),
+                          << " expected a value of 1 but got " << qr.getNReturned(),
             qr.getNReturned() == 1);
 
     uassert(ErrorCodes::BadValue,
             str::stream() << "Got legacy command reply with a bad startingFrom field,"
-                          << " expected a value of 0 but got "
-                          << qr.getStartingFrom(),
+                          << " expected a value of 0 but got " << qr.getStartingFrom(),
             qr.getStartingFrom() == 0);
 
     auto status = Validator<BSONObj>::validateLoad(qr.data(), qr.dataLen());

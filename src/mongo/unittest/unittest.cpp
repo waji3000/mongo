@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,99 +27,134 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/unittest/unittest.h"
-
+#include <algorithm>
+#include <boost/smart_ptr.hpp>
+#include <cstdint>
+#include <cstdlib>
+#include <exception>
+#include <fmt/format.h>
+#include <fmt/printf.h>  // IWYU pragma: keep
+#include <functional>
 #include <iostream>
+#include <iterator>
 #include <map>
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
 
-#include "mongo/base/checked_cast.h"
-#include "mongo/base/init.h"
+#include <boost/exception/exception.hpp>
+#include <boost/log/core/core.hpp>
+// IWYU pragma: no_include "boost/log/detail/attachable_sstream_buf.hpp"
+// IWYU pragma: no_include "boost/log/detail/locking_ptr.hpp"
+#include <boost/log/sinks/unlocked_frontend.hpp>
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/shared_ptr.hpp>
+#include <boost/thread/exceptions.hpp>
+
+#include "mongo/base/init.h"  // IWYU pragma: keep
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/bson/simple_bsonelement_comparator.h"
 #include "mongo/db/server_options.h"
-#include "mongo/logger/console_appender.h"
-#include "mongo/logger/log_manager.h"
-#include "mongo/logger/logger.h"
-#include "mongo/logger/message_event_utf8_encoder.h"
-#include "mongo/logger/message_log_domain.h"
-#include "mongo/stdx/functional.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/logv2/bson_formatter.h"
+#include "mongo/logv2/domain_filter.h"
+#include "mongo/logv2/log.h"
+#include "mongo/logv2/log_capture_backend.h"
+#include "mongo/logv2/plain_formatter.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/unittest/test_info.h"
+#include "mongo/unittest/unittest.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/log.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/exit_code.h"
+#include "mongo/util/signal_handlers_synchronous.h"
 #include "mongo/util/stacktrace.h"
 #include "mongo/util/timer.h"
+#include "mongo/util/version/releases.h"
 
-namespace mongo {
-namespace unittest {
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
+
+
+namespace mongo::unittest {
 namespace {
 
 bool stringContains(const std::string& haystack, const std::string& needle) {
     return haystack.find(needle) != std::string::npos;
 }
 
-logger::MessageLogDomain* unittestOutput = logger::globalLogManager()->getNamedDomain("unittest");
-
-typedef std::map<std::string, std::shared_ptr<Suite>> SuiteMap;
-
-SuiteMap& _allSuites() {
-    static SuiteMap allSuites;
-    return allSuites;
+/** Each map key is owned by its corresponding Suite object. */
+auto& suitesMap() {
+    static std::map<StringData, std::shared_ptr<Suite>> m;
+    return m;
 }
 
 }  // namespace
 
-logger::LogstreamBuilder log() {
-    return LogstreamBuilder(unittestOutput, getThreadName(), logger::LogSeverity::Log());
-}
-
-logger::LogstreamBuilder warning() {
-    return LogstreamBuilder(unittestOutput, getThreadName(), logger::LogSeverity::Warning());
-}
-
-void setupTestLogger() {
-    unittestOutput->attachAppender(
-        std::make_unique<logger::ConsoleAppender<logger::MessageLogDomain::Event>>(
-            std::make_unique<logger::MessageEventDetailsEncoder>()));
-}
-
-MONGO_INITIALIZER_WITH_PREREQUISITES(UnitTestOutput, ("GlobalLogManager", "default"))
-(InitializerContext*) {
-    setupTestLogger();
-    return Status::OK();
+bool searchRegex(const pcre::Regex& pattern, const std::string& string) {
+    return pattern && !!pattern.matchView(string);
 }
 
 class Result {
 public:
-    Result(const std::string& name)
-        : _name(name), _rc(0), _tests(0), _fails(), _asserts(0), _millis(0) {}
+    struct FailStatus {
+        std::string test;
+        std::string type;
+        std::string error;
+        std::string extra;
+
+        friend std::ostream& operator<<(std::ostream& os, const FailStatus& f) {
+            return os                      //
+                << "{test: " << f.test     //
+                << ", type: " << f.type    //
+                << ", error: " << f.error  //
+                << ", extra: " << f.extra  //
+                << "}";
+        }
+    };
+
+    Result(const std::string& name) : _name(name), _rc(0), _tests(0), _fails(), _millis(0) {}
 
     std::string toString() const {
-        char result[144];
-        size_t numWritten = std::snprintf(
-            result,
-            sizeof(result),
-            "%-40s | tests: %4d | fails: %4d | assert calls: %10d | time secs: %6.3f\n",
-            _name.c_str(),
-            _tests,
-            static_cast<int>(_fails.size()),
-            _asserts,
-            _millis / 1000.0);
-
-        if (numWritten >= sizeof(result)) {
-            warning() << "Output for test " << _name << " was truncated";
-        }
-
-        std::stringstream ss;
-        ss << result;
+        std::ostringstream ss;
+        ss << fmt::format("{:<40s} | tests: {:4d} | fails: {:4d} | time secs: {:6.3f}\n",
+                          _name,
+                          _tests,
+                          _fails.size(),
+                          _millis * 1e-3);
 
         for (const auto& i : _messages) {
             ss << "\t" << i << '\n';
         }
 
         return ss.str();
+    }
+
+    BSONObj toBSON() const {
+        BSONObjBuilder bob;
+        bob.append("name", _name);
+        bob.append("tests", _tests);
+        bob.appendNumber("fails", static_cast<long long>(_fails.size()));
+        bob.append("time", Milliseconds(_millis).toBSON());
+        {
+            auto arr = BSONArrayBuilder(bob.subarrayStart("failures"));
+            for (const auto& m : _messages) {
+                auto o = BSONObjBuilder(arr.subobjStart());
+                o.append("test", m.test);
+                o.append("type", m.type);
+                o.append("error", m.error);
+                if (!m.extra.empty()) {
+                    o.append("extra", m.extra);
+                }
+            }
+        }
+        return bob.obj();
     }
 
     int rc() {
@@ -132,53 +166,103 @@ public:
     int _rc;
     int _tests;
     std::vector<std::string> _fails;
-    int _asserts;
     int _millis;
-    std::vector<std::string> _messages;
-
-    static Result* cur;
+    std::vector<FailStatus> _messages;
 };
-
-Result* Result::cur = 0;
 
 namespace {
 
-/**
- * This unsafe scope guard allows exceptions in its destructor. Thus, if it goes out of scope when
- * an exception is active and the guard function also throws an exception, the program will call
- * std::terminate. This should only be used in unittests where termination on exception is okay.
- */
-template <typename F>
-class UnsafeScopeGuard {
-public:
-    UnsafeScopeGuard(F fun) : _fun(fun) {}
+// Attempting to read the featureCompatibilityVersion parameter before it is explicitly initialized
+// with a meaningful value will trigger failures as of SERVER-32630.
+// (Generic FCV reference): This FCV reference should exist across LTS binary versions.
+void setUpFCV() {
+    serverGlobalParams.mutableFCV.setVersion(multiversion::GenericFCV::kLatest);
+}
+void tearDownFCV() {
+    serverGlobalParams.mutableFCV.reset();
+}
 
-    ~UnsafeScopeGuard() noexcept(false) {
-        _fun();
+struct TestSuiteEnvironment {
+    explicit TestSuiteEnvironment() {
+        setUpFCV();
     }
 
-private:
-    F _fun;
+    ~TestSuiteEnvironment() noexcept(false) {
+        tearDownFCV();
+    }
 };
 
-template <typename F>
-inline UnsafeScopeGuard<F> MakeUnsafeScopeGuard(F fun) {
-    return UnsafeScopeGuard<F>(std::move(fun));
+struct UnitTestEnvironment {
+    explicit UnitTestEnvironment(Test* const t) : test(t) {
+        test->setUp();
+    }
+
+    ~UnitTestEnvironment() noexcept(false) {
+        test->tearDown();
+    }
+
+    Test* const test;
+};
+
+class CaptureLogs {
+public:
+    ~CaptureLogs() {
+        stopCapturingLogMessagesIfNeeded();
+    }
+    void startCapturingLogMessages();
+    void stopCapturingLogMessages();
+    void stopCapturingLogMessagesIfNeeded();
+    const synchronized_value<std::vector<std::string>>& getCapturedTextFormatLogMessages() const {
+        return _capturedLogMessages;
+    }
+    std::vector<BSONObj> getCapturedBSONFormatLogMessages() const;
+    int64_t countTextFormatLogLinesContaining(const std::string& needle);
+    int64_t countBSONFormatLogLinesIsSubset(const BSONObj& needle);
+    void printCapturedTextFormatLogLines() const;
+
+private:
+    class Listener : public logv2::LogLineListener {
+    public:
+        explicit Listener(synchronized_value<std::vector<std::string>>* sv) : _sv(sv) {}
+        void accept(const std::string& line) override {
+            (***_sv).push_back(line);
+        }
+
+    private:
+        synchronized_value<std::vector<std::string>>* _sv;
+    };
+
+    bool _isCapturingLogMessages{false};
+
+    // Captures Plain Text Log
+    synchronized_value<std::vector<std::string>> _capturedLogMessages;
+
+    // Captured BSON
+    synchronized_value<std::vector<std::string>> _capturedBSONLogMessages;
+
+    // Capture Sink for Plain Text
+    boost::shared_ptr<boost::log::sinks::unlocked_sink<logv2::LogCaptureBackend>> _captureSink;
+
+    // Capture Sink for BSON
+    boost::shared_ptr<boost::log::sinks::unlocked_sink<logv2::LogCaptureBackend>> _captureBSONSink;
+};
+
+static CaptureLogs* getCaptureLogs() {
+    static CaptureLogs* captureLogs = new CaptureLogs();
+    return captureLogs;
 }
 
 }  // namespace
 
-Test::Test() : _isCapturingLogMessages(false) {}
+
+Test::Test() {}
 
 Test::~Test() {
-    if (_isCapturingLogMessages) {
-        stopCapturingLogMessages();
-    }
+    getCaptureLogs()->stopCapturingLogMessagesIfNeeded();
 }
 
 void Test::run() {
-    setUp();
-    auto guard = MakeUnsafeScopeGuard([this] { tearDown(); });
+    UnitTestEnvironment environment(this);
 
     // An uncaught exception does not prevent the tear down from running. But
     // such an event still constitutes an error. To test this behavior we use a
@@ -186,148 +270,227 @@ void Test::run() {
     // not considered an error.
     try {
         _doTest();
-    } catch (FixtureExceptionForTesting&) {
+    } catch (const FixtureExceptionForTesting&) {
         return;
     }
 }
 
-// Attempting to read the featureCompatibilityVersion parameter before it is explicitly initialized
-// with a meaningful value will trigger failures as of SERVER-32630.
-void Test::setUp() {
-    serverGlobalParams.featureCompatibility.setVersion(
-        ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42);
-}
-void Test::tearDown() {
-    serverGlobalParams.featureCompatibility.reset();
-}
-
 namespace {
-class StringVectorAppender : public logger::MessageLogDomain::EventAppender {
-public:
-    explicit StringVectorAppender(std::vector<std::string>* lines) : _lines(lines) {}
-    virtual ~StringVectorAppender() {}
-    virtual Status append(const logger::MessageLogDomain::Event& event) {
-        std::ostringstream _os;
-        if (!_encoder.encode(event, _os)) {
-            return Status(ErrorCodes::LogWriteFailed, "Failed to append to LogTestAppender.");
-        }
-        stdx::lock_guard<stdx::mutex> lk(_mutex);
-        if (_enabled) {
-            _lines->push_back(_os.str());
-        }
-        return Status::OK();
-    }
 
-    void enable() {
-        stdx::lock_guard<stdx::mutex> lk(_mutex);
-        invariant(!_enabled);
-        _enabled = true;
-    }
-
-    void disable() {
-        stdx::lock_guard<stdx::mutex> lk(_mutex);
-        invariant(_enabled);
-        _enabled = false;
-    }
-
-private:
-    stdx::mutex _mutex;
-    bool _enabled = false;
-    logger::MessageEventDetailsEncoder _encoder;
-    std::vector<std::string>* _lines;
-};
-}  // namespace
-
-void Test::startCapturingLogMessages() {
+void CaptureLogs::startCapturingLogMessages() {
     invariant(!_isCapturingLogMessages);
-    _capturedLogMessages.clear();
-    if (!_captureAppender) {
-        _captureAppender = std::make_unique<StringVectorAppender>(&_capturedLogMessages);
+    (**_capturedLogMessages).clear();
+    (**_capturedBSONLogMessages).clear();
+
+    if (!_captureSink) {
+        _captureSink = logv2::LogCaptureBackend::create(
+            std::make_unique<Listener>(&_capturedLogMessages), true);
+        _captureSink->set_filter(
+            logv2::AllLogsFilter(logv2::LogManager::global().getGlobalDomain()));
+        _captureSink->set_formatter(logv2::PlainFormatter());
+
+        _captureBSONSink = logv2::LogCaptureBackend::create(
+            std::make_unique<Listener>(&_capturedBSONLogMessages), false);
+
+        _captureBSONSink->set_filter(
+            logv2::AllLogsFilter(logv2::LogManager::global().getGlobalDomain()));
+        _captureBSONSink->set_formatter(logv2::BSONFormatter());
     }
-    checked_cast<StringVectorAppender*>(_captureAppender.get())->enable();
-    _captureAppenderHandle = logger::globalLogDomain()->attachAppender(std::move(_captureAppender));
+    _captureSink->locked_backend()->setEnabled(true);
+    _captureBSONSink->locked_backend()->setEnabled(true);
+    boost::log::core::get()->add_sink(_captureSink);
+    boost::log::core::get()->add_sink(_captureBSONSink);
     _isCapturingLogMessages = true;
 }
 
-void Test::stopCapturingLogMessages() {
+void CaptureLogs::stopCapturingLogMessages() {
     invariant(_isCapturingLogMessages);
-    invariant(!_captureAppender);
-    _captureAppender = logger::globalLogDomain()->detachAppender(_captureAppenderHandle);
-    checked_cast<StringVectorAppender*>(_captureAppender.get())->disable();
+    // These sinks can still emit messages after they are detached
+    // from the log core. Disable them first to prevent that race.
+    _captureSink->locked_backend()->setEnabled(false);
+    _captureBSONSink->locked_backend()->setEnabled(false);
+    boost::log::core::get()->remove_sink(_captureSink);
+    boost::log::core::get()->remove_sink(_captureBSONSink);
+
     _isCapturingLogMessages = false;
 }
-void Test::printCapturedLogLines() const {
-    log() << "****************************** Captured Lines (start) *****************************";
-    for (const auto& line : getCapturedLogMessages()) {
-        log() << line;
+
+void CaptureLogs::stopCapturingLogMessagesIfNeeded() {
+    if (_isCapturingLogMessages) {
+        stopCapturingLogMessages();
     }
-    log() << "****************************** Captured Lines (end) ******************************";
 }
 
-int64_t Test::countLogLinesContaining(const std::string& needle) {
-    const auto& msgs = getCapturedLogMessages();
-    return std::count_if(
-        msgs.begin(), msgs.end(), [&](const std::string& s) { return stringContains(s, needle); });
+std::vector<BSONObj> CaptureLogs::getCapturedBSONFormatLogMessages() const {
+    std::vector<BSONObj> objs;
+    auto logLinesLockGuard = *_capturedBSONLogMessages;
+    std::transform(logLinesLockGuard->cbegin(),
+                   logLinesLockGuard->cend(),
+                   std::back_inserter(objs),
+                   [](const std::string& str) { return BSONObj(str.c_str()); });
+    return objs;
+}
+void CaptureLogs::printCapturedTextFormatLogLines() const {
+    LOGV2(23054,
+          "****************************** Captured Lines (start) *****************************");
+    auto logLinesLockGuard = *getCapturedTextFormatLogMessages();
+    for (const auto& line : *logLinesLockGuard) {
+        LOGV2(23055, "{line}", "line"_attr = line);
+    }
+    LOGV2(23056,
+          "****************************** Captured Lines (end) ******************************");
 }
 
-Suite::Suite(const std::string& name) : _name(name) {
-    registerSuite(name, this);
+int64_t CaptureLogs::countTextFormatLogLinesContaining(const std::string& needle) {
+    auto msgs = *getCapturedTextFormatLogMessages();
+    return std::count_if(msgs->begin(), msgs->end(), [&](const std::string& s) {
+        return stringContains(s, needle);
+    });
 }
 
-Suite::~Suite() {}
+bool isSubset(BSONObj haystack, BSONObj needle) {
+    for (const auto& element : needle) {
+        auto foundElement = haystack[element.fieldNameStringData()];
+        if (foundElement.eoo()) {
+            return false;
+        }
 
-void Suite::add(const std::string& name, const TestFunction& testFn) {
-    _tests.push_back(std::make_unique<TestHolder>(name, testFn));
-}
-
-Result* Suite::run(const std::string& filter, int runsPerTest) {
-    LOG(1) << "\t about to setupTests" << std::endl;
-    setupTests();
-    LOG(1) << "\t done setupTests" << std::endl;
-
-    Timer timer;
-    Result* r = new Result(_name);
-    Result::cur = r;
-
-    for (const auto& tc : _tests) {
-        if (filter.size() && tc->getName().find(filter) == std::string::npos) {
-            LOG(1) << "\t skipping test: " << tc->getName() << " because doesn't match filter"
-                   << std::endl;
+        // Only validate if an element exists if it is marked as undefined.
+        if (element.type() == Undefined) {
             continue;
         }
 
-        r->_tests++;
-
-        bool passes = false;
-
-        std::stringstream err;
-        err << tc->getName() << "\t";
-
-        try {
-            for (int x = 0; x < runsPerTest; x++) {
-                std::stringstream runTimes;
-                if (runsPerTest > 1) {
-                    runTimes << "  (" << x + 1 << "/" << runsPerTest << ")";
-                }
-                log() << "\t going to run test: " << tc->getName() << runTimes.str();
-                tc->run();
-            }
-            passes = true;
-        } catch (const TestAssertionFailureException& ae) {
-            err << ae.toString() << " in test " << tc->getName() << '\n' << ae.getStacktrace();
-        } catch (const DBException& e) {
-            err << "DBException: " << e.toString() << " in test " << tc->getName();
-        } catch (const std::exception& e) {
-            err << "std::exception: " << e.what() << " in test " << tc->getName();
-        } catch (int x) {
-            err << "caught int " << x << " in test " << tc->getName();
+        if (foundElement.canonicalType() != element.canonicalType()) {
+            return false;
         }
 
-        if (!passes) {
-            std::string s = err.str();
-            log() << "FAIL: " << s;
-            r->_fails.push_back(tc->getName());
-            r->_messages.push_back(s);
+        switch (element.type()) {
+            case Object:
+                if (!isSubset(foundElement.Obj(), element.Obj())) {
+                    return false;
+                }
+                return true;
+            case Array:
+                // not supported
+                invariant(false);
+                // This annotation shouldn't really be needed because
+                // `invariantFailed` is annotated to be `noreturn`,
+                // but clang 12 doesn't seem to be able to capitalize
+                // on that fact to see that we are not actually
+                // falling through.
+                [[fallthrough]];
+            default:
+                if (SimpleBSONElementComparator::kInstance.compare(foundElement, element) != 0) {
+                    return false;
+                }
+        }
+    }
+
+    return true;
+}
+
+int64_t CaptureLogs::countBSONFormatLogLinesIsSubset(const BSONObj& needle) {
+    const auto& msgs = getCapturedBSONFormatLogMessages();
+    return std::count_if(
+        msgs.begin(), msgs.end(), [&](const BSONObj s) { return isSubset(s, needle); });
+}
+
+}  // namespace
+
+void Test::startCapturingLogMessages() {
+    getCaptureLogs()->startCapturingLogMessages();
+}
+void Test::stopCapturingLogMessages() {
+    getCaptureLogs()->stopCapturingLogMessages();
+}
+std::vector<std::string> Test::getCapturedTextFormatLogMessages() const {
+    return getCaptureLogs()->getCapturedTextFormatLogMessages().get();
+}
+std::vector<BSONObj> Test::getCapturedBSONFormatLogMessages() const {
+    return getCaptureLogs()->getCapturedBSONFormatLogMessages();
+}
+int64_t Test::countTextFormatLogLinesContaining(const std::string& needle) {
+    return getCaptureLogs()->countTextFormatLogLinesContaining(needle);
+}
+int64_t Test::countBSONFormatLogLinesIsSubset(const BSONObj& needle) {
+    return getCaptureLogs()->countBSONFormatLogLinesIsSubset(needle);
+}
+void Test::printCapturedTextFormatLogLines() const {
+    getCaptureLogs()->printCapturedTextFormatLogLines();
+}
+
+Suite::Suite(ConstructorEnable, std::string name) : _name(std::move(name)) {}
+
+void Suite::add(std::string name, std::string fileName, std::function<void()> testFn) {
+    _tests.push_back({std::move(name), std::move(fileName), std::move(testFn)});
+}
+
+std::unique_ptr<Result> Suite::run(const std::string& filter,
+                                   const std::string& fileNameFilter,
+                                   int runsPerTest) {
+    Timer timer;
+    auto r = std::make_unique<Result>(_name);
+
+    boost::optional<pcre::Regex> filterRe;
+    boost::optional<pcre::Regex> fileNameFilterRe;
+    if (!filter.empty())
+        filterRe.emplace(filter);
+    if (!fileNameFilter.empty())
+        fileNameFilterRe.emplace(fileNameFilter);
+
+    for (const auto& tc : _tests) {
+        if (filterRe && !filterRe->matchView(tc.name)) {
+            LOGV2_DEBUG(23057, 3, "skipped due to filter", "test"_attr = tc.name);
+            continue;
+        }
+
+        if (fileNameFilterRe && !fileNameFilterRe->matchView(tc.fileName)) {
+            LOGV2_DEBUG(23058, 3, "skipped due to fileNameFilter", "testFile"_attr = tc.fileName);
+            continue;
+        }
+
+        // This test hasn't been skipped, and is about to run. If it's the first one in this suite
+        // (ie. _tests is zero), then output the suite header before running it.
+        if (r->_tests == 0) {
+            LOGV2(23063, "Running", "suite"_attr = _name);
+        }
+        ++r->_tests;
+
+        struct Event {
+            std::string type;
+            std::string error;
+            std::string extra;
+        };
+        try {
+            try {
+                for (int x = 0; x < runsPerTest; x++) {
+                    LOGV2(23059,
+                          "Running",
+                          "test"_attr = tc.name,
+                          "rep"_attr = x + 1,
+                          "reps"_attr = runsPerTest);
+                    TestSuiteEnvironment environment;
+                    tc.fn();
+                }
+            } catch (const TestAssertionFailureException& ae) {
+                throw Event{"TestAssertionFailureException", ae.toString(), ae.getStacktrace()};
+            } catch (const DBException& e) {
+                throw Event{"DBException", e.toString()};
+            } catch (const std::exception& e) {
+                throw Event{"std::exception", e.what()};
+            } catch (int x) {
+                throw Event{"int", std::to_string(x)};
+            }
+        } catch (const Event& e) {
+            LOGV2_OPTIONS(4680100,
+                          {logv2::LogTruncation::Disabled},
+                          "FAIL",
+                          "test"_attr = tc.name,
+                          "type"_attr = e.type,
+                          "error"_attr = e.error,
+                          "extra"_attr = e.extra);
+            r->_fails.push_back(tc.name);
+            r->_messages.push_back({tc.name, e.type, e.error, e.extra});
         }
     }
 
@@ -336,114 +499,123 @@ Result* Suite::run(const std::string& filter, int runsPerTest) {
 
     r->_millis = timer.millis();
 
-    log() << "\t DONE running tests" << std::endl;
+    // Only show the footer if some tests were run in this suite.
+    if (r->_tests > 0) {
+        LOGV2(23060, "Done running tests");
+    }
 
     return r;
 }
 
-int Suite::run(const std::vector<std::string>& suites, const std::string& filter, int runsPerTest) {
-    if (_allSuites().empty()) {
-        log() << "error: no suites registered.";
-        return EXIT_FAILURE;
+int Suite::run(const std::vector<std::string>& suites,
+               const std::string& filter,
+               const std::string& fileNameFilter,
+               int runsPerTest) {
+    if (suitesMap().empty()) {
+        LOGV2_ERROR(23061, "no suites registered.");
+        return static_cast<int>(ExitCode::fail);
     }
 
     for (unsigned int i = 0; i < suites.size(); i++) {
-        if (_allSuites().count(suites[i]) == 0) {
-            log() << "invalid test suite [" << suites[i] << "], use --list to see valid names"
-                  << std::endl;
-            return EXIT_FAILURE;
+        if (suitesMap().count(suites[i]) == 0) {
+            LOGV2_ERROR(23062,
+                        "invalid test suite, use --list to see valid names",
+                        "suite"_attr = suites[i]);
+            return static_cast<int>(ExitCode::fail);
         }
     }
 
     std::vector<std::string> torun(suites);
 
     if (torun.empty()) {
-        for (const auto& kv : _allSuites()) {
-            torun.push_back(kv.first);
+        for (const auto& kv : suitesMap()) {
+            torun.push_back(std::string{kv.first});
         }
     }
 
     std::vector<std::unique_ptr<Result>> results;
 
-    for (std::string name : torun) {
-        std::shared_ptr<Suite>& s = _allSuites()[name];
-        fassert(16145, s != NULL);
+    for (const std::string& name : torun) {
+        std::shared_ptr<Suite>& s = suitesMap()[name];
+        fassert(16145, s != nullptr);
 
-        log() << "going to run suite: " << name << std::endl;
-        results.emplace_back(s->run(filter, runsPerTest));
+        auto result = s->run(filter, fileNameFilter, runsPerTest);
+        results.push_back(std::move(result));
     }
-
-    log() << "**************************************************" << std::endl;
 
     int rc = 0;
 
     int tests = 0;
-    int asserts = 0;
     int millis = 0;
 
     Result totals("TOTALS");
-    std::vector<std::string> failedSuites;
+    std::vector<BSONObj> failedSuites;
 
-    Result::cur = NULL;
     for (const auto& r : results) {
-        log() << r->toString();
         if (abs(r->rc()) > abs(rc))
             rc = r->rc();
 
         tests += r->_tests;
         if (!r->_fails.empty()) {
-            failedSuites.push_back(r->toString());
-            for (const std::string& s : r->_fails) {
-                totals._fails.push_back(r->_name + "/" + s);
+            failedSuites.push_back(r->toBSON());
+            for (size_t i = 0; i < r->_fails.size(); i++) {
+                totals._fails.push_back(r->_name + "/" + r->_fails[i]);
+                totals._messages.push_back(r->_messages[i]);
             }
         }
-        asserts += r->_asserts;
         millis += r->_millis;
     }
-    results.clear();
-
     totals._tests = tests;
-    totals._asserts = asserts;
     totals._millis = millis;
 
-    log() << totals.toString();  // includes endl
+    for (const auto& r : results) {
+        // Only show results from a suite if some tests were run in it.
+        if (r->_tests > 0) {
+            LOGV2_OPTIONS(
+                4680101, {logv2::LogTruncation::Disabled}, "Result", "suite"_attr = r->toBSON());
+        }
+    }
+    LOGV2(23065, "Totals", "totals"_attr = totals.toBSON());
+
+    std::size_t failCount = totals._fails.size();
+    for (std::size_t i = 0; i < failCount; i++) {
+        LOGV2(8423378,
+              "Test Failed",
+              "testName"_attr = totals._fails[i],
+              "exception"_attr = totals._messages[i].type,
+              "error"_attr = totals._messages[i].error);
+    }
 
     // summary
     if (!totals._fails.empty()) {
-        log() << "Failing tests:" << std::endl;
-        for (const std::string& s : totals._fails) {
-            log() << "\t " << s << " Failed";
-        }
-        log() << "FAILURE - " << totals._fails.size() << " tests in " << failedSuites.size()
-              << " suites failed";
+        LOGV2_OPTIONS(23068,
+                      {logv2::LogTruncation::Disabled},
+                      "FAILURE",
+                      "failedTestsCount"_attr = totals._fails.size(),
+                      "failedSuitesCount"_attr = failedSuites.size(),
+                      "failedTests"_attr = totals._fails);
     } else {
-        log() << "SUCCESS - All tests in all suites passed";
+        LOGV2(23069, "SUCCESS - All tests in all suites passed");
     }
 
     return rc;
 }
 
-void Suite::registerSuite(const std::string& name, Suite* s) {
-    std::shared_ptr<Suite>& m = _allSuites()[name];
-    fassert(10162, !m);
-    m.reset(s);
-}
-
-Suite* Suite::getSuite(const std::string& name) {
-    std::shared_ptr<Suite>& result = _allSuites()[name];
-    if (!result) {
-        // Suites are self-registering.
-        new Suite(name);
+Suite& Suite::getSuite(StringData name) {
+    auto& map = suitesMap();
+    if (auto found = map.find(name); found != map.end()) {
+        return *found->second;
     }
-    invariant(result);
-    return result.get();
+    auto sp = std::make_shared<Suite>(ConstructorEnable{}, std::string{name});
+    auto [it, noCollision] = map.try_emplace(sp->key(), sp->shared_from_this());
+    fassert(10162, noCollision);
+    return *sp;
 }
 
-void Suite::setupTests() {}
-
-TestAssertionFailureException::TestAssertionFailureException(
-    const std::string& theFile, unsigned theLine, const std::string& theFailingExpression)
-    : _file(theFile), _line(theLine), _message(theFailingExpression) {
+TestAssertionFailureException::TestAssertionFailureException(std::string file,
+                                                             unsigned line,
+                                                             std::string message)
+    : _file(std::move(file)), _line(line), _message(std::move(message)) {
     std::ostringstream ostream;
     printStackTrace(ostream);
     _stacktrace = ostream.str();
@@ -480,7 +652,7 @@ TestAssertionFailure::~TestAssertionFailure() noexcept(false) {
     if (!_stream.str().empty()) {
         _exception.setMessage(_exception.getMessage() + " " + _stream.str());
     }
-    error() << "Throwing exception: " << _exception;
+    LOGV2_ERROR(23070, "Throwing exception", "exception"_attr = _exception);
     throw _exception;
 }
 
@@ -492,11 +664,65 @@ std::ostream& TestAssertionFailure::stream() {
 
 std::vector<std::string> getAllSuiteNames() {
     std::vector<std::string> result;
-    for (const auto& kv : _allSuites()) {
-        result.push_back(kv.first);
+    for (const auto& kv : suitesMap()) {
+        result.push_back(std::string{kv.first});
     }
     return result;
 }
 
-}  // namespace unittest
-}  // namespace mongo
+UnitTest* UnitTest::getInstance() {
+    static auto p = new UnitTest;
+    return p;
+}
+
+const TestInfo* UnitTest::currentTestInfo() const {
+    return _currentTestInfo;
+}
+
+void UnitTest::setCurrentTestInfo(const TestInfo* testInfo) {
+    _currentTestInfo = testInfo;
+}
+
+template <ComparisonOp op>
+ComparisonAssertion<op> ComparisonAssertion<op>::make(const char* theFile,
+                                                      unsigned theLine,
+                                                      StringData aExpression,
+                                                      StringData bExpression,
+                                                      StringData a,
+                                                      StringData b) {
+    return ComparisonAssertion(theFile, theLine, aExpression, bExpression, a, b);
+}
+
+template <ComparisonOp op>
+ComparisonAssertion<op> ComparisonAssertion<op>::make(const char* theFile,
+                                                      unsigned theLine,
+                                                      StringData aExpression,
+                                                      StringData bExpression,
+                                                      const void* a,
+                                                      const void* b) {
+    return ComparisonAssertion(theFile, theLine, aExpression, bExpression, a, b);
+}
+
+// Provide definitions for common instantiations of ComparisonAssertion.
+INSTANTIATE_COMPARISON_ASSERTION_CTORS();
+
+
+SpawnInfo& getSpawnInfo() {
+    static auto v = new SpawnInfo{};
+    return *v;
+}
+
+AutoUpdateConfig& getAutoUpdateConfig() {
+    static AutoUpdateConfig config{};
+    return config;
+}
+namespace {
+// At startup, teach the terminate handler how to print TestAssertionFailureException.
+[[maybe_unused]] const auto earlyCall = [] {
+    globalActiveExceptionWitness().addHandler<TestAssertionFailureException>(
+        [](const auto& ex, std::ostream& os) { os << ex.toString() << "\n"; });
+    return 0;
+}();
+}  // namespace
+
+}  // namespace mongo::unittest

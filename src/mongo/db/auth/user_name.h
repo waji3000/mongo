@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,168 +29,25 @@
 
 #pragma once
 
-#include <iosfwd>
-#include <memory>
-#include <string>
-
-
-#include "mongo/base/clonable_ptr.h"
-#include "mongo/base/disallow_copying.h"
-#include "mongo/base/status_with.h"
-#include "mongo/base/string_data.h"
-#include "mongo/bson/bsonelement.h"
-#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/auth/auth_name.h"
 
 namespace mongo {
 
-/**
- * Representation of a name of a principal (authenticatable user) in a MongoDB system.
- *
- * Consists of a "user name" part, and a "database name" part.
- */
-class UserName {
+class UserName : public AuthName<UserName> {
 public:
-    UserName() : _splitPoint(0) {}
-    UserName(StringData user, StringData dbname);
+    static constexpr auto kName = "UserName"_sd;
+    static constexpr auto kFieldName = "user"_sd;
 
-    /**
-     * Parses a string of the form "db.username" into a UserName object.
-     */
-    static StatusWith<UserName> parse(StringData userNameStr);
+    using AuthName::AuthName;
 
-    /*
-     * These methods support parsing usernames from IDL
-     */
-    static UserName parseFromBSON(const BSONElement& elem);
-    void serializeToBSON(StringData fieldName, BSONObjBuilder* bob) const;
-    void serializeToBSON(BSONArrayBuilder* bob) const;
-
-    /**
-     * Gets the user part of a UserName.
-     */
-    StringData getUser() const {
-        return StringData(_fullName).substr(0, _splitPoint);
+    const std::string& getUser() const {
+        return getName();
     }
-
-    /**
-     * Gets the database name part of a UserName.
-     */
-    StringData getDB() const {
-        return StringData(_fullName).substr(_splitPoint + 1);
-    }
-
-    /**
-     * Gets the full unique name of a user as a string, formatted as "user@db".
-     */
-    const std::string& getFullName() const {
-        return _fullName;
-    }
-
-    /**
-     * Gets the full unambiguous unique name of a user as a string, formatted as "db.user"
-     */
-    std::string getUnambiguousName() const {
-        return str::stream() << getDB() << "." << getUser();
-    }
-
-    /**
-     * Stringifies the object, for logging/debugging.
-     */
-    std::string toString() const {
-        return getFullName();
-    }
-
-    bool operator==(const UserName& rhs) const {
-        return _splitPoint == rhs._splitPoint && getFullName() == rhs.getFullName();
-    }
-
-    bool operator!=(const UserName& rhs) const {
-        return _splitPoint != rhs._splitPoint || getFullName() != rhs.getFullName();
-    }
-
-    bool operator<(const UserName& rhs) const {
-        return getUser() < rhs.getUser() || (getUser() == rhs.getUser() && getDB() < rhs.getDB());
-    }
-
-private:
-    void _serializeToSubObj(BSONObjBuilder* sub) const;
-
-    std::string _fullName;  // The full name, stored as a string.  "user@db".
-    size_t _splitPoint;     // The index of the "@" separating the user and db name parts.
 };
 
-std::ostream& operator<<(std::ostream& os, const UserName& name);
-
-/**
- * Iterator over an unspecified container of UserName objects.
- */
-class UserNameIterator {
-public:
-    class Impl {
-    public:
-        Impl() = default;
-        virtual ~Impl(){};
-        std::unique_ptr<Impl> clone() const {
-            return std::unique_ptr<Impl>(doClone());
-        }
-        virtual bool more() const = 0;
-        virtual const UserName& get() const = 0;
-
-        virtual const UserName& next() = 0;
-
-    private:
-        virtual Impl* doClone() const = 0;
-    };
-
-    UserNameIterator() = default;
-    explicit UserNameIterator(std::unique_ptr<Impl> impl) : _impl(std::move(impl)) {}
-
-    bool more() const {
-        return _impl.get() && _impl->more();
-    }
-    const UserName& get() const {
-        return _impl->get();
-    }
-
-    const UserName& next() {
-        return _impl->next();
-    }
-
-    const UserName& operator*() const {
-        return get();
-    }
-    const UserName* operator->() const {
-        return &get();
-    }
-
-private:
-    clonable_ptr<Impl> _impl;
-};
-
-
-template <typename ContainerIterator>
-class UserNameContainerIteratorImpl : public UserNameIterator::Impl {
-public:
-    UserNameContainerIteratorImpl(const ContainerIterator& begin, const ContainerIterator& end)
-        : _curr(begin), _end(end) {}
-    ~UserNameContainerIteratorImpl() override {}
-    bool more() const override {
-        return _curr != _end;
-    }
-    const UserName& next() override {
-        return *(_curr++);
-    }
-    const UserName& get() const override {
-        return *_curr;
-    }
-    UserNameIterator::Impl* doClone() const override {
-        return new UserNameContainerIteratorImpl(*this);
-    }
-
-private:
-    ContainerIterator _curr;
-    ContainerIterator _end;
-};
+using UserNameIterator = AuthNameIterator<UserName>;
+template <typename Container>
+using UserNameContainerIteratorImpl = AuthNameContainerIteratorImpl<Container, UserName>;
 
 template <typename ContainerIterator>
 UserNameIterator makeUserNameIterator(const ContainerIterator& begin,

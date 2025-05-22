@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -41,43 +40,25 @@ class OperationContext;
 
 class RecoveryUnitNoop : public RecoveryUnit {
 public:
-    void beginUnitOfWork(OperationContext* opCtx) final {}
-    void commitUnitOfWork() final {
-        for (auto& change : _changes) {
-            try {
-                change->commit(boost::none);
-            } catch (...) {
-                std::terminate();
-            }
-        }
-        _changes.clear();
-    }
-    void abortUnitOfWork() final {
-        for (auto it = _changes.rbegin(); it != _changes.rend(); ++it) {
-            try {
-                (*it)->rollback();
-            } catch (...) {
-                std::terminate();
-            }
-        }
-        _changes.clear();
-    }
-
-    virtual void abandonSnapshot() {}
-
-    virtual bool waitUntilDurable() {
+    bool isNoop() const final {
         return true;
     }
 
-    virtual void registerChange(Change* change) {
-        _changes.push_back(std::unique_ptr<Change>(change));
+    void setOrderedCommit(bool orderedCommit) final {}
+
+    void validateInUnitOfWork() const final {}
+
+    void doBeginUnitOfWork() override {}
+
+    void doAbandonSnapshot() override {}
+
+    void doCommitUnitOfWork() override {
+        _executeCommitHandlers(boost::none);
     }
 
-    virtual SnapshotId getSnapshotId() const {
-        return SnapshotId();
+    void doAbortUnitOfWork() override {
+        _executeRollbackHandlers();
     }
-
-    virtual void setOrderedCommit(bool orderedCommit) {}
 
 private:
     std::vector<std::unique_ptr<Change>> _changes;

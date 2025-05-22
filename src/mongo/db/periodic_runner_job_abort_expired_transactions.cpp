@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,73 +27,140 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+#include <string>
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/periodic_runner_job_abort_expired_transactions.h"
-
+#include "mongo/base/error_codes.h"
 #include "mongo/db/client.h"
-#include "mongo/db/kill_sessions_local.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/periodic_runner_job_abort_expired_transactions.h"
 #include "mongo/db/service_context.h"
-#include "mongo/db/transaction_participant.h"
-#include "mongo/util/log.h"
+#include "mongo/db/session/kill_sessions_local.h"
+#include "mongo/db/storage/recovery_unit.h"
+#include "mongo/db/transaction/transaction_participant.h"
+#include "mongo/db/transaction/transaction_participant_gen.h"
+#include "mongo/db/transaction_resources.h"
+#include "mongo/idl/mutable_observer_registry.h"
+#include "mongo/logv2/log.h"
+#include "mongo/platform/atomic_word.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/decorable.h"
+#include "mongo/util/duration.h"
 #include "mongo/util/periodic_runner.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
+
 
 namespace mongo {
 
-void startPeriodicThreadToAbortExpiredTransactions(ServiceContext* serviceContext) {
-    // Enforce calling this function once, and only once.
-    static bool firstCall = true;
-    invariant(firstCall);
-    firstCall = false;
+namespace {
+
+using Argument = decltype(TransactionParticipant::observeTransactionLifetimeLimitSeconds)::Argument;
+
+// When setting the period for this job, we wait 500ms for every second, so that we abort
+// expired transactions every transactionLifetimeLimitSeconds/2
+Milliseconds getPeriod(const Argument& transactionLifetimeLimitSeconds) {
+    Milliseconds period(transactionLifetimeLimitSeconds * 500);
+
+    // Ensure: 1 <= period <= 60 seconds
+    period = (period < Seconds(1)) ? Milliseconds(Seconds(1)) : period;
+    period = (period > Seconds(60)) ? Milliseconds(Seconds(60)) : period;
+
+    return period;
+}
+
+}  // namespace
+
+// Tracks the number of passes the "abortExpiredTransactions" thread makes to abort expired
+// transactions.
+auto& abortExpiredTransactionsPasses = *MetricBuilder<Counter64>("abortExpiredTransactions.passes");
+// Tracks the number of transactions the "abortExpiredTransactions" thread successfully killed.
+auto& abortExpiredTransactionsSuccessfulKills =
+    *MetricBuilder<Counter64>("abortExpiredTransactions.successfulKills");
+// Tracks the number of transactions unsuccessfully killed by the "abortExpiredTransactions" thread
+// due to timing out trying to checkout a sessions.
+auto& abortExpiredTransactionsTimedOutKills =
+    *MetricBuilder<Counter64>("abortExpiredTransactions.timedOutKills");
+
+auto PeriodicThreadToAbortExpiredTransactions::get(ServiceContext* serviceContext)
+    -> PeriodicThreadToAbortExpiredTransactions& {
+    auto& jobContainer = _serviceDecoration(serviceContext);
+    jobContainer._init(serviceContext);
+
+    return jobContainer;
+}
+
+auto PeriodicThreadToAbortExpiredTransactions::operator*() const noexcept -> PeriodicJobAnchor& {
+    stdx::lock_guard lk(_mutex);
+    return *_anchor;
+}
+
+auto PeriodicThreadToAbortExpiredTransactions::operator->() const noexcept -> PeriodicJobAnchor* {
+    stdx::lock_guard lk(_mutex);
+    return _anchor.get();
+}
+
+void PeriodicThreadToAbortExpiredTransactions::_init(ServiceContext* serviceContext) {
+    stdx::lock_guard lk(_mutex);
+    if (_anchor) {
+        return;
+    }
 
     auto periodicRunner = serviceContext->getPeriodicRunner();
     invariant(periodicRunner);
 
-    // We want this job period to be dynamic, to run every (transactionLifetimeLimitSeconds/2)
-    // seconds, where transactionLifetimeLimitSeconds is an adjustable server parameter, or within
-    // the 1 second to 1 minute range.
-    //
-    // PeriodicRunner does not currently support altering the period of a job. So we are giving this
-    // job a 1 second period on PeriodicRunner and incrementing a static variable 'seconds' on each
-    // run until we reach transactionLifetimeLimitSeconds/2, at which point we run the code and
-    // reset 'seconds'. Etc.
-    PeriodicRunner::PeriodicJob job("startPeriodicThreadToAbortExpiredTransactions",
-                                    [](Client* client) {
-                                        static int seconds = 0;
-                                        int lifetime = transactionLifetimeLimitSeconds.load();
+    PeriodicRunner::PeriodicJob job(
+        "abortExpiredTransactions",
+        [](Client* client) {
+            // The opCtx destructor handles unsetting itself from the
+            // Client. (The PeriodicRunner's Client must be reset before
+            // returning.)
+            auto opCtx = client->makeOperationContext();
 
-                                        invariant(lifetime >= 1);
-                                        int period = lifetime / 2;
+            // Set the Locker such that all lock requests' timeouts will
+            // be overridden and set to 0. This prevents the expired
+            // transaction aborter thread from stalling behind any
+            // non-transaction, exclusive lock taking operation blocked
+            // behind an active transaction's intent lock.
+            shard_role_details::getLocker(opCtx.get())->setMaxLockTimeout(Milliseconds(0));
 
-                                        // Ensure: 1 <= period <= 60 seconds
-                                        period = (period < 1) ? 1 : period;
-                                        period = (period > 60) ? 60 : period;
+            // This thread needs storage rollback to complete timely, so instruct the storage
+            // engine to not do any extra eviction for this thread, if supported.
+            shard_role_details::getRecoveryUnit(opCtx.get())->setNoEvictionAfterCommitOrRollback();
 
-                                        if (++seconds <= period) {
-                                            return;
-                                        }
+            try {
+                int64_t numKills = 0;
+                int64_t numTimeOuts = 0;
+                killAllExpiredTransactions(
+                    opCtx.get(),
+                    Milliseconds(gAbortExpiredTransactionsSessionCheckoutTimeout.load()),
+                    &numKills,
+                    &numTimeOuts);
+                abortExpiredTransactionsPasses.increment(1);
+                abortExpiredTransactionsSuccessfulKills.increment(numKills);
+                abortExpiredTransactionsTimedOutKills.increment(numTimeOuts);
+            } catch (ExceptionFor<ErrorCategory::CancellationError>& ex) {
+                LOGV2_DEBUG(4684101, 2, "Periodic job canceled", "{reason}"_attr = ex.reason());
+            } catch (ExceptionFor<ErrorCategory::Interruption>& ex) {
+                LOGV2_DEBUG(7465601, 2, "Periodic job canceled", "{reason}"_attr = ex.reason());
+            }
+        },
+        getPeriod(gTransactionLifetimeLimitSeconds.load()),
+        true /*isKillableByStepdown*/);
 
-                                        seconds = 0;
+    _anchor = std::make_shared<PeriodicJobAnchor>(periodicRunner->makeJob(std::move(job)));
 
-                                        // The opCtx destructor handles unsetting itself from the
-                                        // Client. (The PeriodicRunner's Client must be reset before
-                                        // returning.)
-                                        auto opCtx = client->makeOperationContext();
-
-                                        // Set the Locker such that all lock requests' timeouts will
-                                        // be overridden and set to 0. This prevents the expired
-                                        // transaction aborter thread from stalling behind any
-                                        // non-transaction, exclusive lock taking operation blocked
-                                        // behind an active transaction's intent lock.
-                                        opCtx->lockState()->setMaxLockTimeout(Milliseconds(0));
-
-                                        killAllExpiredTransactions(opCtx.get());
-                                    },
-                                    Seconds(1));
-
-    periodicRunner->scheduleJob(std::move(job));
+    TransactionParticipant::observeTransactionLifetimeLimitSeconds.addObserver([anchor = _anchor](
+                                                                                   const Argument&
+                                                                                       secs) {
+        try {
+            anchor->setPeriod(getPeriod(secs));
+        } catch (const DBException& ex) {
+            LOGV2(
+                20892,
+                "Failed to update period of thread which aborts expired transactions {ex_toStatus}",
+                "ex_toStatus"_attr = ex.toStatus());
+        }
+    });
 }
 
 }  // namespace mongo

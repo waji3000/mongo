@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -33,7 +32,6 @@
 #include <memory>
 
 #include "mongo/unittest/unittest.h"
-
 #include "mongo/util/concurrency/thread_pool_interface.h"
 
 namespace mongo {

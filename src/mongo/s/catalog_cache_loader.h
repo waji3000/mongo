@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,26 +29,29 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <functional>
+#include <memory>
 #include <vector>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/status_with.h"
-#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/oid.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/service_context.h"
+#include "mongo/logv2/log.h"
 #include "mongo/s/catalog/type_chunk.h"
-#include "mongo/s/catalog/type_collection.h"
-#include "mongo/s/catalog/type_database.h"
+#include "mongo/s/catalog/type_database_gen.h"
 #include "mongo/s/chunk_version.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/util/concurrency/notification.h"
+#include "mongo/s/resharding/type_collection_fields_gen.h"
+#include "mongo/s/type_collection_common_types_gen.h"
+#include "mongo/util/future.h"
 #include "mongo/util/uuid.h"
 
-#define LOG_CATALOG_REFRESH(level) \
-    MONGO_LOG_COMPONENT(level, ::mongo::logger::LogComponent::kShardingCatalogRefresh)
-
 namespace mongo {
-
-class NamespaceString;
-class OperationContext;
 
 /**
  * Interface through which the sharding catalog cache requests the set of changed chunks to be
@@ -57,117 +59,83 @@ class OperationContext;
  */
 class CatalogCacheLoader {
 public:
-    virtual ~CatalogCacheLoader() = default;
-
-    /**
-     * Stores a loader on the specified service context. May only be called once for the lifetime of
-     * the service context.
-     */
-    static void set(ServiceContext* serviceContext, std::unique_ptr<CatalogCacheLoader> loader);
-
-    static CatalogCacheLoader& get(ServiceContext* serviceContext);
-    static CatalogCacheLoader& get(OperationContext* opCtx);
+    virtual ~CatalogCacheLoader();
 
     /**
      * Used as a return value for getChunksSince.
      */
     struct CollectionAndChangedChunks {
         CollectionAndChangedChunks();
-        CollectionAndChangedChunks(boost::optional<UUID> uuid,
-                                   const OID& collEpoch,
-                                   const BSONObj& collShardKeyPattern,
-                                   const BSONObj& collDefaultCollation,
-                                   bool collShardKeyIsUnique,
-                                   std::vector<ChunkType> chunks);
+        CollectionAndChangedChunks(
+            OID epoch,
+            Timestamp timestamp,
+            UUID uuid,
+            bool unsplittable,
+            const BSONObj& collShardKeyPattern,
+            const BSONObj& collDefaultCollation,
+            bool collShardKeyIsUnique,
+            boost::optional<TypeCollectionTimeseriesFields> collTimeseriesFields,
+            boost::optional<TypeCollectionReshardingFields> collReshardingFields,
+            bool allowMigrations,
+            std::vector<ChunkType> chunks);
 
         // Information about the entire collection
-        boost::optional<UUID> uuid;
         OID epoch;
+        Timestamp timestamp;
+        boost::optional<UUID> uuid;  // This value can never be boost::none,
+                                     // except under the default constructor
+
+        bool unsplittable;
+
         BSONObj shardKeyPattern;
         BSONObj defaultCollation;
-        bool shardKeyIsUnique{false};
+        bool shardKeyIsUnique;
+
+        // This information will be valid if the collection is a time-series buckets collection.
+        boost::optional<TypeCollectionTimeseriesFields> timeseriesFields;
+
+        // If the collection is currently undergoing a resharding operation, the optional will be
+        // populated.
+        boost::optional<TypeCollectionReshardingFields> reshardingFields;
+
+        bool allowMigrations;
 
         // The chunks which have changed sorted by their chunkVersion. This list might potentially
         // contain all the chunks in the collection.
         std::vector<ChunkType> changedChunks;
     };
 
-    using GetChunksSinceCallbackFn =
-        stdx::function<void(OperationContext*, StatusWith<CollectionAndChangedChunks>)>;
-
     /**
-     * Initializes internal state. Must be called only once when sharding state is initialized.
+     * Transitions into shut down and cleans up state. Once this transitions to shut down, should
+     * not be able to transition back to normal. Should be safe to be called more than once.
      */
-    virtual void initializeReplicaSetRole(bool isPrimary) = 0;
+    virtual void shutDown() = 0;
 
     /**
-     * Changes internal state on step down.
-     */
-    virtual void onStepDown() = 0;
-
-    /**
-     * Changes internal state on step up.
-     */
-    virtual void onStepUp() = 0;
-
-    /**
-     * Notifies the loader that the persisted collection version for 'nss' has been updated.
-     */
-    virtual void notifyOfCollectionVersionUpdate(const NamespaceString& nss) = 0;
-
-    /**
-     * Non-blocking call, which requests the chunks changed since the specified version to be
-     * fetched from the persistent metadata store and invokes the callback function with the result.
-     * The callback function must never throw - it is a fatal error to do so.
+     * Non-blocking call, which returns the chunks changed since the specified version to be
+     * fetched from the persistent metadata store.
      *
      * If for some reason the asynchronous fetch operation cannot be dispatched (for example on
-     * shutdown), throws a DBException. Otherwise it is guaranteed that the callback function will
-     * be invoked even on error and the returned notification will be signalled.
-     *
-     * The callbackFn object must not be destroyed until it has been called. The returned
-     * Notification object can be waited on in order to ensure that.
+     * shutdown), throws a DBException.
      */
-    virtual std::shared_ptr<Notification<void>> getChunksSince(
-        const NamespaceString& nss, ChunkVersion version, GetChunksSinceCallbackFn callbackFn) = 0;
+    virtual SemiFuture<CollectionAndChangedChunks> getChunksSince(const NamespaceString& nss,
+                                                                  ChunkVersion version) = 0;
 
     /**
-     * Non-blocking call, which requests the most recent db version for the given dbName from the
-     * the persistent metadata store and invokes the callback function with the result.
-     * The callback function must never throw - it is a fatal error to do so.
+     * Non-blocking call, which returns the most recent db version for the given dbName from the
+     * the persistent metadata store.
      *
      * If for some reason the asynchronous fetch operation cannot be dispatched (for example on
-     * shutdown), throws a DBException. Otherwise it is guaranteed that the callback function will
-     * be invoked even on error.
-     *
-     * The callbackFn object must not be destroyed until it has been called.
+     * shutdown), throws a DBException.
      */
-    virtual void getDatabase(
-        StringData dbName,
-        stdx::function<void(OperationContext*, StatusWith<DatabaseType>)> callbackFn) = 0;
-
-    /**
-     * Waits for any pending changes for the specified collection to be persisted locally (not
-     * necessarily replicated). If newer changes come after this method has started running, they
-     * will not be waited for except if there is a drop.
-     *
-     * May throw if the node steps down from primary or if the operation time is exceeded or due to
-     * any other error condition.
-     *
-     * If the specific loader implementation does not support persistence, this method is undefined
-     * and must fassert.
-     */
-    virtual void waitForCollectionFlush(OperationContext* opCtx, const NamespaceString& nss) = 0;
-
-    virtual void waitForDatabaseFlush(OperationContext* opCtx, StringData dbName) = 0;
-
-    /**
-     * Only used for unit-tests, clears a previously-created catalog cache loader from the specified
-     * service context, so that 'create' can be called again.
-     */
-    static void clearForTests(ServiceContext* serviceContext);
+    virtual SemiFuture<DatabaseType> getDatabase(const DatabaseName& dbName) = 0;
 
 protected:
-    CatalogCacheLoader() = default;
+    CatalogCacheLoader();
 };
 
 }  // namespace mongo
+
+#define LOGV2_FOR_CATALOG_REFRESH(ID, DLEVEL, MESSAGE, ...) \
+    LOGV2_DEBUG_OPTIONS(                                    \
+        ID, DLEVEL, {logv2::LogComponent::kShardingCatalogRefresh}, MESSAGE, ##__VA_ARGS__)

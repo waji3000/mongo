@@ -1,35 +1,17 @@
 """Utility to support running a command in a subprocess."""
 
-from __future__ import print_function
-
 import os
 import pipes
 import shlex
-import sys
+import subprocess
 
 from . import fileops
-
-# The subprocess32 module is untested on Windows and thus isn't recommended for use, even when it's
-# installed. See https://github.com/google/python-subprocess32/blob/3.2.7/README.md#usage.
-if os.name == "posix" and sys.version_info[0] == 2:
-    try:
-        import subprocess32 as subprocess
-    except ImportError:
-        import warnings
-        warnings.warn(("Falling back to using the subprocess module because subprocess32 isn't"
-                       " available. When using the subprocess module, a child process may"
-                       " trigger an invalid free(). See SERVER-22219 for more details."),
-                      RuntimeWarning)
-        import subprocess  # type: ignore
-else:
-    import subprocess
 
 
 class RunCommand(object):
     """Class to abstract executing a subprocess."""
 
-    def __init__(  # pylint: disable=too-many-arguments
-            self, string=None, output_file=None, append_file=False, propagate_signals=True):
+    def __init__(self, string=None, output_file=None, append_file=False, propagate_signals=True):
         """Initialize the RunCommand object."""
         self._command = string if string else ""
         self.output_file = output_file
@@ -67,15 +49,19 @@ class RunCommand(object):
 
     def execute(self):
         """Execute 'cmd' and return err_code and output."""
-        self._process = subprocess.Popen(self._cmd_list(), stdout=subprocess.PIPE,
-                                         stderr=subprocess.STDOUT, **self._preexec_kargs)
+        self._process = subprocess.Popen(
+            self._cmd_list(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            **self._preexec_kargs,
+        )
         output, _ = self._process.communicate()
         error_code = self._process.returncode
         return error_code, output
 
     def execute_with_output(self):
         """Execute the command, return result as a string."""
-        return subprocess.check_output(self._cmd_list())
+        return subprocess.check_output(self._cmd_list()).decode("utf-8")
 
     def execute_save_output(self):
         """Execute the command, save result in 'self.output_file' and return returncode."""
@@ -87,9 +73,13 @@ class RunCommand(object):
         """Start to execute the command."""
         # Do not propagate interrupts to the child process.
         with fileops.get_file_handle(self.output_file, self.append_file) as file_handle:
-            self._process = subprocess.Popen(self._cmd_list(), stdin=subprocess.PIPE,
-                                             stdout=file_handle, stderr=subprocess.STDOUT,
-                                             **self._preexec_kargs)
+            self._process = subprocess.Popen(
+                self._cmd_list(),
+                stdin=subprocess.PIPE,
+                stdout=file_handle,
+                stderr=subprocess.STDOUT,
+                **self._preexec_kargs,
+            )
 
     def send_to_process(self, string=None):
         """Send 'string' to a running processs and return stdout, stderr."""

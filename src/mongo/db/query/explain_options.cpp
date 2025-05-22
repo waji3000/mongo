@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,62 +27,15 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/query/explain_options.h"
-
 #include "mongo/bson/bsonobjbuilder.h"
-#include "mongo/util/assert_util.h"
 
 namespace mongo {
 
 constexpr StringData ExplainOptions::kVerbosityName;
-constexpr StringData ExplainOptions::kQueryPlannerVerbosityStr;
-constexpr StringData ExplainOptions::kExecStatsVerbosityStr;
-constexpr StringData ExplainOptions::kAllPlansExecutionVerbosityStr;
 
 StringData ExplainOptions::verbosityString(ExplainOptions::Verbosity verbosity) {
-    switch (verbosity) {
-        case Verbosity::kQueryPlanner:
-            return kQueryPlannerVerbosityStr;
-        case Verbosity::kExecStats:
-            return kExecStatsVerbosityStr;
-        case Verbosity::kExecAllPlans:
-            return kAllPlansExecutionVerbosityStr;
-        default:
-            MONGO_UNREACHABLE;
-    }
-}
-
-StatusWith<ExplainOptions::Verbosity> ExplainOptions::parseCmdBSON(const BSONObj& cmdObj) {
-    if (BSONType::Object != cmdObj.firstElement().type()) {
-        return Status(ErrorCodes::FailedToParse, "explain command requires a nested object");
-    }
-
-    auto verbosity = Verbosity::kExecAllPlans;
-    if (auto verbosityElt = cmdObj[kVerbosityName]) {
-        if (verbosityElt.type() != BSONType::String) {
-            return Status(ErrorCodes::FailedToParse, "explain verbosity must be a string");
-        }
-
-        auto verbStr = verbosityElt.valueStringData();
-        if (verbStr == kQueryPlannerVerbosityStr) {
-            verbosity = Verbosity::kQueryPlanner;
-        } else if (verbStr == kExecStatsVerbosityStr) {
-            verbosity = Verbosity::kExecStats;
-        } else if (verbStr != kAllPlansExecutionVerbosityStr) {
-            return Status(ErrorCodes::FailedToParse,
-                          str::stream() << "verbosity string must be one of {'"
-                                        << kQueryPlannerVerbosityStr
-                                        << "', '"
-                                        << kExecStatsVerbosityStr
-                                        << "', '"
-                                        << kAllPlansExecutionVerbosityStr
-                                        << "'}");
-        }
-    }
-
-    return verbosity;
+    return Verbosity_serializer(verbosity);
 }
 
 BSONObj ExplainOptions::toBSON(ExplainOptions::Verbosity verbosity) {

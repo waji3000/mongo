@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,27 +27,47 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
+#include <memory>
 #include <set>
 
+// IWYU pragma: no_include "boost/align/detail/aligned_alloc_posix.hpp"
+
+#include "mongo/base/string_data.h"
 #include "mongo/db/catalog/util/partitioned.h"
+#include "mongo/platform/atomic_word.h"
 #include "mongo/stdx/thread.h"
+#include "mongo/stdx/unordered_map.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
 namespace {
 
 const std::size_t nPartitions = 3;
-using PartitionedIntSet = Partitioned<std::set<std::size_t>, nPartitions>;
+using PartitionedIntSet = Partitioned<std::set<std::size_t>>;
+using PartitionedMap = Partitioned<stdx::unordered_map<std::size_t, char>>;
+
+auto makePartitionedIntSet() {
+    return PartitionedIntSet(nPartitions);
+}
+auto makePartitionedMap() {
+    return PartitionedMap(nPartitions, {{0, 'a'}, {1, 'b'}, {2, 'c'}});
+}
+
+TEST(Partitioned, PartitionedUnorderedMap) {
+    auto test = makePartitionedMap();
+    ASSERT_EQ(test.count(0), 1UL);
+    ASSERT_EQ(test.count(1), 1UL);
+    ASSERT_EQ(test.count(2), 1UL);
+    ASSERT_EQ(test.count(3), 0UL);
+}
 
 TEST(Partitioned, DefaultConstructedPartitionedShouldBeEmpty) {
-    PartitionedIntSet test;
+    auto test = makePartitionedIntSet();
     ASSERT_TRUE(test.empty());
 }
 
 TEST(Partitioned, InsertionShouldModifySize) {
-    PartitionedIntSet test;
+    auto test = makePartitionedIntSet();
     test.insert(4);
     ASSERT_EQ(test.size(), 1UL);
     ASSERT_EQ(test.count(4), 1UL);
@@ -56,7 +75,7 @@ TEST(Partitioned, InsertionShouldModifySize) {
 }
 
 TEST(Partitioned, DuplicateInsertionShouldNotModifySize) {
-    PartitionedIntSet test;
+    auto test = makePartitionedIntSet();
     test.insert(4);
     test.insert(4);
     ASSERT_EQ(test.size(), 1UL);
@@ -64,7 +83,7 @@ TEST(Partitioned, DuplicateInsertionShouldNotModifySize) {
 }
 
 TEST(Partitioned, ClearShouldResetSizeToZero) {
-    PartitionedIntSet test;
+    auto test = makePartitionedIntSet();
     test.insert(0);
     test.insert(1);
     test.insert(2);
@@ -78,7 +97,7 @@ TEST(Partitioned, ClearShouldResetSizeToZero) {
 }
 
 TEST(Partitioned, ErasingEntryShouldModifySize) {
-    PartitionedIntSet test;
+    auto test = makePartitionedIntSet();
     test.insert(0);
     test.insert(1);
     test.insert(2);
@@ -90,7 +109,7 @@ TEST(Partitioned, ErasingEntryShouldModifySize) {
 }
 
 TEST(Partitioned, ErasingEntryThatDoesNotExistShouldNotModifySize) {
-    PartitionedIntSet test;
+    auto test = makePartitionedIntSet();
     test.insert(0);
     test.insert(1);
     test.insert(2);
@@ -102,13 +121,13 @@ TEST(Partitioned, ErasingEntryThatDoesNotExistShouldNotModifySize) {
 }
 
 TEST(PartitionedAll, DefaultConstructedPartitionedShouldBeEmpty) {
-    PartitionedIntSet test;
+    auto test = makePartitionedIntSet();
     auto all = test.lockAllPartitions();
     ASSERT_TRUE(all.empty());
 }
 
 TEST(PartitionedAll, InsertionShouldModifySize) {
-    PartitionedIntSet test;
+    auto test = makePartitionedIntSet();
     auto all = test.lockAllPartitions();
     all.insert(4);
     ASSERT_EQ(all.size(), 1UL);
@@ -117,7 +136,7 @@ TEST(PartitionedAll, InsertionShouldModifySize) {
 }
 
 TEST(PartitionedAll, DuplicateInsertionShouldNotModifySize) {
-    PartitionedIntSet test;
+    auto test = makePartitionedIntSet();
     auto all = test.lockAllPartitions();
     all.insert(4);
     all.insert(4);
@@ -126,7 +145,7 @@ TEST(PartitionedAll, DuplicateInsertionShouldNotModifySize) {
 }
 
 TEST(PartitionedAll, ClearShouldResetSizeToZero) {
-    PartitionedIntSet test;
+    auto test = makePartitionedIntSet();
     auto all = test.lockAllPartitions();
     all.insert(0);
     all.insert(1);
@@ -141,7 +160,7 @@ TEST(PartitionedAll, ClearShouldResetSizeToZero) {
 }
 
 TEST(PartitionedAll, ErasingEntryShouldModifySize) {
-    PartitionedIntSet test;
+    auto test = makePartitionedIntSet();
     auto all = test.lockAllPartitions();
     all.insert(0);
     all.insert(1);
@@ -154,7 +173,7 @@ TEST(PartitionedAll, ErasingEntryShouldModifySize) {
 }
 
 TEST(PartitionedAll, ErasingEntryThatDoesNotExistShouldNotModifySize) {
-    PartitionedIntSet test;
+    auto test = makePartitionedIntSet();
     auto all = test.lockAllPartitions();
     all.insert(0);
     all.insert(1);
@@ -167,7 +186,7 @@ TEST(PartitionedAll, ErasingEntryThatDoesNotExistShouldNotModifySize) {
 }
 
 TEST(PartitionedConcurrency, ShouldBeAbleToGuardSeparatePartitionsSimultaneously) {
-    PartitionedIntSet test;
+    auto test = makePartitionedIntSet();
     {
         auto zeroth = test.lockOnePartition(0);
         auto first = test.lockOnePartition(1);
@@ -175,7 +194,7 @@ TEST(PartitionedConcurrency, ShouldBeAbleToGuardSeparatePartitionsSimultaneously
 }
 
 TEST(PartitionedConcurrency, ModificationsFromOnePartitionShouldBeVisible) {
-    PartitionedIntSet test;
+    auto test = makePartitionedIntSet();
     {
         auto zeroth = test.lockOnePartition(0);
         zeroth->insert(0);
@@ -195,14 +214,14 @@ TEST(PartitionedConcurrency, ModificationsFromOnePartitionShouldBeVisible) {
 }
 
 TEST(PartitionedConcurrency, ModificationsFromAllShouldBeVisible) {
-    PartitionedIntSet test;
+    auto test = makePartitionedIntSet();
     {
         auto all = test.lockAllPartitions();
         all.insert(0);
         all.insert(1);
         all.insert(2);
         for (auto&& partition : all) {
-            ASSERT_EQ(1UL, partition.size());
+            ASSERT_EQ(1UL, partition->size());
         }
     }
 
@@ -228,17 +247,16 @@ TEST(PartitionedConcurrency, ModificationsFromAllShouldBeVisible) {
 }
 
 TEST(PartitionedConcurrency, ShouldProtectConcurrentAccesses) {
-    PartitionedIntSet test;
+    auto test = makePartitionedIntSet();
 
     // 4 threads will be accessing each partition.
     const size_t numThreads = nPartitions * 4;
     std::vector<stdx::thread> threads;
     const size_t opsPerThread = 1000;
 
-    AtomicUInt32 ready{0};
+    AtomicWord<unsigned> ready{0};
     for (size_t threadId = 1; threadId <= numThreads; ++threadId) {
         auto workerThreadBody = [&, threadId, opsPerThread]() {
-
             // Busy-wait until everybody is ready
             ready.fetchAndAdd(1);
             while (ready.load() < numThreads) {

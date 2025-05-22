@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,40 +27,42 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <utility>
 
-#include "mongo/db/pipeline/accumulator.h"
+#include <boost/smart_ptr/intrusive_ptr.hpp>
 
+#include "mongo/bson/bsontypes.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/pipeline/accumulation_statement.h"
+#include "mongo/db/pipeline/accumulator.h"
+#include "mongo/db/pipeline/accumulator_helpers.h"
 #include "mongo/db/pipeline/expression.h"
-#include "mongo/db/pipeline/value.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
-using boost::intrusive_ptr;
-
 /* ------------------------- AccumulatorMergeObjects ----------------------------- */
 
-REGISTER_ACCUMULATOR(mergeObjects, AccumulatorMergeObjects::create);
-REGISTER_EXPRESSION(mergeObjects, ExpressionFromAccumulator<AccumulatorMergeObjects>::parse);
-
-const char* AccumulatorMergeObjects::getOpName() const {
-    return "$mergeObjects";
+template <>
+Value ExpressionFromAccumulator<AccumulatorMergeObjects>::evaluate(const Document& root,
+                                                                   Variables* variables) const {
+    return evaluateAccumulator(*this, root, variables);
 }
 
-intrusive_ptr<Accumulator> AccumulatorMergeObjects::create(
-    const boost::intrusive_ptr<ExpressionContext>& expCtx) {
-    return new AccumulatorMergeObjects(expCtx);
-}
+REGISTER_ACCUMULATOR(mergeObjects,
+                     genericParseSingleExpressionAccumulator<AccumulatorMergeObjects>);
+REGISTER_STABLE_EXPRESSION(mergeObjects, ExpressionFromAccumulator<AccumulatorMergeObjects>::parse);
 
-AccumulatorMergeObjects::AccumulatorMergeObjects(
-    const boost::intrusive_ptr<ExpressionContext>& expCtx)
-    : Accumulator(expCtx) {
-    _memUsageBytes = sizeof(*this);
+AccumulatorMergeObjects::AccumulatorMergeObjects(ExpressionContext* const expCtx)
+    : AccumulatorState(expCtx) {
+    _memUsageTracker.set(sizeof(*this));
 }
 
 void AccumulatorMergeObjects::reset() {
-    _memUsageBytes = sizeof(*this);
+    _memUsageTracker.set(sizeof(*this));
     _output.reset();
 }
 
@@ -72,8 +73,7 @@ void AccumulatorMergeObjects::processInternal(const Value& input, bool merging) 
 
     uassert(40400,
             str::stream() << "$mergeObjects requires object inputs, but input " << input.toString()
-                          << " is of type "
-                          << typeName(input.getType()),
+                          << " is of type " << typeName(input.getType()),
             (input.getType() == BSONType::Object));
 
     FieldIterator iter = input.getDocument().fieldIterator();
@@ -83,13 +83,12 @@ void AccumulatorMergeObjects::processInternal(const Value& input, bool merging) 
         if (pair.second.missing())
             continue;
 
-        _output.setField(pair.first, pair.second);
+        _output.setField(pair.first, std::move(pair.second));
     }
-    _memUsageBytes = sizeof(*this) + _output.getApproximateSize();
+    _memUsageTracker.set(sizeof(*this));
 }
 
 Value AccumulatorMergeObjects::getValue(bool toBeMerged) {
     return _output.freezeToValue();
 }
-
 }  // namespace mongo

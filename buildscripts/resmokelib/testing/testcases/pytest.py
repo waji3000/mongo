@@ -1,32 +1,26 @@
 """The unittest.TestCase for Python unittests."""
-import os
-import unittest
 
+import os
+import sys
+
+from buildscripts.resmokelib import core, logging
 from buildscripts.resmokelib.testing.testcases import interface
 
 
-class PyTestCase(interface.TestCase):
+class PyTestCase(interface.ProcessTestCase):
     """A python test to execute."""
 
     REGISTERED_NAME = "py_test"
 
-    def __init__(self, logger, py_filename):
+    def __init__(self, logger: logging.Logger, py_filenames: list[str]):
         """Initialize PyTestCase."""
-        interface.TestCase.__init__(self, logger, "PyTest", py_filename)
+        assert len(py_filenames) == 1
+        interface.ProcessTestCase.__init__(self, logger, "PyTest", py_filenames[0])
 
-    def run_test(self):
-        """Execute the test."""
-        suite = unittest.defaultTestLoader.loadTestsFromName(self.test_module_name)
-        result = unittest.TextTestRunner().run(suite)
-        if not result.wasSuccessful():
-            msg = "Python test {} failed".format(self.test_name)
-            raise self.failureException(msg)
-
-        self.return_code = 0
-
-    def as_command(self):
-        """Return execute command."""
-        return "python -m unittest {}".format(self.test_module_name)
+    def _make_process(self):
+        return core.programs.generic_program(
+            self.logger, [sys.executable, "-m", "unittest", self.test_module_name]
+        )
 
     @property
     def test_module_name(self):

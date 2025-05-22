@@ -1,0 +1,46 @@
+version: 1.0.0
+options:
+  no_parent_owners: true
+filters:
+  - "analyze_shard_key.py":
+    approvers:
+      - 10gen/server-cluster-scalability
+  - "queryable_server_hook.py":
+    approvers:
+      - 10gen/server-backup-restore
+  - "change_streams.py":
+    approvers:
+      - 10gen/query-execution-change-streams
+  - "enable_change_stream.py":
+    approvers:
+      - 10gen/query-execution-change-streams
+  - "run_query_stats.py":
+    approvers:
+      - 10gen/query-integration-observability
+  - "fcv_upgrade_downgrade.py":
+    approvers:
+      - 10gen/server-fcv
+  - "initialsync.py":
+    approvers:
+      - 10gen/server-initial-sync
+  - "magic_restore.py":
+    approvers:
+      - 10gen/server-recovery
+  - "oplog.py":
+    approvers:
+      - 10gen/server-jstest-infra
+  - "periodic_kill_secondaries.py":
+    approvers:
+      - 10gen/server-jstest-infra
+  - "reconfig_background.py":
+    approvers:
+      - 10gen/server-jstest-infra
+  - "secondary_lag.py":
+    approvers:
+      - 10gen/server-jstest-infra
+  - "stepdown.py":
+    approvers:
+      - 10gen/server-jstest-infra
+  - "wait_for_replication.py":
+    approvers:
+      - 10gen/server-jstest-infra

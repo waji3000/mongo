@@ -1,5 +1,5 @@
 /*-
- * Public Domain 2014-2018 MongoDB, Inc.
+ * Public Domain 2014-present MongoDB, Inc.
  * Public Domain 2008-2014 WiredTiger, Inc.
  *
  * This is free and unencumbered software released into the public domain.
@@ -26,10 +26,10 @@
  * OTHER DEALINGS IN THE SOFTWARE.
  */
 
+#pragma once
+
 /*
  * util.h
  * 	Utility functions for test that simulates system crashes.
  */
-
-extern void
-copy_directory(const char *, const char *, bool);
+extern void copy_directory(const char *, const char *, bool);

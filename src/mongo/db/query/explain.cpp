@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,759 +27,253 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <algorithm>
+#include <boost/cstdint.hpp>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <cstdint>
+#include <fmt/format.h>
+#include <memory>
+#include <utility>
+#include <vector>
 
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/db/basic_types_gen.h"
+#include "mongo/db/curop.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/exec/sbe/util/debug_print.h"
+#include "mongo/db/matcher/expression.h"
+#include "mongo/db/pipeline/plan_executor_pipeline.h"
+#include "mongo/db/query/canonical_query.h"
+#include "mongo/db/query/collation/collator_interface.h"
 #include "mongo/db/query/explain.h"
-
-#include "mongo/base/owned_pointer_vector.h"
-#include "mongo/bson/util/builder.h"
-#include "mongo/db/exec/cached_plan.h"
-#include "mongo/db/exec/count_scan.h"
-#include "mongo/db/exec/distinct_scan.h"
-#include "mongo/db/exec/idhack.h"
-#include "mongo/db/exec/index_scan.h"
-#include "mongo/db/exec/multi_plan.h"
-#include "mongo/db/exec/near.h"
-#include "mongo/db/exec/pipeline_proxy.h"
-#include "mongo/db/exec/text.h"
-#include "mongo/db/exec/working_set_common.h"
-#include "mongo/db/keypattern.h"
-#include "mongo/db/query/canonical_query_encoder.h"
-#include "mongo/db/query/get_executor.h"
+#include "mongo/db/query/explain_common.h"
+#include "mongo/db/query/multiple_collection_accessor.h"
+#include "mongo/db/query/plan_cache/plan_cache.h"
+#include "mongo/db/query/plan_cache/plan_cache_debug_info.h"
+#include "mongo/db/query/plan_cache/plan_cache_key_factory.h"
+#include "mongo/db/query/plan_enumerator/plan_enumerator_explain_info.h"
 #include "mongo/db/query/plan_executor.h"
+#include "mongo/db/query/plan_explainer_impl.h"
+#include "mongo/db/query/plan_ranking_decision.h"
 #include "mongo/db/query/plan_summary_stats.h"
-#include "mongo/db/query/query_planner.h"
+#include "mongo/db/query/query_feature_flags_gen.h"
 #include "mongo/db/query/query_settings.h"
-#include "mongo/db/query/stage_builder.h"
-#include "mongo/db/server_options.h"
-#include "mongo/db/server_parameters.h"
+#include "mongo/db/query/query_settings_decoration.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/duration.h"
 #include "mongo/util/hex.h"
-#include "mongo/util/mongoutils/str.h"
-#include "mongo/util/net/socket_utils.h"
-#include "mongo/util/version.h"
-
-namespace {
-
-using namespace mongo;
-using std::string;
-using std::unique_ptr;
-using std::vector;
-
-/**
- * Traverse the tree rooted at 'root', and add all tree nodes into the list 'flattened'.
- */
-void flattenStatsTree(const PlanStageStats* root, vector<const PlanStageStats*>* flattened) {
-    invariant(root->stageType != STAGE_MULTI_PLAN);
-    flattened->push_back(root);
-    for (auto&& child : root->children) {
-        flattenStatsTree(child.get(), flattened);
-    }
-}
-
-/**
- * Traverse the tree rooted at 'root', and add all nodes into the list 'flattened'. If a
- * MultiPlanStage is encountered, only add the best plan and its children to 'flattened'.
- */
-void flattenExecTree(const PlanStage* root, vector<const PlanStage*>* flattened) {
-    flattened->push_back(root);
-
-    if (root->stageType() == STAGE_MULTI_PLAN) {
-        // Only add the winning plan from a MultiPlanStage.
-        auto mps = static_cast<const MultiPlanStage*>(root);
-        const PlanStage* winningStage = mps->getChildren()[mps->bestPlanIdx()].get();
-        return flattenExecTree(winningStage, flattened);
-    }
-
-    const auto& children = root->getChildren();
-    for (size_t i = 0; i < children.size(); ++i) {
-        flattenExecTree(children[i].get(), flattened);
-    }
-}
-
-/**
- * Traverse the stage tree, depth first and return the first stage of a given type.
- */
-PlanStage* findStageOfType(PlanStage* root, StageType desiredStageType) {
-    if (root->stageType() == desiredStageType) {
-        return root;
-    }
-
-    for (const auto& child : root->getChildren()) {
-        PlanStage* p = findStageOfType(child.get(), desiredStageType);
-        if (p) {
-            return p;
-        }
-    }
-    return nullptr;
-}
-
-/**
- * Gets a pointer to the MultiPlanStage inside the stage tree rooted at 'root'. Returns nullptr if
- * there is no MPS.
- */
-MultiPlanStage* getMultiPlanStage(PlanStage* root) {
-    PlanStage* ps = findStageOfType(root, STAGE_MULTI_PLAN);
-    invariant(ps == nullptr || ps->stageType() == STAGE_MULTI_PLAN);
-    return static_cast<MultiPlanStage*>(ps);
-}
-
-/**
- * Gets a pointer to the PipelineProxyStage if it is the root of the tree. Returns nullptr if
- * there is no PPS that is root.
- */
-PipelineProxyStage* getPipelineProxyStage(PlanStage* root) {
-    if (root->stageType() == STAGE_PIPELINE_PROXY) {
-        return static_cast<PipelineProxyStage*>(root);
-    }
-
-    return nullptr;
-}
-
-/**
- * Given the SpecificStats object for a stage and the type of the stage, returns the
- * number of index keys examined by the stage.
- *
- * This is used for getting the total number of keys examined by a plan. We need
- * to collect a 'totalKeysExamined' metric for a regular explain (in which case this
- * gets called from Explain::generateSinglePlanExecutionInfo()) or for the slow query log / profiler
- * (in which case this gets called from Explain::getSummaryStats()).
- */
-size_t getKeysExamined(StageType type, const SpecificStats* specific) {
-    if (STAGE_IXSCAN == type) {
-        const IndexScanStats* spec = static_cast<const IndexScanStats*>(specific);
-        return spec->keysExamined;
-    } else if (STAGE_IDHACK == type) {
-        const IDHackStats* spec = static_cast<const IDHackStats*>(specific);
-        return spec->keysExamined;
-    } else if (STAGE_COUNT_SCAN == type) {
-        const CountScanStats* spec = static_cast<const CountScanStats*>(specific);
-        return spec->keysExamined;
-    } else if (STAGE_DISTINCT_SCAN == type) {
-        const DistinctScanStats* spec = static_cast<const DistinctScanStats*>(specific);
-        return spec->keysExamined;
-    }
-
-    return 0;
-}
-
-/**
- * Given the SpecificStats object for a stage and the type of the stage, returns the
- * number of documents examined by the stage.
- *
- * This is used for getting the total number of documents examined by a plan. We need
- * to collect a 'totalDocsExamined' metric for a regular explain (in which case this
- * gets called from Explain::generateSinglePlanExecutionInfo()) or for the slow query log / profiler
- * (in which case this gets called from Explain::getSummaryStats()).
- */
-size_t getDocsExamined(StageType type, const SpecificStats* specific) {
-    if (STAGE_COLLSCAN == type) {
-        const CollectionScanStats* spec = static_cast<const CollectionScanStats*>(specific);
-        return spec->docsTested;
-    } else if (STAGE_FETCH == type) {
-        const FetchStats* spec = static_cast<const FetchStats*>(specific);
-        return spec->docsExamined;
-    } else if (STAGE_IDHACK == type) {
-        const IDHackStats* spec = static_cast<const IDHackStats*>(specific);
-        return spec->docsExamined;
-    } else if (STAGE_TEXT_OR == type) {
-        const TextOrStats* spec = static_cast<const TextOrStats*>(specific);
-        return spec->fetches;
-    }
-
-    return 0;
-}
-
-/**
- * Adds to the plan summary string being built by 'sb' for the execution stage 'stage'.
- */
-void addStageSummaryStr(const PlanStage* stage, StringBuilder& sb) {
-    // First add the stage type string.
-    const CommonStats* common = stage->getCommonStats();
-    sb << common->stageTypeStr;
-
-    // Some leaf nodes also provide info about the index they used.
-    const SpecificStats* specific = stage->getSpecificStats();
-    if (STAGE_COUNT_SCAN == stage->stageType()) {
-        const CountScanStats* spec = static_cast<const CountScanStats*>(specific);
-        const KeyPattern keyPattern{spec->keyPattern};
-        sb << " " << keyPattern;
-    } else if (STAGE_DISTINCT_SCAN == stage->stageType()) {
-        const DistinctScanStats* spec = static_cast<const DistinctScanStats*>(specific);
-        const KeyPattern keyPattern{spec->keyPattern};
-        sb << " " << keyPattern;
-    } else if (STAGE_GEO_NEAR_2D == stage->stageType()) {
-        const NearStats* spec = static_cast<const NearStats*>(specific);
-        const KeyPattern keyPattern{spec->keyPattern};
-        sb << " " << keyPattern;
-    } else if (STAGE_GEO_NEAR_2DSPHERE == stage->stageType()) {
-        const NearStats* spec = static_cast<const NearStats*>(specific);
-        const KeyPattern keyPattern{spec->keyPattern};
-        sb << " " << keyPattern;
-    } else if (STAGE_IXSCAN == stage->stageType()) {
-        const IndexScanStats* spec = static_cast<const IndexScanStats*>(specific);
-        const KeyPattern keyPattern{spec->keyPattern};
-        sb << " " << keyPattern;
-    } else if (STAGE_TEXT == stage->stageType()) {
-        const TextStats* spec = static_cast<const TextStats*>(specific);
-        const KeyPattern keyPattern{spec->indexPrefix};
-        sb << " " << keyPattern;
-    }
-}
-
-/**
- * Adds the path-level multikey information to the explain output in a field called "multiKeyPaths".
- * The value associated with the "multiKeyPaths" field is an object with keys equal to those in the
- * index key pattern and values equal to an array of strings corresponding to paths that cause the
- * index to be multikey.
- *
- * For example, with the index {'a.b': 1, 'a.c': 1} where the paths "a" and "a.b" cause the
- * index to be multikey, we'd have {'multiKeyPaths': {'a.b': ['a', 'a.b'], 'a.c': ['a']}}.
- *
- * This function should only be called if the associated index supports path-level multikey
- * tracking.
- */
-void appendMultikeyPaths(const BSONObj& keyPattern,
-                         const MultikeyPaths& multikeyPaths,
-                         BSONObjBuilder* bob) {
-    BSONObjBuilder subMultikeyPaths(bob->subobjStart("multiKeyPaths"));
-
-    size_t i = 0;
-    for (const auto keyElem : keyPattern) {
-        const FieldRef path{keyElem.fieldNameStringData()};
-
-        BSONArrayBuilder arrMultikeyComponents(
-            subMultikeyPaths.subarrayStart(keyElem.fieldNameStringData()));
-        for (const auto multikeyComponent : multikeyPaths[i]) {
-            arrMultikeyComponents.append(path.dottedSubstring(0, multikeyComponent + 1));
-        }
-        arrMultikeyComponents.doneFast();
-
-        ++i;
-    }
-
-    subMultikeyPaths.doneFast();
-}
-
-/**
- * Gather the PlanStageStats for all of the losing plans. If exec doesn't have a MultiPlanStage
- * (or any losing plans), will return an empty vector.
- */
-std::vector<std::unique_ptr<PlanStageStats>> getRejectedPlansTrialStats(PlanExecutor* exec) {
-    // Inspect the tree to see if there is a MultiPlanStage. Plan selection has already happened at
-    // this point, since we have a PlanExecutor.
-    const auto mps = getMultiPlanStage(exec->getRootStage());
-    std::vector<std::unique_ptr<PlanStageStats>> res;
-
-    // Get the stats from the trial period for all the plans.
-    if (mps) {
-        const auto mpsStats = mps->getStats();
-        for (size_t i = 0; i < mpsStats->children.size(); ++i) {
-            if (i != static_cast<size_t>(mps->bestPlanIdx())) {
-                res.emplace_back(std::move(mpsStats->children[i]));
-            }
-        }
-    }
-
-    return res;
-}
-
-/**
- * Get PlanExecutor's winning plan stats tree.
- */
-unique_ptr<PlanStageStats> getWinningPlanStatsTree(const PlanExecutor* exec) {
-    MultiPlanStage* mps = getMultiPlanStage(exec->getRootStage());
-    return mps ? std::move(mps->getStats()->children[mps->bestPlanIdx()])
-               : std::move(exec->getRootStage()->getStats());
-}
-
-}  // namespace
+#include "mongo/util/namespace_string_util.h"
+#include "mongo/util/overloaded_visitor.h"  // IWYU pragma: keep
 
 namespace mongo {
+namespace {
 
-using mongoutils::str::stream;
-
-// static
-void Explain::statsToBSON(const PlanStageStats& stats,
-                          ExplainOptions::Verbosity verbosity,
-                          BSONObjBuilder* bob,
-                          BSONObjBuilder* topLevelBob) {
-    invariant(bob);
-    invariant(topLevelBob);
-
-    // Stop as soon as the BSON object we're building exceeds 10 MB.
-    static const int kMaxStatsBSONSize = 10 * 1024 * 1024;
-    if (topLevelBob->len() > kMaxStatsBSONSize) {
-        bob->append("warning", "stats tree exceeded 10 MB");
-        return;
-    }
-
-    // Stage name.
-    bob->append("stage", stats.common.stageTypeStr);
-
-    // Display the BSON representation of the filter, if there is one.
-    if (!stats.common.filter.isEmpty()) {
-        bob->append("filter", stats.common.filter);
-    }
-
-    // Some top-level exec stats get pulled out of the root stage.
-    if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
-        bob->appendNumber("nReturned", stats.common.advanced);
-        bob->appendNumber("executionTimeMillisEstimate", stats.common.executionTimeMillis);
-        bob->appendNumber("works", stats.common.works);
-        bob->appendNumber("advanced", stats.common.advanced);
-        bob->appendNumber("needTime", stats.common.needTime);
-        bob->appendNumber("needYield", stats.common.needYield);
-        bob->appendNumber("saveState", stats.common.yields);
-        bob->appendNumber("restoreState", stats.common.unyields);
-        bob->appendNumber("isEOF", stats.common.isEOF);
-    }
-
-    // Stage-specific stats
-    if (STAGE_AND_HASH == stats.stageType) {
-        AndHashStats* spec = static_cast<AndHashStats*>(stats.specific.get());
-
-        if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
-            bob->appendNumber("memUsage", spec->memUsage);
-            bob->appendNumber("memLimit", spec->memLimit);
-
-            for (size_t i = 0; i < spec->mapAfterChild.size(); ++i) {
-                bob->appendNumber(string(stream() << "mapAfterChild_" << i),
-                                  spec->mapAfterChild[i]);
-            }
-        }
-    } else if (STAGE_AND_SORTED == stats.stageType) {
-        AndSortedStats* spec = static_cast<AndSortedStats*>(stats.specific.get());
-
-        if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
-            for (size_t i = 0; i < spec->failedAnd.size(); ++i) {
-                bob->appendNumber(string(stream() << "failedAnd_" << i), spec->failedAnd[i]);
-            }
-        }
-    } else if (STAGE_COLLSCAN == stats.stageType) {
-        CollectionScanStats* spec = static_cast<CollectionScanStats*>(stats.specific.get());
-        bob->append("direction", spec->direction > 0 ? "forward" : "backward");
-        if (spec->maxTs) {
-            bob->append("maxTs", *(spec->maxTs));
-        }
-        if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
-            bob->appendNumber("docsExamined", spec->docsTested);
-        }
-    } else if (STAGE_COUNT == stats.stageType) {
-        CountStats* spec = static_cast<CountStats*>(stats.specific.get());
-
-        if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
-            bob->appendNumber("nCounted", spec->nCounted);
-            bob->appendNumber("nSkipped", spec->nSkipped);
-        }
-    } else if (STAGE_COUNT_SCAN == stats.stageType) {
-        CountScanStats* spec = static_cast<CountScanStats*>(stats.specific.get());
-
-        if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
-            bob->appendNumber("keysExamined", spec->keysExamined);
-        }
-
-        bob->append("keyPattern", spec->keyPattern);
-        bob->append("indexName", spec->indexName);
-        if (!spec->collation.isEmpty()) {
-            bob->append("collation", spec->collation);
-        }
-        bob->appendBool("isMultiKey", spec->isMultiKey);
-        if (!spec->multiKeyPaths.empty()) {
-            appendMultikeyPaths(spec->keyPattern, spec->multiKeyPaths, bob);
-        }
-        bob->appendBool("isUnique", spec->isUnique);
-        bob->appendBool("isSparse", spec->isSparse);
-        bob->appendBool("isPartial", spec->isPartial);
-        bob->append("indexVersion", spec->indexVersion);
-
-        BSONObjBuilder indexBoundsBob;
-        indexBoundsBob.append("startKey", spec->startKey);
-        indexBoundsBob.append("startKeyInclusive", spec->startKeyInclusive);
-        indexBoundsBob.append("endKey", spec->endKey);
-        indexBoundsBob.append("endKeyInclusive", spec->endKeyInclusive);
-        bob->append("indexBounds", indexBoundsBob.obj());
-    } else if (STAGE_DELETE == stats.stageType) {
-        DeleteStats* spec = static_cast<DeleteStats*>(stats.specific.get());
-
-        if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
-            bob->appendNumber("nWouldDelete", spec->docsDeleted);
-        }
-    } else if (STAGE_DISTINCT_SCAN == stats.stageType) {
-        DistinctScanStats* spec = static_cast<DistinctScanStats*>(stats.specific.get());
-
-        bob->append("keyPattern", spec->keyPattern);
-        bob->append("indexName", spec->indexName);
-        if (!spec->collation.isEmpty()) {
-            bob->append("collation", spec->collation);
-        }
-        bob->appendBool("isMultiKey", spec->isMultiKey);
-        if (!spec->multiKeyPaths.empty()) {
-            appendMultikeyPaths(spec->keyPattern, spec->multiKeyPaths, bob);
-        }
-        bob->appendBool("isUnique", spec->isUnique);
-        bob->appendBool("isSparse", spec->isSparse);
-        bob->appendBool("isPartial", spec->isPartial);
-        bob->append("indexVersion", spec->indexVersion);
-        bob->append("direction", spec->direction > 0 ? "forward" : "backward");
-
-        if ((topLevelBob->len() + spec->indexBounds.objsize()) > kMaxStatsBSONSize) {
-            bob->append("warning", "index bounds omitted due to BSON size limit");
-        } else {
-            bob->append("indexBounds", spec->indexBounds);
-        }
-
-        if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
-            bob->appendNumber("keysExamined", spec->keysExamined);
-        }
-    } else if (STAGE_ENSURE_SORTED == stats.stageType) {
-        EnsureSortedStats* spec = static_cast<EnsureSortedStats*>(stats.specific.get());
-
-        if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
-            bob->appendNumber("nDropped", spec->nDropped);
-        }
-    } else if (STAGE_FETCH == stats.stageType) {
-        FetchStats* spec = static_cast<FetchStats*>(stats.specific.get());
-        if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
-            bob->appendNumber("docsExamined", spec->docsExamined);
-            bob->appendNumber("alreadyHasObj", spec->alreadyHasObj);
-        }
-    } else if (STAGE_GEO_NEAR_2D == stats.stageType || STAGE_GEO_NEAR_2DSPHERE == stats.stageType) {
-        NearStats* spec = static_cast<NearStats*>(stats.specific.get());
-
-        bob->append("keyPattern", spec->keyPattern);
-        bob->append("indexName", spec->indexName);
-        bob->append("indexVersion", spec->indexVersion);
-
-        if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
-            BSONArrayBuilder intervalsBob(bob->subarrayStart("searchIntervals"));
-            for (vector<IntervalStats>::const_iterator it = spec->intervalStats.begin();
-                 it != spec->intervalStats.end();
-                 ++it) {
-                BSONObjBuilder intervalBob(intervalsBob.subobjStart());
-                intervalBob.append("minDistance", it->minDistanceAllowed);
-                intervalBob.append("maxDistance", it->maxDistanceAllowed);
-                intervalBob.append("maxInclusive", it->inclusiveMaxDistanceAllowed);
-                intervalBob.appendNumber("nBuffered", it->numResultsBuffered);
-                intervalBob.appendNumber("nReturned", it->numResultsReturned);
-            }
-            intervalsBob.doneFast();
-        }
-    } else if (STAGE_IDHACK == stats.stageType) {
-        IDHackStats* spec = static_cast<IDHackStats*>(stats.specific.get());
-        if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
-            bob->appendNumber("keysExamined", spec->keysExamined);
-            bob->appendNumber("docsExamined", spec->docsExamined);
-        }
-    } else if (STAGE_IXSCAN == stats.stageType) {
-        IndexScanStats* spec = static_cast<IndexScanStats*>(stats.specific.get());
-
-        bob->append("keyPattern", spec->keyPattern);
-        bob->append("indexName", spec->indexName);
-        if (!spec->collation.isEmpty()) {
-            bob->append("collation", spec->collation);
-        }
-        bob->appendBool("isMultiKey", spec->isMultiKey);
-        if (!spec->multiKeyPaths.empty()) {
-            appendMultikeyPaths(spec->keyPattern, spec->multiKeyPaths, bob);
-        }
-        bob->appendBool("isUnique", spec->isUnique);
-        bob->appendBool("isSparse", spec->isSparse);
-        bob->appendBool("isPartial", spec->isPartial);
-        bob->append("indexVersion", spec->indexVersion);
-        bob->append("direction", spec->direction > 0 ? "forward" : "backward");
-
-        if ((topLevelBob->len() + spec->indexBounds.objsize()) > kMaxStatsBSONSize) {
-            bob->append("warning", "index bounds omitted due to BSON size limit");
-        } else {
-            bob->append("indexBounds", spec->indexBounds);
-        }
-
-        if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
-            bob->appendNumber("keysExamined", spec->keysExamined);
-            bob->appendNumber("seeks", spec->seeks);
-            bob->appendNumber("dupsTested", spec->dupsTested);
-            bob->appendNumber("dupsDropped", spec->dupsDropped);
-        }
-    } else if (STAGE_OR == stats.stageType) {
-        OrStats* spec = static_cast<OrStats*>(stats.specific.get());
-
-        if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
-            bob->appendNumber("dupsTested", spec->dupsTested);
-            bob->appendNumber("dupsDropped", spec->dupsDropped);
-        }
-    } else if (STAGE_LIMIT == stats.stageType) {
-        LimitStats* spec = static_cast<LimitStats*>(stats.specific.get());
-        bob->appendNumber("limitAmount", spec->limit);
-    } else if (STAGE_PROJECTION == stats.stageType) {
-        ProjectionStats* spec = static_cast<ProjectionStats*>(stats.specific.get());
-        bob->append("transformBy", spec->projObj);
-    } else if (STAGE_RECORD_STORE_FAST_COUNT == stats.stageType) {
-        CountStats* spec = static_cast<CountStats*>(stats.specific.get());
-
-        if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
-            bob->appendNumber("nCounted", spec->nCounted);
-            bob->appendNumber("nSkipped", spec->nSkipped);
-        }
-    } else if (STAGE_SHARDING_FILTER == stats.stageType) {
-        ShardingFilterStats* spec = static_cast<ShardingFilterStats*>(stats.specific.get());
-
-        if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
-            bob->appendNumber("chunkSkips", spec->chunkSkips);
-        }
-    } else if (STAGE_SKIP == stats.stageType) {
-        SkipStats* spec = static_cast<SkipStats*>(stats.specific.get());
-        bob->appendNumber("skipAmount", spec->skip);
-    } else if (STAGE_SORT == stats.stageType) {
-        SortStats* spec = static_cast<SortStats*>(stats.specific.get());
-        bob->append("sortPattern", spec->sortPattern);
-
-        if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
-            bob->appendNumber("memUsage", spec->memUsage);
-            bob->appendNumber("memLimit", spec->memLimit);
-        }
-
-        if (spec->limit > 0) {
-            bob->appendNumber("limitAmount", spec->limit);
-        }
-    } else if (STAGE_SORT_MERGE == stats.stageType) {
-        MergeSortStats* spec = static_cast<MergeSortStats*>(stats.specific.get());
-        bob->append("sortPattern", spec->sortPattern);
-
-        if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
-            bob->appendNumber("dupsTested", spec->dupsTested);
-            bob->appendNumber("dupsDropped", spec->dupsDropped);
-        }
-    } else if (STAGE_TEXT == stats.stageType) {
-        TextStats* spec = static_cast<TextStats*>(stats.specific.get());
-
-        bob->append("indexPrefix", spec->indexPrefix);
-        bob->append("indexName", spec->indexName);
-        bob->append("parsedTextQuery", spec->parsedTextQuery);
-        bob->append("textIndexVersion", spec->textIndexVersion);
-    } else if (STAGE_TEXT_MATCH == stats.stageType) {
-        TextMatchStats* spec = static_cast<TextMatchStats*>(stats.specific.get());
-
-        if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
-            bob->appendNumber("docsRejected", spec->docsRejected);
-        }
-    } else if (STAGE_TEXT_OR == stats.stageType) {
-        TextOrStats* spec = static_cast<TextOrStats*>(stats.specific.get());
-
-        if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
-            bob->appendNumber("docsExamined", spec->fetches);
-        }
-    } else if (STAGE_UPDATE == stats.stageType) {
-        UpdateStats* spec = static_cast<UpdateStats*>(stats.specific.get());
-
-        if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
-            bob->appendNumber("nMatched", spec->nMatched);
-            bob->appendNumber("nWouldModify", spec->nModified);
-            bob->appendBool("wouldInsert", spec->inserted);
-            bob->appendBool("fastmodinsert", spec->fastmodinsert);
-        }
-    }
-
-    // We're done if there are no children.
-    if (stats.children.empty()) {
-        return;
-    }
-
-    // If there's just one child (a common scenario), avoid making an array. This makes
-    // the output more readable by saving a level of nesting. Name the field 'inputStage'
-    // rather than 'inputStages'.
-    if (1 == stats.children.size()) {
-        BSONObjBuilder childBob;
-        statsToBSON(*stats.children[0], verbosity, &childBob, topLevelBob);
-        bob->append("inputStage", childBob.obj());
-        return;
-    }
-
-    // There is more than one child. Recursively call statsToBSON(...) on each
-    // of them and add them to the 'inputStages' array.
-
-    BSONArrayBuilder childrenBob(bob->subarrayStart("inputStages"));
-    for (size_t i = 0; i < stats.children.size(); ++i) {
-        BSONObjBuilder childBob(childrenBob.subobjStart());
-        statsToBSON(*stats.children[i], verbosity, &childBob, topLevelBob);
-    }
-    childrenBob.doneFast();
-}
-
-// static
-BSONObj Explain::statsToBSON(const PlanStageStats& stats, ExplainOptions::Verbosity verbosity) {
-    BSONObjBuilder bob;
-    statsToBSON(stats, &bob, verbosity);
-    return bob.obj();
-}
-
-// static
-void Explain::statsToBSON(const PlanStageStats& stats,
-                          BSONObjBuilder* bob,
-                          ExplainOptions::Verbosity verbosity) {
-    statsToBSON(stats, verbosity, bob, bob);
-}
-
-// static
-BSONObj Explain::getWinningPlanStats(const PlanExecutor* exec) {
-    BSONObjBuilder bob;
-    getWinningPlanStats(exec, &bob);
-    return bob.obj();
-}
-
-// static
-void Explain::getWinningPlanStats(const PlanExecutor* exec, BSONObjBuilder* bob) {
-    unique_ptr<PlanStageStats> winningStats = getWinningPlanStatsTree(exec);
-    statsToBSON(*winningStats, ExplainOptions::Verbosity::kExecStats, bob, bob);
-}
-
-// static
-void Explain::generatePlannerInfo(PlanExecutor* exec,
-                                  const Collection* collection,
-                                  BSONObjBuilder* out) {
-    CanonicalQuery* query = exec->getCanonicalQuery();
-
+/**
+ * Adds the 'queryPlanner' explain section to the BSON object being built by 'out'.
+ *
+ * This is a helper for generating explain BSON. It is used by explainStages(...).
+ *
+ * - 'exec' is a PlanExecutor which executes the plan for the operation being explained.
+ * - 'collection' is the collection used in the operation. The caller should hold an IS lock on the
+ *    collection which the query is for, even if 'collection' is nullptr.
+ * - 'extraInfo' specifies additional information to include into the output.
+ * - 'out' is a builder for the explain output.
+ */
+void generatePlannerInfo(PlanExecutor* exec,
+                         const BSONObj& cmd,
+                         const MultipleCollectionAccessor& collections,
+                         BSONObj extraInfo,
+                         const SerializationContext& serializationContext,
+                         BSONObjBuilder* out) {
     BSONObjBuilder plannerBob(out->subobjStart("queryPlanner"));
 
-    plannerBob.append("plannerVersion", QueryPlanner::kPlannerVersion);
-    plannerBob.append("namespace", exec->nss().ns());
+    plannerBob.append("namespace",
+                      NamespaceStringUtil::serialize(exec->nss(), serializationContext));
 
-    // Find whether there is an index filter set for the query shape. The 'indexFilterSet'
-    // field will always be false in the case of EOF or idhack plans.
-    bool indexFilterSet = false;
-    boost::optional<uint32_t> queryHash;
+    boost::optional<uint32_t> planCacheShapeHash;
     boost::optional<uint32_t> planCacheKeyHash;
-    if (collection && exec->getCanonicalQuery()) {
-        const CollectionInfoCache* infoCache = collection->infoCache();
-        const QuerySettings* querySettings = infoCache->getQuerySettings();
-        PlanCacheKey planCacheKey =
-            infoCache->getPlanCache()->computeKey(*exec->getCanonicalQuery());
-        planCacheKeyHash = canonical_query_encoder::computeHash(planCacheKey.toString());
-        queryHash = canonical_query_encoder::computeHash(planCacheKey.getStableKeyStringData());
-
-        if (auto allowedIndicesFilter =
-                querySettings->getAllowedIndicesFilter(planCacheKey.getStableKey())) {
-            // Found an index filter set on the query shape.
-            indexFilterSet = true;
+    const auto& mainCollection = collections.getMainCollection();
+    if (auto* cq = exec->getCanonicalQuery(); mainCollection && cq) {
+        if (cq->isSbeCompatible() && cq->isUsingSbePlanCache() &&
+            feature_flags::gFeatureFlagSbeFull.isEnabled()) {
+            const auto planCacheKeyInfo =
+                plan_cache_key_factory::make(*exec->getCanonicalQuery(), collections);
+            planCacheKeyHash = planCacheKeyInfo.planCacheKeyHash();
+            planCacheShapeHash = planCacheKeyInfo.planCacheShapeHash();
+        } else {
+            const auto planCacheKeyInfo = plan_cache_key_factory::make<PlanCacheKey>(
+                *exec->getCanonicalQuery(), mainCollection);
+            planCacheKeyHash = planCacheKeyInfo.planCacheKeyHash();
+            planCacheShapeHash = planCacheKeyInfo.planCacheShapeHash();
         }
     }
-    plannerBob.append("indexFilterSet", indexFilterSet);
 
-    // In general we should have a canonical query, but sometimes we may avoid
-    // creating a canonical query as an optimization (specifically, the update system
-    // does not canonicalize for idhack updates). In these cases, 'query' is NULL.
-    if (NULL != query) {
+    // In general we should have a canonical query, but sometimes we may avoid creating a canonical
+    // query as an optimization (specifically, the update system does not canonicalize for idhack
+    // updates). In these cases, 'query' is NULL.
+    auto query = exec->getCanonicalQuery();
+
+    if (query) {
         BSONObjBuilder parsedQueryBob(plannerBob.subobjStart("parsedQuery"));
-        query->root()->serialize(&parsedQueryBob);
+        query->getPrimaryMatchExpression()->serialize(&parsedQueryBob, {});
         parsedQueryBob.doneFast();
 
         if (query->getCollator()) {
             plannerBob.append("collation", query->getCollator()->getSpec().toBSON());
         }
+
+        // If there exists a matching index filter, set 'indexFilterSet' to false if query settings
+        // set, as they have higher priority.
+        auto& querySettings = query->getExpCtx()->getQuerySettings();
+        if (auto querySettingsBSON = querySettings.toBSON(); !querySettingsBSON.isEmpty()) {
+            plannerBob.append("querySettings", querySettingsBSON);
+            plannerBob.append("indexFilterSet", false);
+        } else {
+            const bool existsMatchingIndexFilter = [&]() {
+                if (!mainCollection) {
+                    return false;
+                }
+                const auto* indexFilters =
+                    QuerySettingsDecoration::get(mainCollection->getSharedDecorations());
+                return indexFilters->getAllowedIndicesFilter(*query).has_value();
+            }();
+            plannerBob.append("indexFilterSet", existsMatchingIndexFilter);
+        }
     }
 
-    if (queryHash) {
-        plannerBob.append("queryHash", unsignedIntToFixedLengthHex(*queryHash));
+    if (planCacheShapeHash) {
+        // TODO SERVER-93305: Remove deprecated 'queryHash' usages.
+        std::string planCacheShapeHashStr = zeroPaddedHex(*planCacheShapeHash);
+        plannerBob.append("queryHash", planCacheShapeHashStr);
+        plannerBob.append("planCacheShapeHash", planCacheShapeHashStr);
     }
 
     if (planCacheKeyHash) {
-        plannerBob.append("planCacheKey", unsignedIntToFixedLengthHex(*planCacheKeyHash));
+        plannerBob.append("planCacheKey", zeroPaddedHex(*planCacheKeyHash));
     }
 
-    BSONObjBuilder winningPlanBob(plannerBob.subobjStart("winningPlan"));
-    const auto winnerStats = getWinningPlanStatsTree(exec);
-    statsToBSON(*winnerStats.get(), &winningPlanBob, ExplainOptions::Verbosity::kQueryPlanner);
-    winningPlanBob.doneFast();
-
-    // Genenerate array of rejected plans.
-    const vector<unique_ptr<PlanStageStats>> rejectedStats = getRejectedPlansTrialStats(exec);
-    BSONArrayBuilder allPlansBob(plannerBob.subarrayStart("rejectedPlans"));
-    for (size_t i = 0; i < rejectedStats.size(); i++) {
-        BSONObjBuilder childBob(allPlansBob.subobjStart());
-        statsToBSON(*rejectedStats[i], &childBob, ExplainOptions::Verbosity::kQueryPlanner);
+    if (exec->getOpCtx() != nullptr) {
+        plannerBob.appendNumber(
+            "optimizationTimeMillis",
+            durationCount<Milliseconds>(CurOp::get(exec->getOpCtx())->debug().planningTime));
     }
-    allPlansBob.doneFast();
 
+    if (!extraInfo.isEmpty()) {
+        plannerBob.appendElements(extraInfo);
+    }
+
+    auto&& explainer = exec->getPlanExplainer();
+    auto&& enumeratorInfo = explainer.getEnumeratorInfo();
+    plannerBob.append("maxIndexedOrSolutionsReached", enumeratorInfo.hitIndexedOrLimit);
+    plannerBob.append("maxIndexedAndSolutionsReached", enumeratorInfo.hitIndexedAndLimit);
+    plannerBob.append("maxScansToExplodeReached", enumeratorInfo.hitScanLimit);
+    plannerBob.append("prunedSimilarIndexes", enumeratorInfo.prunedAnyIndexes);
+
+    auto&& [winningStats, _] =
+        explainer.getWinningPlanStats(ExplainOptions::Verbosity::kQueryPlanner);
+    plannerBob.append("winningPlan", winningStats);
+
+    BSONArrayBuilder bab{plannerBob.subarrayStart("rejectedPlans")};
+    for (auto&& [rejectedStats, _] :
+         explainer.getRejectedPlansStats(ExplainOptions::Verbosity::kQueryPlanner)) {
+        bab.append(rejectedStats);
+    }
+    bab.doneFast();
     plannerBob.doneFast();
 }
 
-// static
-void Explain::generateSinglePlanExecutionInfo(const PlanStageStats* stats,
-                                              ExplainOptions::Verbosity verbosity,
-                                              boost::optional<long long> totalTimeMillis,
-                                              BSONObjBuilder* out) {
-    out->appendNumber("nReturned", stats->common.advanced);
+/**
+ * Generates the execution stats section from the given 'PlanStatsDetails', adding the resulting
+ * BSON document and specific execution metrics to 'out'.
+ *
+ * The 'totalTimeMillis' value passed here will be added to the top level of the execution stats
+ * section, but will not affect the reporting of timing for individual stages. If 'totalTimeMillis'
+ * is not set, we use the approximate timing information collected by the stages.
+ *
+ * The 'isTrialPeriodInfo' value indicates whether the function was called to generate the
+ * stats collected during the trial period of the plan selection phase, i.e is this section being
+ * generated for the 'allPlansExecution' field.
+ *
+ * Stats are generated at the verbosity specified by 'verbosity'.
+ */
+void generateSinglePlanExecutionInfo(const PlanExplainer::PlanStatsDetails& details,
+                                     boost::optional<long long> totalTimeMillis,
+                                     BSONObjBuilder* out,
+                                     bool isTrialPeriodInfo) {
+    auto&& [stats, summary] = details;
+    invariant(summary);
+
+    out->appendNumber("nReturned", static_cast<long long>(summary->nReturned));
 
     // Time elapsed could might be either precise or approximate.
     if (totalTimeMillis) {
         out->appendNumber("executionTimeMillis", *totalTimeMillis);
     } else {
-        out->appendNumber("executionTimeMillisEstimate", stats->common.executionTimeMillis);
+        if (summary->executionTime.precision == QueryExecTimerPrecision::kNanos) {
+            out->appendNumber(
+                "executionTimeMillisEstimate",
+                durationCount<Milliseconds>(summary->executionTime.executionTimeEstimate));
+            out->appendNumber(
+                "executionTimeMicros",
+                durationCount<Microseconds>(summary->executionTime.executionTimeEstimate));
+            out->appendNumber(
+                "executionTimeNanos",
+                durationCount<Nanoseconds>(summary->executionTime.executionTimeEstimate));
+        } else if (summary->executionTime.precision == QueryExecTimerPrecision::kMillis) {
+            out->appendNumber(
+                "executionTimeMillisEstimate",
+                durationCount<Milliseconds>(summary->executionTime.executionTimeEstimate));
+        }
     }
 
-    // Flatten the stats tree into a list.
-    vector<const PlanStageStats*> statsNodes;
-    flattenStatsTree(stats, &statsNodes);
+    out->appendNumber("totalKeysExamined", static_cast<long long>(summary->totalKeysExamined));
+    out->appendNumber("totalDocsExamined", static_cast<long long>(summary->totalDocsExamined));
 
-    // Iterate over all stages in the tree and get the total number of keys/docs examined.
-    // These are just aggregations of information already available in the stats tree.
-    size_t totalKeysExamined = 0;
-    size_t totalDocsExamined = 0;
-    for (size_t i = 0; i < statsNodes.size(); ++i) {
-        totalKeysExamined +=
-            getKeysExamined(statsNodes[i]->stageType, statsNodes[i]->specific.get());
-        totalDocsExamined +=
-            getDocsExamined(statsNodes[i]->stageType, statsNodes[i]->specific.get());
+    if (summary->planFailed) {
+        out->appendBool("failed", true);
     }
 
-    out->appendNumber("totalKeysExamined", totalKeysExamined);
-    out->appendNumber("totalDocsExamined", totalDocsExamined);
+    // Only the scores calculated from the trial period should be outputted alongside each plan
+    // in 'allPlansExecution' and not alongside the winning plan stats in 'executionStats'.
+    if (isTrialPeriodInfo && summary->score) {
+        out->appendNumber("score", *summary->score);
+    }
 
     // Add the tree of stages, with individual execution stats for each stage.
-    BSONObjBuilder stagesBob(out->subobjStart("executionStages"));
-    statsToBSON(*stats, &stagesBob, verbosity);
-    stagesBob.doneFast();
+    out->append("executionStages", stats);
 }
 
-// static
-void Explain::generateServerInfo(BSONObjBuilder* out) {
-    BSONObjBuilder serverBob(out->subobjStart("serverInfo"));
-    out->append("host", getHostNameCached());
-    out->appendNumber("port", serverGlobalParams.port);
-    auto&& vii = VersionInfoInterface::instance();
-    out->append("version", vii.version());
-    out->append("gitVersion", vii.gitVersion());
-    serverBob.doneFast();
-}
-
-std::unique_ptr<PlanStageStats> Explain::getWinningPlanTrialStats(PlanExecutor* exec) {
-    // Inspect the tree to see if there is a MultiPlanStage. Plan selection has already happened at
-    // this point, since we have a PlanExecutor.
-    const auto mps = getMultiPlanStage(exec->getRootStage());
-
-    if (mps) {
-        const auto mpsStats = mps->getStats();
-        return std::move(mpsStats->children[mps->bestPlanIdx()]);
-    }
-
-    return nullptr;
-}
-
-// static
-void Explain::generateExecutionInfo(PlanExecutor* exec,
-                                    ExplainOptions::Verbosity verbosity,
-                                    Status executePlanStatus,
-                                    PlanStageStats* winningPlanTrialStats,
-                                    BSONObjBuilder* out) {
+/**
+ * Adds the "executionStats" field to out. Assumes that the PlanExecutor has already been executed
+ * to the point of reaching EOF. Also assumes that verbosity >= kExecStats.
+ *
+ * If verbosity >= kExecAllPlans, it will include the "allPlansExecution" array.
+ *
+ * - 'execPlanStatus' is OK if the query was exected successfully, or a non-OK status if there
+ *   was a runtime error.
+ */
+void generateExecutionInfo(PlanExecutor* exec,
+                           ExplainOptions::Verbosity verbosity,
+                           Status executePlanStatus,
+                           boost::optional<PlanExplainer::PlanStatsDetails> winningPlanTrialStats,
+                           BSONObjBuilder* out) {
     invariant(verbosity >= ExplainOptions::Verbosity::kExecStats);
-    if (verbosity >= ExplainOptions::Verbosity::kExecAllPlans &&
-        findStageOfType(exec->getRootStage(), STAGE_MULTI_PLAN) != nullptr) {
+
+    auto&& explainer = exec->getPlanExplainer();
+
+    if (verbosity >= ExplainOptions::Verbosity::kExecAllPlans && explainer.isMultiPlan()) {
         invariant(winningPlanTrialStats,
-                  "winningPlanTrialStats must be non-null when requesting all execution stats");
+                  "winningPlanTrialStats must be present when requesting all execution stats");
     }
     BSONObjBuilder execBob(out->subobjStart("executionStats"));
 
-    // If there is an execution error while running the query, the error is reported under
-    // the "executionStats" section and the explain as a whole succeeds.
+    // If there is an execution error while running the query, the error is reported under the
+    // "executionStats" section and the explain as a whole succeeds.
     execBob.append("executionSuccess", executePlanStatus.isOK());
     if (!executePlanStatus.isOK()) {
         execBob.append("errorMessage", executePlanStatus.reason());
@@ -788,257 +281,292 @@ void Explain::generateExecutionInfo(PlanExecutor* exec,
     }
 
     // Generate exec stats BSON for the winning plan.
-    OperationContext* opCtx = exec->getOpCtx();
-    long long totalTimeMillis = durationCount<Milliseconds>(CurOp::get(opCtx)->elapsedTimeTotal());
-    const auto winningExecStats = getWinningPlanStatsTree(exec);
-    generateSinglePlanExecutionInfo(winningExecStats.get(), verbosity, totalTimeMillis, &execBob);
+    auto opCtx = exec->getOpCtx();
+    auto totalTimeMillis = durationCount<Milliseconds>(CurOp::get(opCtx)->elapsedTimeTotal());
+    generateSinglePlanExecutionInfo(explainer.getWinningPlanStats(verbosity),
+                                    totalTimeMillis,
+                                    &execBob,
+                                    false /* isTrialPeriodInfo */);
 
-    // Also generate exec stats for all plans, if the verbosity level is high enough.
-    // These stats reflect what happened during the trial period that ranked the plans.
+    // Also generate exec stats for all plans, if the verbosity level is high enough. These stats
+    // reflect what happened during the trial period that ranked the plans.
     if (verbosity >= ExplainOptions::Verbosity::kExecAllPlans) {
-        // If we ranked multiple plans against each other, then add stats collected
-        // from the trial period of the winning plan. The "allPlansExecution" section
-        // will contain an apples-to-apples comparison of the winning plan's stats against
-        // all rejected plans' stats collected during the trial period.
-
+        // If we ranked multiple plans against each other, then add stats collected from the trial
+        // period of the winning plan. The "allPlansExecution" section will contain an
+        // apples-to-apples comparison of the winning plan's stats against all rejected plans' stats
+        // collected during the trial period.
         BSONArrayBuilder allPlansBob(execBob.subarrayStart("allPlansExecution"));
 
-        if (winningPlanTrialStats) {
+        // If the winning plan was uncontested, leave the `allPlansExecution` array empty.
+        if (explainer.isMultiPlan()) {
             BSONObjBuilder planBob(allPlansBob.subobjStart());
             generateSinglePlanExecutionInfo(
-                winningPlanTrialStats, verbosity, boost::none, &planBob);
+                *winningPlanTrialStats, boost::none, &planBob, true /* isTrialPeriodInfo */);
             planBob.doneFast();
-        }
 
-        const vector<unique_ptr<PlanStageStats>> rejectedStats = getRejectedPlansTrialStats(exec);
-        for (size_t i = 0; i < rejectedStats.size(); ++i) {
-            BSONObjBuilder planBob(allPlansBob.subobjStart());
-            generateSinglePlanExecutionInfo(
-                rejectedStats[i].get(), verbosity, boost::none, &planBob);
-            planBob.doneFast();
+            for (auto&& stats : explainer.getRejectedPlansStats(verbosity)) {
+                BSONObjBuilder planBob(allPlansBob.subobjStart());
+                generateSinglePlanExecutionInfo(
+                    stats, boost::none, &planBob, true /* isTrialPeriodInfo */);
+                planBob.doneFast();
+            }
         }
-
         allPlansBob.doneFast();
     }
-
     execBob.doneFast();
 }
 
+/**
+ * Executes the given plan executor, discarding the resulting documents, until it reaches EOF. If a
+ * runtime error occur or execution is killed, throws a DBException.
+ *
+ * If 'exec' is configured for yielding, then a call to this helper could result in a yield.
+ */
+void executePlan(PlanExecutor* exec) {
+    // Using 'getNextBatch()' rather than 'getNext()' means we iterate the PlanExecutor in a tighter
+    // loop. We are passing a null callback function because explain wishes to simply discard the
+    // query result set.
+    (void)exec->getNextBatch(std::numeric_limits<int64_t>::max(), nullptr);
+}
+
+/**
+ * Returns a BSON document in the form of {explainVersion: <version>} with the 'version' parameter
+ * serialized into the <version> element.
+ */
+BSONObj explainVersionToBson(const PlanExplainer::ExplainVersion& version) {
+    return BSON("explainVersion" << version);
+}
+
+template <typename EntryType>
+void appendBasicPlanCacheEntryInfoToBSON(const EntryType& entry, BSONObjBuilder* out) {
+    // TODO SERVER-93305: Remove deprecated 'queryHash' usages.
+    std::string planCacheShapeHashStr = zeroPaddedHex(entry.planCacheShapeHash);
+    out->append("queryHash", planCacheShapeHashStr);
+    out->append("planCacheShapeHash", planCacheShapeHashStr);
+    out->append("planCacheKey", zeroPaddedHex(entry.planCacheKey));
+    out->append("isActive", entry.isActive);
+    out->append("works",
+                static_cast<long long>(entry.readsOrWorks ? entry.readsOrWorks->rawValue() : 0));
+    if (entry.readsOrWorks) {
+        out->append("worksType", entry.readsOrWorks->type());
+    }
+    out->append("timeOfCreation", entry.timeOfCreation);
+
+    if (entry.securityLevel == PlanSecurityLevel::kSensitive) {
+        out->append("securityLevel", entry.securityLevel);
+    }
+}
+}  // namespace
+
 void Explain::explainStages(PlanExecutor* exec,
-                            const Collection* collection,
+                            const MultipleCollectionAccessor& collections,
                             ExplainOptions::Verbosity verbosity,
                             Status executePlanStatus,
-                            PlanStageStats* winningPlanTrialStats,
+                            boost::optional<PlanExplainer::PlanStatsDetails> winningPlanTrialStats,
+                            BSONObj extraInfo,
+                            const SerializationContext& serializationContext,
+                            const BSONObj& command,
                             BSONObjBuilder* out) {
     //
     // Use the stats trees to produce explain BSON.
     //
 
+    auto&& explainer = exec->getPlanExplainer();
+    out->appendElements(explainVersionToBson(explainer.getVersion()));
+
     if (verbosity >= ExplainOptions::Verbosity::kQueryPlanner) {
-        generatePlannerInfo(exec, collection, out);
+        generatePlannerInfo(exec, command, collections, extraInfo, serializationContext, out);
     }
 
     if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
         generateExecutionInfo(exec, verbosity, executePlanStatus, winningPlanTrialStats, out);
     }
+
+    explain_common::generateQueryShapeHash(exec->getOpCtx(), out);
+    explain_common::appendIfRoom(command, "command", out);
 }
 
-// static
-void Explain::explainPipelineExecutor(PlanExecutor* exec,
-                                      ExplainOptions::Verbosity verbosity,
-                                      BSONObjBuilder* out) {
+void Explain::explainPipeline(PlanExecutor* exec,
+                              bool executePipeline,
+                              ExplainOptions::Verbosity verbosity,
+                              const BSONObj& command,
+                              BSONObjBuilder* out) {
+    invariant(exec);
     invariant(out);
 
-    PipelineProxyStage* pps = getPipelineProxyStage(exec->getRootStage());
-    invariant(pps, "Expected exec's root stage to be a PipelineProxyStage");
+    auto pipelineExec = dynamic_cast<PlanExecutorPipeline*>(exec);
+    invariant(pipelineExec);
 
     // If we need execution stats, this runs the plan in order to gather the stats.
-    if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
+    if (verbosity >= ExplainOptions::Verbosity::kExecStats && executePipeline) {
         // TODO SERVER-32732: An execution error should be reported in explain, but should not
         // cause the explain itself to fail.
-        uassertStatusOK(exec->executePlan());
+        executePlan(pipelineExec);
     }
 
-    *out << "stages" << Value(pps->writeExplainOps(verbosity));
+    auto&& explainer = pipelineExec->getPlanExplainer();
+    out->appendElements(explainVersionToBson(explainer.getVersion()));
+    *out << "stages" << Value(pipelineExec->writeExplainOps(verbosity));
+
+    explain_common::generateQueryShapeHash(exec->getOpCtx(), out);
+    explain_common::generateMaxUsedMemBytes(exec->getOpCtx(), out);
+    explain_common::generateServerInfo(out);
+
+    auto* cq = exec->getCanonicalQuery();
+    const auto& expCtx = cq
+        ? cq->getExpCtx()
+        : ExpressionContext::makeBlankExpressionContext(exec->getOpCtx(), exec->nss());
+    explain_common::generateServerParameters(expCtx, out);
+    explain_common::appendIfRoom(command, "command", out);
 }
 
-// static
 void Explain::explainStages(PlanExecutor* exec,
-                            const Collection* collection,
+                            const MultipleCollectionAccessor& collections,
                             ExplainOptions::Verbosity verbosity,
+                            BSONObj extraInfo,
+                            const SerializationContext& serializationContext,
+                            const BSONObj& command,
                             BSONObjBuilder* out) {
-    auto winningPlanTrialStats = Explain::getWinningPlanTrialStats(exec);
-
+    auto&& explainer = exec->getPlanExplainer();
+    auto winningPlanTrialStats = explainer.getWinningPlanTrialStats();
     Status executePlanStatus = Status::OK();
+    const MultipleCollectionAccessor* collectionsPtr = &collections;
 
     // If we need execution stats, then run the plan in order to gather the stats.
+    const MultipleCollectionAccessor emptyCollections;
     if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
-        executePlanStatus = exec->executePlan();
+        try {
+            executePlan(exec);
+        } catch (const DBException&) {
+            executePlanStatus = exceptionToStatus();
+        }
 
-        // If executing the query failed because it was killed, then the collection may no longer be
-        // valid. We indicate this by setting our collection pointer to null.
-        if (executePlanStatus == ErrorCodes::QueryPlanKilled) {
-            collection = nullptr;
+        // If executing the query failed, for any number of reasons other than a planning failure,
+        // then the collection may no longer be valid. We conservatively set our collection pointer
+        // to null in case it is invalid.
+        if (!executePlanStatus.isOK() && executePlanStatus != ErrorCodes::NoQueryExecutionPlans) {
+            collectionsPtr = &emptyCollections;
         }
     }
 
-    explainStages(exec, collection, verbosity, executePlanStatus, winningPlanTrialStats.get(), out);
+    explainStages(exec,
+                  *collectionsPtr,
+                  verbosity,
+                  executePlanStatus,
+                  winningPlanTrialStats,
+                  extraInfo,
+                  serializationContext,
+                  command,
+                  out);
 
-    generateServerInfo(out);
+    explain_common::generateServerInfo(out);
+    auto* cq = exec->getCanonicalQuery();
+    const auto& expCtx = cq
+        ? cq->getExpCtx()
+        : ExpressionContext::makeBlankExpressionContext(exec->getOpCtx(), exec->nss());
+    explain_common::generateServerParameters(expCtx, out);
 }
 
-// static
-std::string Explain::getPlanSummary(const PlanExecutor* exec) {
-    return getPlanSummary(exec->getRootStage());
+void Explain::explainStages(PlanExecutor* exec,
+                            const CollectionPtr& collection,
+                            ExplainOptions::Verbosity verbosity,
+                            BSONObj extraInfo,
+                            const SerializationContext& serializationContext,
+                            const BSONObj& command,
+                            BSONObjBuilder* out) {
+    explainStages(exec,
+                  MultipleCollectionAccessor(collection),
+                  verbosity,
+                  extraInfo,
+                  serializationContext,
+                  command,
+                  out);
 }
 
-// static
-std::string Explain::getPlanSummary(const PlanStage* root) {
-    if (root->stageType() == STAGE_PIPELINE_PROXY) {
-        auto pipelineProxy = static_cast<const PipelineProxyStage*>(root);
-        return pipelineProxy->getPlanSummaryStr();
-    }
-
-    std::vector<const PlanStage*> stages;
-    flattenExecTree(root, &stages);
-
-    // Use this stream to build the plan summary string.
-    StringBuilder sb;
-    bool seenLeaf = false;
-
-    for (size_t i = 0; i < stages.size(); i++) {
-        if (stages[i]->getChildren().empty()) {
-            // This is a leaf node. Add to the plan summary string accordingly. Unless
-            // this is the first leaf we've seen, add a delimiting string first.
-            if (seenLeaf) {
-                sb << ", ";
-            } else {
-                seenLeaf = true;
-            }
-            addStageSummaryStr(stages[i], sb);
-        }
-    }
-
-    return sb.str();
-}
-
-// static
-void Explain::getSummaryStats(const PlanExecutor& exec, PlanSummaryStats* statsOut) {
-    invariant(NULL != statsOut);
-
-    PlanStage* root = exec.getRootStage();
-
-    if (root->stageType() == STAGE_PIPELINE_PROXY) {
-        auto pipelineProxy = static_cast<PipelineProxyStage*>(root);
-        pipelineProxy->getPlanSummaryStats(statsOut);
-        return;
-    }
-
-    // We can get some of the fields we need from the common stats stored in the
-    // root stage of the plan tree.
-    const CommonStats* common = root->getCommonStats();
-    statsOut->nReturned = common->advanced;
-    statsOut->executionTimeMillis = common->executionTimeMillis;
-
-    // The other fields are aggregations over the stages in the plan tree. We flatten
-    // the tree into a list and then compute these aggregations.
-    std::vector<const PlanStage*> stages;
-    flattenExecTree(root, &stages);
-
-    statsOut->totalKeysExamined = 0;
-    statsOut->totalDocsExamined = 0;
-
-    for (size_t i = 0; i < stages.size(); i++) {
-        statsOut->totalKeysExamined +=
-            getKeysExamined(stages[i]->stageType(), stages[i]->getSpecificStats());
-        statsOut->totalDocsExamined +=
-            getDocsExamined(stages[i]->stageType(), stages[i]->getSpecificStats());
-
-        if (STAGE_SORT == stages[i]->stageType()) {
-            statsOut->hasSortStage = true;
-        }
-
-        if (STAGE_IXSCAN == stages[i]->stageType()) {
-            const IndexScan* ixscan = static_cast<const IndexScan*>(stages[i]);
-            const IndexScanStats* ixscanStats =
-                static_cast<const IndexScanStats*>(ixscan->getSpecificStats());
-            statsOut->indexesUsed.insert(ixscanStats->indexName);
-        } else if (STAGE_COUNT_SCAN == stages[i]->stageType()) {
-            const CountScan* countScan = static_cast<const CountScan*>(stages[i]);
-            const CountScanStats* countScanStats =
-                static_cast<const CountScanStats*>(countScan->getSpecificStats());
-            statsOut->indexesUsed.insert(countScanStats->indexName);
-        } else if (STAGE_IDHACK == stages[i]->stageType()) {
-            const IDHackStage* idHackStage = static_cast<const IDHackStage*>(stages[i]);
-            const IDHackStats* idHackStats =
-                static_cast<const IDHackStats*>(idHackStage->getSpecificStats());
-            statsOut->indexesUsed.insert(idHackStats->indexName);
-        } else if (STAGE_DISTINCT_SCAN == stages[i]->stageType()) {
-            const DistinctScan* distinctScan = static_cast<const DistinctScan*>(stages[i]);
-            const DistinctScanStats* distinctScanStats =
-                static_cast<const DistinctScanStats*>(distinctScan->getSpecificStats());
-            statsOut->indexesUsed.insert(distinctScanStats->indexName);
-        } else if (STAGE_TEXT == stages[i]->stageType()) {
-            const TextStage* textStage = static_cast<const TextStage*>(stages[i]);
-            const TextStats* textStats =
-                static_cast<const TextStats*>(textStage->getSpecificStats());
-            statsOut->indexesUsed.insert(textStats->indexName);
-        } else if (STAGE_GEO_NEAR_2D == stages[i]->stageType() ||
-                   STAGE_GEO_NEAR_2DSPHERE == stages[i]->stageType()) {
-            const NearStage* nearStage = static_cast<const NearStage*>(stages[i]);
-            const NearStats* nearStats =
-                static_cast<const NearStats*>(nearStage->getSpecificStats());
-            statsOut->indexesUsed.insert(nearStats->indexName);
-        } else if (STAGE_CACHED_PLAN == stages[i]->stageType()) {
-            const CachedPlanStage* cachedPlan = static_cast<const CachedPlanStage*>(stages[i]);
-            const CachedPlanStats* cachedStats =
-                static_cast<const CachedPlanStats*>(cachedPlan->getSpecificStats());
-            statsOut->replanned = cachedStats->replanned;
-        } else if (STAGE_MULTI_PLAN == stages[i]->stageType()) {
-            statsOut->fromMultiPlanner = true;
-        }
-    }
+void Explain::explainStages(PlanExecutor* exec,
+                            const CollectionAcquisition& collection,
+                            ExplainOptions::Verbosity verbosity,
+                            BSONObj extraInfo,
+                            const SerializationContext& serializationContext,
+                            const BSONObj& command,
+                            BSONObjBuilder* out) {
+    explainStages(exec,
+                  MultipleCollectionAccessor(collection),
+                  verbosity,
+                  extraInfo,
+                  serializationContext,
+                  command,
+                  out);
 }
 
 void Explain::planCacheEntryToBSON(const PlanCacheEntry& entry, BSONObjBuilder* out) {
-    BSONObjBuilder shapeBuilder(out->subobjStart("createdFromQuery"));
-    shapeBuilder.append("query", entry.query);
-    shapeBuilder.append("sort", entry.sort);
-    shapeBuilder.append("projection", entry.projection);
-    if (!entry.collation.isEmpty()) {
-        shapeBuilder.append("collation", entry.collation);
+    out->append("version", "1");
+
+    appendBasicPlanCacheEntryInfoToBSON(entry, out);
+
+    if (entry.debugInfo) {
+        const auto& debugInfo = *entry.debugInfo;
+        invariant(debugInfo.decision);
+
+        // Add the 'createdFromQuery' object.
+        {
+            const auto& createdFromQuery = entry.debugInfo->createdFromQuery;
+            BSONObjBuilder shapeBuilder(out->subobjStart("createdFromQuery"));
+            shapeBuilder.append("query", createdFromQuery.filter);
+            shapeBuilder.append("sort", createdFromQuery.sort);
+            shapeBuilder.append("projection", createdFromQuery.projection);
+            if (!createdFromQuery.collation.isEmpty()) {
+                shapeBuilder.append("collation", createdFromQuery.collation);
+            }
+            if (!createdFromQuery.distinct.isEmpty()) {
+                shapeBuilder.append("distinct", createdFromQuery.distinct);
+            }
+        }
+
+        auto plannerStats = getCachedPlanStats(debugInfo, ExplainOptions::Verbosity::kQueryPlanner);
+        auto execStats = getCachedPlanStats(debugInfo, ExplainOptions::Verbosity::kExecStats);
+
+        invariant(plannerStats.size() > 0);
+        out->append("cachedPlan", plannerStats[0].first);
+
+        BSONArrayBuilder creationBuilder(out->subarrayStart("creationExecStats"));
+        for (auto&& stats : execStats) {
+            BSONObjBuilder planBob(creationBuilder.subobjStart());
+            generateSinglePlanExecutionInfo(
+                stats, boost::none, &planBob, false /* isTrialPeriodInfo */);
+            planBob.doneFast();
+        }
+        creationBuilder.doneFast();
+
+        BSONArrayBuilder scoresBuilder(out->subarrayStart("candidatePlanScores"));
+        for (double score : debugInfo.decision->scores) {
+            scoresBuilder.append(score);
+        }
+
+        std::for_each(debugInfo.decision->failedCandidates.begin(),
+                      debugInfo.decision->failedCandidates.end(),
+                      [&scoresBuilder](const auto&) { scoresBuilder.append(0.0); });
+        scoresBuilder.doneFast();
     }
-    shapeBuilder.doneFast();
-    out->append("queryHash", unsignedIntToFixedLengthHex(entry.queryHash));
-    out->append("planCacheKey", unsignedIntToFixedLengthHex(entry.planCacheKey));
 
-    // Append whether or not the entry is active.
-    out->append("isActive", entry.isActive);
-    out->append("works", static_cast<long long>(entry.works));
+    out->append("indexFilterSet", entry.cachedPlan->indexFilterApplied);
 
-    BSONObjBuilder cachedPlanBob(out->subobjStart("cachedPlan"));
-    Explain::statsToBSON(
-        *entry.decision->stats[0], &cachedPlanBob, ExplainOptions::Verbosity::kQueryPlanner);
-    cachedPlanBob.doneFast();
-
-    out->append("timeOfCreation", entry.timeOfCreation);
-
-    BSONArrayBuilder creationBuilder(out->subarrayStart("creationExecStats"));
-    for (auto&& stat : entry.decision->stats) {
-        BSONObjBuilder planBob(creationBuilder.subobjStart());
-        Explain::generateSinglePlanExecutionInfo(
-            stat.get(), ExplainOptions::Verbosity::kExecAllPlans, boost::none, &planBob);
-        planBob.doneFast();
-    }
-    creationBuilder.doneFast();
-
-    BSONArrayBuilder scoresBuilder(out->subarrayStart("candidatePlanScores"));
-    for (double score : entry.decision->scores) {
-        scoresBuilder.append(score);
-    }
-    scoresBuilder.doneFast();
-
-    out->append("indexFilterSet", entry.plannerData[0]->indexFilterApplied);
+    out->append("estimatedSizeBytes", static_cast<long long>(entry.estimatedEntrySizeBytes));
+    out->append("solutionHash", static_cast<long long>(entry.cachedPlan->solutionHash));
 }
 
+void Explain::planCacheEntryToBSON(const sbe::PlanCacheEntry& entry, BSONObjBuilder* out) {
+    out->append("version", "2");
+
+    appendBasicPlanCacheEntryInfoToBSON(entry, out);
+
+    out->append("cachedPlan",
+                BSON("slots" << entry.cachedPlan->planStageData.debugString() << "stages"
+                             << sbe::DebugPrinter().print(*entry.cachedPlan->root)));
+
+    out->append("indexFilterSet", entry.cachedPlan->indexFilterApplied);
+    out->append("isPinned", entry.isPinned());
+    out->append("estimatedSizeBytes", static_cast<long long>(entry.estimatedEntrySizeBytes));
+    out->append("solutionHash", static_cast<long long>(entry.cachedPlan->solutionHash));
+}
 }  // namespace mongo

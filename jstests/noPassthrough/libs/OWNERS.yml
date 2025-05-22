@@ -1,0 +1,11 @@
+version: 1.0.0
+filters:
+  - "*server_parameter*":
+    approvers:
+      - 10gen/server-programmability
+  - "*change_stream*":
+    approvers:
+      - 10gen/query-execution-change-streams
+  - "*proxy_protocol*":
+    approvers:
+      - 10gen/server-networking-and-observability

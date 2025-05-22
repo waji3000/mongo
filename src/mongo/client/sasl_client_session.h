@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,13 +29,13 @@
 
 #pragma once
 
+#include <cstddef>
+#include <functional>
 #include <memory>
 #include <string>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/status.h"
 #include "mongo/base/string_data.h"
-#include "mongo/stdx/functional.h"
 
 namespace mongo {
 
@@ -54,10 +53,11 @@ namespace mongo {
  * parameterPassword parameter is not constrained.
  */
 class SaslClientSession {
-    MONGO_DISALLOW_COPYING(SaslClientSession);
+    SaslClientSession(const SaslClientSession&) = delete;
+    SaslClientSession& operator=(const SaslClientSession&) = delete;
 
 public:
-    typedef stdx::function<SaslClientSession*(const std::string&)> SaslClientSessionFactoryFn;
+    typedef std::function<SaslClientSession*(const std::string&)> SaslClientSessionFactoryFn;
     static SaslClientSessionFactoryFn create;
 
     /**
@@ -70,6 +70,8 @@ public:
         parameterMechanism,
         parameterUser,
         parameterPassword,
+        parameterAWSSessionToken,
+        parameterOIDCAccessToken,
         numParameters  // Must be last
     };
 
@@ -122,16 +124,16 @@ public:
      * authentication, though the specific return value may provide insight into the cause of
      * the failure (e.g., ProtocolError, AuthenticationFailed).
      *
-     * In the event that this method returns Status::OK(), consult the value of isDone() to
-     * determine if the conversation has completed.  When step() returns Status::OK() and
-     * isDone() returns true, authentication has completed successfully.
+     * In the event that this method does not return Status::OK(), authentication has failed.
+     * When step() returns Status::OK() and isSuccess() returns true,
+     * authentication has completed successfully.
      */
     virtual Status step(StringData inputData, std::string* outputData) = 0;
 
     /**
      * Returns true if the authentication completed successfully.
      */
-    virtual bool isDone() const = 0;
+    virtual bool isSuccess() const = 0;
 
 private:
     /**

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,6 +27,37 @@
  *    it in the license file.
  */
 
-#include "mongo/base/init.h"
+#include "mongo/base/init.h"  // IWYU pragma: keep
 
-MONGO_INITIALIZER_GROUP(default, MONGO_NO_PREREQUISITES, MONGO_NO_DEPENDENTS)
+#include <cstdlib>
+#include <iostream>
+#include <utility>
+
+#include "mongo/base/initializer.h"
+#include "mongo/util/assert_util.h"
+
+namespace mongo {
+
+GlobalInitializerRegisterer::GlobalInitializerRegisterer(std::string name,
+                                                         InitializerFunction initFn,
+                                                         DeinitializerFunction deinitFn,
+                                                         std::vector<std::string> prerequisites,
+                                                         std::vector<std::string> dependents) {
+    try {
+        getGlobalInitializer().addInitializer(std::move(name),
+                                              std::move(initFn),
+                                              std::move(deinitFn),
+                                              std::move(prerequisites),
+                                              std::move(dependents));
+    } catch (const DBException& ex) {
+        std::cerr << "Attempt to add global initializer failed, status: " << ex.toString()
+                  << std::endl;
+        ::abort();
+    }
+}
+
+namespace {
+GlobalInitializerRegisterer defaultInitializerRegisterer("default", [](auto) {}, nullptr, {}, {});
+}  // namespace
+
+}  // namespace mongo

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,10 +29,15 @@
 
 #pragma once
 
+#include "mongo/db/namespace_string.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
 #include <string>
 
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
-#include "mongo/s/shard_id.h"
+#include "mongo/db/shard_id.h"
 #include "mongo/util/timer.h"
 
 namespace mongo {
@@ -45,14 +49,25 @@ class MoveTimingHelper {
 public:
     MoveTimingHelper(OperationContext* opCtx,
                      const std::string& where,
-                     const std::string& ns,
-                     const BSONObj& min,
-                     const BSONObj& max,
+                     const NamespaceString& ns,
+                     const boost::optional<BSONObj>& min,
+                     const boost::optional<BSONObj>& max,
                      int totalNumSteps,
-                     std::string* cmdErrmsg,
                      const ShardId& toShard,
                      const ShardId& fromShard);
     ~MoveTimingHelper();
+
+    void setMin(const BSONObj& min) {
+        _min.emplace(min);
+    }
+
+    void setMax(const BSONObj& max) {
+        _max.emplace(max);
+    }
+
+    void setCmdErrMsg(std::string cmdErrMsg) {
+        _cmdErrmsg = std::move(cmdErrMsg);
+    }
 
     void done(int step);
 
@@ -62,11 +77,13 @@ private:
 
     OperationContext* const _opCtx;
     const std::string _where;
-    const std::string _ns;
+    const NamespaceString _ns;
     const ShardId _to;
     const ShardId _from;
+
+    boost::optional<BSONObj> _min, _max;
     const int _totalNumSteps;
-    const std::string* _cmdErrmsg;
+    std::string _cmdErrmsg;
 
     int _nextStep;
     BSONObjBuilder _b;

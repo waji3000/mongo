@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,25 +27,31 @@
  *    it in the license file.
  */
 
+#include <boost/optional/optional.hpp>
+// IWYU pragma: no_include "ext/alloc_traits.h"
 #include <algorithm>
+#include <cstddef>
+#include <cstdint>
+#include <iterator>
+#include <span>
 #include <stack>
 #include <string>
 
-#include "mongo/idl/idl_parser.h"
-
+#include "mongo/base/error_codes.h"
 #include "mongo/bson/bsonobjbuilder.h"
-#include "mongo/db/command_generic_argument.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/idl/idl_parser.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
 namespace {
+
 /**
  * For a vector of BSONType, return a string of comma separated names.
  *
  * Example: "string, bool, numberDouble"
  */
-std::string toCommaDelimitedList(const std::vector<BSONType>& types) {
+std::string toCommaDelimitedList(std::span<const BSONType> types) {
     str::stream builder;
 
     for (std::size_t i = 0; i < types.size(); ++i) {
@@ -62,11 +67,11 @@ std::string toCommaDelimitedList(const std::vector<BSONType>& types) {
 
 }  // namespace
 
-constexpr StringData IDLParserErrorContext::kOpMsgDollarDBDefault;
-constexpr StringData IDLParserErrorContext::kOpMsgDollarDB;
+constexpr StringData IDLParserContext::kOpMsgDollarDBDefault;
+constexpr StringData IDLParserContext::kOpMsgDollarDB;
+constexpr auto collectionlessAggregateCursorCol = "$cmd.aggregate"_sd;
 
-bool IDLParserErrorContext::checkAndAssertTypeSlowPath(const BSONElement& element,
-                                                       BSONType type) const {
+bool IDLParserContext::checkAndAssertTypeSlowPath(const BSONElement& element, BSONType type) const {
     auto elementType = element.type();
 
     // If the type is wrong, ignore Null and Undefined values
@@ -77,14 +82,12 @@ bool IDLParserErrorContext::checkAndAssertTypeSlowPath(const BSONElement& elemen
     std::string path = getElementPath(element);
     uasserted(ErrorCodes::TypeMismatch,
               str::stream() << "BSON field '" << path << "' is the wrong type '"
-                            << typeName(elementType)
-                            << "', expected type '"
-                            << typeName(type)
+                            << typeName(elementType) << "', expected type '" << typeName(type)
                             << "'");
 }
 
-bool IDLParserErrorContext::checkAndAssertBinDataTypeSlowPath(const BSONElement& element,
-                                                              BinDataType type) const {
+bool IDLParserContext::checkAndAssertBinDataTypeSlowPath(const BSONElement& element,
+                                                         BinDataType type) const {
     bool isBinDataType = checkAndAssertType(element, BinData);
     if (!isBinDataType) {
         return false;
@@ -93,18 +96,16 @@ bool IDLParserErrorContext::checkAndAssertBinDataTypeSlowPath(const BSONElement&
     if (element.binDataType() != type) {
         std::string path = getElementPath(element);
         uasserted(ErrorCodes::TypeMismatch,
-                  str::stream() << "BSON field '" << path << "' is the wrong bindData type '"
-                                << typeName(element.binDataType())
-                                << "', expected type '"
-                                << typeName(type)
-                                << "'");
+                  str::stream() << "BSON field '" << path << "' is the wrong binData type '"
+                                << typeName(element.binDataType()) << "', expected type '"
+                                << typeName(type) << "'");
     }
 
     return true;
 }
 
-bool IDLParserErrorContext::checkAndAssertTypes(const BSONElement& element,
-                                                const std::vector<BSONType>& types) const {
+bool IDLParserContext::checkAndAssertTypes(const BSONElement& element,
+                                           std::span<const BSONType> types) const {
     auto elementType = element.type();
 
     auto pos = std::find(types.begin(), types.end(), elementType);
@@ -114,25 +115,18 @@ bool IDLParserErrorContext::checkAndAssertTypes(const BSONElement& element,
             return false;
         }
 
-        std::string path = getElementPath(element);
-        std::string type_str = toCommaDelimitedList(types);
-        uasserted(ErrorCodes::TypeMismatch,
-                  str::stream() << "BSON field '" << path << "' is the wrong type '"
-                                << typeName(element.type())
-                                << "', expected types '["
-                                << type_str
-                                << "']");
+        throwBadType(element, types);
     }
 
     return true;
 }
 
 
-std::string IDLParserErrorContext::getElementPath(const BSONElement& element) const {
+std::string IDLParserContext::getElementPath(const BSONElement& element) const {
     return getElementPath(element.fieldNameStringData());
 }
 
-std::string IDLParserErrorContext::getElementPath(StringData fieldName) const {
+std::string IDLParserContext::getElementPath(StringData fieldName) const {
     if (_predecessor == nullptr) {
         str::stream builder;
 
@@ -152,7 +146,7 @@ std::string IDLParserErrorContext::getElementPath(StringData fieldName) const {
 
         pieces.push(_currentField);
 
-        const IDLParserErrorContext* head = _predecessor;
+        const IDLParserContext* head = _predecessor;
         while (head) {
             pieces.push(head->_currentField);
             head = head->_predecessor;
@@ -173,87 +167,121 @@ std::string IDLParserErrorContext::getElementPath(StringData fieldName) const {
     }
 }
 
-void IDLParserErrorContext::throwDuplicateField(StringData fieldName) const {
+void IDLParserContext::throwDuplicateField(StringData fieldName) const {
     std::string path = getElementPath(fieldName);
-    uasserted(40413, str::stream() << "BSON field '" << path << "' is a duplicate field");
+    uasserted(ErrorCodes::IDLDuplicateField,
+              str::stream() << "BSON field '" << path << "' is a duplicate field");
 }
 
-void IDLParserErrorContext::throwDuplicateField(const BSONElement& element) const {
+void IDLParserContext::throwDuplicateField(const BSONElement& element) const {
     throwDuplicateField(element.fieldNameStringData());
 }
 
-void IDLParserErrorContext::throwMissingField(StringData fieldName) const {
+void IDLParserContext::throwMissingField(StringData fieldName) const {
     std::string path = getElementPath(fieldName);
-    uasserted(40414,
+    uasserted(ErrorCodes::IDLFailedToParse,
               str::stream() << "BSON field '" << path << "' is missing but a required field");
 }
 
-void IDLParserErrorContext::throwUnknownField(StringData fieldName) const {
+bool isMongocryptdArgument(StringData arg) {
+    return arg == "jsonSchema"_sd;
+}
+
+void IDLParserContext::throwUnknownField(StringData fieldName) const {
     std::string path = getElementPath(fieldName);
-    uasserted(40415, str::stream() << "BSON field '" << path << "' is an unknown field.");
-}
-
-void IDLParserErrorContext::throwBadArrayFieldNumberValue(StringData value) const {
-    std::string path = getElementPath(StringData());
-    uasserted(40422,
-              str::stream() << "BSON array field '" << path << "' has an invalid value '" << value
-                            << "' for an array field name.");
-}
-
-void IDLParserErrorContext::throwBadArrayFieldNumberSequence(std::uint32_t actualValue,
-                                                             std::uint32_t expectedValue) const {
-    std::string path = getElementPath(StringData());
-    uasserted(40423,
-              str::stream() << "BSON array field '" << path << "' has a non-sequential value '"
-                            << actualValue
-                            << "' for an array field name, expected value '"
-                            << expectedValue
-                            << "'.");
-}
-
-void IDLParserErrorContext::throwBadEnumValue(int enumValue) const {
-    std::string path = getElementPath(StringData());
-    uasserted(ErrorCodes::BadValue,
-              str::stream() << "Enumeration value '" << enumValue << "' for field '" << path
-                            << "' is not a valid value.");
-}
-
-void IDLParserErrorContext::throwBadEnumValue(StringData enumValue) const {
-    std::string path = getElementPath(StringData());
-    uasserted(ErrorCodes::BadValue,
-              str::stream() << "Enumeration value '" << enumValue << "' for field '" << path
-                            << "' is not a valid value.");
-}
-
-NamespaceString IDLParserErrorContext::parseNSCollectionRequired(StringData dbName,
-                                                                 const BSONElement& element) {
-    uassert(ErrorCodes::BadValue,
-            str::stream() << "collection name has invalid type " << typeName(element.type()),
-            element.canonicalType() == canonicalizeBSONType(mongo::String));
-
-    const NamespaceString nss(dbName, element.valueStringData());
-
-    uassert(ErrorCodes::InvalidNamespace,
-            str::stream() << "Invalid namespace specified '" << nss.ns() << "'",
-            nss.isValid());
-
-    return nss;
-}
-
-void IDLParserErrorContext::appendGenericCommandArguments(
-    const BSONObj& commandPassthroughFields,
-    const std::vector<StringData>& knownFields,
-    BSONObjBuilder* builder) {
-
-    for (const auto& element : commandPassthroughFields) {
-
-        StringData name = element.fieldNameStringData();
-        // Include a passthrough field as long the IDL class has not defined it.
-        if (mongo::isGenericArgument(name) &&
-            std::find(knownFields.begin(), knownFields.end(), name) == knownFields.end()) {
-            builder->append(element);
-        }
+    if (isMongocryptdArgument(fieldName)) {
+        uasserted(
+            ErrorCodes::IDLUnknownFieldPossibleMongocryptd,
+            str::stream()
+                << "BSON field '" << path
+                << "' is an unknown field. This command may be meant for a mongocryptd process.");
     }
+
+    uasserted(ErrorCodes::IDLUnknownField,
+              str::stream() << "BSON field '" << path << "' is an unknown field.");
+}
+
+void IDLParserContext::throwBadArrayFieldNumberSequence(StringData actual,
+                                                        StringData expected) const {
+    uasserted(
+        ErrorCodes::BadValue,
+        fmt::format("BSON array field '{}' has an invalid index field name: '{}', expected '{}'",
+                    getElementPath(StringData()),
+                    actual,
+                    expected));
+}
+
+void IDLParserContext::throwBadEnumValue(int enumValue) const {
+    std::string path = getElementPath(StringData());
+    uasserted(ErrorCodes::BadValue,
+              str::stream() << "Enumeration value '" << enumValue << "' for field '" << path
+                            << "' is not a valid value.");
+}
+
+void IDLParserContext::throwBadEnumValue(StringData enumValue) const {
+    std::string path = getElementPath(StringData());
+    uasserted(ErrorCodes::BadValue,
+              str::stream() << "Enumeration value '" << enumValue << "' for field '" << path
+                            << "' is not a valid value.");
+}
+
+void IDLParserContext::throwBadType(const BSONElement& element,
+                                    std::span<const BSONType> types) const {
+    std::string path = getElementPath(element);
+    std::string type_str = toCommaDelimitedList(types);
+    uasserted(ErrorCodes::TypeMismatch,
+              str::stream() << "BSON field '" << path << "' is the wrong type '"
+                            << typeName(element.type()) << "', expected types '[" << type_str
+                            << "]'");
+}
+
+StringData IDLParserContext::checkAndAssertCollectionName(const BSONElement& element,
+                                                          bool allowGlobalCollectionName) {
+    const bool isUUID =
+        (element.type() == BinData && element.binDataType() == BinDataType::newUUID);
+    uassert(ErrorCodes::InvalidNamespace,
+            str::stream() << "Collection name must be provided. UUID is not valid in this "
+                          << "context",
+            !isUUID);
+    if (allowGlobalCollectionName && element.isNumber()) {
+        uassert(ErrorCodes::BadValue,
+                str::stream() << "Invalid command format: the '" << element.fieldNameStringData()
+                              << "' field must specify a collection name or 1",
+                element.number() == 1);
+        return collectionlessAggregateCursorCol;
+    }
+    // Accepts both BSON String and Symbol for collection name per SERVER-16260.
+    // TODO SERVER-98383 remove Symbol support
+    uassert(ErrorCodes::InvalidNamespace,
+            str::stream() << "Collection name has invalid type " << typeName(element.type()),
+            element.type() == Symbol || element.type() == String);
+    return element.valueStringData();
+}
+
+std::variant<UUID, StringData> IDLParserContext::checkAndAssertCollectionNameOrUUID(
+    const BSONElement& element) {
+    if (element.type() == BinData && element.binDataType() == BinDataType::newUUID) {
+        return uassertStatusOK(UUID::parse(element));
+    } else {
+        // Ensure collection identifier is not a Command
+        return checkAndAssertCollectionName(element, false);
+    }
+}
+
+const boost::optional<TenantId>& IDLParserContext::getTenantId() const {
+    if (_tenantId || _predecessor == nullptr)
+        return _tenantId;
+
+    return _predecessor->getTenantId();
+}
+
+const SerializationContext& IDLParserContext::getSerializationContext() const {
+    return _serializationContext;
+}
+
+const boost::optional<auth::ValidatedTenancyScope>& IDLParserContext::getValidatedTenancyScope()
+    const {
+    return _validatedTenancyScope;
 }
 
 std::vector<StringData> transformVector(const std::vector<std::string>& input) {
@@ -278,7 +306,7 @@ std::vector<ConstDataRange> transformVector(const std::vector<std::vector<std::u
     output.reserve(input.size());
 
     std::transform(begin(input), end(input), std::back_inserter(output), [](auto&& vec) {
-        return makeCDR(vec);
+        return ConstDataRange(vec);
     });
 
     return output;
@@ -297,4 +325,45 @@ std::vector<std::vector<std::uint8_t>> transformVector(const std::vector<ConstDa
 
     return output;
 }
+
+/**
+ * IMPORTANT: The method should not be modified, as API version input/output guarantees could
+ * break because of it.
+ */
+void noOpSerializer(bool, StringData fieldName, BSONObjBuilder* bob) {}
+
+/**
+ * IMPORTANT: The method should not be modified, as API version input/output guarantees could
+ * break because of it.
+ */
+void serializeBSONWhenNotEmpty(BSONObj obj, StringData fieldName, BSONObjBuilder* bob) {
+    if (!obj.isEmpty()) {
+        bob->append(fieldName, obj);
+    }
+}
+
+/**
+ * IMPORTANT: The method should not be modified, as API version input/output guarantees could
+ * break because of it.
+ */
+BSONObj parseOwnedBSON(BSONElement element) {
+    uassert(ErrorCodes::TypeMismatch,
+            str::stream() << "Expected field " << element.fieldNameStringData()
+                          << "to be of type object",
+            element.type() == BSONType::Object);
+    return element.Obj().getOwned();
+}
+
+/**
+ * IMPORTANT: The method should not be modified, as API version input/output guarantees could
+ * break because of it.
+ */
+bool parseBoolean(BSONElement element) {
+    uassert(ErrorCodes::TypeMismatch,
+            str::stream() << "Expected field " << element.fieldNameStringData()
+                          << "to be of type object",
+            element.type() == BSONType::Bool);
+    return element.boolean();
+}
+
 }  // namespace mongo

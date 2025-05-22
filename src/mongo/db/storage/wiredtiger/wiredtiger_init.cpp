@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,43 +27,84 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+
+#include <boost/filesystem/operations.hpp>
+#include <boost/filesystem/path.hpp>
+#include <boost/optional/optional.hpp>
+#include <cstddef>
+#include <memory>
+#include <string>
+#include <utility>
 
 #if defined(__linux__)
-#include <sys/vfs.h>
+#include <sys/statfs.h>  // IWYU pragma: keep
+#include <sys/vfs.h>     // IWYU pragma: keep
 #endif
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/base/init.h"
-#include "mongo/db/catalog/collection_options.h"
-#include "mongo/db/jsobj.h"
+#include "mongo/base/init.h"  // IWYU pragma: keep
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/service_context.h"
-#include "mongo/db/storage/kv/kv_storage_engine.h"
+#include "mongo/db/storage/storage_engine.h"
+#include "mongo/db/storage/storage_engine_impl.h"
 #include "mongo/db/storage/storage_engine_init.h"
 #include "mongo/db/storage/storage_engine_lock_file.h"
 #include "mongo/db/storage/storage_engine_metadata.h"
 #include "mongo/db/storage/storage_options.h"
+#include "mongo/db/storage/storage_parameters_gen.h"
+#include "mongo/db/storage/wiredtiger/spill_kv_engine.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_global_options.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_index.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_kv_engine.h"
-#include "mongo/db/storage/wiredtiger/wiredtiger_parameters.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_record_store.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_server_status.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_util.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/processinfo.h"
+
+#if __has_feature(address_sanitizer)
+#include <sanitizer/lsan_interface.h>
+#endif
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
+
 
 namespace mongo {
 
 namespace {
+std::string kWiredTigerBackupFile = "WiredTiger.backup";
+std::once_flag initializeServerStatusSectionFlag;
+
 class WiredTigerFactory : public StorageEngine::Factory {
 public:
-    virtual ~WiredTigerFactory() {}
-    virtual StorageEngine* create(const StorageGlobalParams& params,
-                                  const StorageEngineLockFile* lockFile) const {
+    ~WiredTigerFactory() override {}
+
+    std::unique_ptr<StorageEngine> create(OperationContext* opCtx,
+                                          const StorageGlobalParams& params,
+                                          const StorageEngineLockFile* lockFile,
+                                          bool isReplSet,
+                                          bool shouldRecoverFromOplogAsStandalone,
+                                          bool inStandaloneMode) const override {
         if (lockFile && lockFile->createdByUncleanShutdown()) {
-            warning() << "Recovering data from the last clean checkpoint.";
+            LOGV2_WARNING(22302, "Recovering data from the last clean checkpoint.");
+
+            // If we had an unclean shutdown during an ongoing backup remove WiredTiger.backup. This
+            // allows WT to use checkpoints taken while the backup cursor was open for recovery.
+            boost::filesystem::path basePath(storageGlobalParams.dbpath);
+            if (boost::filesystem::remove(basePath / WiredTigerBackup::kOngoingBackupFile)) {
+                if (boost::filesystem::remove(basePath / kWiredTigerBackupFile)) {
+                    LOGV2_INFO(
+                        5844600,
+                        "Removing WiredTiger.backup to allow recovery from any checkpoints taken "
+                        "during ongoing backup.");
+                } else {
+                    LOGV2_INFO(5844601, "WiredTiger.backup doesn't exist, cleanup not needed.");
+                }
+            }
         }
 
 #if defined(__linux__)
@@ -76,13 +116,11 @@ public:
             int ret = statfs(params.dbpath.c_str(), &fs_stats);
 
             if (ret == 0 && fs_stats.f_type == EXT4_SUPER_MAGIC) {
-                log() << startupWarningsLog;
-                log() << "** WARNING: Using the XFS filesystem is strongly recommended with the "
-                         "WiredTiger storage engine"
-                      << startupWarningsLog;
-                log() << "**          See "
-                         "http://dochub.mongodb.org/core/prodnotes-filesystem"
-                      << startupWarningsLog;
+                LOGV2_OPTIONS(22297,
+                              {logv2::LogTag::kStartupWarnings},
+                              "Using the XFS filesystem is strongly recommended with the "
+                              "WiredTiger storage engine. See "
+                              "http://dochub.mongodb.org/core/prodnotes-filesystem");
             }
         }
 #endif
@@ -92,53 +130,88 @@ public:
         ProcessInfo p;
         if (p.supported()) {
             if (cacheMB > memoryThresholdPercentage * p.getMemSizeMB()) {
-                log() << startupWarningsLog;
-                log() << "** WARNING: The configured WiredTiger cache size is more than "
-                      << memoryThresholdPercentage * 100 << "% of available RAM."
-                      << startupWarningsLog;
-                log() << "**          See "
-                         "http://dochub.mongodb.org/core/faq-memory-diagnostics-wt"
-                      << startupWarningsLog;
+                LOGV2_OPTIONS(22300,
+                              {logv2::LogTag::kStartupWarnings},
+                              "The configured WiredTiger cache size is more than 80% of available "
+                              "RAM. See http://dochub.mongodb.org/core/faq-memory-diagnostics-wt");
             }
         }
-        const bool ephemeral = false;
-        WiredTigerKVEngine* kv =
-            new WiredTigerKVEngine(getCanonicalName().toString(),
-                                   params.dbpath,
-                                   getGlobalServiceContext()->getFastClockSource(),
-                                   wiredTigerGlobalOptions.engineConfig,
-                                   cacheMB,
-                                   params.dur,
-                                   ephemeral,
-                                   params.repair,
-                                   params.readOnly);
+
+        WiredTigerKVEngineBase::WiredTigerConfig wtConfig = getWiredTigerConfigFromStartupOptions();
+        wtConfig.cacheSizeMB = cacheMB;
+        wtConfig.inMemory = params.inMemory;
+        if (params.inMemory) {
+            wtConfig.logEnabled = false;
+        }
+        auto kv =
+            std::make_unique<WiredTigerKVEngine>(getCanonicalName().toString(),
+                                                 params.dbpath,
+                                                 getGlobalServiceContext()->getFastClockSource(),
+                                                 std::move(wtConfig),
+                                                 params.inMemory,
+                                                 params.repair,
+                                                 isReplSet,
+                                                 shouldRecoverFromOplogAsStandalone,
+                                                 inStandaloneMode);
         kv->setRecordStoreExtraOptions(wiredTigerGlobalOptions.collectionConfig);
         kv->setSortedDataInterfaceExtraOptions(wiredTigerGlobalOptions.indexConfig);
-        // Intentionally leaked.
-        new WiredTigerServerStatusSection(kv);
-        new WiredTigerEngineRuntimeConfigParameter(kv);
 
-        KVStorageEngineOptions options;
+        std::unique_ptr<SpillKVEngine> spillKVEngine;
+        if (feature_flags::gFeatureFlagCreateSpillKVEngine.isEnabled()) {
+            boost::system::error_code ec;
+            boost::filesystem::remove_all(params.getSpillDbPath(), ec);
+            if (ec) {
+                LOGV2_WARNING(10380300,
+                              "Failed to clear dbpath of the internal WiredTiger instance",
+                              "error"_attr = ec.message());
+            }
+
+            WiredTigerKVEngineBase::WiredTigerConfig wtConfig =
+                getWiredTigerConfigFromStartupOptions(true /* usingSpillKVEngine */);
+            // TODO(SERVER-103753): Compute cache size properly.
+            wtConfig.cacheSizeMB = 100;
+            wtConfig.inMemory = params.inMemory;
+            wtConfig.logEnabled = false;
+            spillKVEngine =
+                std::make_unique<SpillKVEngine>(getCanonicalName().toString(),
+                                                params.getSpillDbPath(),
+                                                getGlobalServiceContext()->getFastClockSource(),
+                                                std::move(wtConfig));
+        }
+
+        // We're using the WT engine; register the ServerStatusSection for it.
+        // Only do so once; even if we re-create the StorageEngine for FCBIS. The section is
+        // stateless.
+        std::call_once(initializeServerStatusSectionFlag, [] {
+            *ServerStatusSectionBuilder<WiredTigerServerStatusSection>(
+                 std::string{WiredTigerServerStatusSection::kServerStatusSectionName})
+                 .forShard();
+        });
+
+        StorageEngineOptions options;
         options.directoryPerDB = params.directoryperdb;
         options.directoryForIndexes = wiredTigerGlobalOptions.directoryForIndexes;
         options.forRepair = params.repair;
-        return new KVStorageEngine(kv, options);
+        options.forRestore = params.restore;
+        options.lockFileCreatedByUncleanShutdown = lockFile && lockFile->createdByUncleanShutdown();
+        return std::make_unique<StorageEngineImpl>(
+            opCtx, std::move(kv), std::move(spillKVEngine), options);
     }
 
-    virtual StringData getCanonicalName() const {
+    StringData getCanonicalName() const override {
         return kWiredTigerEngineName;
     }
 
-    virtual Status validateCollectionStorageOptions(const BSONObj& options) const {
-        return WiredTigerRecordStore::parseOptionsField(options).getStatus();
+    Status validateCollectionStorageOptions(const BSONObj& options) const override {
+        return WiredTigerRecordStoreBase::parseOptionsField(options).getStatus();
     }
 
-    virtual Status validateIndexStorageOptions(const BSONObj& options) const {
+    Status validateIndexStorageOptions(const BSONObj& options) const override {
         return WiredTigerIndex::parseIndexOptions(options).getStatus();
     }
 
-    virtual Status validateMetadata(const StorageEngineMetadata& metadata,
-                                    const StorageGlobalParams& params) const {
+    Status validateMetadata(const StorageEngineMetadata& metadata,
+                            const StorageGlobalParams& params) const override {
         Status status =
             metadata.validateStorageEngineOption("directoryPerDB", params.directoryperdb);
         if (!status.isOK()) {
@@ -167,7 +240,7 @@ public:
         return Status::OK();
     }
 
-    virtual BSONObj createMetadataOptions(const StorageGlobalParams& params) const {
+    BSONObj createMetadataOptions(const StorageGlobalParams& params) const override {
         BSONObjBuilder builder;
         builder.appendBool("directoryPerDB", params.directoryperdb);
         builder.appendBool("directoryForIndexes", wiredTigerGlobalOptions.directoryForIndexes);
@@ -175,7 +248,7 @@ public:
         return builder.obj();
     }
 
-    bool supportsReadOnly() const final {
+    bool supportsQueryableBackupMode() const final {
         return true;
     }
 };
@@ -184,5 +257,6 @@ ServiceContext::ConstructorActionRegisterer registerWiredTiger(
     "WiredTigerEngineInit", [](ServiceContext* service) {
         registerStorageEngine(service, std::make_unique<WiredTigerFactory>());
     });
+
 }  // namespace
-}  // namespace
+}  // namespace mongo

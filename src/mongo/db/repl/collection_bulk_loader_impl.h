@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -31,15 +30,19 @@
 
 #pragma once
 
-#include "mongo/base/disallow_copying.h"
+#include <memory>
+#include <string>
+#include <vector>
+
 #include "mongo/base/status.h"
-#include "mongo/base/status_with.h"
 #include "mongo/bson/bsonobj.h"
-#include "mongo/db/catalog/multi_index_block.h"
-#include "mongo/db/db_raii.h"
+#include "mongo/db/index_builds/multi_index_block.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/record_id.h"
 #include "mongo/db/repl/collection_bulk_loader.h"
-#include "mongo/db/repl/storage_interface.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/shard_role.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo {
 namespace repl {
@@ -50,7 +53,8 @@ namespace repl {
  * Note: Call commit when done inserting documents.
  */
 class CollectionBulkLoaderImpl : public CollectionBulkLoader {
-    MONGO_DISALLOW_COPYING(CollectionBulkLoaderImpl);
+    CollectionBulkLoaderImpl(const CollectionBulkLoaderImpl&) = delete;
+    CollectionBulkLoaderImpl& operator=(const CollectionBulkLoaderImpl&) = delete;
 
 public:
     struct Stats {
@@ -61,28 +65,42 @@ public:
         BSONObj toBSON() const;
     };
 
-    CollectionBulkLoaderImpl(ServiceContext::UniqueClient&& client,
-                             ServiceContext::UniqueOperationContext&& opCtx,
-                             std::unique_ptr<AutoGetCollection>&& autoColl,
+    CollectionBulkLoaderImpl(ServiceContext::UniqueClient client,
+                             ServiceContext::UniqueOperationContext opCtx,
+                             const NamespaceString& nss,
                              const BSONObj& idIndexSpec);
-    virtual ~CollectionBulkLoaderImpl();
+    ~CollectionBulkLoaderImpl() override;
 
-    virtual Status init(const std::vector<BSONObj>& secondaryIndexSpecs) override;
+    Status init(const std::vector<BSONObj>& secondaryIndexSpecs) override;
 
-    virtual Status insertDocuments(const std::vector<BSONObj>::const_iterator begin,
-                                   const std::vector<BSONObj>::const_iterator end) override;
-    virtual Status commit() override;
+    Status insertDocuments(std::vector<BSONObj>::const_iterator begin,
+                           std::vector<BSONObj>::const_iterator end,
+                           ParseRecordIdAndDocFunc fn) override;
+    Status commit() override;
 
     CollectionBulkLoaderImpl::Stats getStats() const;
-
-    virtual std::string toString() const override;
-    virtual BSONObj toBSON() const override;
 
 private:
     void _releaseResources();
 
     template <typename F>
-    Status _runTaskReleaseResourcesOnFailure(F task) noexcept;
+    Status _runTaskReleaseResourcesOnFailure(const F& task) noexcept;
+
+    /**
+     * For capped collections, each document will be inserted in its own WriteUnitOfWork.
+     */
+    Status _insertDocumentsForCappedCollection(std::vector<BSONObj>::const_iterator begin,
+                                               std::vector<BSONObj>::const_iterator end,
+                                               ParseRecordIdAndDocFunc fn);
+
+    /**
+     * For uncapped collections, we will insert documents in batches of size
+     * collectionBulkLoaderBatchSizeInBytes or up to one document size greater. All insertions in a
+     * given batch will be inserted in one WriteUnitOfWork.
+     */
+    Status _insertDocumentsForUncappedCollection(std::vector<BSONObj>::const_iterator begin,
+                                                 std::vector<BSONObj>::const_iterator end,
+                                                 ParseRecordIdAndDocFunc fn);
 
     /**
      * Adds document and associated RecordId to index blocks after inserting into RecordStore.
@@ -91,7 +109,7 @@ private:
 
     ServiceContext::UniqueClient _client;
     ServiceContext::UniqueOperationContext _opCtx;
-    std::unique_ptr<AutoGetCollection> _autoColl;
+    CollectionAcquisition _acquisition;
     NamespaceString _nss;
     std::unique_ptr<MultiIndexBlock> _idIndexBlock;
     std::unique_ptr<MultiIndexBlock> _secondaryIndexesBlock;

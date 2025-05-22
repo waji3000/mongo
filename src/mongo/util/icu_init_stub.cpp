@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,7 +27,6 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
 
 #include "mongo/base/init.h"
 
@@ -37,9 +35,8 @@ namespace {
 
 // This initializer provides a no-op definition of the LoadICUData MONGO_INITIALIZER, for use when
 // the system version of ICU is used instead of the vendored version.
-MONGO_INITIALIZER(LoadICUData)(InitializerContext* context) {
-    return Status::OK();
-}
+MONGO_INITIALIZER_GENERAL(LoadICUData, (), ("BeginStartupOptionHandling"))
+(InitializerContext*) {}
 
 }  // namespace
 }  // namespace mongo

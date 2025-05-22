@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,13 +29,12 @@
 
 #pragma once
 
-#include "mongo/db/query/collation/collator_interface.h"
-
 #include <memory>
+#include <unicode/coll.h>
 
-namespace icu {
-class Collator;
-}  // namespace icu
+#include "mongo/base/string_data.h"
+#include "mongo/db/basic_types_gen.h"
+#include "mongo/db/query/collation/collator_interface.h"
 
 namespace mongo {
 
@@ -46,9 +44,10 @@ namespace mongo {
  */
 class CollatorInterfaceICU final : public CollatorInterface {
 public:
-    CollatorInterfaceICU(CollationSpec spec, std::unique_ptr<icu::Collator> collator);
+    CollatorInterfaceICU(Collation spec, std::unique_ptr<icu::Collator> collator);
 
     std::unique_ptr<CollatorInterface> clone() const final;
+    std::shared_ptr<CollatorInterface> cloneShared() const final;
 
     int compare(StringData left, StringData right) const final;
 

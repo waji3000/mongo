@@ -1,6 +1,3 @@
-// @file background.h
-
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -36,7 +33,6 @@
 #include <string>
 #include <vector>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/status.h"
 
 namespace mongo {
@@ -58,7 +54,8 @@ namespace mongo {
  */
 
 class BackgroundJob {
-    MONGO_DISALLOW_COPYING(BackgroundJob);
+    BackgroundJob(const BackgroundJob&) = delete;
+    BackgroundJob& operator=(const BackgroundJob&) = delete;
 
 protected:
     /**
@@ -110,7 +107,8 @@ public:
     /**
      * wait for completion.
      *
-     * @param msTimeOut maximum amount of time to wait in milliseconds
+     * @param msTimeOut maximum amount of time to wait in milliseconds. Default wait of 0
+     * ms will wait without deadline.
      * @return true if did not time out. false otherwise.
      *
      * @note you can call wait() more than once if the first call times out.

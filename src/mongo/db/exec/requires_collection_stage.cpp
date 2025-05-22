@@ -27,36 +27,71 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <boost/optional/optional.hpp>
 
+#include "mongo/base/error_codes.h"
 #include "mongo/db/exec/requires_collection_stage.h"
-
-#include "mongo/db/catalog/uuid_catalog.h"
+#include "mongo/db/query/plan_yield_policy.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 
-template <typename CollectionT>
-void RequiresCollectionStageBase<CollectionT>::doSaveState() {
-    // A stage may not access storage while in a saved state.
-    _collection = nullptr;
-
-    saveState(RequiresCollTag{});
+void RequiresCollectionStage::doSaveState() {
+    doSaveStateRequiresCollection();
 }
 
-template <typename CollectionT>
-void RequiresCollectionStageBase<CollectionT>::doRestoreState() {
-    invariant(!_collection);
+void RequiresCollectionStage::doRestoreState(const RestoreContext& context) {
+    if (context.type() == RestoreContext::RestoreType::kExternal) {
+        // Restore the CollectionPtr only if we're still using the legacy approach. If we're using
+        // CollectionAcquisition it means the restoration is performed outside of this method
+        // and the pointers are still valid since it will survive across external yields.
+        if (_collection.isCollectionPtr()) {
+            // RequiresCollectionStage requires a collection to be provided in restore. However, it
+            // may be null in case the collection got dropped or renamed.
+            auto collPtr = context.collection();
+            invariant(collPtr);
+            _collection = VariantCollectionPtrOrAcquisition{collPtr};
+        }
 
-    const UUIDCatalog& catalog = UUIDCatalog::get(getOpCtx());
-    _collection = catalog.lookupCollectionByUUID(_collectionUUID);
+        // If we restore externally and get a null Collection we need to figure out if this was a
+        // drop or rename. The external lookup could have been done for UUID or namespace.
+        const auto& coll = _collection.getCollectionPtr();
+        _collectionPtr = &coll;
+
+        // If collection exists uuid does not match assume lookup was over namespace and treat this
+        // as a drop.
+        if (coll && coll->uuid() != _collectionUUID) {
+            PlanYieldPolicy::throwCollectionDroppedError(_collectionUUID);
+        }
+
+        // If we didn't get a valid collection but can still find the UUID in the catalog then we
+        // treat this as a rename.
+        if (!coll) {
+            auto catalog = CollectionCatalog::get(opCtx());
+            auto newNss = catalog->lookupNSSByUUID(opCtx(), _collectionUUID);
+            if (newNss && *newNss != _nss) {
+                PlanYieldPolicy::throwCollectionRenamedError(_nss, *newNss, _collectionUUID);
+            }
+        }
+    }
+
+    const auto& coll = *_collectionPtr;
+
+    if (!coll) {
+        PlanYieldPolicy::throwCollectionDroppedError(_collectionUUID);
+    }
+
+    // TODO SERVER-31695: Allow queries to survive collection rename, rather than throwing here
+    // when a rename has happened during yield.
+    if (const auto& newNss = coll->ns(); newNss != _nss) {
+        PlanYieldPolicy::throwCollectionRenamedError(_nss, newNss, _collectionUUID);
+    }
+
     uassert(ErrorCodes::QueryPlanKilled,
-            str::stream() << "UUID " << _collectionUUID << " no longer exists.",
-            _collection);
+            "the catalog was closed and reopened",
+            getCatalogEpoch() == _catalogEpoch);
 
-    restoreState(RequiresCollTag{});
+    doRestoreStateRequiresCollection();
 }
-
-template class RequiresCollectionStageBase<const Collection*>;
-template class RequiresCollectionStageBase<Collection*>;
 
 }  // namespace mongo

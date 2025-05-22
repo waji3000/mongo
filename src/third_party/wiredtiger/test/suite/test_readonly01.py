@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Public Domain 2014-2018 MongoDB, Inc.
+# Public Domain 2014-present MongoDB, Inc.
 # Public Domain 2008-2014 WiredTiger, Inc.
 #
 # This is free and unencumbered software released into the public domain.
@@ -30,7 +30,7 @@
 #   Readonly: Test readonly mode.
 #
 
-import fnmatch, os, shutil, time
+import os
 from suite_subprocess import suite_subprocess
 from wtscenario import make_scenarios
 import wttest
@@ -52,13 +52,11 @@ class test_readonly01(wttest.WiredTigerTestCase, suite_subprocess):
         ('readonly', dict(dirchmod=True)),
     ]
     log_list = [
-        ('logging', dict(logcfg='log=(archive=false,enabled,file_max=100K),')),
+        ('logging', dict(logcfg='log=(enabled,file_max=100K,remove=false),')),
         ('no_logging', dict(logcfg='log=(enabled=false),')),
     ]
 
     types = [
-        ('lsm', dict(tabletype='lsm', uri='lsm',
-                    create_params = 'key_format=i,value_format=i')),
         ('file-row', dict(tabletype='row', uri='file',
                     create_params = 'key_format=i,value_format=i')),
         ('file-var', dict(tabletype='var', uri='file',
@@ -100,8 +98,8 @@ class test_readonly01(wttest.WiredTigerTestCase, suite_subprocess):
         if self.dirchmod and os.name == 'posix':
             for f in os.listdir(self.home):
                 if os.path.isfile(f):
-                    os.chmod(f, 0444)
-            os.chmod(self.home, 0555)
+                    os.chmod(f, 0o444)
+            os.chmod(self.home, 0o555)
         self.conn = self.setUpConnectionOpen(self.home)
         self.session = self.setUpSessionOpen(self.conn)
 
@@ -139,6 +137,3 @@ class test_readonly01(wttest.WiredTigerTestCase, suite_subprocess):
                 self.readonly()
         else:
             self.readonly()
-
-if __name__ == '__main__':
-    wttest.run()

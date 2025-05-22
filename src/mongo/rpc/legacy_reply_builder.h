@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,9 +29,12 @@
 
 #pragma once
 
+#include <cstddef>
 #include <memory>
 
 #include "mongo/base/status.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/util/builder.h"
 #include "mongo/rpc/message.h"
 #include "mongo/rpc/protocol.h"
@@ -41,7 +43,7 @@
 namespace mongo {
 namespace rpc {
 
-class LegacyReplyBuilder : public ReplyBuilderInterface {
+class LegacyReplyBuilder final : public ReplyBuilderInterface {
 public:
     static const char kCursorTag[];
     static const char kFirstBatchTag[];
@@ -50,7 +52,7 @@ public:
     LegacyReplyBuilder(Message&&);
     ~LegacyReplyBuilder() final;
 
-    // Override of setCommandReply specifically used to handle StaleConfigException.
+    // Override of setCommandReply specifically used to handle StaleConfig errors
     LegacyReplyBuilder& setCommandReply(Status nonOKStatus, BSONObj extraErrorInfo) final;
     LegacyReplyBuilder& setRawCommandReply(const BSONObj& commandReply) final;
 
@@ -62,15 +64,13 @@ public:
 
     Protocol getProtocol() const final;
 
-    void reserveBytes(const std::size_t bytes) final;
+    void reserveBytes(std::size_t bytes) final;
 
 private:
     BufBuilder _builder;
     std::size_t _bodyOffset = 0;
     Message _message;
     bool _haveCommandReply = false;
-    // For stale config errors we need to set the correct ResultFlag.
-    bool _staleConfigError = false;
 };
 
 }  // namespace rpc

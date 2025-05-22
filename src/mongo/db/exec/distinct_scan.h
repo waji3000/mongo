@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,13 +29,29 @@
 
 #pragma once
 
+#include <memory>
+#include <string>
+#include <utility>
 
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/index_catalog_entry.h"
+#include "mongo/db/exec/orphan_chunk_skipper.h"
 #include "mongo/db/exec/plan_stage.h"
-#include "mongo/db/index/index_access_method.h"
-#include "mongo/db/jsobj.h"
-#include "mongo/db/matcher/expression.h"
+#include "mongo/db/exec/plan_stats.h"
+#include "mongo/db/exec/requires_index_stage.h"
+#include "mongo/db/exec/shard_filterer_impl.h"
+#include "mongo/db/exec/working_set.h"
+#include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/index/multikey_paths.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/query/index_bounds.h"
-#include "mongo/db/record_id.h"
+#include "mongo/db/query/plan_executor.h"
+#include "mongo/db/query/stage_types.h"
+#include "mongo/db/storage/index_entry_comparison.h"
+#include "mongo/db/storage/sorted_data_interface.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 
@@ -45,48 +60,35 @@ class IndexDescriptor;
 class WorkingSet;
 
 struct DistinctParams {
-    DistinctParams(const IndexDescriptor& descriptor,
+    DistinctParams(const IndexDescriptor* descriptor,
                    std::string indexName,
                    BSONObj keyPattern,
                    MultikeyPaths multikeyPaths,
                    bool multikey)
-        : accessMethod(descriptor.getIndexCatalog()->getIndex(&descriptor)),
+        : indexDescriptor(descriptor),
           name(std::move(indexName)),
           keyPattern(std::move(keyPattern)),
           multikeyPaths(std::move(multikeyPaths)),
-          isMultiKey(multikey),
-          isSparse(descriptor.isSparse()),
-          isUnique(descriptor.unique()),
-          isPartial(descriptor.isPartial()),
-          version(descriptor.version()),
-          collation(descriptor.infoObj()
-                        .getObjectField(IndexDescriptor::kCollationFieldName)
-                        .getOwned()) {
-        invariant(accessMethod);
+          isMultiKey(multikey) {
+        invariant(indexDescriptor);
     }
 
-    DistinctParams(OperationContext* opCtx, const IndexDescriptor& descriptor)
+    DistinctParams(OperationContext* opCtx,
+                   const CollectionPtr& collection,
+                   const IndexDescriptor* descriptor)
         : DistinctParams(descriptor,
-                         descriptor.indexName(),
-                         descriptor.keyPattern(),
-                         descriptor.getMultikeyPaths(opCtx),
-                         descriptor.isMultikey(opCtx)) {}
+                         descriptor->indexName(),
+                         descriptor->keyPattern(),
+                         descriptor->getEntry()->getMultikeyPaths(opCtx, collection),
+                         descriptor->getEntry()->isMultikey(opCtx, collection)) {}
 
-    const IndexAccessMethod* accessMethod;
+    const IndexDescriptor* indexDescriptor;
     std::string name;
 
     BSONObj keyPattern;
 
     MultikeyPaths multikeyPaths;
     bool isMultiKey;
-
-    bool isSparse;
-    bool isUnique;
-    bool isPartial;
-
-    IndexDescriptor::IndexVersion version;
-
-    BSONObj collation;
 
     int scanDirection{1};
 
@@ -102,22 +104,22 @@ struct DistinctParams {
 };
 
 /**
- * Used by the distinct command.  Executes a mutated index scan over the provided bounds.
- * However, rather than looking at every key in the bounds, it skips to the next value of the
- * _params.fieldNo-th indexed field.  This is because distinct only cares about distinct values
- * for that field, so there is no point in examining all keys with the same value for that
- * field.
- *
- * Only created through the getExecutorDistinct path.  See db/query/get_executor.cpp
+ * Executes an index scan over the provided bounds. However, rather than looking at every key in the
+ * bounds, it skips to the next value of the _params.fieldNo-th indexed field. This is because
+ * distinct only cares about distinct values for that field, so there is no point in examining all
+ * keys with the same value for that field.
  */
-class DistinctScan final : public PlanStage {
+class DistinctScan final : public RequiresIndexStage {
 public:
-    DistinctScan(OperationContext* opCtx, DistinctParams params, WorkingSet* workingSet);
+    DistinctScan(ExpressionContext* expCtx,
+                 VariantCollectionPtrOrAcquisition collection,
+                 DistinctParams params,
+                 WorkingSet* workingSet,
+                 std::unique_ptr<ShardFiltererImpl> _shardFilterer = nullptr,
+                 bool needsFetch = false);
 
     StageState doWork(WorkingSetID* out) final;
-    bool isEOF() final;
-    void doSaveState() final;
-    void doRestoreState() final;
+    bool isEOF() const final;
     void doDetachFromOperationContext() final;
     void doReattachToOperationContext() final;
 
@@ -131,14 +133,25 @@ public:
 
     static const char* kStageType;
 
+protected:
+    void doSaveStateRequiresIndex() final;
+
+    void doRestoreStateRequiresIndex() final;
+
 private:
-    // The parameters used to configure this DistinctScan stage.
-    DistinctParams _params;
+    // Helper method containing logic for fetching.
+    PlanStage::StageState doFetch(WorkingSetMember* member, WorkingSetID id, WorkingSetID* out);
 
     // The WorkingSet we annotate with results.  Not owned by us.
     WorkingSet* _workingSet;
 
-    const IndexAccessMethod* _iam;
+    const BSONObj _keyPattern;
+
+    const int _scanDirection = 1;
+
+    const IndexBounds _bounds;
+
+    const size_t _fieldNo = 0;
 
     // The cursor we use to navigate the tree.
     std::unique_ptr<SortedDataInterface::Cursor> _cursor;
@@ -146,6 +159,23 @@ private:
     // _checker gives us our start key and ensures we stay in bounds.
     IndexBoundsChecker _checker;
     IndexSeekPoint _seekPoint;
+
+    // State used to implement shard filtering.
+    std::unique_ptr<ShardFiltererImpl> _shardFilterer;
+    boost::optional<OrphanChunkSkipper> _chunkSkipper;
+    // When '_needsSequentialScan' is true, the 'DistinctScan' stage cannot skip over consecutive
+    // index entries with the same value, as it normally would, but must instead examine the next
+    // entry, as a normal index scan does. This step is necessary when the '_shardFilterer' rejects
+    // an entry, requiring the DistinctScan to examine other entries with the same value to
+    // determine if one of them may be accepted.
+    bool _needsSequentialScan = false;
+    // When set to true, performs a fetch before outputting.
+    const bool _needsFetch;
+    // The cursor we use to fetch.
+    std::unique_ptr<SeekableRecordCursor> _fetchCursor;
+    // In case of a yield while fetching, this is the id of the working set entry that we need to
+    // retry fetching.
+    WorkingSetID _idRetrying = WorkingSet::INVALID_ID;
 
     // Stats
     DistinctScanStats _specificStats;

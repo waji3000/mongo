@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,12 +29,13 @@
 
 #include "mongo/base/data_range_cursor.h"
 
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
 Status ConstDataRangeCursor::makeAdvanceStatus(size_t advance) const {
-    mongoutils::str::stream ss;
+    str::stream ss;
     ss << "Invalid advance (" << advance << ") past end of buffer[" << length()
        << "] at offset: " << _debug_offset;
 
@@ -43,7 +43,7 @@ Status ConstDataRangeCursor::makeAdvanceStatus(size_t advance) const {
 }
 
 Status DataRangeCursor::makeAdvanceStatus(size_t advance) const {
-    mongoutils::str::stream ss;
+    str::stream ss;
     ss << "Invalid advance (" << advance << ") past end of buffer[" << length()
        << "] at offset: " << _debug_offset;
 

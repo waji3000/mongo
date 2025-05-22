@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,27 +27,33 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
-
-#include "mongo/platform/basic.h"
-
+#include <memory>
 #include <string>
 
+#include "mongo/base/parse_number.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
 #include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
-#include "mongo/bson/util/bson_extract.h"
+#include "mongo/bson/bsontypes.h"
 #include "mongo/client/connpool.h"
-#include "mongo/db/audit.h"
-#include "mongo/db/auth/authorization_session.h"
-#include "mongo/db/commands.h"
+#include "mongo/client/dbclient_base.h"
+#include "mongo/db/api_parameters.h"
 #include "mongo/db/commands/kill_op_cmd_base.h"
-#include "mongo/rpc/metadata.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/logv2/log.h"
+#include "mongo/rpc/op_msg.h"
 #include "mongo/s/client/shard.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
-#include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/decorable.h"
+#include "mongo/util/str.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 namespace mongo {
 namespace {
@@ -56,7 +61,7 @@ namespace {
 class ClusterKillOpCommand : public KillOpCmdBase {
 public:
     bool run(OperationContext* opCtx,
-             const std::string& db,
+             const DatabaseName& dbName,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) final {
         BSONElement element = cmdObj.getField("op");
@@ -65,12 +70,18 @@ public:
         if (isKillingLocalOp(element)) {
             const unsigned int opId = KillOpCmdBase::parseOpId(cmdObj);
             killLocalOperation(opCtx, opId);
+            reportSuccessfulCompletion(opCtx, dbName, cmdObj);
 
             // killOp always reports success once past the auth check.
             return true;
         } else if (element.type() == BSONType::String) {
             // It's a string. Should be of the form shardid:opid.
-            return _killShardOperation(opCtx, element.str(), result);
+            if (_killShardOperation(opCtx, element.str(), result)) {
+                reportSuccessfulCompletion(opCtx, dbName, cmdObj);
+                return true;
+            } else {
+                return false;
+            }
         }
 
         uasserted(50760,
@@ -87,16 +98,14 @@ private:
 
         uassert(28625,
                 str::stream() << "The op argument to killOp must be of the format shardid:opid"
-                              << " but found \""
-                              << opToKill
-                              << '"',
+                              << " but found \"" << opToKill << '"',
                 (opToKill.size() >= 3) &&                  // must have at least N:N
                     (opSepPos != std::string::npos) &&     // must have ':' as separator
                     (opSepPos != 0) &&                     // can't be :NN
                     (opSepPos != (opToKill.size() - 1)));  // can't be NN:
 
         auto shardIdent = opToKill.substr(0, opSepPos);
-        log() << "want to kill op: " << redact(opToKill);
+        LOGV2(22754, "About to kill op", "opToKill"_attr = redact(opToKill));
 
         // Will throw if shard id is not found
         auto shardStatus = Grid::get(opCtx)->shardRegistry()->getShard(opCtx, shardIdent);
@@ -104,23 +113,28 @@ private:
         auto shard = shardStatus.getValue();
 
         int opId;
-        uassertStatusOK(parseNumberFromStringWithBase(opToKill.substr(opSepPos + 1), 10, &opId));
+        uassertStatusOK(NumberParser().base(10)(opToKill.substr(opSepPos + 1), &opId));
 
         // shardid is actually the opid - keeping for backwards compatibility.
         result.append("shard", shardIdent);
         result.append("shardid", opId);
 
-        ScopedDbConnection conn(shard->getConnString());
-        // intentionally ignore return value - that is how legacy killOp worked.
-        conn->runCommand(OpMsgRequest::fromDBAndBody("admin", BSON("killOp" << 1 << "op" << opId)));
-        conn.done();
+        auto cmdToSend = BSON("killOp" << 1 << "op" << opId);
+        shard
+            ->runCommand(opCtx,
+                         ReadPreferenceSetting{ReadPreference::PrimaryOnly},
+                         DatabaseName::kAdmin,
+                         cmdToSend,
+                         Shard::RetryPolicy::kNoRetry)
+            .getStatus()
+            .ignore();
 
         // The original behavior of killOp on mongos is to always return success, regardless of
         // whether the shard reported success or not.
         return true;
     }
-
-} clusterKillOpCommand;
+};
+MONGO_REGISTER_COMMAND(ClusterKillOpCommand).forRouter();
 
 }  // namespace
 }  // namespace mongo

@@ -1,15 +1,14 @@
 """Class to support running various linters in a common framework."""
-from __future__ import absolute_import
-from __future__ import print_function
 
-import difflib
 import logging
 import os
 import re
+import site
 import subprocess
 import sys
 import threading
-from typing import Dict, List, Optional
+
+import pkg_resources
 
 from . import base
 
@@ -23,19 +22,37 @@ def _check_version(linter, cmd_path, args):
         logging.info(str(cmd))
         process_handle = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         output, stderr = process_handle.communicate()
+        decoded_output = output.decode("utf-8")
 
         if process_handle.returncode:
-            logging.info("Version check failed for [%s], return code '%d'." +
-                         "Standard Output:\n%s\nStandard Error:\n%s", cmd,
-                         process_handle.returncode, output, stderr)
+            logging.info(
+                "Version check failed for [%s], return code '%d'."
+                "Standard Output:\n%s\nStandard Error:\n%s",
+                cmd,
+                process_handle.returncode,
+                decoded_output,
+                stderr,
+            )
 
-        required_version = re.escape(linter.required_version)
+        pattern = r"\b(?:(%s) )?(?P<version>\S+)\b" % (linter.cmd_name)
+        required_version = pkg_resources.parse_version(linter.required_version)
 
-        pattern = r"\b%s\b" % (required_version)
-        if not re.search(pattern, output):
-            logging.info("Linter %s has wrong version for '%s'. Expected '%s'," +
-                         "Standard Output:\n'%s'\nStandard Error:\n%s", linter.cmd_name, cmd,
-                         required_version, output, stderr)
+        match = re.search(pattern, decoded_output)
+        if match:
+            found_version = match.group("version")
+        else:
+            found_version = "0.0"
+
+        if pkg_resources.parse_version(found_version) < required_version:
+            logging.info(
+                "Linter %s has wrong version for '%s'. Expected >= '%s',"
+                "Standard Output:\n'%s'\nStandard Error:\n%s",
+                linter.cmd_name,
+                cmd,
+                required_version,
+                decoded_output,
+                stderr,
+            )
             return False
 
     except OSError as os_error:
@@ -66,12 +83,13 @@ def _find_linter(linter, config_dict):
 
     # Search for tool
     # 1. In the same directory as the interpreter
-    # 2. The current path
-    # 3. In '/opt/mongodbtoolchain/v2/bin' if virtualenv is set up.
+    # 2. Check user base -- i.e. site.USERBASE. With "pip install --user" puts files
+    # 3. The current path
+    # 4. In '/opt/mongodbtoolchain/v5/bin' if virtualenv is set up.
     python_dir = os.path.dirname(sys.executable)
     if sys.platform == "win32":
         # On Windows, these scripts are installed in %PYTHONDIR%\scripts like
-        # 'C:\Python27\scripts', and have .exe extensions.
+        # 'C:\python\python310\scripts', and have .exe extensions.
         python_dir = os.path.join(python_dir, "scripts")
 
         cmd_str = os.path.join(python_dir, linter.cmd_name)
@@ -79,39 +97,41 @@ def _find_linter(linter, config_dict):
         cmd = [cmd_str]
     else:
         # On Mac and with Homebrew, check for the binaries in /usr/local instead of sys.executable.
-        if sys.platform == 'darwin' and python_dir.startswith('/usr/local/opt'):
-            python_dir = '/usr/local/bin'
+        if sys.platform == "darwin" and python_dir.startswith("/usr/local/opt"):
+            python_dir = "/usr/local/bin"
 
         # On Linux, these scripts are installed in %PYTHONDIR%\bin like
-        # '/opt/mongodbtoolchain/v2/bin', but they may point to the wrong interpreter.
+        # '/opt/mongodbtoolchain/v5/bin', but they may point to the wrong interpreter.
         cmd_str = os.path.join(python_dir, linter.cmd_name)
 
-        if linter.ignore_interpreter():
-            # Some linters use a different interpreter then the current interpreter.
-            # If the linter cmd_location is specified then use that location.
-            if linter.cmd_location:
-                cmd_str = linter.cmd_location
-            else:
-                cmd_str = os.path.join('/opt/mongodbtoolchain/v2/bin', linter.cmd_name)
-            cmd = [cmd_str]
-        else:
-            cmd = [sys.executable, cmd_str]
+        # Check for executables before assuming they are python scripts
+        cmd = [cmd_str]
+        if _check_version(linter, cmd, linter.get_lint_version_cmd_args()):
+            return base.LinterInstance(linter, cmd)
+
+        cmd = [sys.executable] + cmd
 
     # Check 1: interpreter location or for linters that ignore current interpreter.
     if _check_version(linter, cmd, linter.get_lint_version_cmd_args()):
         return base.LinterInstance(linter, cmd)
 
-    logging.info("First version check failed for linter '%s', trying a different location.",
-                 linter.cmd_name)
+    logging.info(
+        "First version check failed for linter '%s', trying a different location.", linter.cmd_name
+    )
 
-    # Check 2: current path
+    # Check 2: Check USERBASE
+    cmd = [os.path.join(site.getuserbase(), "bin", linter.cmd_name)]
+    if _check_version(linter, cmd, linter.get_lint_version_cmd_args()):
+        return base.LinterInstance(linter, cmd)
+
+    # Check 3: current path
     cmd = [linter.cmd_name]
     if _check_version(linter, cmd, linter.get_lint_version_cmd_args()):
         return base.LinterInstance(linter, cmd)
 
-    # Check 3: When a virtualenv is setup the linter modules are not installed, so we need
-    # to use the linters installed in '/opt/mongodbtoolchain/v2/bin'.
-    cmd = [sys.executable, os.path.join('/opt/mongodbtoolchain/v2/bin', linter.cmd_name)]
+    # Check 4: When a virtualenv is setup the linter modules are not installed, so we need
+    # to use the linters installed in '/opt/mongodbtoolchain/v5/bin'.
+    cmd = [sys.executable, os.path.join("/opt/mongodbtoolchain/v5/bin", linter.cmd_name)]
     if _check_version(linter, cmd, linter.get_lint_version_cmd_args()):
         return base.LinterInstance(linter, cmd)
 
@@ -126,17 +146,20 @@ def find_linters(linter_list, config_dict):
     for linter in linter_list:
         linter_instance = _find_linter(linter, config_dict)
         if not linter_instance:
-            logging.error("""\
+            logging.error(
+                """\
 Could not find the correct version of linter '%s', expected '%s'. Check your
 PATH environment variable or re-run with --verbose for more information.
 
-To fix, install the needed python modules for both Python 2.7, and Python 3.x:
-   sudo pip2 install -r etc/pip/lint-requirements.txt
-   sudo pip3 install -r etc/pip/lint-requirements.txt
+To fix, install the needed python modules for Python 3.x:
+   python3 -m poetry install --no-root --sync
 
 These commands are typically available via packages with names like python-pip,
-python2-pip, and python3-pip. See your OS documentation for help.
-""", linter.cmd_name, linter.required_version)
+or python3-pip. See your OS documentation for help.
+""",
+                linter.cmd_name,
+                linter.required_version,
+            )
             return None
 
         linter_instances.append(linter_instance)
@@ -162,53 +185,28 @@ class LintRunner(object):
         with self.print_lock:
             print(line)
 
-    def run_lint(self, linter, file_name):
-        # type: (base.LinterInstance, str) -> bool
+    def run_lint(self, linter: base.LinterInstance, file_name: str, mongo_path: str) -> bool:
         """Run the specified linter for the file."""
 
-        cmd = linter.cmd_path + linter.linter.get_lint_cmd_args(file_name)
-        logging.debug(str(cmd))
+        linter_args = linter.linter.get_lint_cmd_args(file_name)
+        cmd = linter.cmd_path + linter_args
 
-        try:
-            if linter.linter.needs_file_diff():
-                # Need a file diff
-                with open(file_name, 'rb') as original_text:
-                    original_file = original_text.read()
+        logging.debug(" ".join(cmd))
 
-                formatted_file = subprocess.check_output(cmd)
-                if original_file != formatted_file:
-                    original_lines = original_file.splitlines()
-                    formatted_lines = formatted_file.splitlines()
-                    result = difflib.unified_diff(original_lines, formatted_lines)
+        no_lint_errors = self.run(cmd)
+        return no_lint_errors
 
-                    # Take a lock to ensure diffs do not get mixed when printed to the screen
-                    with self.print_lock:
-                        print("ERROR: Found diff for " + file_name)
-                        print("To fix formatting errors, run pylinters.py fix %s" % (file_name))
+    def run_fix(self, linter: base.LinterInstance, file_name: str, mongo_path: str) -> bool:
+        """Run the specified lint fixes for the file."""
 
-                        count = 0
-                        for line in result:
-                            print(line.rstrip())
-                            count += 1
+        linter_args = linter.linter.get_fix_cmd_args(file_name)
 
-                        if count == 0:
-                            print("ERROR: The files only differ in trailing whitespace? LF vs CRLF")
+        cmd = linter.cmd_path + linter_args
 
-                    return False
-            else:
-                output = subprocess.check_output(cmd)
+        logging.debug(" ".join(cmd))
 
-                # On Windows, mypy.bat returns 0 even if there are length failures so we need to
-                # check if there was any output
-                if output and sys.platform == "win32":
-                    self._safe_print("CMD [%s] output:\n%s" % (cmd, output))
-                    return False
-
-        except subprocess.CalledProcessError as cpe:
-            self._safe_print("CMD [%s] failed:\n%s" % (cmd, cpe.output))
-            return False
-
-        return True
+        no_lint_errors = self.run(cmd)
+        return no_lint_errors
 
     def run(self, cmd):
         # type: (List[str]) -> bool
@@ -217,9 +215,9 @@ class LintRunner(object):
         logging.debug(str(cmd))
 
         try:
-            subprocess.check_output(cmd)
+            subprocess.check_output(cmd).decode("utf-8")
         except subprocess.CalledProcessError as cpe:
-            self._safe_print("CMD [%s] failed:\n%s" % (cmd, cpe.output))
+            self._safe_print("CMD [%s] failed:\n%s" % (" ".join(cmd), cpe.output.decode("utf-8")))
             return False
 
         return True

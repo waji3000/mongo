@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,12 +29,24 @@
 
 #pragma once
 
-#include "mongo/db/client.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/transport/session.h"
+#include <memory>
+#include <utility>
+
+#include "mongo/base/status.h"
+#include "mongo/db/tenant_id.h"
 #include "mongo/util/net/sockaddr.h"
 
 namespace mongo {
+
+inline Status validateClientSourceAuthenticationRestrictionMode(StringData mode,
+                                                                const boost::optional<TenantId>&) {
+    if (mode != "origin" && mode != "peer") {
+        return Status(ErrorCodes::BadValue,
+                      "Unable to set value for clientSourceAuthenticationRestrictionMode. Valid "
+                      "options are  \"origin\" or \"peer\".");
+    }
+    return Status::OK();
+}
 
 // A RestrictionEnvironment stores all information about an incoming client which could be used to
 // verify whether it should be able to authenticate as a user, or be granted a role.
@@ -44,16 +55,9 @@ namespace mongo {
 // which attempt to perform authentication or authorization must have a RestrictionEnvironment.
 class RestrictionEnvironment {
 public:
+    RestrictionEnvironment() = default;
     RestrictionEnvironment(SockAddr clientSource, SockAddr serverAddress)
         : clientSource(std::move(clientSource)), serverAddress(std::move(serverAddress)) {}
-
-    // Retrieve a RestrictionEnvironment from a Client.
-    static const RestrictionEnvironment& get(const Client& client);
-    static void get(Client&&) = delete;
-
-    // Set a RestrictionEnvironment on a transport Session
-    static void set(const transport::SessionHandle& session,
-                    std::unique_ptr<RestrictionEnvironment> environment);
 
     // Returns the source address of the client.
     // This value is useful for filering clients by their address, or network block. Note that

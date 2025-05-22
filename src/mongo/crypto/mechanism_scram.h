@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,17 +29,28 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
+#include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <string>
+#include <tuple>
+#include <utility>
 #include <vector>
 
+#include "mongo/base/error_codes.h"
 #include "mongo/base/secure_allocator.h"
 #include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/crypto/sha1_block.h"
-#include "mongo/db/jsobj.h"
 #include "mongo/platform/random.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/base64.h"
+#include "mongo/util/secure_compare_memory.h"
 
 namespace mongo {
 namespace scram {
@@ -103,15 +113,9 @@ public:
     }
 
     static std::vector<std::uint8_t> generateSecureRandomSalt() {
-        // Express salt length as a number of quad words, rounded up.
-        constexpr auto qwords = (saltLength() + sizeof(std::int64_t) - 1) / sizeof(std::int64_t);
-        std::array<std::int64_t, qwords> userSalt;
-
-        std::unique_ptr<SecureRandom> sr(SecureRandom::create());
-        std::generate(userSalt.begin(), userSalt.end(), [&sr] { return sr->nextInt64(); });
-        return std::vector<std::uint8_t>(reinterpret_cast<std::uint8_t*>(userSalt.data()),
-                                         reinterpret_cast<std::uint8_t*>(userSalt.data()) +
-                                             saltLength());
+        std::vector<std::uint8_t> salt(saltLength());
+        SecureRandom().fill(salt.data(), salt.size());
+        return salt;
     }
 
 private:
@@ -122,7 +126,9 @@ private:
         return std::tie(_password, _salt, _iterationCount);
     }
 
-    static constexpr auto saltLength() {
+    // clang-tidy flags this return type as readability-const-return-type
+    // NOLINTNEXTLINE(readability-const-return-type)
+    static constexpr auto saltLength() -> decltype(HashBlock::kHashLength) {
         return HashBlock::kHashLength - 4;
     }
 
@@ -139,6 +145,47 @@ template <typename T>
 bool operator!=(const Presecrets<T>& lhs, const Presecrets<T>& rhs) {
     return !(lhs == rhs);
 }
+template <typename HashBlock>
+struct SecretsHolder {
+    HashBlock clientKey;
+    HashBlock storedKey;
+    HashBlock serverKey;
+};
+
+template <typename HashBlock>
+class LockedSecretsPolicy {
+public:
+    LockedSecretsPolicy() = default;
+
+    const SecretsHolder<HashBlock>* operator->() const {
+        return &(*_holder);
+    }
+    SecretsHolder<HashBlock>* operator->() {
+        return &(*_holder);
+    }
+
+private:
+    using SecureSecrets = SecureAllocatorAuthDomain::SecureHandle<SecretsHolder<HashBlock>>;
+
+    SecureSecrets _holder;
+};
+
+template <typename HashBlock>
+class UnlockedSecretsPolicy {
+public:
+    UnlockedSecretsPolicy() = default;
+
+    const SecretsHolder<HashBlock>* operator->() const {
+        return &_holder;
+    }
+
+    SecretsHolder<HashBlock>* operator->() {
+        return &_holder;
+    }
+
+private:
+    SecretsHolder<HashBlock> _holder;
+};
 
 /* Stores all of the keys, generated from a password, needed for a client or server to perform a
  * SCRAM handshake.
@@ -146,47 +193,39 @@ bool operator!=(const Presecrets<T>& lhs, const Presecrets<T>& rhs) {
  * May be unpopulated. SCRAMSecrets created via the default constructor are unpopulated.
  * The behavior is undefined if the accessors are called when unpopulated.
  */
-template <typename HashBlock>
+template <typename HashBlock, template <typename> class MemoryPolicy = LockedSecretsPolicy>
 class Secrets {
-private:
-    struct SecretsHolder {
-        HashBlock clientKey;
-        HashBlock storedKey;
-        HashBlock serverKey;
-    };
-    using SecureSecrets = SecureAllocatorAuthDomain::SecureHandle<SecretsHolder>;
-
 public:
     Secrets() = default;
 
     Secrets(StringData client, StringData stored, StringData server)
-        : _ptr(std::make_shared<SecureSecrets>()) {
+        : _ptr(std::make_shared<MemoryPolicy<HashBlock>>()) {
         if (!client.empty()) {
             (*_ptr)->clientKey = uassertStatusOK(HashBlock::fromBuffer(
-                reinterpret_cast<const unsigned char*>(client.rawData()), client.size()));
+                reinterpret_cast<const unsigned char*>(client.data()), client.size()));
         }
         (*_ptr)->storedKey = uassertStatusOK(HashBlock::fromBuffer(
-            reinterpret_cast<const unsigned char*>(stored.rawData()), stored.size()));
+            reinterpret_cast<const unsigned char*>(stored.data()), stored.size()));
         (*_ptr)->serverKey = uassertStatusOK(HashBlock::fromBuffer(
-            reinterpret_cast<const unsigned char*>(server.rawData()), stored.size()));
+            reinterpret_cast<const unsigned char*>(server.data()), stored.size()));
     }
 
-    Secrets(const HashBlock& saltedPassword) : _ptr(std::make_shared<SecureSecrets>()) {
+    Secrets(const HashBlock& saltedPassword) : _ptr(std::make_shared<MemoryPolicy<HashBlock>>()) {
         // ClientKey := HMAC(saltedPassword, "Client Key")
-        (*_ptr)->clientKey = HashBlock::computeHmac(
-            saltedPassword.data(),
-            saltedPassword.size(),
-            reinterpret_cast<const unsigned char*>(kClientKeyConst.rawData()),
-            kClientKeyConst.size());
+        (*_ptr)->clientKey =
+            (HashBlock::computeHmac(saltedPassword.data(),
+                                    saltedPassword.size(),
+                                    reinterpret_cast<const unsigned char*>(kClientKeyConst.data()),
+                                    kClientKeyConst.size()));
         // StoredKey := H(clientKey)
         (*_ptr)->storedKey = HashBlock::computeHash(clientKey().data(), clientKey().size());
 
         // ServerKey := HMAC(SaltedPassword, "Server Key")
-        (*_ptr)->serverKey = HashBlock::computeHmac(
-            saltedPassword.data(),
-            saltedPassword.size(),
-            reinterpret_cast<const unsigned char*>(kServerKeyConst.rawData()),
-            kServerKeyConst.size());
+        (*_ptr)->serverKey =
+            HashBlock::computeHmac(saltedPassword.data(),
+                                   saltedPassword.size(),
+                                   reinterpret_cast<const unsigned char*>(kServerKeyConst.data()),
+                                   kServerKeyConst.size());
     }
     Secrets(const Presecrets<HashBlock>& presecrets)
         : Secrets(presecrets.generateSaltedPassword()) {}
@@ -196,7 +235,7 @@ public:
         auto proof =
             HashBlock::computeHmac(storedKey().data(),
                                    storedKey().size(),
-                                   reinterpret_cast<const unsigned char*>(authMessage.rawData()),
+                                   reinterpret_cast<const unsigned char*>(authMessage.data()),
                                    authMessage.size());
         proof.xorInline(clientKey());
         return proof.toString();
@@ -206,10 +245,10 @@ public:
         auto key =
             HashBlock::computeHmac(storedKey().data(),
                                    storedKey().size(),
-                                   reinterpret_cast<const unsigned char*>(authMessage.rawData()),
+                                   reinterpret_cast<const unsigned char*>(authMessage.data()),
                                    authMessage.size());
-        key.xorInline(uassertStatusOK(HashBlock::fromBuffer(
-            reinterpret_cast<const uint8_t*>(proof.rawData()), proof.size())));
+        key.xorInline(uassertStatusOK(
+            HashBlock::fromBuffer(reinterpret_cast<const uint8_t*>(proof.data()), proof.size())));
 
         // StoredKey := H(ClientKey)
         auto exp = HashBlock::computeHash(key.data(), key.size());
@@ -227,7 +266,7 @@ public:
         // ServerSignature := HMAC(ServerKey, AuthMessage)
         return HashBlock::computeHmac(serverKey().data(),
                                       serverKey().size(),
-                                      reinterpret_cast<const unsigned char*>(authMessage.rawData()),
+                                      reinterpret_cast<const unsigned char*>(authMessage.data()),
                                       authMessage.size())
             .toString();
     }
@@ -236,13 +275,13 @@ public:
         const auto exp =
             HashBlock::computeHmac(serverKey().data(),
                                    serverKey().size(),
-                                   reinterpret_cast<const unsigned char*>(authMessage.rawData()),
+                                   reinterpret_cast<const unsigned char*>(authMessage.data()),
                                    authMessage.size());
 
         if ((sig.size() != HashBlock::kHashLength) || (exp.size() != HashBlock::kHashLength)) {
             return false;
         }
-        return consttimeMemEqual(reinterpret_cast<const unsigned char*>(sig.rawData()),
+        return consttimeMemEqual(reinterpret_cast<const unsigned char*>(sig.data()),
                                  reinterpret_cast<const unsigned char*>(exp.data()),
                                  HashBlock::kHashLength);
     }
@@ -255,14 +294,14 @@ public:
     static BSONObj generateCredentials(const std::vector<uint8_t>& salt,
                                        const std::string& password,
                                        int iterationCount) {
-        Secrets<HashBlock> secrets(Presecrets<HashBlock>(password, salt, iterationCount));
+        Secrets<HashBlock, MemoryPolicy> secrets(
+            Presecrets<HashBlock>(password, salt, iterationCount));
         const auto encodedSalt =
-            base64::encode(reinterpret_cast<const char*>(salt.data()), salt.size());
-        return BSON(kIterationCountFieldName << iterationCount << kSaltFieldName << encodedSalt
-                                             << kStoredKeyFieldName
-                                             << secrets.storedKey().toString()
-                                             << kServerKeyFieldName
-                                             << secrets.serverKey().toString());
+            base64::encode(StringData(reinterpret_cast<const char*>(salt.data()), salt.size()));
+        return BSON(kIterationCountFieldName
+                    << iterationCount << kSaltFieldName << encodedSalt << kStoredKeyFieldName
+                    << secrets.storedKey().toString() << kServerKeyFieldName
+                    << secrets.serverKey().toString());
     }
 
     const HashBlock& clientKey() const {
@@ -289,7 +328,7 @@ public:
     }
 
 private:
-    std::shared_ptr<SecureSecrets> _ptr;
+    std::shared_ptr<MemoryPolicy<HashBlock>> _ptr;
 };
 
 }  // namespace scram

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,57 +27,19 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kIndex
-
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/catalog/index_catalog_entry.h"
-
-#include "mongo/db/index/index_access_method.h"
 #include "mongo/db/index/index_descriptor.h"
 
 namespace mongo {
 
-const IndexCatalogEntry* IndexCatalogEntryContainer::find(const IndexDescriptor* desc) const {
-    if (desc->_cachedEntry)
-        return desc->_cachedEntry;
-
-    for (const_iterator i = begin(); i != end(); ++i) {
-        const IndexCatalogEntry* e = i->get();
-        if (e->descriptor() == desc)
-            return e;
-    }
-    return nullptr;
-}
-
-IndexCatalogEntry* IndexCatalogEntryContainer::find(const IndexDescriptor* desc) {
-    if (desc->_cachedEntry)
-        return desc->_cachedEntry;
-
-    for (iterator i = begin(); i != end(); ++i) {
-        IndexCatalogEntry* e = i->get();
-        if (e->descriptor() == desc)
-            return e;
-    }
-    return nullptr;
-}
-
-IndexCatalogEntry* IndexCatalogEntryContainer::find(const std::string& name) {
-    for (iterator i = begin(); i != end(); ++i) {
-        IndexCatalogEntry* e = i->get();
-        if (e->descriptor()->indexName() == name)
-            return e;
-    }
-    return nullptr;
-}
-
-IndexCatalogEntry* IndexCatalogEntryContainer::release(const IndexDescriptor* desc) {
+std::shared_ptr<const IndexCatalogEntry> IndexCatalogEntryContainer::release(
+    const IndexDescriptor* desc) {
     for (auto i = _entries.begin(); i != _entries.end(); ++i) {
-        if ((*i)->descriptor() != desc)
-            continue;
-        IndexCatalogEntry* e = i->release();
-        _entries.erase(i);
-        return e;
+        if ((*i)->descriptor() == desc) {
+            auto e = std::move(*i);
+            _entries.erase(i);
+            return e;
+        }
     }
     return nullptr;
 }

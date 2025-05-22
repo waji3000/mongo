@@ -1,5 +1,5 @@
 /*-
- * Public Domain 2014-2018 MongoDB, Inc.
+ * Public Domain 2014-present MongoDB, Inc.
  * Public Domain 2008-2014 WiredTiger, Inc.
  *
  * This is free and unencumbered software released into the public domain.
@@ -26,19 +26,21 @@
  * OTHER DEALINGS IN THE SOFTWARE.
  */
 
+#pragma once
+
 #include "test_util.h"
 
 #include <signal.h>
 
-extern bool use_txn;				/* Operations with user txn */
-extern WT_CONNECTION *conn;			/* WiredTiger connection */
+extern bool use_txn;        /* Operations with user txn */
+extern WT_CONNECTION *conn; /* WiredTiger connection */
 
-extern u_int nops;				/* Operations per thread */
+extern u_int nops; /* Operations per thread */
 
-extern const char *uri;				/* Object */
-extern const char *config;			/* Object config */
+extern const char *uri;    /* Object */
+extern const char *config; /* Object config */
 
-extern pthread_rwlock_t single;			/* Single-thread */
+extern pthread_rwlock_t single; /* Single-thread */
 
 void fop_start(u_int);
 void obj_bulk(void);
@@ -48,6 +50,4 @@ void obj_create(void);
 void obj_create_unique(int);
 void obj_cursor(void);
 void obj_drop(int);
-void obj_rebalance(void);
-void obj_upgrade(void);
 void obj_verify(void);

@@ -1,7 +1,5 @@
 """Utility for loading all modules within a package."""
 
-from __future__ import absolute_import
-
 import importlib
 import pkgutil
 
@@ -20,5 +18,5 @@ def load_all_modules(name, path):
         _autoloader.load_all_modules(name=__name__, path=__path__)
     """
 
-    for (_, module, _) in pkgutil.walk_packages(path=path):
+    for _, module, _ in pkgutil.walk_packages(path=path):
         importlib.import_module("." + module, package=name)

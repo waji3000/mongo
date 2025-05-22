@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,13 +27,9 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/update/update_object_node.h"
-
-#include "mongo/bson/mutable/algorithm.h"
-#include "mongo/bson/mutable/mutable_bson_test_utils.h"
-#include "mongo/db/json.h"
+#include "mongo/bson/json.h"
+#include "mongo/db/exec/mutable_bson/algorithm.h"
+#include "mongo/db/exec/mutable_bson/mutable_bson_test_utils.h"
 #include "mongo/db/matcher/expression_parser.h"
 #include "mongo/db/pipeline/expression_context_for_test.h"
 #include "mongo/db/query/collation/collator_interface_mock.h"
@@ -42,14 +37,14 @@
 #include "mongo/db/update/rename_node.h"
 #include "mongo/db/update/update_array_node.h"
 #include "mongo/db/update/update_node_test_fixture.h"
+#include "mongo/db/update/update_object_node.h"
 #include "mongo/unittest/death_test.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
 namespace {
 
-using UpdateObjectNodeTest = UpdateNodeTest;
-using mongo::mutablebson::Element;
+using UpdateObjectNodeTest = UpdateTestFixture;
 using unittest::assertGet;
 
 TEST(UpdateObjectNodeTest, InvalidPathFailsToParse) {
@@ -1536,9 +1531,9 @@ TEST(UpdateObjectNodeTest, MergeWithConflictingPositionalFails) {
         "Update created a conflict at 'root.a.$'");
 }
 
-DEATH_TEST(UpdateObjectNodeTest,
-           MergingArrayNodesWithDifferentArrayFiltersFails,
-           "Invariant failure &leftNode._arrayFilters == &rightNode._arrayFilters") {
+DEATH_TEST_REGEX(UpdateObjectNodeTest,
+                 MergingArrayNodesWithDifferentArrayFiltersFails,
+                 "Invariant failure.*leftNode._arrayFilters == &rightNode._arrayFilters") {
     auto setUpdate1 = fromjson("{$set: {'a.$[i]': 5}}");
     auto setUpdate2 = fromjson("{$set: {'a.$[j]': 6}}");
     FieldRef fakeFieldRef("root");
@@ -1770,12 +1765,14 @@ TEST_F(UpdateObjectNodeTest, ApplyCreateField) {
 
     mutablebson::Document doc(fromjson("{a: 5}"));
     addIndexedPath("b");
-    auto result = root.apply(getApplyParams(doc.root()));
-    ASSERT_TRUE(result.indexesAffected);
+    auto result = root.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{a: 5, b: 6}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(fromjson("{$set: {b: 6}}"), getLogDoc());
+
+    assertOplogEntry(fromjson("{$v: 2, diff: {i: {b: 6}}}"));
+    ASSERT_EQUALS(getModifiedPaths(), "{b}");
 }
 
 TEST_F(UpdateObjectNodeTest, ApplyExistingField) {
@@ -1793,12 +1790,14 @@ TEST_F(UpdateObjectNodeTest, ApplyExistingField) {
 
     mutablebson::Document doc(fromjson("{a: 5}"));
     addIndexedPath("a");
-    auto result = root.apply(getApplyParams(doc.root()));
-    ASSERT_TRUE(result.indexesAffected);
+    auto result = root.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{a: 6}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(fromjson("{$set: {a: 6}}"), getLogDoc());
+
+    assertOplogEntry(fromjson("{$v: 2, diff: {u: {a: 6}}}"));
+    ASSERT_EQUALS(getModifiedPaths(), "{a}");
 }
 
 TEST_F(UpdateObjectNodeTest, ApplyExistingAndNonexistingFields) {
@@ -1834,12 +1833,14 @@ TEST_F(UpdateObjectNodeTest, ApplyExistingAndNonexistingFields) {
 
     mutablebson::Document doc(fromjson("{a: 0, c: 0}"));
     addIndexedPath("a");
-    auto result = root.apply(getApplyParams(doc.root()));
-    ASSERT_TRUE(result.indexesAffected);
+    auto result = root.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
     ASSERT_BSONOBJ_EQ(fromjson("{a: 5, c: 7, b: 6, d: 8}"), doc.getObject());
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
-    ASSERT_BSONOBJ_EQ(fromjson("{$set: {a: 5, b: 6, c: 7, d: 8}}"), getLogDoc().getObject());
+
+    assertOplogEntry(fromjson("{$v: 2, diff: {u: {a: 5, c: 7}, i: {b: 6, d: 8}}}"));
+    ASSERT_EQUALS(getModifiedPaths(), "{a, b, c, d}");
 }
 
 TEST_F(UpdateObjectNodeTest, ApplyExistingNestedPaths) {
@@ -1875,13 +1876,14 @@ TEST_F(UpdateObjectNodeTest, ApplyExistingNestedPaths) {
 
     mutablebson::Document doc(fromjson("{a: {b: 5, c: 5}, b: {d: 5, e: 5}}"));
     addIndexedPath("a");
-    auto result = root.apply(getApplyParams(doc.root()));
-    ASSERT_TRUE(result.indexesAffected);
+    auto result = root.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
     ASSERT_BSONOBJ_EQ(fromjson("{a: {b: 6, c: 7}, b: {d: 8, e: 9}}"), doc.getObject());
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
-    ASSERT_BSONOBJ_EQ(fromjson("{$set: {'a.b': 6, 'a.c': 7, 'b.d': 8, 'b.e': 9}}"),
-                      getLogDoc().getObject());
+
+    assertOplogEntry(fromjson("{$v: 2, diff: {sa: {u: {b: 6, c: 7}}, sb: {u: {d: 8, e: 9}}}}"));
+    ASSERT_EQUALS(getModifiedPaths(), "{a.b, a.c, b.d, b.e}");
 }
 
 TEST_F(UpdateObjectNodeTest, ApplyCreateNestedPaths) {
@@ -1917,13 +1919,14 @@ TEST_F(UpdateObjectNodeTest, ApplyCreateNestedPaths) {
 
     mutablebson::Document doc(fromjson("{z: 0}"));
     addIndexedPath("a");
-    auto result = root.apply(getApplyParams(doc.root()));
-    ASSERT_TRUE(result.indexesAffected);
+    auto result = root.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
     ASSERT_BSONOBJ_EQ(fromjson("{z: 0, a: {b: 6, c: 7}, b: {d: 8, e: 9}}"), doc.getObject());
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
-    ASSERT_BSONOBJ_EQ(fromjson("{$set: {'a.b': 6, 'a.c': 7, 'b.d': 8, 'b.e': 9}}"),
-                      getLogDoc().getObject());
+
+    assertOplogEntry(fromjson("{$v: 2, diff: {i: {a: {b: 6, c: 7}, b: {d: 8, e: 9}}}}"));
+    ASSERT_EQUALS(getModifiedPaths(), "{a.b, a.c, b.d, b.e}");
 }
 
 TEST_F(UpdateObjectNodeTest, ApplyCreateDeeplyNestedPaths) {
@@ -1953,13 +1956,14 @@ TEST_F(UpdateObjectNodeTest, ApplyCreateDeeplyNestedPaths) {
 
     mutablebson::Document doc(fromjson("{z: 0}"));
     addIndexedPath("a");
-    auto result = root.apply(getApplyParams(doc.root()));
-    ASSERT_TRUE(result.indexesAffected);
+    auto result = root.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
     ASSERT_BSONOBJ_EQ(fromjson("{z: 0, a: {b: {c: {d: 6, e: 7}}, f: 8}}"), doc.getObject());
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
-    ASSERT_BSONOBJ_EQ(fromjson("{$set: {'a.b.c.d': 6, 'a.b.c.e': 7, 'a.f': 8}}"),
-                      getLogDoc().getObject());
+
+    assertOplogEntry(fromjson("{$v: 2, diff: {i: {a: {b: {c: {d: 6, e: 7}}, f: 8}}}}"));
+    ASSERT_EQUALS(getModifiedPaths(), "{a.b.c.d, a.b.c.e, a.f}");
 }
 
 TEST_F(UpdateObjectNodeTest, ChildrenShouldBeAppliedInAlphabeticalOrder) {
@@ -2001,19 +2005,22 @@ TEST_F(UpdateObjectNodeTest, ChildrenShouldBeAppliedInAlphabeticalOrder) {
 
     mutablebson::Document doc(fromjson("{z: 0, a: 0}"));
     addIndexedPath("a");
-    auto result = root.apply(getApplyParams(doc.root()));
-    ASSERT_TRUE(result.indexesAffected);
+    auto result = root.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
     ASSERT_BSONOBJ_EQ(fromjson("{z: 9, a: 5, b: 8, c: 7, d: 6}"), doc.getObject());
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
-    ASSERT_BSONOBJ_EQ(fromjson("{$set: {a: 5, b: 8, c: 7, d: 6, z: 9}}"), getLogDoc().getObject());
+
+    assertOplogEntry(fromjson("{$v: 2, diff: {u: {a: 5, z: 9}, i: {b: 8, c: 7, d: 6}}}"));
+    ASSERT_EQUALS(getModifiedPaths(), "{a, b, c, d, z}");
 }
 
 TEST_F(UpdateObjectNodeTest, CollatorShouldNotAffectUpdateOrder) {
     auto setUpdate = fromjson("{$set: {abc: 5, cba: 6}}");
-    CollatorInterfaceMock collator(CollatorInterfaceMock::MockType::kReverseString);
+    auto collator =
+        std::make_unique<CollatorInterfaceMock>(CollatorInterfaceMock::MockType::kReverseString);
     boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    expCtx->setCollator(&collator);
+    expCtx->setCollator(std::move(collator));
     std::map<StringData, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
     std::set<std::string> foundIdentifiers;
     UpdateObjectNode root;
@@ -2032,12 +2039,13 @@ TEST_F(UpdateObjectNodeTest, CollatorShouldNotAffectUpdateOrder) {
 
     mutablebson::Document doc(fromjson("{}"));
     addIndexedPath("abc");
-    auto result = root.apply(getApplyParams(doc.root()));
-    ASSERT_TRUE(result.indexesAffected);
+    auto result = root.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
     ASSERT_BSONOBJ_EQ(fromjson("{abc: 5, cba: 6}"), doc.getObject());
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
-    ASSERT_BSONOBJ_EQ(fromjson("{$set: {abc: 5, cba: 6}}"), getLogDoc().getObject());
+
+    assertOplogEntry(fromjson("{$v: 2, diff: {i: {abc: 5, cba: 6}}}"));
 }
 
 TEST_F(UpdateObjectNodeTest, ApplyNoop) {
@@ -2069,12 +2077,14 @@ TEST_F(UpdateObjectNodeTest, ApplyNoop) {
     addIndexedPath("a");
     addIndexedPath("b");
     addIndexedPath("c");
-    auto result = root.apply(getApplyParams(doc.root()));
-    ASSERT_FALSE(result.indexesAffected);
+    auto result = root.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
     ASSERT_TRUE(result.noop);
+    ASSERT_FALSE(getIndexAffectedFromLogEntry());
     ASSERT_BSONOBJ_EQ(fromjson("{a: 5, b: 6, c: 7}"), doc.getObject());
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
-    ASSERT_BSONOBJ_EQ(fromjson("{}"), getLogDoc().getObject());
+
+    assertOplogEntryIsNoop();
+    ASSERT_EQUALS(getModifiedPaths(), "{a, b, c}");
 }
 
 TEST_F(UpdateObjectNodeTest, ApplySomeChildrenNoops) {
@@ -2106,12 +2116,14 @@ TEST_F(UpdateObjectNodeTest, ApplySomeChildrenNoops) {
     addIndexedPath("a");
     addIndexedPath("b");
     addIndexedPath("c");
-    auto result = root.apply(getApplyParams(doc.root()));
-    ASSERT_TRUE(result.indexesAffected);
+    auto result = root.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
     ASSERT_BSONOBJ_EQ(fromjson("{a: 5, b: 6, c: 7}"), doc.getObject());
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
-    ASSERT_BSONOBJ_EQ(fromjson("{$set: {b: 6}}"), getLogDoc().getObject());
+
+    assertOplogEntry(fromjson("{$v: 2, diff: {u: {b: 6}}}"));
+    ASSERT_EQUALS(getModifiedPaths(), "{a, b, c}");
 }
 
 TEST_F(UpdateObjectNodeTest, ApplyBlockingElement) {
@@ -2129,7 +2141,8 @@ TEST_F(UpdateObjectNodeTest, ApplyBlockingElement) {
 
     mutablebson::Document doc(fromjson("{a: 0}"));
     addIndexedPath("a");
-    ASSERT_THROWS_CODE_AND_WHAT(root.apply(getApplyParams(doc.root())),
+    ASSERT_EQUALS(getModifiedPaths(), "{}");
+    ASSERT_THROWS_CODE_AND_WHAT(root.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams()),
                                 AssertionException,
                                 ErrorCodes::PathNotViable,
                                 "Cannot create field 'b' in element {a: 0}");
@@ -2157,12 +2170,13 @@ TEST_F(UpdateObjectNodeTest, ApplyBlockingElementFromReplication) {
     mutablebson::Document doc(fromjson("{a: 0}"));
     addIndexedPath("a");
     setFromOplogApplication(true);
-    auto result = root.apply(getApplyParams(doc.root()));
-    ASSERT_FALSE(result.indexesAffected);
+    auto result = root.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
+    ASSERT_FALSE(getIndexAffectedFromLogEntry());
     ASSERT_BSONOBJ_EQ(fromjson("{a: 0, b: 6}"), doc.getObject());
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
-    ASSERT_BSONOBJ_EQ(fromjson("{$set: {b: 6}}"), getLogDoc().getObject());
+
+    assertOplogEntry(fromjson("{$v: 2, diff: {i: {b: 6}}}"));
 }
 
 TEST_F(UpdateObjectNodeTest, ApplyPositionalMissingMatchedField) {
@@ -2180,8 +2194,9 @@ TEST_F(UpdateObjectNodeTest, ApplyPositionalMissingMatchedField) {
 
     mutablebson::Document doc(fromjson("{}"));
     addIndexedPath("a");
+    ASSERT_EQUALS(getModifiedPaths(), "{}");
     ASSERT_THROWS_CODE_AND_WHAT(
-        root.apply(getApplyParams(doc.root())),
+        root.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams()),
         AssertionException,
         ErrorCodes::BadValue,
         "The positional operator did not find the match needed from the query.");
@@ -2209,12 +2224,14 @@ TEST_F(UpdateObjectNodeTest, ApplyMergePositionalChild) {
     mutablebson::Document doc(fromjson("{a: [{b: 0, c: 0}]}"));
     setMatchedField("0");
     addIndexedPath("a");
-    auto result = root.apply(getApplyParams(doc.root()));
-    ASSERT_TRUE(result.indexesAffected);
+    auto result = root.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
     ASSERT_BSONOBJ_EQ(fromjson("{a: [{b: 5, c: 6}]}"), doc.getObject());
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
-    ASSERT_BSONOBJ_EQ(fromjson("{$set: {'a.0.b': 5, 'a.0.c': 6}}"), getLogDoc().getObject());
+
+    assertOplogEntry(fromjson("{$v: 2, diff: {sa: {a: true, s0: {u: {b: 5, c: 6}}}}}"));
+    ASSERT_EQUALS(getModifiedPaths(), "{a.0.b, a.0.c}");
 }
 
 TEST_F(UpdateObjectNodeTest, ApplyOrderMergedPositionalChild) {
@@ -2251,13 +2268,14 @@ TEST_F(UpdateObjectNodeTest, ApplyOrderMergedPositionalChild) {
     mutablebson::Document doc(fromjson("{}"));
     setMatchedField("1");
     addIndexedPath("a");
-    auto result = root.apply(getApplyParams(doc.root()));
-    ASSERT_TRUE(result.indexesAffected);
+    auto result = root.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
     ASSERT_BSONOBJ_EQ(fromjson("{a: {'0': 7, '1': {b: 6, c: 8}, '2': 5}}"), doc.getObject());
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
-    ASSERT_BSONOBJ_EQ(fromjson("{$set: {'a.0': 7, 'a.1.b': 6, 'a.1.c': 8, 'a.2': 5}}"),
-                      getLogDoc().getObject());
+
+    assertOplogEntry(fromjson("{$v: 2, diff: {i: {a: {'0': 7, '1': {b: 6, c: 8}, '2': 5}}}}"));
+    ASSERT_EQUALS(getModifiedPaths(), "{a.0, a.1.b, a.1.c, a.2}");
 }
 
 TEST_F(UpdateObjectNodeTest, ApplyMergeConflictWithPositionalChild) {
@@ -2282,7 +2300,8 @@ TEST_F(UpdateObjectNodeTest, ApplyMergeConflictWithPositionalChild) {
     mutablebson::Document doc(fromjson("{}"));
     setMatchedField("0");
     addIndexedPath("a");
-    ASSERT_THROWS_CODE_AND_WHAT(root.apply(getApplyParams(doc.root())),
+    ASSERT_EQUALS(getModifiedPaths(), "{}");
+    ASSERT_THROWS_CODE_AND_WHAT(root.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams()),
                                 AssertionException,
                                 ErrorCodes::ConflictingUpdateOperators,
                                 "Update created a conflict at 'a.0'");
@@ -2316,12 +2335,14 @@ TEST_F(UpdateObjectNodeTest, ApplyDoNotMergePositionalChild) {
     mutablebson::Document doc(fromjson("{}"));
     setMatchedField("1");
     addIndexedPath("a");
-    auto result = root.apply(getApplyParams(doc.root()));
-    ASSERT_TRUE(result.indexesAffected);
+    auto result = root.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
     ASSERT_BSONOBJ_EQ(fromjson("{a: {'0': 5, '1': 7, '2': 6}}"), doc.getObject());
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
-    ASSERT_BSONOBJ_EQ(fromjson("{$set: {'a.0': 5, 'a.1': 7, 'a.2': 6}}"), getLogDoc().getObject());
+
+    assertOplogEntry(fromjson("{$v: 2, diff: {i: {a: {'0': 5, '1': 7, '2': 6}}}}"));
+    ASSERT_EQUALS(getModifiedPaths(), "{a.0, a.1, a.2}");
 }
 
 TEST_F(UpdateObjectNodeTest, ApplyPositionalChildLast) {
@@ -2352,12 +2373,14 @@ TEST_F(UpdateObjectNodeTest, ApplyPositionalChildLast) {
     mutablebson::Document doc(fromjson("{}"));
     setMatchedField("2");
     addIndexedPath("a");
-    auto result = root.apply(getApplyParams(doc.root()));
-    ASSERT_TRUE(result.indexesAffected);
+    auto result = root.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
     ASSERT_BSONOBJ_EQ(fromjson("{a: {'0': 6, '1': 7, '2': 5}}"), doc.getObject());
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
-    ASSERT_BSONOBJ_EQ(fromjson("{$set: {'a.0': 6, 'a.1': 7, 'a.2': 5}}"), getLogDoc().getObject());
+
+    assertOplogEntry(fromjson("{$v: 2, diff: {i: {a: {'0': 6, '1': 7, '2': 5}}}}"));
+    ASSERT_EQUALS(getModifiedPaths(), "{a.0, a.1, a.2}");
 }
 
 TEST_F(UpdateObjectNodeTest, ApplyUseStoredMergedPositional) {
@@ -2382,23 +2405,27 @@ TEST_F(UpdateObjectNodeTest, ApplyUseStoredMergedPositional) {
     mutablebson::Document doc(fromjson("{a: [{b: 0, c: 0}]}"));
     setMatchedField("0");
     addIndexedPath("a");
-    auto result = root.apply(getApplyParams(doc.root()));
-    ASSERT_TRUE(result.indexesAffected);
+    auto result = root.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
     ASSERT_BSONOBJ_EQ(fromjson("{a: [{b: 5, c: 6}]}"), doc.getObject());
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
-    ASSERT_BSONOBJ_EQ(fromjson("{$set: {'a.0.b': 5, 'a.0.c': 6}}"), getLogDoc().getObject());
+
+    assertOplogEntry(fromjson("{$v: 2, diff: {sa: {a: true, s0: {u: {b: 5, c: 6}}}}}"));
+    ASSERT_EQUALS(getModifiedPaths(), "{a.0.b, a.0.c}");
 
     mutablebson::Document doc2(fromjson("{a: [{b: 0, c: 0}]}"));
     resetApplyParams();
     setMatchedField("0");
     addIndexedPath("a");
-    result = root.apply(getApplyParams(doc2.root()));
-    ASSERT_TRUE(result.indexesAffected);
+    result = root.apply(getApplyParams(doc2.root()), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
     ASSERT_BSONOBJ_EQ(fromjson("{a: [{b: 5, c: 6}]}"), doc2.getObject());
     ASSERT_TRUE(doc2.isInPlaceModeEnabled());
-    ASSERT_BSONOBJ_EQ(fromjson("{$set: {'a.0.b': 5, 'a.0.c': 6}}"), getLogDoc().getObject());
+
+    assertOplogEntry(fromjson("{$v: 2, diff: {sa: {a: true, s0: {u: {b: 5, c: 6}}}}}"));
+    ASSERT_EQUALS(getModifiedPaths(), "{a.0.b, a.0.c}");
 }
 
 TEST_F(UpdateObjectNodeTest, ApplyDoNotUseStoredMergedPositional) {
@@ -2429,25 +2456,29 @@ TEST_F(UpdateObjectNodeTest, ApplyDoNotUseStoredMergedPositional) {
     mutablebson::Document doc(fromjson("{a: [{b: 0, c: 0}, {c: 0, d: 0}]}"));
     setMatchedField("0");
     addIndexedPath("a");
-    auto result = root.apply(getApplyParams(doc.root()));
-    ASSERT_TRUE(result.indexesAffected);
+    auto result = root.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
     ASSERT_BSONOBJ_EQ(fromjson("{a: [{b: 5, c: 6}, {c: 0, d: 7}]}"), doc.getObject());
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
-    ASSERT_BSONOBJ_EQ(fromjson("{$set: {'a.0.b': 5, 'a.0.c': 6, 'a.1.d': 7}}"),
-                      getLogDoc().getObject());
+
+    assertOplogEntry(
+        fromjson("{$v: 2, diff: {sa: {a: true, s0: {u: {b: 5, c: 6}}, s1: {u: {d: 7}}}}}"));
+    ASSERT_EQUALS(getModifiedPaths(), "{a.0.b, a.0.c, a.1.d}");
 
     mutablebson::Document doc2(fromjson("{a: [{b: 0, c: 0}, {c: 0, d: 0}]}"));
     resetApplyParams();
     setMatchedField("1");
     addIndexedPath("a");
-    result = root.apply(getApplyParams(doc2.root()));
-    ASSERT_TRUE(result.indexesAffected);
+    result = root.apply(getApplyParams(doc2.root()), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
     ASSERT_BSONOBJ_EQ(fromjson("{a: [{b: 5, c: 0}, {c: 6, d: 7}]}"), doc2.getObject());
     ASSERT_TRUE(doc2.isInPlaceModeEnabled());
-    ASSERT_BSONOBJ_EQ(fromjson("{$set: {'a.0.b': 5, 'a.1.c': 6, 'a.1.d': 7}}"),
-                      getLogDoc().getObject());
+
+    assertOplogEntry(
+        fromjson("{$v: 2, diff: {sa: {a: true, s0: {u: {b: 5}}, s1: {u: {c: 6, d: 7}}}}}"));
+    ASSERT_EQUALS(getModifiedPaths(), "{a.0.b, a.1.c, a.1.d}");
 }
 
 /**
@@ -2470,12 +2501,14 @@ TEST_F(UpdateObjectNodeTest, ApplyToArrayByIndexWithLeadingZero) {
 
     mutablebson::Document doc(fromjson("{a: [0, 0, 0, 0, 0]}"));
     addIndexedPath("a");
-    auto result = root.apply(getApplyParams(doc.root()));
-    ASSERT_TRUE(result.indexesAffected);
+    auto result = root.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
     ASSERT_BSONOBJ_EQ(fromjson("{a: [0, 0, 2, 0, 0]}"), doc.getObject());
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
-    ASSERT_BSONOBJ_EQ(fromjson("{$set: {'a.02': 2}}"), getLogDoc().getObject());
+
+    assertOplogEntry(fromjson("{$v: 2, diff: {sa: {a: true, u2: 2}}}"));
+    ASSERT_EQUALS(getModifiedPaths(), "{a.02}");
 }
 
 /**
@@ -2505,14 +2538,15 @@ TEST_F(UpdateObjectNodeTest, ApplyMultipleArrayUpdates) {
 
     mutablebson::Document doc(fromjson("{a: []}"));
     addIndexedPath("a");
-    auto result = root.apply(getApplyParams(doc.root()));
-    ASSERT_TRUE(result.indexesAffected);
+    auto result = root.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
     ASSERT_BSONOBJ_EQ(
         fromjson("{a: [null, null, 2, null, null, null, null, null, null, null, 10]}"),
         doc.getObject());
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
-    ASSERT_BSONOBJ_EQ(fromjson("{$set: {'a.10': 10, 'a.2': 2}}"), getLogDoc().getObject());
+
+    assertOplogEntry(fromjson("{$v: 2, diff: {sa: {a: true, u2: 2, u10: 10}}}"));
 }
 
 TEST_F(UpdateObjectNodeTest, ApplyMultipleUpdatesToDocumentInArray) {
@@ -2536,12 +2570,14 @@ TEST_F(UpdateObjectNodeTest, ApplyMultipleUpdatesToDocumentInArray) {
 
     mutablebson::Document doc(fromjson("{a: []}"));
     addIndexedPath("a");
-    auto result = root.apply(getApplyParams(doc.root()));
-    ASSERT_TRUE(result.indexesAffected);
+    auto result = root.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
     ASSERT_BSONOBJ_EQ(fromjson("{a: [null, null, {b: 1, c: 1}]}"), doc.getObject());
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
-    ASSERT_BSONOBJ_EQ(fromjson("{$set: {'a.2.b': 1, 'a.2.c': 1}}"), getLogDoc().getObject());
+
+    assertOplogEntry(fromjson("{$v: 2, diff: {sa: {a: true, u2: {b: 1, c: 1}}}}"));
+    ASSERT_EQUALS(getModifiedPaths(), "{a}");
 }
 
 TEST_F(UpdateObjectNodeTest, ApplyUpdateToNonViablePathInArray) {
@@ -2559,7 +2595,7 @@ TEST_F(UpdateObjectNodeTest, ApplyUpdateToNonViablePathInArray) {
 
     mutablebson::Document doc(fromjson("{a: [{b: 1}, {b: 2}]}"));
     addIndexedPath("a");
-    ASSERT_THROWS_CODE_AND_WHAT(root.apply(getApplyParams(doc.root())),
+    ASSERT_THROWS_CODE_AND_WHAT(root.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams()),
                                 AssertionException,
                                 ErrorCodes::PathNotViable,
                                 "Cannot create field 'b' in element {a: [ { b: 1 }, { b: 2 } ]}");
@@ -2585,12 +2621,14 @@ TEST_F(UpdateObjectNodeTest, SetAndPopModifiersWithCommonPrefixApplySuccessfully
                                               foundIdentifiers));
 
     mutablebson::Document doc(fromjson("{a: {b: 3, c: [1, 2, 3, 4]}}"));
-    auto result = root.apply(getApplyParams(doc.root()));
-    ASSERT_FALSE(result.indexesAffected);
+    auto result = root.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
+    ASSERT_FALSE(getIndexAffectedFromLogEntry());
     ASSERT_BSONOBJ_EQ(fromjson("{a: {b: 5, c: [2, 3, 4]}}"), doc.getObject());
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
-    ASSERT_BSONOBJ_EQ(fromjson("{$set: {'a.b': 5, 'a.c': [2, 3, 4]}}"), getLogDoc().getObject());
+
+    assertOplogEntry(fromjson("{$v: 2, diff: {sa: {u: {b: 5, c: [ 2, 3, 4 ]}}}}"));
+    ASSERT_EQUALS(getModifiedPaths(), "{a.b, a.c}");
 }
 
 TEST(ParseRenameTest, RenameToStringWithEmbeddedNullFails) {
@@ -2603,14 +2641,16 @@ TEST(ParseRenameTest, RenameToStringWithEmbeddedNullFails) {
         auto update = BSON("$rename" << BSON("a.b" << embeddedNull));
 
         UpdateObjectNode root;
-        auto result = UpdateObjectNode::parseAndMerge(&root,
-                                                      modifiertable::ModifierType::MOD_RENAME,
-                                                      update["$rename"]["a.b"],
-                                                      expCtx,
-                                                      arrayFilters,
-                                                      foundIdentifiers);
-        ASSERT_NOT_OK(result);
-        ASSERT_EQ(result.getStatus().code(), ErrorCodes::BadValue);
+        ASSERT_THROWS_CODE_AND_WHAT(
+            UpdateObjectNode::parseAndMerge(&root,
+                                            modifiertable::ModifierType::MOD_RENAME,
+                                            update["$rename"]["a.b"],
+                                            expCtx,
+                                            arrayFilters,
+                                            foundIdentifiers),
+            AssertionException,
+            9867600,
+            "Field name can't contain null bytes");
     }
 
     {
@@ -2618,14 +2658,16 @@ TEST(ParseRenameTest, RenameToStringWithEmbeddedNullFails) {
         auto update = BSON("$rename" << BSON("a.b" << singleNullByte));
 
         UpdateObjectNode root;
-        auto result = UpdateObjectNode::parseAndMerge(&root,
-                                                      modifiertable::ModifierType::MOD_RENAME,
-                                                      update["$rename"]["a.b"],
-                                                      expCtx,
-                                                      arrayFilters,
-                                                      foundIdentifiers);
-        ASSERT_NOT_OK(result);
-        ASSERT_EQ(result.getStatus().code(), ErrorCodes::BadValue);
+        ASSERT_THROWS_CODE_AND_WHAT(
+            UpdateObjectNode::parseAndMerge(&root,
+                                            modifiertable::ModifierType::MOD_RENAME,
+                                            update["$rename"]["a.b"],
+                                            expCtx,
+                                            arrayFilters,
+                                            foundIdentifiers),
+            AssertionException,
+            9867600,
+            "Field name can't contain null bytes");
     }
 
     {
@@ -2633,14 +2675,16 @@ TEST(ParseRenameTest, RenameToStringWithEmbeddedNullFails) {
         auto update = BSON("$rename" << BSON("a.b" << leadingNullByte));
 
         UpdateObjectNode root;
-        auto result = UpdateObjectNode::parseAndMerge(&root,
-                                                      modifiertable::ModifierType::MOD_RENAME,
-                                                      update["$rename"]["a.b"],
-                                                      expCtx,
-                                                      arrayFilters,
-                                                      foundIdentifiers);
-        ASSERT_NOT_OK(result);
-        ASSERT_EQ(result.getStatus().code(), ErrorCodes::BadValue);
+        ASSERT_THROWS_CODE_AND_WHAT(
+            UpdateObjectNode::parseAndMerge(&root,
+                                            modifiertable::ModifierType::MOD_RENAME,
+                                            update["$rename"]["a.b"],
+                                            expCtx,
+                                            arrayFilters,
+                                            foundIdentifiers),
+            AssertionException,
+            9867600,
+            "Field name can't contain null bytes");
     }
 
     {
@@ -2648,14 +2692,16 @@ TEST(ParseRenameTest, RenameToStringWithEmbeddedNullFails) {
         auto update = BSON("$rename" << BSON("a.b" << trailingNullByte));
 
         UpdateObjectNode root;
-        auto result = UpdateObjectNode::parseAndMerge(&root,
-                                                      modifiertable::ModifierType::MOD_RENAME,
-                                                      update["$rename"]["a.b"],
-                                                      expCtx,
-                                                      arrayFilters,
-                                                      foundIdentifiers);
-        ASSERT_NOT_OK(result);
-        ASSERT_EQ(result.getStatus().code(), ErrorCodes::BadValue);
+        ASSERT_THROWS_CODE_AND_WHAT(
+            UpdateObjectNode::parseAndMerge(&root,
+                                            modifiertable::ModifierType::MOD_RENAME,
+                                            update["$rename"]["a.b"],
+                                            expCtx,
+                                            arrayFilters,
+                                            foundIdentifiers),
+            AssertionException,
+            9867600,
+            "Field name can't contain null bytes");
     }
 }
 

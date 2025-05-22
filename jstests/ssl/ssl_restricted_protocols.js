@@ -1,40 +1,53 @@
 // Ensure that the shell may connect to servers running supporting restricted subsets of TLS
 // protocols.
 
-(function() {
-    'use strict';
+import {
+    clientSupportsTLS1_2,
+    clientSupportsTLS1_3,
+    determineSSLProvider
+} from "jstests/ssl/libs/ssl_helpers.js";
 
-    var SERVER_CERT = "jstests/libs/server.pem";
-    var CLIENT_CERT = "jstests/libs/client.pem";
-    var CA_CERT = "jstests/libs/ca.pem";
+var SERVER_CERT = "jstests/libs/server.pem";
+var CLIENT_CERT = "jstests/libs/client.pem";
+var CA_CERT = "jstests/libs/ca.pem";
 
-    function runTestWithoutSubset(subset) {
-        const disabledProtocols = subset.join(",");
-        const conn = MongoRunner.runMongod({
-            sslMode: 'allowSSL',
-            sslPEMKeyFile: SERVER_CERT,
-            sslDisabledProtocols: disabledProtocols
-        });
+const supportsTLS1_2 = clientSupportsTLS1_2();
+const supportsTLS1_3 = clientSupportsTLS1_3();
 
-        const exitStatus = runMongoProgram('mongo',
-                                           '--ssl',
-                                           '--sslAllowInvalidHostnames',
-                                           '--sslPEMKeyFile',
-                                           CLIENT_CERT,
-                                           '--sslCAFile',
-                                           CA_CERT,
-                                           '--port',
-                                           conn.port,
-                                           '--eval',
-                                           'quit()');
+function runTestWithoutSubset(subset) {
+    const disabledProtocols = subset.join(",");
+    const conn = MongoRunner.runMongod({
+        tlsMode: 'allowTLS',
+        tlsCertificateKeyFile: SERVER_CERT,
+        tlsDisabledProtocols: disabledProtocols,
+        tlsCAFile: CA_CERT
+    });
 
-        assert.eq(0, exitStatus, "");
+    const exitStatus = runMongoProgram('mongo',
+                                       '--tls',
+                                       '--tlsAllowInvalidHostnames',
+                                       '--tlsCertificateKeyFile',
+                                       CLIENT_CERT,
+                                       '--tlsCAFile',
+                                       CA_CERT,
+                                       '--port',
+                                       conn.port,
+                                       '--eval',
+                                       'quit()');
 
-        MongoRunner.stopMongod(conn);
-    }
+    assert.eq(0, exitStatus, "");
 
-    runTestWithoutSubset(["TLS1_0"]);
+    MongoRunner.stopMongod(conn);
+}
+
+runTestWithoutSubset(["TLS1_0"]);
+runTestWithoutSubset(["TLS1_0", "TLS1_1"]);
+
+if (determineSSLProvider() === 'openssl' && (!supportsTLS1_2 || supportsTLS1_3)) {
     runTestWithoutSubset(["TLS1_2"]);
-    runTestWithoutSubset(["TLS1_0", "TLS1_1"]);
+}
 
-})();
+if (determineSSLProvider() === 'openssl' && supportsTLS1_3) {
+    runTestWithoutSubset(["TLS1_3"]);
+    runTestWithoutSubset(["TLS1_0", "TLS1_1", "TLS1_2"]);
+}

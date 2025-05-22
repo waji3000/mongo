@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,10 +29,14 @@
 
 #pragma once
 
-#include "mongo/base/disallow_copying.h"
+#include <functional>
+#include <memory>
+
 #include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/sync_source_selector.h"
-#include "mongo/stdx/functional.h"
+#include "mongo/rpc/metadata/oplog_query_metadata.h"
+#include "mongo/util/net/hostandport.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo {
 namespace repl {
@@ -42,20 +45,26 @@ namespace repl {
  * Mock implementation of SyncSourceSelector interface for testing.
  */
 class SyncSourceSelectorMock : public SyncSourceSelector {
-    MONGO_DISALLOW_COPYING(SyncSourceSelectorMock);
+    SyncSourceSelectorMock(const SyncSourceSelectorMock&) = delete;
+    SyncSourceSelectorMock& operator=(const SyncSourceSelectorMock&) = delete;
 
 public:
-    using ChooseNewSyncSourceHook = stdx::function<void()>;
+    using ChooseNewSyncSourceHook = std::function<void()>;
 
     SyncSourceSelectorMock();
-    virtual ~SyncSourceSelectorMock();
+    ~SyncSourceSelectorMock() override;
 
-    void clearSyncSourceBlacklist() override;
+    void clearSyncSourceDenylist() override;
     HostAndPort chooseNewSyncSource(const OpTime& ot) override;
-    void blacklistSyncSource(const HostAndPort& host, Date_t until) override;
-    bool shouldChangeSyncSource(const HostAndPort&,
-                                const rpc::ReplSetMetadata&,
-                                boost::optional<rpc::OplogQueryMetadata> oqMetadata) override;
+    void denylistSyncSource(const HostAndPort& host, Date_t until) override;
+    ChangeSyncSourceAction shouldChangeSyncSource(const HostAndPort&,
+                                                  const rpc::ReplSetMetadata&,
+                                                  const rpc::OplogQueryMetadata& oqMetadata,
+                                                  const OpTime& previousOpTimeFetched,
+                                                  const OpTime& lastOpTimeFetched) const override;
+
+    ChangeSyncSourceAction shouldChangeSyncSourceOnError(
+        const HostAndPort&, const OpTime& lastOpTimeFetched) const override;
 
     /**
      * Sets a function that will be run every time chooseNewSyncSource() is called.
@@ -73,14 +82,14 @@ public:
     OpTime getChooseNewSyncSourceOpTime_forTest() const;
 
     /**
-     * Returns most recently blacklisted sync source.
+     * Returns most recently denylisted sync source.
      */
-    HostAndPort getLastBlacklistedSyncSource_forTest() const;
+    HostAndPort getLastDenylistedSyncSource_forTest() const;
 
     /**
-     * Returns the expiration associated with the most recently blacklisted sync source.
+     * Returns the expiration associated with the most recently denylisted sync source.
      */
-    Date_t getLastBlacklistExpiration_forTest() const;
+    Date_t getLastDenylistExpiration_forTest() const;
 
 private:
     // This is the sync source that chooseNewSyncSource returns.
@@ -90,13 +99,14 @@ private:
     OpTime _chooseNewSyncSourceOpTime;
 
     // This is run every time chooseNewSyncSource() is called.
-    ChooseNewSyncSourceHook _chooseNewSyncSourceHook = []() {};
+    ChooseNewSyncSourceHook _chooseNewSyncSourceHook = []() {
+    };
 
-    // This is the most recently blacklisted sync source passed to blacklistSyncSource().
-    HostAndPort _lastBlacklistedSyncSource;
+    // This is the most recently denylisted sync source passed to denylistSyncSource().
+    HostAndPort _lastDenylistedSyncSource;
 
-    // This is the most recent 'util' argument value passed to blacklistSyncSource().
-    Date_t _lastBlacklistExpiration;
+    // This is the most recent 'util' argument value passed to denylistSyncSource().
+    Date_t _lastDenylistExpiration;
 };
 
 }  // namespace repl

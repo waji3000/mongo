@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,58 +29,38 @@
 
 #pragma once
 
+#include <array>
+#include <compare>
+#include <cstdint>
+#include <cstring>
 #include <functional>
+#include <iosfwd>
 #include <string>
-
-#include <third_party/murmurhash3/MurmurHash3.h>
 
 #include "mongo/base/data_range.h"
 #include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
 #include "mongo/bson/bsonelement.h"
-#include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/bson/util/builder_fwd.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/stdx/type_traits.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
-
-namespace repl {
-class OplogEntryBase;
-class ReplOperation;
-}  // namespace repl
-
-namespace idl {
-namespace import {
-class One_UUID;
-}  // namespace import
-}  // namespace idl
 
 /**
  * A UUID is a 128-bit unique identifier, per RFC 4122, v4, using
  * a secure random number generator.
  */
 class UUID {
-    using UUIDStorage = std::array<unsigned char, 16>;
-
-    // Make the IDL generated parser a friend
-    friend class ConfigsvrShardCollectionResponse;
-    friend class ConfigsvrCommitShardCollection;
-    friend class ShardsvrShardCollectionResponse;
-    friend class DatabaseVersion;
-    friend class DbCheckOplogCollection;
-    friend class idl::import::One_UUID;
-    friend class IndexBuildEntry;
-    friend class LogicalSessionId;
-    friend class LogicalSessionToClient;
-    friend class LogicalSessionIdToClient;
-    friend class LogicalSessionFromClient;
-    friend class repl::OplogEntryBase;
-    friend class repl::ReplOperation;
-    friend class ResumeTokenInternal;
-
 public:
     /**
      * The number of bytes contained in a UUID.
      */
-    static constexpr int kNumBytes = sizeof(UUIDStorage);
+    static constexpr int kNumBytes = 16;
 
     /**
      * Generate a new random v4 UUID per RFC 4122.
@@ -92,7 +71,7 @@ public:
      * If the given string represents a valid UUID, constructs and returns the UUID,
      * otherwise returns an error.
      */
-    static StatusWith<UUID> parse(const std::string& s);
+    static StatusWith<UUID> parse(StringData s);
 
     /**
      * If the given BSONElement represents a valid UUID, constructs and returns the UUID,
@@ -108,28 +87,44 @@ public:
     static UUID parse(const BSONObj& obj);
 
     static UUID fromCDR(ConstDataRange cdr) {
-        UUID uuid;
-        invariant(cdr.length() == uuid._uuid.size());
-        memcpy(uuid._uuid.data(), cdr.data(), uuid._uuid.size());
+        UUID uuid{UUIDStorage{}};
+        // Allow empty CDRs to generate empty UUIDs.
+        if (cdr.length() > 0) {
+            invariant(cdr.length() == uuid._uuid.size());
+            memcpy(uuid._uuid.data(), cdr.data(), uuid._uuid.size());
+        }
+
         return uuid;
     }
 
     /**
      * Returns whether this string represents a valid UUID.
      */
-    static bool isUUIDString(const std::string& s);
+    static bool isUUIDString(StringData s);
+
+    /*
+     * Return the underlying 128-bit array.
+     */
+    std::array<unsigned char, 16> data() const {
+        return _uuid;
+    }
 
     /**
      * Returns a ConstDataRange view of the UUID.
      */
     ConstDataRange toCDR() const {
-        return ConstDataRange(reinterpret_cast<const char*>(_uuid.data()), _uuid.size());
+        return ConstDataRange(_uuid);
     }
 
     /**
      * Appends to builder as BinData(4, "...") element with the given name.
      */
     void appendToBuilder(BSONObjBuilder* builder, StringData name) const;
+
+    /**
+     * Appends to array builder as BinData(4, "...").
+     */
+    void appendToArrayBuilder(BSONArrayBuilder* builder) const;
 
     /**
      * Returns a BSON object of the form { uuid: BinData(4, "...") }.
@@ -144,8 +139,16 @@ public:
      */
     std::string toString() const;
 
+    ConstDataRange asDataRange() const {
+        return ConstDataRange(_uuid.data(), _uuid.size());
+    }
+
+    inline int compare(const UUID& rhs) const {
+        return memcmp(&_uuid, &rhs._uuid, sizeof(_uuid));
+    }
+
     inline bool operator==(const UUID& rhs) const {
-        return !memcmp(&_uuid, &rhs._uuid, sizeof(_uuid));
+        return !compare(rhs);
     }
 
     inline bool operator!=(const UUID& rhs) const {
@@ -168,37 +171,44 @@ public:
         return _uuid >= rhs._uuid;
     }
 
+    template <typename H>
+    friend H AbslHashValue(H h, const UUID& uuid) {
+        return H::combine(std::move(h), uuid._uuid);
+    }
+
     /**
      * Returns true only if the UUID is the RFC 4122 variant, v4 (random).
      */
     bool isRFC4122v4() const;
 
     /**
-     * Custom hasher so UUIDs can be used in unordered data structures.
-     *
-     * ex: std::unordered_set<UUID, UUID::Hash> uuidSet;
+     * Custom hasher so UUIDs can be used in unordered data structures. Uses the first four bytes
+     * of the UUID itself as the hash, since these are already randomly generated.
+     * e.g. std::unordered_set<UUID, UUID::Hash> uuidSet;
      */
     struct Hash {
         std::size_t operator()(const UUID& uuid) const {
-            uint32_t hash;
-            MurmurHash3_x86_32(uuid._uuid.data(), UUID::kNumBytes, 0, &hash);
-            return hash;
+            return uuid.toCDR()
+                .read<BigEndian<uint32_t>>();  // BigEndian because UUID is in network order
         }
     };
 
-private:
-    UUID(const UUIDStorage& uuid) : _uuid(uuid) {}
+    friend auto logAttrs(const UUID& uuid) {
+        return "uuid"_attr = uuid;
+    }
 
-    /**
-     *  Should never be used, as the resulting UUID will not be unique.
-     *  The exception is in code generated by the IDL compiler, which itself ensures
-     *  such an invalid value cannot propagate.
-     */
-    friend class LogicalSessionId;
-    UUID() = default;
+private:
+    using UUIDStorage = std::array<unsigned char, kNumBytes>;
+
+    UUID(const UUIDStorage& uuid) : _uuid(uuid) {}
 
     UUIDStorage _uuid{};  // UUID in network byte order
 };
+
+/** Allow IDL-generated parsers to define uninitialized UUID objects. */
+inline auto idlPreparsedValue(stdx::type_identity<UUID>) {
+    return UUID::fromCDR(std::array<unsigned char, 16>{});
+}
 
 inline std::ostream& operator<<(std::ostream& s, const UUID& uuid) {
     return (s << uuid.toString());
@@ -212,7 +222,6 @@ inline StringBuilder& operator<<(StringBuilder& s, const UUID& uuid) {
  * Supports use of UUID with the BSON macro:
  *     BSON("uuid" << uuid) -> { uuid: BinData(4, "...") }
  */
-template <>
-BSONObjBuilder& BSONObjBuilderValueStream::operator<<<UUID>(UUID value);
+BSONObjBuilder& operator<<(BSONObjBuilder::ValueStream& stream, const UUID& value);
 
 }  // namespace mongo

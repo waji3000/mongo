@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,82 +27,108 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/pipeline/document_source_mock.h"
 
-#include "mongo/db/pipeline/document.h"
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/bson/json.h"
+#include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/pipeline/expression_context.h"
-#include "mongo/db/pipeline/expression_context_for_test.h"
 
 namespace mongo {
 
-using boost::intrusive_ptr;
-using std::deque;
+ALLOCATE_DOCUMENT_SOURCE_ID(mock, DocumentSourceMock::id)
 
-DocumentSourceMock::DocumentSourceMock(deque<GetNextResult> results)
-    : DocumentSource(new ExpressionContextForTest()),
-      queue(std::move(results)),
-      sorts(SimpleBSONObjComparator::kInstance.makeBSONObjSet()) {}
+boost::intrusive_ptr<DocumentSourceMock> DocumentSourceMock::create(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx) {
+    return make_intrusive<DocumentSourceMock>(std::deque<GetNextResult>{}, expCtx);
+}
 
-DocumentSourceMock::DocumentSourceMock(deque<GetNextResult> results,
+DocumentSourceMock::DocumentSourceMock(std::deque<GetNextResult> results,
                                        const boost::intrusive_ptr<ExpressionContext>& expCtx)
-    : DocumentSource(expCtx),
-      queue(std::move(results)),
-      sorts(SimpleBSONObjComparator::kInstance.makeBSONObjSet()) {}
+    : DocumentSource(kStageName, expCtx),
+      mockConstraints(StreamType::kStreaming,
+                      PositionRequirement::kNone,
+                      HostTypeRequirement::kNone,
+                      DiskUseRequirement::kNoDiskUse,
+                      FacetRequirement::kAllowed,
+                      TransactionRequirement::kAllowed,
+                      LookupRequirement::kAllowed,
+                      UnionRequirement::kAllowed) {
+    for (auto& res : results) {
+        _queue.push_back(QueueItem{std::move(res), /*count*/ 1});
+    }
+    mockConstraints.requiresInputDocSource = false;
+}
 
 const char* DocumentSourceMock::getSourceName() const {
-    return "mock";
+    return kStageName.data();
 }
 
-Value DocumentSourceMock::serialize(boost::optional<ExplainOptions::Verbosity> explain) const {
-    return Value(Document{{getSourceName(), Document()}});
+size_t DocumentSourceMock::size() const {
+    return _queue.size();
 }
 
-void DocumentSourceMock::doDispose() {
-    isDisposed = true;
+boost::intrusive_ptr<DocumentSourceMock> DocumentSourceMock::createForTest(
+    Document doc, const boost::intrusive_ptr<ExpressionContext>& expCtx) {
+    std::deque<GetNextResult> results;
+    if (doc.metadata().isChangeStreamControlEvent()) {
+        results.push_back(GetNextResult::makeAdvancedControlDocument(std::move(doc)));
+    } else {
+        results.push_back(std::move(doc));
+    }
+    return new DocumentSourceMock(std::move(results), expCtx);
 }
 
-intrusive_ptr<DocumentSourceMock> DocumentSourceMock::create(Document doc) {
-    return new DocumentSourceMock({std::move(doc)});
+boost::intrusive_ptr<DocumentSourceMock> DocumentSourceMock::createForTest(
+    std::deque<GetNextResult> results, const boost::intrusive_ptr<ExpressionContext>& expCtx) {
+    return new DocumentSourceMock(std::move(results), expCtx);
 }
 
-intrusive_ptr<DocumentSourceMock> DocumentSourceMock::create(deque<GetNextResult> results) {
-    return new DocumentSourceMock(std::move(results));
+boost::intrusive_ptr<DocumentSourceMock> DocumentSourceMock::createForTest(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx) {
+    return new DocumentSourceMock(std::deque<GetNextResult>(), expCtx);
 }
 
-intrusive_ptr<DocumentSourceMock> DocumentSourceMock::create() {
-    return new DocumentSourceMock(deque<GetNextResult>());
+boost::intrusive_ptr<DocumentSourceMock> DocumentSourceMock::createForTest(
+    const GetNextResult& result, const boost::intrusive_ptr<ExpressionContext>& expCtx) {
+    std::deque<GetNextResult> results = {result};
+    return new DocumentSourceMock(std::move(results), expCtx);
 }
 
-intrusive_ptr<DocumentSourceMock> DocumentSourceMock::create(const GetNextResult& result) {
-    deque<GetNextResult> results = {result};
-    return new DocumentSourceMock(std::move(results));
+boost::intrusive_ptr<DocumentSourceMock> DocumentSourceMock::createForTest(
+    const char* json, const boost::intrusive_ptr<ExpressionContext>& expCtx) {
+    return createForTest(Document(fromjson(json)), expCtx);
 }
 
-intrusive_ptr<DocumentSourceMock> DocumentSourceMock::create(const char* json) {
-    return create(Document(fromjson(json)));
-}
-
-intrusive_ptr<DocumentSourceMock> DocumentSourceMock::create(
-    const std::initializer_list<const char*>& jsons) {
-    deque<GetNextResult> results;
+boost::intrusive_ptr<DocumentSourceMock> DocumentSourceMock::createForTest(
+    const std::initializer_list<const char*>& jsons,
+    const boost::intrusive_ptr<ExpressionContext>& expCtx) {
+    std::deque<GetNextResult> results;
     for (auto&& json : jsons) {
         results.emplace_back(Document(fromjson(json)));
     }
-    return new DocumentSourceMock(std::move(results));
+    return new DocumentSourceMock(std::move(results), expCtx);
 }
 
-DocumentSource::GetNextResult DocumentSourceMock::getNext() {
+DocumentSource::GetNextResult DocumentSourceMock::doGetNext() {
     invariant(!isDisposed);
     invariant(!isDetachedFromOpCtx);
 
-    if (queue.empty()) {
+    if (_queue.empty()) {
         return GetNextResult::makeEOF();
     }
 
-    auto next = std::move(queue.front());
-    queue.pop_front();
-    return next;
+    boost::optional<DocumentSource::GetNextResult> next;
+    auto& nextQueueItem = _queue.front();
+    --nextQueueItem.count;
+    if (nextQueueItem.count == 0) {
+        next = std::move(nextQueueItem.next);
+        _queue.pop_front();
+    } else {
+        next = nextQueueItem.next;
+    }
+    return std::move(*next);
 }
-}
+
+}  // namespace mongo

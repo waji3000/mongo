@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -59,6 +58,6 @@ Status makeSocketError(SocketErrorKind kind,
         MONGO_UNREACHABLE;                             \
     } while (false)
 
-using NetworkException = ExceptionForCat<ErrorCategory::NetworkError>;
+using NetworkException = ExceptionFor<ErrorCategory::NetworkError>;
 
 }  // namespace mongo

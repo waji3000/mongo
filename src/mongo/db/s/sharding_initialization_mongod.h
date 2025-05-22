@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,17 +29,23 @@
 
 #pragma once
 
-#include "mongo/base/disallow_copying.h"
+#include <boost/optional/optional.hpp>
+#include <functional>
+#include <memory>
+#include <string>
+#include <utility>
+
 #include "mongo/base/string_data.h"
-#include "mongo/db/s/sharding_state.h"
+#include "mongo/client/connection_string.h"
+#include "mongo/client/replica_set_change_notifier.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/repl/replica_set_aware_service.h"
 #include "mongo/db/s/type_shard_identity.h"
-#include "mongo/stdx/functional.h"
+#include "mongo/db/service_context.h"
+#include "mongo/s/sharding_initialization.h"
+#include "mongo/stdx/mutex.h"
 
 namespace mongo {
-
-class ConnectionString;
-class OperationContext;
-class ServiceContext;
 
 /**
  * This class serves as a bootstrap and shutdown for the sharding subsystem and also controls the
@@ -48,36 +53,25 @@ class ServiceContext;
  * services, attaches them to the same service context to which it itself is attached and puts the
  * ShardingState in the initialized state.
  */
-class ShardingInitializationMongoD {
-    MONGO_DISALLOW_COPYING(ShardingInitializationMongoD);
+class ShardingInitializationMongoD : public ReplicaSetAwareService<ShardingInitializationMongoD> {
+    ShardingInitializationMongoD(const ShardingInitializationMongoD&) = delete;
+    ShardingInitializationMongoD& operator=(const ShardingInitializationMongoD&) = delete;
 
 public:
-    using ShardingEnvironmentInitFunc = stdx::function<void(
-        OperationContext* opCtx, const ShardIdentity& shardIdentity, StringData distLockProcessId)>;
+    using ShardingEnvironmentInitFunc =
+        std::function<void(OperationContext* opCtx, const ShardIdentity& shardIdentity)>;
 
     ShardingInitializationMongoD();
-    ~ShardingInitializationMongoD();
+    ~ShardingInitializationMongoD() override;
 
     static ShardingInitializationMongoD* get(OperationContext* opCtx);
     static ShardingInitializationMongoD* get(ServiceContext* service);
 
     /**
-     * If started with --shardsvr, initializes sharding awareness from the shardIdentity document on
-     * disk, if there is one.
-     *
-     * If started with --shardsvr in queryableBackupMode, initializes sharding awareness from the
-     * shardIdentity document passed through the --overrideShardIdentity startup parameter.
-     *
-     * If it returns true, the '_initFunc' was called, meaning all the core classes for sharding
-     * were initialized, but no networking calls were made yet (with the exception of the duplicate
-     * ShardRegistry reload in ShardRegistry::startup() (see SERVER-26123). Outgoing networking
-     * calls to cluster members can now be made.
-     *
-     * If it returns false, this means the node is not yet sharding aware.
-     *
-     * NOTE: this function briefly takes the global lock to determine primary/secondary state.
+     * Returns the shard identity document for this shard if it exists. This method
+     * will also take into account the --overrideShardIdentity startup parameter
      */
-    bool initializeShardingAwarenessIfNeeded(OperationContext* opCtx);
+    static boost::optional<ShardIdentity> getShardIdentityDoc(OperationContext* opCtx);
 
     /**
      * Initializes the sharding state of this server from the shard identity document argument and
@@ -95,8 +89,8 @@ public:
      * Updates the config server field of the shardIdentity document with the given connection
      * string.
      */
-    static Status updateShardIdentityConfigString(OperationContext* opCtx,
-                                                  const ConnectionString& newConnectionString);
+    static void updateShardIdentityConfigString(OperationContext* opCtx,
+                                                const ConnectionString& newConnectionString);
 
     /**
      * For testing only. Mock the initialization method used by initializeFromConfigConnString and
@@ -106,23 +100,58 @@ public:
         _initFunc = std::move(func);
     }
 
+    /**
+     * Installs a listener for RSM change notifications.
+     */
+    void installReplicaSetChangeListener(ServiceContext* service);
+
 private:
+    void _initializeShardingEnvironmentOnShardServer(OperationContext* opCtx,
+                                                     const ShardIdentity& shardIdentity);
+
+    // Virtual methods coming from the ReplicaSetAwareService
+    void onStartup(OperationContext* opCtx) final {}
+    void onSetCurrentConfig(OperationContext* opCtx) final;
+    void onConsistentDataAvailable(OperationContext* opCtx, bool isMajority, bool isRollback) final;
+    void onShutdown() final {}
+    void onStepUpBegin(OperationContext* opCtx, long long term) final;
+    void onStepUpComplete(OperationContext* opCtx, long long term) final {}
+    void onStepDown() final;
+    void onRollbackBegin() final {}
+    void onBecomeArbiter() final {}
+    inline std::string getServiceName() const final {
+        return "ShardingInitializationMongoD";
+    }
+
+    AtomicWord<bool> _isPrimary;
+
     // This mutex ensures that only one thread at a time executes the sharding
     // initialization/teardown sequence
     stdx::mutex _initSynchronizationMutex;
 
     // Function for initializing the sharding environment components (i.e. everything on the Grid)
     ShardingEnvironmentInitFunc _initFunc;
+
+    std::shared_ptr<ReplicaSetChangeNotifier::Listener> _replicaSetChangeListener;
 };
 
 /**
- * Initialize the sharding components of this server. This can be used on both shard and config
- * servers.
- *
- * NOTE: This does not initialize ShardingState, which should only be done for shard servers.
+ * Initialize the sharding components for a mongod running as a config server (if they haven't
+ * already been set up).
  */
-void initializeGlobalShardingStateForMongoD(OperationContext* opCtx,
-                                            const ConnectionString& configCS,
-                                            StringData distLockProcessId);
+void initializeGlobalShardingStateForConfigServer(OperationContext* opCtx);
+
+/**
+ * Helper method to initialize sharding awareness from the shard identity document if it can be
+ * found and load global sharding settings awareness was initialized. See
+ * ShardingInitializationMongoD::initializeShardingAwarenessIfNeeded() above for more details.
+ * The optional parameter `startupTimeElapsedBuilder` is for adding time elapsed of tasks done in
+ * this function into one single builder that records the time elapsed during startup. Its default
+ * value is nullptr because we only want to time this function when it is called during startup.
+ */
+void initializeShardingAwarenessAndLoadGlobalSettings(
+    OperationContext* opCtx,
+    const ShardIdentity& shardIdentity,
+    BSONObjBuilder* startupTimeElapsedBuilder = nullptr);
 
 }  // namespace mongo

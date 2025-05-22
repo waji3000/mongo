@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,10 +29,11 @@
 
 #pragma once
 
+#include <mutex>
+#include <utility>
+
 #include "mongo/stdx/mutex.h"
 #include "mongo/util/assert_util.h"
-
-#include <utility>
 
 namespace mongo {
 
@@ -69,19 +69,19 @@ namespace mongo {
  *
  */
 struct WithLock {
-    template <typename Mutex>
-    WithLock(stdx::lock_guard<Mutex> const&) noexcept {}
+    template <typename LatchT>
+    WithLock(stdx::lock_guard<LatchT> const&) {}
 
-    template <typename Mutex>
-    WithLock(stdx::unique_lock<Mutex> const& lock) noexcept {
+    template <typename LatchT>
+    WithLock(stdx::unique_lock<LatchT> const& lock) {
         invariant(lock.owns_lock());
     }
 
     // Add constructors from any other lock types here.
 
     // Pass by value is OK.
-    WithLock(WithLock const&) noexcept {}
-    WithLock(WithLock&&) noexcept {}
+    WithLock(WithLock const&) = default;
+    WithLock(WithLock&&) noexcept = default;
 
     // No assigning WithLocks.
     void operator=(WithLock const&) = delete;
@@ -89,26 +89,20 @@ struct WithLock {
 
     // No moving a lock_guard<> or unique_lock<> in.
     template <typename Mutex>
-    WithLock(stdx::lock_guard<Mutex>&&) = delete;
+    WithLock(stdx::lock_guard<stdx::mutex>&&) = delete;
     template <typename Mutex>
-    WithLock(stdx::unique_lock<Mutex>&&) = delete;
+    WithLock(stdx::unique_lock<stdx::mutex>&&) = delete;
 
     /*
      * Produces a WithLock without benefit of any actual lock, for use in cases where a lock is not
      * really needed, such as in many (but not all!) constructors.
      */
-    static WithLock withoutLock() noexcept {
+    static WithLock withoutLock() {
         return {};
     }
 
 private:
-    WithLock() noexcept = default;
+    WithLock() = default;
 };
 
 }  // namespace mongo
-
-namespace std {
-// No moving a WithLock:
-template <>
-mongo::WithLock&& move<mongo::WithLock>(mongo::WithLock&&) noexcept = delete;
-}  // namespace std

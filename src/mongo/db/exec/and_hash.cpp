@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,12 +29,18 @@
 
 #include "mongo/db/exec/and_hash.h"
 
-#include "mongo/db/exec/and_common-inl.h"
-#include "mongo/db/exec/scoped_timer.h"
+#include <memory>
+#include <utility>
+
+#include <absl/container/node_hash_map.h>
+#include <absl/meta/type_traits.h>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/util/builder.h"
+#include "mongo/bson/util/builder_fwd.h"
+#include "mongo/db/exec/and_common.h"
 #include "mongo/db/exec/working_set.h"
-#include "mongo/db/exec/working_set_common.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/assert_util.h"
 
 namespace {
 
@@ -48,39 +53,37 @@ const size_t kDefaultMaxMemUsageBytes = 32 * 1024 * 1024;
 namespace mongo {
 
 using std::unique_ptr;
-using std::vector;
-using stdx::make_unique;
 
 const size_t AndHashStage::kLookAheadWorks = 10;
 
 // static
 const char* AndHashStage::kStageType = "AND_HASH";
 
-AndHashStage::AndHashStage(OperationContext* opCtx, WorkingSet* ws)
-    : PlanStage(kStageType, opCtx),
+AndHashStage::AndHashStage(ExpressionContext* expCtx, WorkingSet* ws)
+    : PlanStage(kStageType, expCtx),
       _ws(ws),
       _hashingChildren(true),
       _currentChild(0),
       _memUsage(0),
       _maxMemUsage(kDefaultMaxMemUsageBytes) {}
 
-AndHashStage::AndHashStage(OperationContext* opCtx, WorkingSet* ws, size_t maxMemUsage)
-    : PlanStage(kStageType, opCtx),
+AndHashStage::AndHashStage(ExpressionContext* expCtx, WorkingSet* ws, size_t maxMemUsage)
+    : PlanStage(kStageType, expCtx),
       _ws(ws),
       _hashingChildren(true),
       _currentChild(0),
       _memUsage(0),
       _maxMemUsage(maxMemUsage) {}
 
-void AndHashStage::addChild(PlanStage* child) {
-    _children.emplace_back(child);
+void AndHashStage::addChild(std::unique_ptr<PlanStage> child) {
+    _children.emplace_back(std::move(child));
 }
 
 size_t AndHashStage::getMemUsage() const {
     return _memUsage;
 }
 
-bool AndHashStage::isEOF() {
+bool AndHashStage::isEOF() const {
     // This is empty before calling work() and not-empty after.
     if (_lookAheadResults.empty()) {
         return false;
@@ -141,14 +144,6 @@ PlanStage::StageState AndHashStage::doWork(WorkingSetID* out) {
                     // yield.
                     _ws->get(_lookAheadResults[i])->makeObjOwnedIfNeeded();
                     break;  // Stop looking at this child.
-                } else if (PlanStage::FAILURE == childStatus || PlanStage::DEAD == childStatus) {
-                    // The stage which produces a failure is responsible for allocating a working
-                    // set member with error details.
-                    invariant(WorkingSet::INVALID_ID != _lookAheadResults[i]);
-                    *out = _lookAheadResults[i];
-                    _hashingChildren = false;
-                    _dataMap.clear();
-                    return childStatus;
                 }
                 // We ignore NEED_TIME. TODO: what do we want to do if we get NEED_YIELD here?
             }
@@ -166,12 +161,10 @@ PlanStage::StageState AndHashStage::doWork(WorkingSetID* out) {
     if (_hashingChildren) {
         // Check memory usage of previously hashed results.
         if (_memUsage > _maxMemUsage) {
-            mongoutils::str::stream ss;
-            ss << "hashed AND stage buffered data usage of " << _memUsage
+            StringBuilder sb;
+            sb << "hashed AND stage buffered data usage of " << _memUsage
                << " bytes exceeds internal limit of " << kDefaultMaxMemUsageBytes << " bytes";
-            Status status(ErrorCodes::Overflow, ss);
-            *out = WorkingSetCommon::allocateStatusMember(_ws, status);
-            return PlanStage::FAILURE;
+            uasserted(ErrorCodes::QueryExceededMemoryLimitNoDiskUseAllowed, sb.str());
         }
 
         if (0 == _currentChild) {
@@ -190,10 +183,10 @@ PlanStage::StageState AndHashStage::doWork(WorkingSetID* out) {
     // hash map.
 
     // We should be EOF if we're not hashing results and the dataMap is empty.
-    verify(!_dataMap.empty());
+    MONGO_verify(!_dataMap.empty());
 
     // We probe _dataMap with the last child.
-    verify(_currentChild == _children.size() - 1);
+    MONGO_verify(_currentChild == _children.size() - 1);
 
     // Get the next result for the (_children.size() - 1)-th child.
     StageState childStatus = workChild(_children.size() - 1, out);
@@ -239,7 +232,7 @@ PlanStage::StageState AndHashStage::workChild(size_t childNo, WorkingSetID* out)
 }
 
 PlanStage::StageState AndHashStage::readFirstChild(WorkingSetID* out) {
-    verify(_currentChild == 0);
+    MONGO_verify(_currentChild == 0);
 
     WorkingSetID id = WorkingSet::INVALID_ID;
     StageState childStatus = workChild(0, &id);
@@ -280,12 +273,6 @@ PlanStage::StageState AndHashStage::readFirstChild(WorkingSetID* out) {
         _specificStats.mapAfterChild.push_back(_dataMap.size());
 
         return PlanStage::NEED_TIME;
-    } else if (PlanStage::FAILURE == childStatus || PlanStage::DEAD == childStatus) {
-        // The stage which produces a failure is responsible for allocating a working set member
-        // with error details.
-        invariant(WorkingSet::INVALID_ID != id);
-        *out = id;
-        return childStatus;
     } else {
         if (PlanStage::NEED_YIELD == childStatus) {
             *out = id;
@@ -296,7 +283,7 @@ PlanStage::StageState AndHashStage::readFirstChild(WorkingSetID* out) {
 }
 
 PlanStage::StageState AndHashStage::hashOtherChildren(WorkingSetID* out) {
-    verify(_currentChild > 0);
+    MONGO_verify(_currentChild > 0);
 
     WorkingSetID id = WorkingSet::INVALID_ID;
     StageState childStatus = workChild(_currentChild, &id);
@@ -365,12 +352,6 @@ PlanStage::StageState AndHashStage::hashOtherChildren(WorkingSetID* out) {
         }
 
         return PlanStage::NEED_TIME;
-    } else if (PlanStage::FAILURE == childStatus || PlanStage::DEAD == childStatus) {
-        // The stage which produces a failure is responsible for allocating a working set member
-        // with error details.
-        invariant(WorkingSet::INVALID_ID != id);
-        *out = id;
-        return childStatus;
     } else {
         if (PlanStage::NEED_YIELD == childStatus) {
             *out = id;
@@ -386,8 +367,8 @@ unique_ptr<PlanStageStats> AndHashStage::getStats() {
     _specificStats.memLimit = _maxMemUsage;
     _specificStats.memUsage = _memUsage;
 
-    unique_ptr<PlanStageStats> ret = make_unique<PlanStageStats>(_commonStats, STAGE_AND_HASH);
-    ret->specific = make_unique<AndHashStats>(_specificStats);
+    unique_ptr<PlanStageStats> ret = std::make_unique<PlanStageStats>(_commonStats, STAGE_AND_HASH);
+    ret->specific = std::make_unique<AndHashStats>(_specificStats);
     for (size_t i = 0; i < _children.size(); ++i) {
         ret->children.emplace_back(_children[i]->getStats());
     }

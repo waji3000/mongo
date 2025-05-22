@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -29,20 +28,39 @@
  */
 
 #include "mongo/db/index/fts_access_method.h"
+
+#include <utility>
+
+#include <boost/optional/optional.hpp>
+
 #include "mongo/db/catalog/index_catalog_entry.h"
 #include "mongo/db/index/expression_keys_private.h"
 #include "mongo/db/index/index_descriptor.h"
 
 namespace mongo {
 
-FTSAccessMethod::FTSAccessMethod(IndexCatalogEntry* btreeState, SortedDataInterface* btree)
-    : AbstractIndexAccessMethod(btreeState, btree), _ftsSpec(btreeState->descriptor()->infoObj()) {}
+FTSAccessMethod::FTSAccessMethod(IndexCatalogEntry* btreeState,
+                                 std::unique_ptr<SortedDataInterface> btree)
+    : SortedDataIndexAccessMethod(btreeState, std::move(btree)),
+      _ftsSpec(btreeState->descriptor()->infoObj()) {}
 
-void FTSAccessMethod::doGetKeys(const BSONObj& obj,
-                                BSONObjSet* keys,
-                                BSONObjSet* multikeyMetadataKeys,
-                                MultikeyPaths* multikeyPaths) const {
-    ExpressionKeysPrivate::getFTSKeys(obj, _ftsSpec, keys);
+void FTSAccessMethod::doGetKeys(OperationContext* opCtx,
+                                const CollectionPtr& collection,
+                                const IndexCatalogEntry* entry,
+                                SharedBufferFragmentBuilder& pooledBufferBuilder,
+                                const BSONObj& obj,
+                                GetKeysContext context,
+                                KeyStringSet* keys,
+                                KeyStringSet* multikeyMetadataKeys,
+                                MultikeyPaths* multikeyPaths,
+                                const boost::optional<RecordId>& id) const {
+    ExpressionKeysPrivate::getFTSKeys(pooledBufferBuilder,
+                                      obj,
+                                      _ftsSpec,
+                                      keys,
+                                      getSortedDataInterface()->getKeyStringVersion(),
+                                      getSortedDataInterface()->getOrdering(),
+                                      id);
 }
 
 }  // namespace mongo

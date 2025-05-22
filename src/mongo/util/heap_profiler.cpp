@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,26 +27,92 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#include <absl/hash/hash.h>
 
-#include "mongo/platform/basic.h"
+// IWYU pragma: no_include "cxxabi.h"
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <cstdint>
+#include <cstdlib>
+#include <memory>
+#include <mutex>
+#include <ostream>
+#include <queue>
+#include <set>
+#include <string>
+#include <utility>
+#include <vector>
 
-#include "mongo/base/init.h"
+#include "mongo/base/data_range.h"
+#include "mongo/base/init.h"  // IWYU pragma: keep
+#include "mongo/base/initializer.h"
 #include "mongo/base/static_assert.h"
-#include "mongo/config.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/config.h"  // IWYU pragma: keep
 #include "mongo/db/commands/server_status.h"
-#include "mongo/db/server_parameters.h"
-#include "mongo/util/log.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/logv2/log.h"
+#include "mongo/stdx/unordered_map.h"
+#include "mongo/util/processinfo.h"
 #include "mongo/util/stacktrace.h"
+#include "mongo/util/tcmalloc_parameters_gen.h"
 
+#if defined(MONGO_CONFIG_HAVE_HEADER_UNISTD_H)
+#include <unistd.h>
+#endif
+
+#include <MurmurHash3.h>
+
+#ifdef MONGO_CONFIG_TCMALLOC_GPERF
 #include <gperftools/malloc_hook.h>
-#include <third_party/murmurhash3/MurmurHash3.h>
+#endif
 
-// for dlfcn.h and backtrace
+#ifdef MONGO_CONFIG_TCMALLOC_GOOGLE
+#include <absl/debugging/symbolize.h>
+#include <tcmalloc/malloc_extension.h>
+#endif
+
 #if defined(_POSIX_VERSION) && defined(MONGO_CONFIG_HAVE_EXECINFO_BACKTRACE)
-
 #include <dlfcn.h>
 #include <execinfo.h>
+#endif
+
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
+
+#if defined(_POSIX_VERSION) && defined(MONGO_CONFIG_HAVE_EXECINFO_BACKTRACE) && \
+    (defined(MONGO_CONFIG_TCMALLOC_GPERF) || defined(MONGO_CONFIG_TCMALLOC_GOOGLE))
+
+
+namespace mongo {
+namespace {
+
+/** Simple wrapper for the demangler, particularly its buffer space. */
+class Demangler {
+public:
+    Demangler() = default;
+    Demangler(const Demangler&) = delete;
+    ~Demangler() {
+        free(_buf);
+    }
+
+    char* operator()(const char* sym) {
+        char* dm = abi::__cxa_demangle(sym, _buf, &_bufSize, &_status);
+        if (dm)
+            _buf = dm;
+        return dm;
+    }
+
+private:
+    size_t _bufSize = 0;
+    char* _buf = nullptr;
+    int _status = 0;
+};
+
 
 //
 // Sampling heap profiler
@@ -74,7 +139,9 @@
 //   * the number of active bytes charged to the allocating stack trace is decreased
 //   * the object is removed from the object hash table
 //
-// Enable at startup time (only) with
+// If running mongod with tcmalloc-google allocator, enable at startup or runtime with
+//     {setParameter: 1, heapProfilingSampleIntervalBytes: >0}
+// If running mongod with tcmalloc-gperf allocator, enable at startup time (only) with
 //     mongod --setParameter heapProfilingEnabled=true
 //
 // If enabled, adds a heapProfile section to serverStatus as follows:
@@ -125,9 +192,7 @@
 // and acceptable size overhead for the hash tables.
 //
 
-namespace mongo {
-namespace {
-
+// TODO SERVER-44010: Consider replacing this custom implementation with a generic one.
 //
 // Simple hash table maps Key->Value.
 // All storage is pre-allocated at creation.
@@ -148,32 +213,10 @@ namespace {
 //             caller must ensure safety wrt concurrent modification of Value of existing entry
 //
 
-using Hash = uint32_t;
+using Hash = size_t;
 
 template <class Key, class Value>
 class HashTable {
-    MONGO_DISALLOW_COPYING(HashTable);
-
-private:
-    struct Entry {
-        Key key{};
-        Value value{};
-        std::atomic<Entry*> next{nullptr};  // NOLINT
-        std::atomic<bool> valid{false};     // NOLINT
-        Entry() {}
-    };
-
-    const size_t maxEntries;        // we allocate storage for this many entries on creation
-    std::atomic_size_t numEntries;  // number of entries currently in use  NOLINT
-    size_t numBuckets;              // number of buckets, computed as numEntries * loadFactor
-
-    // pre-allocate buckets and entries
-    std::unique_ptr<std::atomic<Entry*>[]> buckets;  // NOLINT
-    std::unique_ptr<Entry[]> entries;
-
-    std::atomic_size_t nextEntry;  // first entry that's never been used  NOLINT
-    Entry* freeEntry;              // linked list of entries returned to us by removeEntry
-
 public:
     HashTable(size_t maxEntries, int loadFactor)
         : maxEntries(maxEntries),
@@ -196,17 +239,15 @@ public:
         } else if (nextEntry < maxEntries) {
             entry = &entries[nextEntry++];
         }
-        if (entry) {
-            entry->next = buckets[hash].load();
-            buckets[hash] = entry;
-            entry->key = key;
-            entry->value = value;
-            entry->valid = true;  // signal that the entry is well-formed and may be traversed
-            numEntries++;
-            return &entry->value;
-        } else {
+        if (!entry)
             return nullptr;
-        }
+        entry->next = buckets[hash].load();
+        buckets[hash] = entry;
+        entry->key = key;
+        entry->value = value;
+        entry->valid = true;  // signal that the entry is well-formed and may be traversed
+        ++numEntries;
+        return &entry->value;
     }
 
     // Find the entry containing Key in the specified hash bucket.
@@ -229,7 +270,7 @@ public:
                 entry->valid = false;  // first signal entry is invalid as it may get reused
                 entry->next = freeEntry;
                 freeEntry = entry;
-                numEntries--;
+                --numEntries;
                 break;
             }
         }
@@ -242,145 +283,165 @@ public:
     // Note however it is not guaranteed to provide snapshot semantics wrt the set of entries,
     // and caller must ensure safety wrt concurrent updates to the Value of an entry
     template <typename F>
-    void forEach(F f) {
+    void forEach(const F& f) {
         for (size_t i = 0; i < nextEntry; i++) {
-            Entry& entry = entries[i];
-            if (entry.valid)  // only traverse well-formed entries
-                f(entry.key, entry.value);
+            Entry& e = entries[i];
+            if (e.valid)  // only traverse well-formed entries
+                f(e.key, e.value);
         }
     }
 
     // Determines whether the specified hash bucket is empty. May be called concurrently with
     // insert() and remove(). Concurrent visibility on other threads is guaranteed because
     // buckets[hash] is atomic.
-    bool isEmptyBucket(Hash hash) {
-        hash %= numBuckets;
-        return buckets[hash] == nullptr;
+    bool isEmptyBucket(Hash hash) const {
+        return !buckets[hash % numBuckets];
     }
 
     // Number of entries.
-    size_t size() {
+    size_t size() const {
         return numEntries;
     }
 
     // Highwater mark of number of entries used, for reporting stats.
-    size_t maxSizeSeen() {
+    size_t maxSizeSeen() const {
         return nextEntry;
     }
 
     // Returns total allocated size of the hash table, for reporting stats.
-    size_t memorySizeBytes() {
+    size_t memorySizeBytes() const {
         return numBuckets * sizeof(buckets[0]) + maxEntries * sizeof(entries[0]);
     }
+
+private:
+    struct Entry {
+        Key key{};
+        Value value{};
+        std::atomic<Entry*> next{nullptr};  // NOLINT
+        std::atomic<bool> valid{false};     // NOLINT
+    };
+
+    const size_t maxEntries;        // we allocate storage for this many entries on creation
+    std::atomic_size_t numEntries;  // number of entries currently in use  NOLINT
+    size_t numBuckets;              // number of buckets, computed as numEntries * loadFactor
+
+    // pre-allocate buckets and entries
+    std::unique_ptr<std::atomic<Entry*>[]> buckets;  // NOLINT
+    std::unique_ptr<Entry[]> entries;
+
+    std::atomic_size_t nextEntry;  // first entry that's never been used  NOLINT
+    Entry* freeEntry;              // linked list of entries returned to us by removeEntry
 };
 
-
+namespace heap_profiler_detail_gperf_tcmalloc {
 class HeapProfiler {
+public:
+    static inline HeapProfiler* heapProfiler;
+
+    HeapProfiler() {
+        // Set sample interval from the parameter.
+        sampleIntervalBytes = HeapProfilingSampleIntervalBytes;
+
+        // This is our only allocator dependency - ifdef and change as
+        // appropriate for other allocators, using hooks or shims.
+        // For tcmalloc we skip two frames that are internal to the allocator
+        // so that the top frame is the public tc_* function.
+        skipStartFrames = 2;
+        skipEndFrames = 0;
+#ifdef MONGO_CONFIG_TCMALLOC_GPERF
+        MallocHook::AddNewHook(+[](const void* p, size_t sz) { heapProfiler->_alloc(p, sz); });
+        MallocHook::AddDeleteHook(+[](const void* p) { heapProfiler->_free(p); });
+#endif
+    }
+
+    static void generateServerStatusSection(BSONObjBuilder& builder) {
+        if (heapProfiler)
+            heapProfiler->_generateServerStatusSection(builder);
+    }
+
+    static void start() {
+        heapProfiler = new HeapProfiler();
+    }
+
 private:
-    // 0: sampling internally disabled
-    // 1: sample every allocation - byte accurate but slow and big
-    // >1: sample ever sampleIntervalBytes bytes allocated - less accurate but fast and small
-    std::atomic_size_t sampleIntervalBytes;  // NOLINT
-
-    stdx::mutex hashtable_mutex;  // guards updates to both object and stack hash tables
-    stdx::mutex stackinfo_mutex;  // guards against races updating the StackInfo bson representation
-
-    // cumulative bytes allocated - determines when samples are taken
-    std::atomic_size_t bytesAllocated{0};  // NOLINT
-
-    // estimated currently active bytes - sum of activeBytes for all stacks
-    size_t totalActiveBytes = 0;
-
-    //
-    // Hash table of stacks
-    //
-
     using FrameInfo = void*;  // per-frame information is just the IP
 
     static const int kMaxStackInfos = 20000;         // max number of unique call sites we handle
     static const int kStackHashTableLoadFactor = 2;  // keep loading <50%
-    static const int kMaxFramesPerStack = 100;       // max depth of stack
-
-    // stack HashTable Key
-    struct Stack {
-        int numFrames = 0;
-        std::array<FrameInfo, kMaxFramesPerStack> frames;
-        Stack() {}
-
-        bool operator==(const Stack& that) {
-            return this->numFrames == that.numFrames &&
-                std::equal(frames.begin(), frames.begin() + numFrames, that.frames.begin());
-        }
-
-        Hash hash() {
-            Hash hash;
-            MONGO_STATIC_ASSERT_MSG(sizeof(frames) == sizeof(FrameInfo) * kMaxFramesPerStack,
-                                    "frames array is not dense");
-            MurmurHash3_x86_32(frames.data(), numFrames * sizeof(FrameInfo), 0, &hash);
-            return hash;
-        }
-    };
-
-    // Stack HashTable Value.
-    struct StackInfo {
-        int stackNum = 0;        // used for stack short name
-        BSONObj stackObj{};      // symbolized representation
-        size_t activeBytes = 0;  // number of live allocated bytes charged to this stack
-        explicit StackInfo(int stackNum) : stackNum(stackNum) {}
-        StackInfo() {}
-    };
-
-    // The stack HashTable itself.
-    HashTable<Stack, StackInfo> stackHashTable{kMaxStackInfos, kStackHashTableLoadFactor};
-
-    // frames to skip at top and bottom of backtrace when reporting stacks
-    int skipStartFrames = 0;
-    int skipEndFrames = 0;
-
-
-    //
-    // Hash table of allocated objects.
-    //
+    static const size_t kMaxFramesPerStack = 100;    // max depth of stack
 
     static const int kMaxObjInfos = 1024 * 1024;   // maximum tracked allocations
     static const int kObjHashTableLoadFactor = 4;  // keep hash table loading <25%
 
-    // Obj HashTable Key.
-    struct Obj {
-        const void* objPtr = nullptr;
-        explicit Obj(const void* objPtr) : objPtr(objPtr) {}
-        Obj() {}
+    static const int kMaxImportantSamples = 4 * 3600;  // reset every 4 hours at 1Hz
 
-        bool operator==(const Obj& that) {
-            return this->objPtr == that.objPtr;
+    // stack HashTable Key
+    struct Stack {
+        Stack() = default;
+
+        friend bool operator==(const Stack& a, const Stack& b) {
+            return a.numFrames == b.numFrames &&
+                std::equal(a.frames.begin(), a.frames.begin() + a.numFrames, b.frames.begin());
         }
 
         Hash hash() {
-            Hash hash = 0;
-            MurmurHash3_x86_32(&objPtr, sizeof(objPtr), 0, &hash);
-            return hash;
+            MONGO_STATIC_ASSERT_MSG(sizeof(frames) == sizeof(FrameInfo) * kMaxFramesPerStack,
+                                    "frames array is not dense");
+            ConstDataRange dataRange{reinterpret_cast<const char*>(frames.data()),
+                                     numFrames * sizeof(FrameInfo)};
+            return absl::HashOf(dataRange);
+        }
+
+        size_t numFrames = 0;
+        std::array<FrameInfo, kMaxFramesPerStack> frames;
+    };
+
+    // Stack HashTable Value.
+    struct StackInfo {
+        StackInfo() = default;
+        explicit StackInfo(int stackNum) : stackNum(stackNum) {}
+
+        int stackNum = 0;        // used for stack short name
+        size_t activeBytes = 0;  // number of live allocated bytes charged to this stack
+        bool logged = false;     // true when stack has been logged once.
+    };
+
+    struct ByPointeeStackNum {
+        bool operator()(const StackInfo* a, const StackInfo* b) const {
+            return a->stackNum < b->stackNum;
         }
     };
 
-    // Obj HashTable Value.
-    struct ObjInfo {
-        size_t accountedLen = 0;
-        StackInfo* stackInfo = nullptr;
-        ObjInfo(size_t accountedLen, StackInfo* stackInfo)
-            : accountedLen(accountedLen), stackInfo(stackInfo) {}
-        ObjInfo() {}
+    struct Obj {
+        Obj() = default;
+        explicit Obj(const void* objPtr) : objPtr(objPtr) {}
+
+        friend bool operator==(const Obj& a, const Obj& b) {
+            return a.objPtr == b.objPtr;
+        }
+
+        Hash hash() {
+            return absl::HashOf(objPtr);
+        }
+
+        const void* objPtr = nullptr;
     };
 
-    // The obj HashTable itself.
-    HashTable<Obj, ObjInfo> objHashTable{kMaxObjInfos, kObjHashTableLoadFactor};
+    struct ObjInfo {
+        ObjInfo() = default;
+        ObjInfo(size_t accountedLen, StackInfo* stackInfo)
+            : accountedLen(accountedLen), stackInfo(stackInfo) {}
 
+        size_t accountedLen = 0;
+        StackInfo* stackInfo = nullptr;
+    };
 
     // If we encounter an error that doesn't allow us to proceed, for
     // example out of space for new hash table entries, we internally
     // disable profiling and then log an error message.
     void disable(const char* msg) {
         sampleIntervalBytes = 0;
-        log() << msg;
+        LOGV2(23157, "{msg}", "msg"_attr = msg);
     }
 
     //
@@ -388,7 +449,8 @@ private:
     //
     void _alloc(const void* objPtr, size_t objLen) {
         // still profiling?
-        if (sampleIntervalBytes == 0)
+        size_t nBytes = sampleIntervalBytes;
+        if (nBytes == 0)
             return;
 
         // Sample every sampleIntervalBytes bytes of allocation.
@@ -397,14 +459,13 @@ private:
         // number of samples will be correct.
         size_t lastSample = bytesAllocated.fetch_add(objLen);
         size_t currentSample = lastSample + objLen;
-        size_t accountedLen = sampleIntervalBytes *
-            (currentSample / sampleIntervalBytes - lastSample / sampleIntervalBytes);
+        size_t accountedLen = nBytes * (currentSample / nBytes - lastSample / nBytes);
         if (accountedLen == 0)
             return;
 
         // Get backtrace.
         Stack tempStack;
-        tempStack.numFrames = backtrace(tempStack.frames.data(), kMaxFramesPerStack);
+        tempStack.numFrames = rawBacktrace(tempStack.frames.data(), kMaxFramesPerStack);
 
         // Compute backtrace hash.
         Hash stackHash = tempStack.hash();
@@ -470,58 +531,46 @@ private:
     //
     // Generate bson representation of stack.
     //
-    void generateStackIfNeeded(Stack& stack, StackInfo& stackInfo) {
-        if (!stackInfo.stackObj.isEmpty())
-            return;
+    void generateStack(StackTraceAddressMetadataGenerator& metaGen,
+                       Demangler& demangler,
+                       Stack& stack,
+                       const StackInfo& stackInfo) {
         BSONArrayBuilder builder;
-        for (int j = skipStartFrames; j < stack.numFrames - skipEndFrames; j++) {
-            Dl_info dli;
-            StringData frameString;
-            char* demangled = nullptr;
-            if (dladdr(stack.frames[j], &dli)) {
-                if (dli.dli_sname) {
-                    int status;
-                    demangled = abi::__cxa_demangle(dli.dli_sname, 0, 0, &status);
-                    if (demangled) {
-                        // strip off function parameters as they are very verbose and not useful
-                        char* p = strchr(demangled, '(');
-                        if (p)
-                            frameString = StringData(demangled, p - demangled);
-                        else
-                            frameString = demangled;
-                    } else {
-                        frameString = dli.dli_sname;
+
+        std::string frameString;
+
+        size_t jb = std::min(stack.numFrames, skipStartFrames);
+        size_t je = stack.numFrames - std::min(stack.numFrames - jb, skipEndFrames);
+        for (size_t j = jb; j != je; ++j) {
+            frameString.clear();
+            void* addr = stack.frames[j];
+            const auto& meta = metaGen.load(addr);
+            if (meta.symbol()) {
+                if (StringData name = meta.symbol().name(); !name.empty()) {
+                    // Upgrade frameString to symbol name.
+                    frameString.assign(name.begin(), name.end());
+                    if (char* dm = demangler(frameString.c_str())) {
+                        // Further upgrade frameString to demangled name.
+                        // We strip function parameters as they are very verbose and not useful.
+                        frameString = dm;
+                        if (auto paren = frameString.find('('); paren != std::string::npos)
+                            frameString.erase(paren);
                     }
                 }
             }
             if (frameString.empty()) {
+                // Fall back to frameString as stringified `void*`.
                 std::ostringstream s;
-                s << stack.frames[j];
+                s << addr;
                 frameString = s.str();
             }
             builder.append(frameString);
-            if (demangled)
-                free(demangled);
         }
-        stackInfo.stackObj = builder.obj();
-        log() << "heapProfile stack" << stackInfo.stackNum << ": " << stackInfo.stackObj;
+        LOGV2(23158,
+              "heapProfile stack",
+              "stackNum"_attr = stackInfo.stackNum,
+              "stackObj"_attr = builder.done());
     }
-
-    //
-    // Generate serverStatus section.
-    //
-
-    bool logGeneralStats = true;  // first time only
-
-    // In order to reduce load on ftdc we track the stacks we deem important enough to emit
-    // once a stack is deemed "important" it remains important from that point on.
-    // "Important" is a sticky quality to improve the stability of the set of stacks we emit,
-    // and we always emit them in stackNum order, greatly improving ftdc compression efficiency.
-    std::set<StackInfo*, bool (*)(StackInfo*, StackInfo*)> importantStacks{
-        [](StackInfo* a, StackInfo* b) -> bool { return a->stackNum < b->stackNum; }};
-
-    int numImportantSamples = 0;                // samples currently included in importantStacks
-    const int kMaxImportantSamples = 4 * 3600;  // reset every 4 hours at default 1 sample / sec
 
     void _generateServerStatusSection(BSONObjBuilder& builder) {
         // compute and log some informational stats first time through
@@ -530,23 +579,26 @@ private:
             const size_t objTableSize = objHashTable.memorySizeBytes();
             const size_t stackTableSize = stackHashTable.memorySizeBytes();
             const double MB = 1024 * 1024;
-            log() << "sampleIntervalBytes " << sampleIntervalBytesParameter << "; "
-                  << "maxActiveMemory " << maxActiveMemory / MB << " MB; "
-                  << "objTableSize " << objTableSize / MB << " MB; "
-                  << "stackTableSize " << stackTableSize / MB << " MB";
+            LOGV2(23159,
+                  "Generating heap profiler serverStatus",
+                  "heapProfilingSampleIntervalBytes"_attr = HeapProfilingSampleIntervalBytes,
+                  "maxActiveMemoryMB"_attr = maxActiveMemory / MB,
+                  "objTableSize_MB"_attr = objTableSize / MB,
+                  "stackTableSizeMB"_attr = stackTableSize / MB);
             // print a stack trace to log somap for post-facto symbolization
-            log() << "following stack trace is for heap profiler informational purposes";
+            LOGV2(23160, "Following stack trace is for heap profiler informational purposes");
             printStackTrace();
             logGeneralStats = false;
         }
 
         // Stats subsection.
         BSONObjBuilder statsBuilder(builder.subobjStart("stats"));
-        statsBuilder.appendNumber("totalActiveBytes", totalActiveBytes);
-        statsBuilder.appendNumber("bytesAllocated", bytesAllocated);
-        statsBuilder.appendNumber("numStacks", stackHashTable.size());
-        statsBuilder.appendNumber("currentObjEntries", objHashTable.size());
-        statsBuilder.appendNumber("maxObjEntriesUsed", objHashTable.maxSizeSeen());
+        statsBuilder.appendNumber("totalActiveBytes", static_cast<long long>(totalActiveBytes));
+        statsBuilder.appendNumber("bytesAllocated", static_cast<long long>(bytesAllocated));
+        statsBuilder.appendNumber("numStacks", static_cast<long long>(stackHashTable.size()));
+        statsBuilder.appendNumber("currentObjEntries", static_cast<long long>(objHashTable.size()));
+        statsBuilder.appendNumber("maxObjEntriesUsed",
+                                  static_cast<long long>(objHashTable.maxSizeSeen()));
         statsBuilder.doneFast();
 
         // Guard against races updating the StackInfo bson representation.
@@ -557,131 +609,345 @@ private:
         // forEach guarantees this is safe wrt to insert(), and we never call remove().
         // We use stackinfo_mutex to ensure safety wrt concurrent updates to the StackInfo objects.
         // We can get skew between entries, which is ok.
-        std::vector<StackInfo*> stackInfos;
+        struct HeapEntry {
+            const StackInfo* info;
+            size_t activeBytes;  // snapshot `info->activeBytes` because it changes during sort.
+        };
+        std::vector<HeapEntry> heap;
+        size_t snapshotTotal = 0;
+
+        StackTraceAddressMetadataGenerator metaGen;
+        Demangler demangler;
         stackHashTable.forEach([&](Stack& stack, StackInfo& stackInfo) {
-            if (stackInfo.activeBytes) {
-                generateStackIfNeeded(stack, stackInfo);
-                stackInfos.push_back(&stackInfo);
+            if (auto bytes = stackInfo.activeBytes) {
+                if (!std::exchange(stackInfo.logged, true)) {
+                    generateStack(metaGen, demangler, stack, stackInfo);
+                }
+                heap.push_back({&stackInfo, bytes});
+                snapshotTotal += bytes;
             }
         });
+        auto heapEnd = heap.end();
 
         // Sort the stacks and find enough stacks to account for at least 99% of the active bytes
         // deem any stack that has ever met this criterion as "important".
-        auto sortByActiveBytes = [](StackInfo* a, StackInfo* b) -> bool {
-            return a->activeBytes > b->activeBytes;
+        // Using heap structure to avoid comparing elements that won't make the cut anyway.
+        auto heapCompare = [](auto&& a, auto&& b) {
+            return a.activeBytes > b.activeBytes;
         };
-        std::stable_sort(stackInfos.begin(), stackInfos.end(), sortByActiveBytes);
+        std::make_heap(heap.begin(), heapEnd, heapCompare);
+
         size_t threshold = totalActiveBytes * 0.99;
         size_t cumulative = 0;
-        for (auto it = stackInfos.begin(); it != stackInfos.end(); ++it) {
-            StackInfo* stackInfo = *it;
-            importantStacks.insert(stackInfo);
-            cumulative += stackInfo->activeBytes;
-            if (cumulative > threshold)
+        size_t previous = 0;
+        while (heapEnd != heap.begin()) {
+            const auto& front = heap.front();
+            if (cumulative > threshold && front.activeBytes > previous)
                 break;
+            importantStacks.insert(front.info);
+            previous = front.activeBytes;
+            cumulative += front.activeBytes;
+            std::pop_heap(heap.begin(), heapEnd--, heapCompare);
         }
 
         // Build the stacks subsection by emitting the "important" stacks.
         BSONObjBuilder stacksBuilder(builder.subobjStart("stacks"));
         for (auto it = importantStacks.begin(); it != importantStacks.end(); ++it) {
-            StackInfo* stackInfo = *it;
+            const StackInfo* stackInfo = *it;
             std::ostringstream shortName;
             shortName << "stack" << stackInfo->stackNum;
             BSONObjBuilder stackBuilder(stacksBuilder.subobjStart(shortName.str()));
-            stackBuilder.appendNumber("activeBytes", stackInfo->activeBytes);
+            stackBuilder.appendNumber("activeBytes",
+                                      static_cast<long long>(stackInfo->activeBytes));
         }
         stacksBuilder.doneFast();
 
         // importantStacks grows monotonically, so it can accumulate unneeded stacks,
         // so we clear it periodically.
         if (++numImportantSamples >= kMaxImportantSamples) {
-            log() << "clearing importantStacks";
+            LOGV2(23161, "Clearing importantStacks");
             importantStacks.clear();
             numImportantSamples = 0;
         }
     }
 
-    //
-    // Static hooks to give to the allocator.
-    //
+    // 0: sampling internally disabled
+    // 1: sample every allocation - byte accurate but slow and big
+    // >1: sample ever sampleIntervalBytes bytes allocated - less accurate but fast and small
+    std::atomic_size_t sampleIntervalBytes;  // NOLINT
 
-    static void alloc(const void* obj, size_t objLen) {
-        heapProfiler->_alloc(obj, objLen);
-    }
+    // guards updates to both object and stack hash tables
+    stdx::mutex hashtable_mutex;
+    // guards against races updating the StackInfo bson representation
+    stdx::mutex stackinfo_mutex;
 
-    static void free(const void* obj) {
-        heapProfiler->_free(obj);
-    }
+    // cumulative bytes allocated - determines when samples are taken
+    std::atomic_size_t bytesAllocated{0};  // NOLINT
 
+    // estimated currently active bytes - sum of activeBytes for all stacks
+    size_t totalActiveBytes = 0;
+
+    // The stack HashTable itself.
+    HashTable<Stack, StackInfo> stackHashTable{kMaxStackInfos, kStackHashTableLoadFactor};
+
+    // frames to skip at top and bottom of backtrace when reporting stacks
+    size_t skipStartFrames = 0;
+    size_t skipEndFrames = 0;
+
+    // The obj HashTable itself.
+    HashTable<Obj, ObjInfo> objHashTable{kMaxObjInfos, kObjHashTableLoadFactor};
+
+    bool logGeneralStats = true;  // first time only
+
+    // In order to reduce load on ftdc we track the stacks we deem important enough to emit
+    // once a stack is deemed "important" it remains important from that point on.
+    // "Important" is a sticky quality to improve the stability of the set of stacks we emit,
+    // and we always emit them in stackNum order, greatly improving ftdc compression efficiency.
+    std::set<const StackInfo*, ByPointeeStackNum> importantStacks;
+
+    int numImportantSamples = 0;  // samples currently included in importantStacks
+};
+}  // namespace heap_profiler_detail_gperf_tcmalloc
+
+namespace heap_profiler_detail_tcmalloc {
+#ifdef MONGO_CONFIG_TCMALLOC_GOOGLE
+class HeapProfiler {
 public:
-    static HeapProfiler* heapProfiler;
-    static bool enabledParameter;
-    static long long sampleIntervalBytesParameter;
-
-    HeapProfiler() {
-        // Set sample interval from the parameter.
-        sampleIntervalBytes = sampleIntervalBytesParameter;
-
-        // This is our only allocator dependency - ifdef and change as
-        // appropriate for other allocators, using hooks or shims.
-        // For tcmalloc we skip two frames that are internal to the allocator
-        // so that the top frame is the public tc_* function.
-        skipStartFrames = 2;
-        skipEndFrames = 0;
-        MallocHook::AddNewHook(alloc);
-        MallocHook::AddDeleteHook(free);
-    }
+    static const int kMaxImportantSamples = 4 * 3600;  // reset every 4 hours at 1Hz
+    static const int kMaxStackInfos = 20000;
+    static inline HeapProfiler* heapProfiler;
 
     static void generateServerStatusSection(BSONObjBuilder& builder) {
         if (heapProfiler)
             heapProfiler->_generateServerStatusSection(builder);
     }
-};
 
-//
-// serverStatus section
-//
+    static void start() {
+        heapProfiler = new HeapProfiler();
+    }
+
+private:
+    struct StackInfo {
+        StackInfo(const tcmalloc::Profile::Sample& stackSample, int id) {
+            stackNum = id;
+            numFrames = stackSample.depth;
+            // Generate a bson representation of our new stack.
+            BSONArrayBuilder builder;
+            std::string frameString(256, '\0');
+            for (int i = 0; i < stackSample.depth; ++i) {
+                char buf[256];
+                if (!absl::Symbolize(stackSample.stack[i], buf, sizeof(buf))) {
+                    frameString = fmt::format("{}", stackSample.stack[i]);
+                } else {
+                    frameString.assign(buf);
+                }
+                builder.append(frameString);
+            }
+            LOGV2(8592501,
+                  "heapProfile stack",
+                  "stackNum"_attr = stackNum,
+                  "stackObj"_attr = builder.obj());
+        }
+
+        int stackNum = 0;  // used for stack short name
+        BSONObj stackObj;  // symbolized representation
+        int numFrames = 0;
+        uint64_t activeBytes = 0;
+    };
+
+    struct ByStackNum {
+        bool operator()(StackInfo* a, StackInfo* b) const {
+            return a->stackNum < b->stackNum;
+        }
+    };
+
+    uint32_t StackHash(const tcmalloc::Profile::Sample& stackSample) {
+        uint32_t hash;
+        MurmurHash3_x86_32(stackSample.stack, stackSample.depth * sizeof(void*), 0, &hash);
+        return hash;
+    }
+
+    void _generateServerStatusSection(BSONObjBuilder& builder) {
+        // Compute and log some informational stats first time through
+        bool expected = true;
+        if (_logGeneralStats.compareAndSwap(&expected, false)) {
+            LOGV2(8592504,
+                  "Generating heap profiler serverStatus",
+                  "heapProfilingSampleIntervalBytes"_attr = HeapProfilingSampleIntervalBytes,
+                  "maximumSampledObjects"_attr = _maxSampledObjects);
+        }
+
+        stdx::lock_guard lk(heapProfiler->_mutex);
+
+        // Get a live snapshot profile of the current heap usage
+        int64_t totalActiveBytes = 0;
+        size_t activeSamples = 0;
+        std::vector<StackInfo*> stackInfos;
+        std::set<StackInfo*, ByStackNum> activeStacks;
+        bool disabled = false;
+        tcmalloc::MallocExtension::SnapshotCurrent(tcmalloc::ProfileType::kHeap)
+            .Iterate([&](const auto& sample) {
+                if (disabled)
+                    return;
+                activeSamples++;
+                totalActiveBytes += sample.sum;
+                _sampleBytesAllocated += sample.allocated_size;
+                // Compute backtrace hash of sample stack
+                uint32_t stackHash = StackHash(sample);
+                auto& stackInfo = _stackInfoMap[stackHash];
+                if (!stackInfo) {
+                    stackInfo = std::make_unique<StackInfo>(sample, _stackInfoMap.size());
+                }
+                auto activeStackSearch = activeStacks.find(stackInfo.get());
+                if (activeStackSearch != activeStacks.end()) {
+                    stackInfo->activeBytes += sample.sum;
+                } else {
+                    activeStacks.insert(stackInfo.get());
+                    stackInfos.push_back(stackInfo.get());
+                    stackInfo->activeBytes = sample.sum;
+                }
+
+                if (activeSamples > _maxSampledObjects) {
+                    LOGV2(9060100,
+                          "Exceeded active sample maximum, disabling heap profiler",
+                          "activeSamples"_attr = activeSamples);
+
+                    uassertStatusOK(ServerParameterSet::getNodeParameterSet()
+                                        ->get<IDLServerParameterWithStorage<
+                                            ServerParameterType::kStartupAndRuntime,
+                                            long long>>("heapProfilingSampleIntervalBytes")
+                                        ->setValue(0, boost::none));
+                    disabled = true;
+                }
+            });
+
+        if (disabled)
+            return;
+
+        BSONObjBuilder(builder.subobjStart("stats"))
+            .appendNumber("totalActiveBytes", static_cast<long long>(totalActiveBytes))
+            .appendNumber("bytesAllocated", static_cast<long long>(_sampleBytesAllocated))
+            .appendNumber("numStacks", static_cast<long long>(_stackInfoMap.size()));
+
+        // Sort the stacks and find enough stacks to account for at least 99% of the active bytes
+        // deem any stack that has ever met this criterion as "important".
+        std::stable_sort(stackInfos.begin(), stackInfos.end(), [](StackInfo* a, StackInfo* b) {
+            return a->activeBytes > b->activeBytes;
+        });
+        size_t threshold = totalActiveBytes * 0.99;
+        size_t cumulative = 0;
+        for (auto&& stackInfo : stackInfos) {
+            _importantStacks.insert(stackInfo);
+            cumulative += stackInfo->activeBytes;
+            if (cumulative > threshold)
+                break;
+        }
+
+        // Build the stacks subsection by emitting a sample of stacks that were live at a peak of
+        // total heap usage.
+        {
+            BSONObjBuilder stacks(builder.subobjStart("stacks"));
+            for (auto&& stackInfo : _importantStacks)
+                BSONObjBuilder{stacks.subobjStart(fmt::format("stack{}", stackInfo->stackNum))}
+                    .appendNumber("activeBytes", static_cast<long long>(stackInfo->activeBytes));
+        }
+
+        // importantStacks grows monotonically, so it can accumulate unneeded stacks,
+        // so we clear it periodically.
+        if (++_numImportantSamples >= kMaxImportantSamples) {
+            LOGV2_DEBUG(8592502, 1, "Clearing importantStacks");
+            _importantStacks.clear();
+            _numImportantSamples = 0;
+        }
+
+        // We also will clear the stack infos if it gets too large, as opposed to taking up more
+        // memory or disabling the heap profiler entirely.
+        if (_stackInfoMap.size() >= kMaxStackInfos) {
+            LOGV2_DEBUG(8592505, 1, "Clearing _stackInfoMap");
+            _stackInfoMap.clear();
+        }
+    }
+
+    mutable stdx::mutex _mutex;
+    size_t _sampleBytesAllocated = 0;
+    stdx::unordered_map<uint32_t, std::unique_ptr<StackInfo>> _stackInfoMap;
+    Atomic<bool> _logGeneralStats = true;
+    // Either use the user-configured maximum, or the heuristic that each tcmalloc sample takes up a
+    // page-- do not exceed 5% of pages in the system.
+    const size_t _maxSampledObjects =
+        HeapProfilingMaxObjects != 0 ? HeapProfilingMaxObjects : []() {
+            return (static_cast<float>(ProcessInfo::getMemSizeMB() * (1024 * 1024)) /
+                    static_cast<float>(ProcessInfo::getPageSize())) *
+                0.05;
+        }();
+
+    // In order to reduce load on ftdc we track the stacks we deem important enough to emit
+    // once a stack is deemed "important" it remains important from that point on.
+    // "Important" is a sticky quality to improve the stability of the set of stacks we emit,
+    // and we always emit them in stackNum order, greatly improving ftdc compression efficiency.
+    std::set<StackInfo*, ByStackNum> _importantStacks;
+
+    int _numImportantSamples = 0;  // samples currently included in importantStacks
+};
+#endif  // MONGO_CONFIG_TCMALLOC_GOOGLE
+}  // namespace heap_profiler_detail_tcmalloc
+
+#if defined(MONGO_CONFIG_TCMALLOC_GOOGLE)
+using heap_profiler_detail_tcmalloc::HeapProfiler;
 
 class HeapProfilerServerStatusSection final : public ServerStatusSection {
 public:
-    HeapProfilerServerStatusSection() : ServerStatusSection("heapProfile") {}
+    using ServerStatusSection::ServerStatusSection;
 
     bool includeByDefault() const override {
-        return HeapProfiler::enabledParameter;
+        return HeapProfilingSampleIntervalBytes > 0;
     }
 
-    BSONObj generateSection(OperationContext* opCtx,
-                            const BSONElement& configElement) const override {
+    BSONObj generateSection(OperationContext*, const BSONElement&) const override {
+        BSONObjBuilder builder;
+        if (HeapProfilingSampleIntervalBytes > 0) {
+            HeapProfiler::generateServerStatusSection(builder);
+        }
+        return builder.obj();
+    }
+};
+
+MONGO_INITIALIZER_GENERAL(StartHeapProfiling, ("EndStartupOptionHandling"), ("default"))
+(InitializerContext*) {
+    HeapProfiler::start();
+}
+#elif defined(MONGO_CONFIG_TCMALLOC_GPERF)
+using heap_profiler_detail_gperf_tcmalloc::HeapProfiler;
+
+class HeapProfilerServerStatusSection final : public ServerStatusSection {
+public:
+    using ServerStatusSection::ServerStatusSection;
+
+    bool includeByDefault() const override {
+        return HeapProfilingEnabled;
+    }
+
+    BSONObj generateSection(OperationContext*, const BSONElement&) const override {
         BSONObjBuilder builder;
         HeapProfiler::generateServerStatusSection(builder);
         return builder.obj();
     }
-} heapProfilerServerStatusSection;
-
-//
-// startup
-//
-
-HeapProfiler* HeapProfiler::heapProfiler;
-bool HeapProfiler::enabledParameter = false;
-long long HeapProfiler::sampleIntervalBytesParameter = 256 * 1024;
-
-ExportedServerParameter<bool, ServerParameterType::kStartupOnly> heapProfilingEnabledParameter(
-    ServerParameterSet::getGlobal(), "heapProfilingEnabled", &HeapProfiler::enabledParameter);
-
-ExportedServerParameter<long long, ServerParameterType::kStartupOnly>
-    heapProfilingSampleIntervalBytes(ServerParameterSet::getGlobal(),
-                                     "heapProfilingSampleIntervalBytes",
-                                     &HeapProfiler::sampleIntervalBytesParameter);
+};
 
 MONGO_INITIALIZER_GENERAL(StartHeapProfiling, ("EndStartupOptionHandling"), ("default"))
-(InitializerContext* context) {
-    if (HeapProfiler::enabledParameter)
-        HeapProfiler::heapProfiler = new HeapProfiler();
-    return Status::OK();
+(InitializerContext*) {
+    if (HeapProfilingEnabled)
+        HeapProfiler::start();
 }
+#endif  // MONGO_CONFIG_TCMALLOC_GPERF
+
+// Register one instance of the section shared by both roles; this is a process-wide resource.
+auto& heapProfilerServerStatusSection =
+    *ServerStatusSectionBuilder<HeapProfilerServerStatusSection>("heapProfile")
+         .forShard()
+         .forRouter();
 
 }  // namespace
 }  // namespace mongo
 
-#endif  // MONGO_HAVE_HEAP_PROFILER
+#endif  //_POSIX_VERSION

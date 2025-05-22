@@ -15,13 +15,8 @@
 #pragma once
 #endif  // defined(_MSC_VER) && (_MSC_VER >= 1200)
 
-#include "asio/detail/config.hpp"
+#include <asio/detail/config.hpp>
 
-#include "asio/async_result.hpp"
-#include "asio/detail/buffer_sequence_adapter.hpp"
-#include "asio/detail/handler_type_requirements.hpp"
-#include "asio/detail/noncopyable.hpp"
-#include "asio/detail/type_traits.hpp"
 #include "mongo/util/net/ssl/apple.hpp"
 #include "mongo/util/net/ssl/context.hpp"
 #include "mongo/util/net/ssl/detail/buffered_handshake_op.hpp"
@@ -32,8 +27,14 @@
 #include "mongo/util/net/ssl/detail/stream_core.hpp"
 #include "mongo/util/net/ssl/detail/write_op.hpp"
 #include "mongo/util/net/ssl/stream_base.hpp"
+#include <asio/async_result.hpp>
+#include <asio/detail/buffer_sequence_adapter.hpp>
+#include <asio/detail/handler_type_requirements.hpp>
+#include <asio/detail/noncopyable.hpp>
+#include <asio/detail/type_traits.hpp>
 
-#include "asio/detail/push_options.hpp"
+// This must be after all other includes
+#include <asio/detail/push_options.hpp>
 
 namespace asio {
 namespace ssl {
@@ -164,6 +165,11 @@ public:
      */
     native_handle_type native_handle() {
         return core_.engine_.native_handle();
+    }
+
+    /// Gets the sni from the client hello.
+    boost::optional<std::string> get_sni() {
+        return core_.engine_.get_sni();
     }
 
     /// Get a reference to the next layer.
@@ -589,6 +595,6 @@ private:
 }  // namespace ssl
 }  // namespace asio
 
-#include "asio/detail/pop_options.hpp"
+#include <asio/detail/pop_options.hpp>
 
 #endif  // ASIO_SSL_STREAM_HPP

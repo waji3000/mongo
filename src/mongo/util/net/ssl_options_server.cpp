@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,25 +27,29 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kControl
 
-#include "mongo/platform/basic.h"
+#include "mongo/base/error_codes.h"
 
 #include "mongo/util/net/ssl_options.h"
 
+#include <absl/strings/str_split.h>
 #include <boost/filesystem/operations.hpp>
 
 #include "mongo/base/status.h"
 #include "mongo/config.h"
+#include "mongo/db/auth/auth_options_gen.h"
+#include "mongo/db/server_feature_flags_gen.h"
 #include "mongo/db/server_options.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/options_parser/startup_option_init.h"
 #include "mongo/util/options_parser/startup_options.h"
-#include "mongo/util/text.h"
 
 #if MONGO_CONFIG_SSL_PROVIDER == MONGO_CONFIG_SSL_PROVIDER_OPENSSL
 #include <openssl/ssl.h>
 #endif
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
+
 
 namespace moe = mongo::optionenvironment;
 using std::string;
@@ -54,174 +57,10 @@ using std::string;
 // Export these to the process space for the sake of ssl_options_test.cpp
 // but don't provide a header because we don't want to encourage use from elsewhere.
 namespace mongo {
-Status addSSLServerOptions(moe::OptionSection* options) {
-    options
-        ->addOptionChaining("net.tls.tlsOnNormalPorts",
-                            "tlsOnNormalPorts",
-                            moe::Switch,
-                            "Use TLS on configured ports",
-                            {"net.ssl.sslOnNormalPorts"},
-                            {"sslOnNormalPorts"})
-        .setSources(moe::SourceAllLegacy)
-        .incompatibleWith("net.tls.mode")
-        .incompatibleWith("net.ssl.mode");
-
-    options
-        ->addOptionChaining("net.tls.mode",
-                            "tlsMode",
-                            moe::String,
-                            "Set the TLS operation mode (disabled|allowTLS|preferTLS|requireTLS)")
-        .incompatibleWith("net.ssl.mode");
-    options
-        ->addOptionChaining("net.ssl.mode",
-                            "sslMode",
-                            moe::String,
-                            "Set the TLS operation mode (disabled|allowSSL|preferSSL|requireSSL)")
-        .incompatibleWith("net.tls.mode")
-        .hidden();
-
-    options->addOptionChaining("net.tls.PEMKeyFile",
-                               "tlsPEMKeyFile",
-                               moe::String,
-                               "PEM file for TLS",
-                               {"net.ssl.PEMKeyFile"},
-                               {"sslPEMKeyFile"});
-
-    options
-        ->addOptionChaining("net.tls.PEMKeyPassword",
-                            "tlsPEMKeyPassword",
-                            moe::String,
-                            "PEM file password",
-                            {"net.ssl.PEMKeyPassword"},
-                            {"sslPEMKeyPassword"})
-        .setImplicit(moe::Value(std::string("")));
-
-    options->addOptionChaining("net.tls.clusterFile",
-                               "tlsClusterFile",
-                               moe::String,
-                               "Key file for internal TLS authentication",
-                               {"net.ssl.clusterFile"},
-                               {"sslClusterFile"});
-
-    options
-        ->addOptionChaining("net.tls.clusterPassword",
-                            "tlsClusterPassword",
-                            moe::String,
-                            "Internal authentication key file password",
-                            {"net.ssl.clusterPassword"},
-                            {"sslClusterPassword"})
-        .setImplicit(moe::Value(std::string("")));
-
-    options->addOptionChaining("net.tls.CAFile",
-                               "tlsCAFile",
-                               moe::String,
-                               "Certificate Authority file for TLS",
-                               {"net.ssl.CAFile"},
-                               {"sslCAFile"});
-
-    options->addOptionChaining("net.tls.clusterCAFile",
-                               "tlsClusterCAFile",
-                               moe::String,
-                               "CA used for verifying remotes during inbound connections",
-                               {"net.ssl.clusterCAFile"},
-                               {"sslClusterCAFile"});
-
-    options->addOptionChaining("net.tls.CRLFile",
-                               "tlsCRLFile",
-                               moe::String,
-                               "Certificate Revocation List file for TLS",
-                               {"net.ssl.CRLFile"},
-                               {"sslCRLFile"});
-
-    options
-        ->addOptionChaining("net.tls.tlsCipherConfig",
-                            "tlsCipherConfig",
-                            moe::String,
-                            "OpenSSL cipher configuration string",
-                            {"net.ssl.sslCipherConfig"},
-                            {"sslCipherConfig"})
-        .hidden();
-
-    options->addOptionChaining(
-        "net.tls.disabledProtocols",
-        "tlsDisabledProtocols",
-        moe::String,
-        "Comma separated list of TLS protocols to disable [TLS1_0,TLS1_1,TLS1_2]",
-        {"net.ssl.disabledProtocols"},
-        {"sslDisabledProtocols"});
-
-
-    options->addOptionChaining(
-        "net.tls.logVersions",
-        "tlsLogVersions",
-        moe::String,
-        "Comma separated list of TLS protocols to log on connect [TLS1_0,TLS1_1,TLS1_2]");
-
-    options->addOptionChaining("net.tls.weakCertificateValidation",
-                               "tlsWeakCertificateValidation",
-                               moe::Switch,
-                               "Allow client to connect without presenting a certificate",
-                               {"net.ssl.weakCertificateValidation"},
-                               {"sslWeakCertificateValidation"});
-
-    // Alias for --tlsWeakCertificateValidation.
-    options->addOptionChaining("net.tls.allowConnectionsWithoutCertificates",
-                               "tlsAllowConnectionsWithoutCertificates",
-                               moe::Switch,
-                               "Allow client to connect without presenting a certificate",
-                               {"net.ssl.allowConnectionsWithoutCertificates"},
-                               {"sslAllowConnectionsWithoutCertificates"});
-
-    options->addOptionChaining("net.tls.allowInvalidHostnames",
-                               "tlsAllowInvalidHostnames",
-                               moe::Switch,
-                               "Allow server certificates to provide non-matching hostnames",
-                               {"net.ssl.allowInvalidHostnames"},
-                               {"sslAllowInvalidHostnames"});
-
-    options->addOptionChaining("net.tls.allowInvalidCertificates",
-                               "tlsAllowInvalidCertificates",
-                               moe::Switch,
-                               "Allow connections to servers with invalid certificates",
-                               {"net.ssl.allowInvalidCertificates"},
-                               {"sslAllowInvalidCertificates"});
-
-    options->addOptionChaining("net.tls.FIPSMode",
-                               "tlsFIPSMode",
-                               moe::Switch,
-                               "Activate FIPS 140-2 mode at startup",
-                               {"net.ssl.FIPSMode"},
-                               {"sslFIPSMode"});
-
-#ifdef MONGO_CONFIG_SSL_CERTIFICATE_SELECTORS
-    options
-        ->addOptionChaining("net.tls.certificateSelector",
-                            "tlsCertificateSelector",
-                            moe::String,
-                            "TLS Certificate in system store",
-                            {"net.ssl.certificateSelector"},
-                            {"sslCertificateSelector"})
-        .incompatibleWith("net.tls.PEMKeyFile")
-        .incompatibleWith("net.tls.PEMKeyPassword");
-
-    options
-        ->addOptionChaining("net.tls.clusterCertificateSelector",
-                            "tlsClusterCertificateSelector",
-                            moe::String,
-                            "SSL/TLS Certificate in system store for internal TLS authentication",
-                            {"net.ssl.clusterCertificateSelector"},
-                            {"sslClusterCertificateSelector"})
-        .incompatibleWith("net.tls.clusterFile")
-        .incompatibleWith("net.tls.clusterFilePassword");
-#endif
-
-    return Status::OK();
-}
-
 Status storeTLSLogVersion(const std::string& loggedProtocols) {
     // The tlsLogVersion field is composed of a comma separated list of protocols to
     // log. First, tokenize the field.
-    const auto tokens = StringSplitter::split(loggedProtocols, ",");
+    const auto tokens = absl::StrSplit(loggedProtocols, ",", absl::SkipEmpty());
 
     // All universally accepted tokens, and their corresponding enum representation.
     const std::map<std::string, SSLParams::Protocols> validConfigs{
@@ -232,7 +71,8 @@ Status storeTLSLogVersion(const std::string& loggedProtocols) {
     };
 
     // Map the tokens to their enum values, and push them onto the list of logged protocols.
-    for (const std::string& token : tokens) {
+    for (const auto& t : tokens) {
+        std::string token(t);
         auto mappedToken = validConfigs.find(token);
         if (mappedToken != validConfigs.end()) {
             sslGlobalParams.tlsLogVersions.push_back(mappedToken->second);
@@ -245,52 +85,44 @@ Status storeTLSLogVersion(const std::string& loggedProtocols) {
     return Status::OK();
 }
 
-Status storeSSLServerOptions(const moe::Environment& params) {
+namespace {
+
+bool gImplicitDisableTLS10 = false;
+bool gImplicitDisableTLS11 = false;
+
+// storeSSLServerOptions depends on serverGlobalParams.clusterAuthMode
+// and IDL based storage actions, and therefore must run later.
+MONGO_STARTUP_OPTIONS_POST(SSLServerOptions)(InitializerContext*) {
+    auto& params = moe::startupOptionsParsed;
+
     if (params.count("net.tls.mode")) {
         std::string sslModeParam = params["net.tls.mode"].as<string>();
-        if (sslModeParam == "disabled") {
-            sslGlobalParams.sslMode.store(SSLParams::SSLMode_disabled);
-        } else if (sslModeParam == "allowTLS") {
-            sslGlobalParams.sslMode.store(SSLParams::SSLMode_allowSSL);
-        } else if (sslModeParam == "preferTLS") {
-            sslGlobalParams.sslMode.store(SSLParams::SSLMode_preferSSL);
-        } else if (sslModeParam == "requireTLS") {
-            sslGlobalParams.sslMode.store(SSLParams::SSLMode_requireSSL);
+        auto swMode = SSLParams::tlsModeParse(sslModeParam);
+        if (swMode.isOK()) {
+            sslGlobalParams.sslMode.store(swMode.getValue());
         } else {
-            return {ErrorCodes::BadValue, "unsupported value for tlsMode " + sslModeParam};
+            uasserted(ErrorCodes::BadValue, "unsupported value for tlsMode " + sslModeParam);
         }
     } else if (params.count("net.ssl.mode")) {
         std::string sslModeParam = params["net.ssl.mode"].as<string>();
-        if (sslModeParam == "disabled") {
-            sslGlobalParams.sslMode.store(SSLParams::SSLMode_disabled);
-        } else if (sslModeParam == "allowSSL") {
-            sslGlobalParams.sslMode.store(SSLParams::SSLMode_allowSSL);
-        } else if (sslModeParam == "preferSSL") {
-            sslGlobalParams.sslMode.store(SSLParams::SSLMode_preferSSL);
-        } else if (sslModeParam == "requireSSL") {
-            sslGlobalParams.sslMode.store(SSLParams::SSLMode_requireSSL);
+        auto swMode = SSLParams::sslModeParse(sslModeParam);
+        if (swMode.isOK()) {
+            sslGlobalParams.sslMode.store(swMode.getValue());
         } else {
-            return {ErrorCodes::BadValue, "unsupported value for sslMode " + sslModeParam};
+            uasserted(ErrorCodes::BadValue, "unsupported value for sslMode " + sslModeParam);
         }
     }
 
-    if (params.count("net.tls.PEMKeyFile")) {
+    if (params.count("net.tls.certificateKeyFile")) {
         sslGlobalParams.sslPEMKeyFile =
-            boost::filesystem::absolute(params["net.tls.PEMKeyFile"].as<string>()).generic_string();
-    }
-
-    if (params.count("net.tls.PEMKeyPassword")) {
-        sslGlobalParams.sslPEMKeyPassword = params["net.tls.PEMKeyPassword"].as<string>();
+            boost::filesystem::absolute(params["net.tls.certificateKeyFile"].as<string>())
+                .generic_string();
     }
 
     if (params.count("net.tls.clusterFile")) {
         sslGlobalParams.sslClusterFile =
             boost::filesystem::absolute(params["net.tls.clusterFile"].as<string>())
                 .generic_string();
-    }
-
-    if (params.count("net.tls.clusterPassword")) {
-        sslGlobalParams.sslClusterPassword = params["net.tls.clusterPassword"].as<string>();
     }
 
     if (params.count("net.tls.CAFile")) {
@@ -312,12 +144,13 @@ Status storeSSLServerOptions(const moe::Environment& params) {
     }
 
     if (params.count("net.tls.tlsCipherConfig")) {
-        warning()
-            << "net.tls.tlsCipherConfig is deprecated. It will be removed in a future release.";
-        if (!sslGlobalParams.sslCipherConfig.empty()) {
-            return {ErrorCodes::BadValue,
-                    "net.tls.tlsCipherConfig is incompatible with the openTLSCipherConfig "
-                    "setParameter"};
+        LOGV2_WARNING(
+            23286,
+            "net.tls.tlsCipherConfig is deprecated. It will be removed in a future release.");
+        if (sslGlobalParams.sslCipherConfig != kSSLCipherConfigDefault) {
+            uasserted(ErrorCodes::BadValue,
+                      "net.tls.tlsCipherConfig is incompatible with the openTLSCipherConfig "
+                      "setParameter");
         }
         sslGlobalParams.sslCipherConfig = params["net.tls.tlsCipherConfig"].as<string>();
     }
@@ -326,9 +159,7 @@ Status storeSSLServerOptions(const moe::Environment& params) {
         const auto status =
             storeSSLDisabledProtocols(params["net.tls.disabledProtocols"].as<string>(),
                                       SSLDisabledProtocolsMode::kAcceptNegativePrefix);
-        if (!status.isOK()) {
-            return status;
-        }
+        uassertStatusOK(status);
 #if (MONGO_CONFIG_SSL_PROVIDER != MONGO_CONFIG_SSL_PROVIDER_OPENSSL) || \
     (OPENSSL_VERSION_NUMBER >= 0x100000cf) /* 1.0.0l */
     } else {
@@ -337,39 +168,19 @@ Status storeSSLServerOptions(const moe::Environment& params) {
          * old version of OpenSSL (pre 1.0.0l)
          * which does not support TLS 1.1 or later.
          */
-        log() << "Automatically disabling TLS 1.0, to force-enable TLS 1.0 "
-                 "specify --sslDisabledProtocols 'none'";
+        gImplicitDisableTLS10 = true;
         sslGlobalParams.sslDisabledProtocols.push_back(SSLParams::Protocols::TLS1_0);
+#endif
+#if (MONGO_CONFIG_SSL_PROVIDER != MONGO_CONFIG_SSL_PROVIDER_OPENSSL) || \
+    (OPENSSL_VERSION_NUMBER >= 0x1000106f) /* 1.0.1f */
+        // Disables TLS 1.1 as well for platforms which support TLS 1.2 and later.
+        gImplicitDisableTLS11 = true;
+        sslGlobalParams.sslDisabledProtocols.push_back(SSLParams::Protocols::TLS1_1);
 #endif
     }
 
     if (params.count("net.tls.logVersions")) {
-        const auto status = storeTLSLogVersion(params["net.tls.logVersions"].as<string>());
-        if (!status.isOK()) {
-            return status;
-        }
-    }
-
-    if (params.count("net.tls.weakCertificateValidation")) {
-        sslGlobalParams.sslWeakCertificateValidation =
-            params["net.tls.weakCertificateValidation"].as<bool>();
-    } else if (params.count("net.tls.allowConnectionsWithoutCertificates")) {
-        sslGlobalParams.sslWeakCertificateValidation =
-            params["net.tls.allowConnectionsWithoutCertificates"].as<bool>();
-    }
-
-    if (params.count("net.tls.allowInvalidHostnames")) {
-        sslGlobalParams.sslAllowInvalidHostnames =
-            params["net.tls.allowInvalidHostnames"].as<bool>();
-    }
-
-    if (params.count("net.tls.allowInvalidCertificates")) {
-        sslGlobalParams.sslAllowInvalidCertificates =
-            params["net.tls.allowInvalidCertificates"].as<bool>();
-    }
-
-    if (params.count("net.tls.FIPSMode")) {
-        sslGlobalParams.sslFIPSMode = params["net.tls.FIPSMode"].as<bool>();
+        uassertStatusOK(storeTLSLogVersion(params["net.tls.logVersions"].as<string>()));
     }
 
 #ifdef MONGO_CONFIG_SSL_CERTIFICATE_SELECTORS
@@ -378,9 +189,7 @@ Status storeSSLServerOptions(const moe::Environment& params) {
             parseCertificateSelector(&sslGlobalParams.sslCertificateSelector,
                                      "net.tls.certificateSelector",
                                      params["net.tls.certificateSelector"].as<std::string>());
-        if (!status.isOK()) {
-            return status;
-        }
+        uassertStatusOK(status);
     }
 
     if (params.count("net.tls.clusterCertificateSelector")) {
@@ -388,21 +197,32 @@ Status storeSSLServerOptions(const moe::Environment& params) {
             &sslGlobalParams.sslClusterCertificateSelector,
             "net.tls.clusterCertificateSelector",
             params["net.tls.clusterCertificateSelector"].as<std::string>());
-        if (!status.isOK()) {
-            return status;
-        }
+        uassertStatusOK(status);
     }
 #endif
 
-    const int clusterAuthMode = serverGlobalParams.clusterAuthMode.load();
+    const auto clusterAuthMode = serverGlobalParams.startupClusterAuthMode;
     if (sslGlobalParams.sslMode.load() != SSLParams::SSLMode_disabled) {
+        uassert(ErrorCodes::InvalidOptions,
+                "Specifying a tlsClusterCAFile requires a tlsCAFile also be specified. See  "
+                "https://dochub.mongodb.org/core/mongod"
+                "#std-option-mongod.--tlsClusterCAFile for details.",
+                sslGlobalParams.sslClusterCAFile.empty() || !sslGlobalParams.sslCAFile.empty());
+        uassert(ErrorCodes::InvalidOptions,
+                "The use of both a CA File and the System Certificate store is not supported.",
+                !sslGlobalParams.sslUseSystemCA || sslGlobalParams.sslCAFile.empty());
+        uassert(ErrorCodes::InvalidOptions,
+                "The use of TLS without specifying a chain of trust is no longer supported. See "
+                "https://jira.mongodb.org/browse/SERVER-72839 for details.",
+                sslGlobalParams.sslUseSystemCA || !sslGlobalParams.sslCAFile.empty());
+        if (!sslGlobalParams.sslCRLFile.empty() && sslGlobalParams.sslCAFile.empty()) {
+            uasserted(ErrorCodes::BadValue,
+                      "Specifying a tlsCRLFile requires a tlsCAFile also be specified.");
+        }
         bool usingCertifiateSelectors = params.count("net.tls.certificateSelector");
         if (sslGlobalParams.sslPEMKeyFile.size() == 0 && !usingCertifiateSelectors) {
-            return {ErrorCodes::BadValue,
-                    "need tlsPEMKeyFile or certificateSelector when TLS is enabled"};
-        }
-        if (!sslGlobalParams.sslCRLFile.empty() && sslGlobalParams.sslCAFile.empty()) {
-            return {ErrorCodes::BadValue, "need tlsCAFile with tlsCRLFile"};
+            uasserted(ErrorCodes::BadValue,
+                      "need tlsCertificateKeyFile or certificateSelector when TLS is enabled");
         }
 
         std::string sslCANotFoundError(
@@ -413,56 +233,60 @@ Status storeSSLServerOptions(const moe::Environment& params) {
         // When using cetificate selectors, we use the local system certificate store for verifying
         // X.509 certificates for auth instead of relying on a CA file.
         if (sslGlobalParams.sslCAFile.empty() && !usingCertifiateSelectors &&
-            clusterAuthMode == ServerGlobalParams::ClusterAuthMode_x509) {
-            return {ErrorCodes::BadValue, sslCANotFoundError};
+            clusterAuthMode.allowsX509()) {
+            uasserted(ErrorCodes::BadValue, sslCANotFoundError);
         }
     } else if (sslGlobalParams.sslPEMKeyFile.size() || sslGlobalParams.sslPEMKeyPassword.size() ||
                sslGlobalParams.sslClusterFile.size() || sslGlobalParams.sslClusterPassword.size() ||
                sslGlobalParams.sslCAFile.size() || sslGlobalParams.sslCRLFile.size() ||
-               sslGlobalParams.sslCipherConfig.size() ||
+               sslGlobalParams.sslCipherConfig != kSSLCipherConfigDefault ||
                params.count("net.tls.disabledProtocols") ||
 #ifdef MONGO_CONFIG_SSL_CERTIFICATE_SELECTORS
                params.count("net.tls.certificateSelector") ||
                params.count("net.tls.clusterCertificateSelector") ||
 #endif
                sslGlobalParams.sslWeakCertificateValidation) {
-        return {ErrorCodes::BadValue,
-                "need to enable TLS via the sslMode/tlsMode flag when "
-                "using TLS configuration parameters"};
+        uasserted(ErrorCodes::BadValue,
+                  "need to enable TLS via the sslMode/tlsMode flag when "
+                  "using TLS configuration parameters");
     }
 
-    if (clusterAuthMode == ServerGlobalParams::ClusterAuthMode_sendKeyFile ||
-        clusterAuthMode == ServerGlobalParams::ClusterAuthMode_sendX509 ||
-        clusterAuthMode == ServerGlobalParams::ClusterAuthMode_x509) {
+    if (clusterAuthMode.allowsX509()) {
         if (sslGlobalParams.sslMode.load() == SSLParams::SSLMode_disabled) {
-            return {ErrorCodes::BadValue, "need to enable TLS via the tlsMode flag"};
+            uasserted(ErrorCodes::BadValue, "need to enable TLS via the tlsMode flag");
         }
+
+        if (!gEnforceUserClusterSeparation) {
+            uasserted(ErrorCodes::BadValue,
+                      "cannot have have x.509 cluster authentication while not enforcing user "
+                      "cluster separation");
+        }
+    }
+
+    if (params.count("net.tls.clusterAuthX509.extensionValue")) {
+        uassert(ErrorCodes::BadValue,
+                "net.tls.clusterAuthX509.extensionValue requires "
+                "a clusterAuthMode which allows for usage of X509",
+                clusterAuthMode.allowsX509());
+        sslGlobalParams.clusterAuthX509ExtensionValue =
+            params["net.tls.clusterAuthX509.extensionValue"].as<std::string>();
+    }
+
+    if (params.count("net.tls.clusterAuthX509.attributes")) {
+        uassert(ErrorCodes::BadValue,
+                "Cannot set clusterAuthX509.attributes when clusterAuthMode does not allow X.509",
+                clusterAuthMode.allowsX509());
+        sslGlobalParams.clusterAuthX509Attributes =
+            params["net.tls.clusterAuthX509.attributes"].as<std::string>();
     }
 
     if (sslGlobalParams.sslMode.load() == SSLParams::SSLMode_allowSSL) {
         // allowSSL and x509 is valid only when we are transitioning to auth.
-        if (clusterAuthMode == ServerGlobalParams::ClusterAuthMode_sendX509 ||
-            (clusterAuthMode == ServerGlobalParams::ClusterAuthMode_x509 &&
-             !serverGlobalParams.transitionToAuth)) {
-            return {ErrorCodes::BadValue,
-                    "cannot have x.509 cluster authentication in allowTLS mode"};
+        if (clusterAuthMode.sendsX509() && !serverGlobalParams.transitionToAuth) {
+            uasserted(ErrorCodes::BadValue,
+                      "cannot have x.509 cluster authentication in allowTLS mode");
         }
     }
-    return Status::OK();
-}
-
-namespace {
-
-// Use module API to force this section to appear after core server options.
-MONGO_MODULE_STARTUP_OPTIONS_REGISTER(SSLServerOptions)(InitializerContext*) {
-    moe::OptionSection options("SSL options");
-
-    auto status = addSSLServerOptions(&options);
-    if (!status.isOK()) {
-        return status;
-    }
-
-    return moe::startupOptions.addSection(options);
 }
 
 // Alias --tlsOnNormalPorts as --tlsMode=requireTLS
@@ -482,52 +306,78 @@ Status canonicalizeSSLServerOptions(moe::Environment* params) {
         }
     }
 
+    if (params->count("net.ssl.mode")) {
+        auto mode = (*params)["net.ssl.mode"].as<std::string>();
+        auto ret = params->remove("net.ssl.mode");
+        if (!ret.isOK()) {
+            return ret;
+        }
+
+        if (StringData(mode).ends_with("SSL")) {
+            mode.replace(mode.size() - 3, 3, "TLS");
+        }
+
+        ret = params->set("net.tls.mode", moe::Value(mode));
+        if (!ret.isOK()) {
+            return ret;
+        }
+    }
+
     return Status::OK();
 }
 
 MONGO_STARTUP_OPTIONS_VALIDATE(SSLServerOptions)(InitializerContext*) {
     auto status = canonicalizeSSLServerOptions(&moe::startupOptionsParsed);
-    if (!status.isOK()) {
-        return status;
-    }
+    uassertStatusOK(status);
 
 #ifdef _WIN32
     const auto& params = moe::startupOptionsParsed;
 
     if (params.count("install") || params.count("reinstall")) {
-        if (params.count("net.tls.PEMKeyFile") &&
-            !boost::filesystem::path(params["net.tls.PEMKeyFile"].as<string>()).is_absolute()) {
-            return {ErrorCodes::BadValue,
-                    "PEMKeyFile requires an absolute file path with Windows services"};
+        if (params.count("net.tls.certificateKeyFile") &&
+            !boost::filesystem::path(params["net.tls.certificateKeyFile"].as<string>())
+                 .is_absolute()) {
+            uasserted(ErrorCodes::BadValue,
+                      "PEMKeyFile requires an absolute file path with Windows services");
         }
 
         if (params.count("net.tls.clusterFile") &&
             !boost::filesystem::path(params["net.tls.clusterFile"].as<string>()).is_absolute()) {
-            return {ErrorCodes::BadValue,
-                    "clusterFile requires an absolute file path with Windows services"};
+            uasserted(ErrorCodes::BadValue,
+                      "clusterFile requires an absolute file path with Windows services");
         }
 
         if (params.count("net.tls.CAFile") &&
             !boost::filesystem::path(params["net.tls.CAFile"].as<string>()).is_absolute()) {
-            return {ErrorCodes::BadValue,
-                    "CAFile requires an absolute file path with Windows services"};
+            uasserted(ErrorCodes::BadValue,
+                      "CAFile requires an absolute file path with Windows services");
         }
 
         if (params.count("net.tls.CRLFile") &&
             !boost::filesystem::path(params["net.tls.CRLFile"].as<string>()).is_absolute()) {
-            return {ErrorCodes::BadValue,
-                    "CRLFile requires an absolute file path with Windows services"};
+            uasserted(ErrorCodes::BadValue,
+                      "CRLFile requires an absolute file path with Windows services");
         }
     }
 #endif
-
-    return Status::OK();
 }
 
-// storeSSLServerOptions depends on serverGlobalParams.clusterAuthMode
-// and therefore must run later.
-MONGO_STARTUP_OPTIONS_POST(SSLServerOptions)(InitializerContext*) {
-    return storeSSLServerOptions(moe::startupOptionsParsed);
+// This warning must be deferred until after
+// ServerLogRedirection has started up so that
+// it goes to the right place.
+MONGO_INITIALIZER_WITH_PREREQUISITES(ImplicitDisableTLS10Warning, ("ServerLogRedirection"))
+(InitializerContext*) {
+
+    if (gImplicitDisableTLS11) {
+        LOGV2(97374,
+              "Automatically disabling TLS 1.0 and TLS 1.1, "
+              "to force-enable TLS 1.1 specify --sslDisabledProtocols 'TLS1_0'; "
+              "to force-enable TLS 1.0 specify --sslDisabledProtocols 'none'");
+    } else if (gImplicitDisableTLS10) {
+        LOGV2(23285,
+              "Automatically disabling TLS 1.0, "
+              "to force-enable TLS 1.0 specify --sslDisabledProtocols 'none'");
+    }
 }
 
 }  // namespace

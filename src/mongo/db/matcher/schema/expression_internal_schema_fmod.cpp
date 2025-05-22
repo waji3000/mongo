@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,20 +27,28 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <utility>
 
-#include "mongo/db/matcher/schema/expression_internal_schema_fmod.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
 
+#include "mongo/base/error_codes.h"
 #include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/util/builder.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/matcher/schema/expression_internal_schema_fmod.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 
-InternalSchemaFmodMatchExpression::InternalSchemaFmodMatchExpression(StringData path,
-                                                                     Decimal128 divisor,
-                                                                     Decimal128 remainder)
-    : LeafMatchExpression(MatchType::INTERNAL_SCHEMA_FMOD, path),
+InternalSchemaFmodMatchExpression::InternalSchemaFmodMatchExpression(
+    boost::optional<StringData> path,
+    Decimal128 divisor,
+    Decimal128 remainder,
+    clonable_ptr<ErrorAnnotation> annotation)
+    : LeafMatchExpression(MatchType::INTERNAL_SCHEMA_FMOD, path, std::move(annotation)),
       _divisor(divisor),
       _remainder(remainder) {
     uassert(ErrorCodes::BadValue, "divisor cannot be 0", !divisor.isZero());
@@ -49,38 +56,18 @@ InternalSchemaFmodMatchExpression::InternalSchemaFmodMatchExpression(StringData 
     uassert(ErrorCodes::BadValue, "divisor cannot be infinite", !divisor.isInfinite());
 }
 
-bool InternalSchemaFmodMatchExpression::matchesSingleElement(const BSONElement& e,
-                                                             MatchDetails* details) const {
-    if (!e.isNumber()) {
-        return false;
-    }
-    std::uint32_t flags = Decimal128::SignalingFlag::kNoFlag;
-    Decimal128 result = e.numberDecimal().modulo(_divisor, &flags);
-    if (flags == Decimal128::SignalingFlag::kNoFlag) {
-        return result.isEqual(_remainder);
-    }
-    return false;
-}
-
-void InternalSchemaFmodMatchExpression::debugString(StringBuilder& debug, int level) const {
-    _debugAddSpace(debug, level);
+void InternalSchemaFmodMatchExpression::debugString(StringBuilder& debug,
+                                                    int indentationLevel) const {
+    _debugAddSpace(debug, indentationLevel);
     debug << path() << " fmod: divisor: " << _divisor.toString()
           << " remainder: " << _remainder.toString();
-    MatchExpression::TagData* td = getTag();
-    if (td) {
-        debug << " ";
-        td->debugString(&debug);
-    }
-    debug << "\n";
+    _debugStringAttachTagInfo(&debug);
 }
 
-void InternalSchemaFmodMatchExpression::serialize(BSONObjBuilder* out) const {
-    BSONObjBuilder objMatchBob(out->subobjStart(path()));
-    BSONArrayBuilder arrBuilder(objMatchBob.subarrayStart("$_internalSchemaFmod"));
-    arrBuilder.append(_divisor);
-    arrBuilder.append(_remainder);
-    arrBuilder.doneFast();
-    objMatchBob.doneFast();
+void InternalSchemaFmodMatchExpression::appendSerializedRightHandSide(
+    BSONObjBuilder* bob, const SerializationOptions& opts, bool includePath) const {
+    bob->append("$_internalSchemaFmod"_sd,
+                BSON_ARRAY(opts.serializeLiteral(_divisor) << opts.serializeLiteral(_remainder)));
 }
 
 bool InternalSchemaFmodMatchExpression::equivalent(const MatchExpression* other) const {

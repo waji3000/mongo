@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,22 +27,46 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
 
-#include "mongo/platform/basic.h"
+#include <string>
 
-#include "mongo/db/auth/action_set.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/util/builder.h"
+#include "mongo/client/connection_string.h"
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
-#include "mongo/db/auth/privilege.h"
+#include "mongo/db/auth/resource_pattern.h"
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/concurrency/lock_manager_defs.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/s/collection_metadata.h"
 #include "mongo/db/s/collection_sharding_runtime.h"
-#include "mongo/db/s/sharded_connection_info.h"
-#include "mongo/db/s/sharding_state.h"
+#include "mongo/db/service_context.h"
+#include "mongo/s/chunk_version.h"
+#include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
-#include "mongo/util/log.h"
-#include "mongo/util/stringutils.h"
+#include "mongo/s/index_version.h"
+#include "mongo/s/shard_key_pattern.h"
+#include "mongo/s/sharding_index_catalog_cache.h"
+#include "mongo/s/sharding_state.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/namespace_string_util.h"
+#include "mongo/util/uuid.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
+
 
 namespace mongo {
 namespace {
@@ -68,49 +91,45 @@ public:
         return true;
     }
 
-    Status checkAuthForCommand(Client* client,
-                               const std::string& dbname,
-                               const BSONObj& cmdObj) const override {
-        if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
-                ResourcePattern::forExactNamespace(NamespaceString(parseNs(dbname, cmdObj))),
-                ActionType::getShardVersion)) {
+    Status checkAuthForOperation(OperationContext* opCtx,
+                                 const DatabaseName& dbName,
+                                 const BSONObj& cmdObj) const override {
+        if (!AuthorizationSession::get(opCtx->getClient())
+                 ->isAuthorizedForActionsOnResource(
+                     ResourcePattern::forExactNamespace(parseNs(dbName, cmdObj)),
+                     ActionType::getShardVersion)) {
             return Status(ErrorCodes::Unauthorized, "Unauthorized");
         }
         return Status::OK();
     }
 
-    std::string parseNs(const std::string& dbname, const BSONObj& cmdObj) const override {
-        return CommandHelpers::parseNsFullyQualified(cmdObj);
+    NamespaceString parseNs(const DatabaseName& dbName, const BSONObj& cmdObj) const override {
+        return NamespaceStringUtil::deserialize(dbName.tenantId(),
+                                                CommandHelpers::parseNsFullyQualified(cmdObj),
+                                                SerializationContext::stateDefault());
     }
 
     bool run(OperationContext* opCtx,
-             const std::string& dbname,
+             const DatabaseName& dbName,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) override {
-        const NamespaceString nss(parseNs(dbname, cmdObj));
+        const NamespaceString nss(parseNs(dbName, cmdObj));
 
-        ShardingState* const shardingState = ShardingState::get(opCtx);
-        if (shardingState->enabled()) {
-            result.append(
-                "configServer",
-                Grid::get(opCtx)->shardRegistry()->getConfigServerConnectionString().toString());
-        } else {
-            result.append("configServer", "");
-        }
+        ShardingState::get(opCtx)->assertCanAcceptShardedCommands();
 
-        ShardedConnectionInfo* const sci = ShardedConnectionInfo::get(opCtx->getClient(), false);
-        result.appendBool("inShardedMode", sci != nullptr);
+        result.append(
+            "configServer",
+            Grid::get(opCtx)->shardRegistry()->getConfigServerConnectionString().toString());
 
-        if (sci && sci->getVersion(nss.ns())) {
-            result.appendTimestamp("mine", sci->getVersion(nss.ns())->toLong());
-        } else {
-            result.appendTimestamp("mine", 0);
-        }
+        AutoGetCollection autoColl(
+            opCtx,
+            nss,
+            MODE_IS,
+            AutoGetCollection::Options{}.viewMode(auto_get_collection::ViewMode::kViewsPermitted));
+        const auto scopedCsr =
+            CollectionShardingRuntime::assertCollectionLockedAndAcquireShared(opCtx, nss);
 
-        AutoGetCollection autoColl(opCtx, nss, MODE_IS);
-        auto* const css = CollectionShardingRuntime::get(opCtx, nss);
-
-        const auto optMetadata = css->getCurrentMetadataIfKnown();
+        auto optMetadata = scopedCsr->getCurrentMetadataIfKnown();
         if (!optMetadata) {
             result.append("global", "UNKNOWN");
 
@@ -119,34 +138,68 @@ public:
             }
         } else {
             const auto& metadata = *optMetadata;
-
-            if (metadata->isSharded()) {
-                result.appendTimestamp("global", metadata->getShardVersion().toLong());
-            } else {
-                result.appendTimestamp("global", ChunkVersion::UNSHARDED().toLong());
-            }
+            result.appendTimestamp("global", metadata.getShardPlacementVersion().toLong());
 
             if (cmdObj["fullMetadata"].trueValue()) {
                 BSONObjBuilder metadataBuilder(result.subobjStart("metadata"));
-                if (metadata->isSharded()) {
-                    metadata->toBSONBasic(metadataBuilder);
+                if (metadata.isSharded()) {
+                    metadataBuilder.appendTimestamp("collVersion",
+                                                    metadata.getCollPlacementVersion().toLong());
+                    metadataBuilder.append("collVersionEpoch",
+                                           metadata.getCollPlacementVersion().epoch());
+                    metadataBuilder.append("collVersionTimestamp",
+                                           metadata.getCollPlacementVersion().getTimestamp());
+
+                    metadataBuilder.appendTimestamp(
+                        "shardVersion", metadata.getShardPlacementVersionForLogging().toLong());
+                    metadataBuilder.append("shardVersionEpoch",
+                                           metadata.getShardPlacementVersionForLogging().epoch());
+                    metadataBuilder.append(
+                        "shardVersionTimestamp",
+                        metadata.getShardPlacementVersionForLogging().getTimestamp());
+
+                    metadataBuilder.append("keyPattern", metadata.getShardKeyPattern().toBSON());
 
                     BSONArrayBuilder chunksArr(metadataBuilder.subarrayStart("chunks"));
-                    metadata->toBSONChunks(chunksArr);
+                    metadata.toBSONChunks(&chunksArr);
                     chunksArr.doneFast();
-
-                    BSONArrayBuilder pendingArr(metadataBuilder.subarrayStart("pending"));
-                    css->toBSONPending(pendingArr);
-                    pendingArr.doneFast();
                 }
                 metadataBuilder.doneFast();
             }
         }
 
+        if (scopedCsr->getCollectionIndexes(opCtx)) {
+            result.append("indexVersion", scopedCsr->getCollectionIndexes(opCtx)->indexVersion());
+
+            if (cmdObj["fullMetadata"].trueValue()) {
+                BSONArrayBuilder indexesArrBuilder;
+                // Added to the result bson if the max bson size is exceeded
+                BSONObjBuilder exceededSizeElt(BSON("exceededSize" << true));
+                bool exceedsSizeLimit = false;
+                scopedCsr->getIndexes(opCtx)->forEachIndex([&](const auto& index) {
+                    BSONObjBuilder indexB(index.toBSON());
+                    if (result.len() + exceededSizeElt.len() + indexesArrBuilder.len() +
+                            indexB.len() >
+                        BSONObjMaxUserSize) {
+                        exceedsSizeLimit = true;
+                    } else {
+                        indexesArrBuilder.append(indexB.done());
+                    }
+
+                    return !exceedsSizeLimit;
+                });
+
+                result.append("indexes", indexesArrBuilder.arr());
+                if (exceedsSizeLimit) {
+                    result.appendElements(exceededSizeElt.done());
+                }
+            }
+        }
+
         return true;
     }
-
-} getShardVersionCmd;
+};
+MONGO_REGISTER_COMMAND(GetShardVersion).forShard();
 
 }  // namespace
 }  // namespace mongo

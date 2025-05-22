@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,26 +27,105 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
 
-#include "mongo/platform/basic.h"
+#include <string>
 
+#include "mongo/base/error_codes.h"
+#include "mongo/base/string_data.h"
+#include "mongo/client/read_preference.h"
+#include "mongo/db/auth/action_type.h"
+#include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/auth/resource_pattern.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/service_context.h"
+#include "mongo/s/client/shard.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
-#include "mongo/s/request_types/add_shard_request_type.h"
-#include "mongo/util/log.h"
-#include "mongo/util/scopeguard.h"
+#include "mongo/s/request_types/add_shard_gen.h"
+#include "mongo/util/assert_util.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
+
 
 namespace mongo {
 namespace {
 
 const ReadPreferenceSetting kPrimaryOnlyReadPreference{ReadPreference::PrimaryOnly};
-const char kShardAdded[] = "shardAdded";
 
-class AddShardCmd : public BasicCommand {
+class AddShardCmd : public TypedCommand<AddShardCmd> {
 public:
-    AddShardCmd() : BasicCommand("addShard", "addshard") {}
+    using Request = AddShard;
+    using Response = AddShardResponse;
+
+    AddShardCmd() : TypedCommand(Request::kCommandName, Request::kCommandAlias) {}
+
+    class Invocation final : public InvocationBase {
+    public:
+        using InvocationBase::InvocationBase;
+
+        Response typedRun(OperationContext* opCtx) {
+            uassert(ErrorCodes::InvalidOptions,
+                    "addShard no longer supports maxSize field",
+                    !unparsedRequest().body.hasField("maxSize"));
+
+            const auto& target = request().getCommandParameter();
+            if (target.type() != ConnectionString::ConnectionType::kStandalone &&
+                target.type() != ConnectionString::ConnectionType::kReplicaSet) {
+                uasserted(ErrorCodes::FailedToParse,
+                          str::stream() << "Invalid connection string " << target.toString());
+            }
+
+            ConfigsvrAddShard configsvrRequest{target};
+            configsvrRequest.setAddShardRequestBase(request().getAddShardRequestBase());
+            configsvrRequest.setDbName(request().getDbName());
+
+            const auto cmdResponseWithStatus =
+                Grid::get(opCtx)
+                    ->shardRegistry()
+                    ->getConfigShard()
+                    ->runCommandWithFixedRetryAttempts(
+                        opCtx,
+                        kPrimaryOnlyReadPreference,
+                        DatabaseName::kAdmin,
+                        // TODO SERVER-91373: Remove appendMajorityWriteConcern
+                        CommandHelpers::appendMajorityWriteConcern(
+                            CommandHelpers::filterCommandRequestForPassthrough(
+                                configsvrRequest.toBSON()),
+                            opCtx->getWriteConcern()),
+                        Shard::RetryPolicy::kIdempotent);
+
+            Grid::get(opCtx)->shardRegistry()->reload(opCtx);
+
+            const auto cmdResponse = uassertStatusOK(cmdResponseWithStatus);
+            uassertStatusOK(cmdResponseWithStatus.getValue().commandStatus);
+
+            return Response::parse(IDLParserContext("addShardResponse"), cmdResponse.response);
+        }
+
+    private:
+        bool supportsWriteConcern() const override {
+            return true;
+        }
+
+        NamespaceString ns() const override {
+            return {};
+        }
+
+        void doCheckAuthorization(OperationContext* opCtx) const override {
+            uassert(ErrorCodes::Unauthorized,
+                    "Unauthorized",
+                    AuthorizationSession::get(opCtx->getClient())
+                        ->isAuthorizedForActionsOnResource(
+                            ResourcePattern::forClusterResource(request().getDbName().tenantId()),
+                            ActionType::addShard));
+        }
+    };
+
+    std::string help() const override {
+        return "add a new shard to the system";
+    }
 
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kAlways;
@@ -56,49 +134,8 @@ public:
     bool adminOnly() const override {
         return true;
     }
-
-    bool supportsWriteConcern(const BSONObj& cmd) const override {
-        return true;
-    }
-
-    std::string help() const override {
-        return "add a new shard to the system";
-    }
-
-    void addRequiredPrivileges(const std::string& dbname,
-                               const BSONObj& cmdObj,
-                               std::vector<Privilege>* out) const override {
-        ActionSet actions;
-        actions.addAction(ActionType::addShard);
-        out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
-    }
-
-    bool run(OperationContext* opCtx,
-             const std::string& dbname,
-             const BSONObj& cmdObj,
-             BSONObjBuilder& result) override {
-        auto parsedRequest = uassertStatusOK(AddShardRequest::parseFromMongosCommand(cmdObj));
-
-        auto configShard = Grid::get(opCtx)->shardRegistry()->getConfigShard();
-
-        // Force a reload of this node's shard list cache at the end of this command.
-        auto cmdResponseWithStatus = configShard->runCommandWithFixedRetryAttempts(
-            opCtx,
-            kPrimaryOnlyReadPreference,
-            "admin",
-            CommandHelpers::appendMajorityWriteConcern(CommandHelpers::appendPassthroughFields(
-                cmdObj, parsedRequest.toCommandForConfig())),
-            Shard::RetryPolicy::kIdempotent);
-
-        if (!Grid::get(opCtx)->shardRegistry()->reload(opCtx)) {
-            Grid::get(opCtx)->shardRegistry()->reload(opCtx);
-        }
-        auto cmdResponse = uassertStatusOK(cmdResponseWithStatus);
-        CommandHelpers::filterCommandReplyForPassthrough(cmdResponse.response, &result);
-        return true;
-    }
-
-} addShardCmd;
+};
+MONGO_REGISTER_COMMAND(AddShardCmd).forRouter();
 
 }  // namespace
 }  // namespace mongo

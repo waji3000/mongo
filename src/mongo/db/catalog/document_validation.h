@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,17 +29,19 @@
 
 #pragma once
 
-#include "mongo/base/disallow_copying.h"
+#include <cstdint>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
 #include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/decorable.h"
 
 namespace mongo {
-/**
- * If true, Collection should do no validation of writes from this OperationContext.
- *
- * Note that Decorations are value-constructed so this defaults to false.
- */
-extern const OperationContext::Decoration<bool> documentValidationDisabled;
 
 inline StringData bypassDocumentValidationCommandOption() {
     return "bypassDocumentValidation";
@@ -51,38 +52,130 @@ inline bool shouldBypassDocumentValidationForCommand(const BSONObj& cmdObj) {
 }
 
 /**
+ * This container decorates an OperationContext object. It stores the document validation
+ * settings for writes associated with an OperationContext. By default, document validation (both
+ * schema and internal) is enabled. DocumentValidationSettings objects are not thread-safe.
+ *
+ */
+class DocumentValidationSettings {
+public:
+    enum flag : std::uint8_t {
+        /*
+         * Enables document validation (schema, internal, and safeContent).
+         */
+        kEnableValidation = 0x00,
+        /*
+         * Disables the schema validation during document inserts and updates.
+         * This flag should be enabled if WriteCommandRequestBase::_bypassDocumentValidation
+         * is set to true.
+         */
+        kDisableSchemaValidation = 0x01,
+        /*
+         * Disables any internal validation (like fixDocumentForInsert()). This flag
+         * should be enabled only for trusted internal writes or internal writes that
+         * doesn't comply with internal validation rules.
+         */
+        kDisableInternalValidation = 0x02,
+        /*
+         * If set, modifications to the safeContent array are allowed. This flag is only
+         * enabled when bypass document validation is enabled or if crudProcessed is true
+         * in the query.
+         */
+        kDisableSafeContentValidation = 0x04,
+    };
+
+    using Flags = std::uint8_t;
+
+    static const OperationContext::Decoration<DocumentValidationSettings> get;
+
+    DocumentValidationSettings() = default;
+
+    void setFlags(Flags flags) {
+        invariant(flags != kEnableValidation);
+        _flags |= flags;
+    }
+
+    void clearFlags() {
+        _flags = kEnableValidation;
+    }
+
+    bool isSchemaValidationDisabled() const {
+        return _flags & kDisableSchemaValidation;
+    }
+
+    bool isInternalValidationDisabled() const {
+        return _flags & kDisableInternalValidation;
+    }
+
+    bool isSafeContentValidationDisabled() const {
+        return _flags & kDisableSafeContentValidation;
+    }
+
+    bool isDocumentValidationEnabled() const {
+        return _flags == kEnableValidation;
+    }
+
+private:
+    Flags _flags = kEnableValidation;
+};
+
+/**
  * Disables document validation on a single OperationContext while in scope.
  * Resets to original value when leaving scope so they are safe to nest.
  */
 class DisableDocumentValidation {
-    MONGO_DISALLOW_COPYING(DisableDocumentValidation);
+    DisableDocumentValidation(const DisableDocumentValidation&) = delete;
+    DisableDocumentValidation& operator=(const DisableDocumentValidation&) = delete;
 
 public:
-    DisableDocumentValidation(OperationContext* opCtx)
-        : _opCtx(opCtx), _initialState(documentValidationDisabled(_opCtx)) {
-        documentValidationDisabled(_opCtx) = true;
+    DisableDocumentValidation(OperationContext* opCtx,
+                              DocumentValidationSettings::Flags flags =
+                                  DocumentValidationSettings::kDisableSchemaValidation)
+        : _opCtx(opCtx) {
+        auto& documentValidationSettings = DocumentValidationSettings::get(_opCtx);
+        _initialState = documentValidationSettings;
+        documentValidationSettings.setFlags(flags);
     }
 
     ~DisableDocumentValidation() {
-        documentValidationDisabled(_opCtx) = _initialState;
+        DocumentValidationSettings::get(_opCtx) = _initialState;
     }
 
 private:
     OperationContext* const _opCtx;
-    const bool _initialState;
+    DocumentValidationSettings _initialState;
 };
 
 /**
- * Disables document validation while in scope if the constructor is passed true.
+ * Disables document schema validation while in scope if the constructor is passed true.
  */
-class DisableDocumentValidationIfTrue {
+class DisableDocumentSchemaValidationIfTrue {
 public:
-    DisableDocumentValidationIfTrue(OperationContext* opCtx, bool shouldDisableValidation) {
-        if (shouldDisableValidation)
-            _documentValidationDisabler.emplace(opCtx);
+    DisableDocumentSchemaValidationIfTrue(OperationContext* opCtx,
+                                          bool shouldDisableSchemaValidation) {
+        if (shouldDisableSchemaValidation) {
+            _documentSchemaValidationDisabler.emplace(
+                opCtx, DocumentValidationSettings::kDisableSchemaValidation);
+        }
     }
 
 private:
-    boost::optional<DisableDocumentValidation> _documentValidationDisabler;
+    boost::optional<DisableDocumentValidation> _documentSchemaValidationDisabler;
 };
-}
+
+class DisableSafeContentValidationIfTrue {
+public:
+    DisableSafeContentValidationIfTrue(OperationContext* opCtx,
+                                       bool shouldDisableSchemaValidation,
+                                       bool encryptionInformationCrudProcessed) {
+        if (shouldDisableSchemaValidation || encryptionInformationCrudProcessed) {
+            _documentSchemaValidationDisabler.emplace(
+                opCtx, DocumentValidationSettings::kDisableSafeContentValidation);
+        }
+    }
+
+private:
+    boost::optional<DisableDocumentValidation> _documentSchemaValidationDisabler;
+};
+
+}  // namespace mongo

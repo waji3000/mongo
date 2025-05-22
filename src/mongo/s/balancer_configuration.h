@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,11 +29,16 @@
 
 #pragma once
 
-#include <boost/date_time/posix_time/posix_time.hpp>
+#include <boost/date_time/posix_time/ptime.hpp>
+#include <boost/move/utility_core.hpp>
 #include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
 #include <cstdint>
 
-#include "mongo/base/disallow_copying.h"
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/s/request_types/migration_secondary_throttle_options.h"
 #include "mongo/stdx/mutex.h"
@@ -53,24 +57,41 @@ class StatusWith;
  *
  * balancer: {
  *  stopped: <true|false>,
- *  mode: <full|autoSplitOnly|off>,         // Only consulted if "stopped" is missing or false
- *  activeWindow: { start: "<HH:MM>", stop: "<HH:MM>" }
+ *  mode: <full|off>,  // Only consulted if "stopped" is missing or
+ * false activeWindow: { start: "<HH:MM>", stop: "<HH:MM>" }
  * }
  */
 class BalancerSettingsType {
 public:
     // Supported balancer modes
     enum BalancerMode {
-        kFull,           // Balancer will always try to keep the cluster even
-        kAutoSplitOnly,  // Only balance on auto splits
-        kOff,            // Balancer is completely off
+        kFull,  // Balancer will always try to keep the cluster even
+        kOff,   // Balancer is completely off
     };
 
     // The key under which this setting is stored on the config server
     static const char kKey[];
 
     // String representation of the balancer modes
-    static const char* kBalancerModes[];
+    static const std::vector<std::string> kBalancerModes;
+
+    /**
+     * Part of schema to enforce on config.settings document relating to documents with _id:
+     * "balancer".
+     *
+     * {"properties": {_id: {enum: ["balancer"]},
+     *                 mode: {bsonType: {enum: ["full", "off"]}},
+     *                 stopped: {bsonType: bool},
+     *                 activeWindow: {bsonType: object}
+     *                 _secondaryThrottle: {"oneOf": [{bsonType: bool}, {bsonType: object}]}
+     *                 _waitForDelete: {bsonType: bool}
+     *                 attemptToBalanceJumboChunks: {bsonType: bool}}
+     *  "additionalProperties": false}
+     *
+     * Note: validation of the active window values and secondary throttle object values are still
+     * handled after parsing.
+     */
+    static const BSONObj kSchema;
 
     /**
      * Constructs a settings object with the default values. To be used when no balancer settings
@@ -109,6 +130,15 @@ public:
         return _waitForDelete;
     }
 
+    /**
+     * Returns whether the balancer should schedule migrations of chunks that are 'large' rather
+     * than marking these chunks as 'jumbo' (meaning they will not be scheduled for split or
+     * migration).
+     */
+    bool attemptToBalanceJumboChunks() const {
+        return _attemptToBalanceJumboChunks;
+    }
+
 private:
     BalancerSettingsType();
 
@@ -120,6 +150,8 @@ private:
     MigrationSecondaryThrottleOptions _secondaryThrottle;
 
     bool _waitForDelete{false};
+
+    bool _attemptToBalanceJumboChunks{false};
 };
 
 /**
@@ -135,6 +167,21 @@ public:
     // Default value to use for the max chunk size if one is not specified in the balancer
     // configuration
     static const uint64_t kDefaultMaxChunkSizeBytes;
+
+    /**
+     * Part of schema to enforce on config.settings document relating to documents with _id:
+     * "chunksize".
+     *
+     * {"properties": {_id: {enum: ["chunksize"]}},
+     *                      {value: {bsonType: "number", minimum: 1, maximum: 1024}}
+     *  "additionalProperties": false}
+     *
+     * Note: the schema uses "number" for the chunksize instead of "int" because "int" requires the
+     * user to pass NumberInt(x) as the value rather than x (as all of our docs recommend). Non-
+     * integer values will be handled as they were before the schema, by the balancer failing until
+     * a new value is set.
+     */
+    static const BSONObj kSchema;
 
     /**
      * Constructs a settings object with the default values. To be used when no chunk size settings
@@ -163,41 +210,44 @@ private:
 };
 
 /**
- * Utility class to parse the sharding autoSplit settings document, which has the following format:
+ * Utility class to parse the sharding autoMerge settings document, which has the following format:
  *
- * autosplit: { enabled: <true|false> }
+ * automerge: { enabled: <true|false> }
  */
-class AutoSplitSettingsType {
+class AutoMergeSettingsType {
 public:
     // The key under which this setting is stored on the config server
     static const char kKey[];
 
+    AutoMergeSettingsType() = default;
+
     /**
-     * Constructs a settings object with the default values. To be used when no AutoSplit settings
+     * Constructs a settings object with the default values. To be used when no AutoMerge settings
      * have been specified.
      */
-    static AutoSplitSettingsType createDefault();
+    static AutoMergeSettingsType createDefault() {
+        return AutoMergeSettingsType();
+    }
 
     /**
-     * Interprets the BSON content as autosplit settings and extracts the respective values
+     * Interprets the BSON content as autoMerge settings and extracts the respective values
      */
-    static StatusWith<AutoSplitSettingsType> fromBSON(const BSONObj& obj);
+    static StatusWith<AutoMergeSettingsType> fromBSON(const BSONObj& obj);
 
-    bool getShouldAutoSplit() const {
-        return _shouldAutoSplit;
+    bool isEnabled() const {
+        return _isEnabled;
     }
 
 private:
-    AutoSplitSettingsType();
-
-    bool _shouldAutoSplit{true};
+    bool _isEnabled{true};
 };
 
 /**
  * Contains settings, which control the behaviour of the balancer.
  */
 class BalancerConfiguration {
-    MONGO_DISALLOW_COPYING(BalancerConfiguration);
+    BalancerConfiguration(const BalancerConfiguration&) = delete;
+    BalancerConfiguration& operator=(const BalancerConfiguration&) = delete;
 
 public:
     /**
@@ -223,7 +273,7 @@ public:
      * balancing window.
      */
     bool shouldBalance() const;
-    bool shouldBalanceForAutoSplit() const;
+    bool shouldBalanceForAutoMerge() const;
 
     /**
      * Returns the secondary throttle options for the balancer.
@@ -237,14 +287,26 @@ public:
     bool waitForDelete() const;
 
     /**
+     * Returns whether the balancer should attempt to schedule migrations of 'large' chunks. If
+     * false, the balancer will instead mark these chunks as 'jumbo', meaning they will not be
+     * scheduled for any split or move in the future.
+     */
+    bool attemptToBalanceJumboChunks() const;
+
+    /**
      * Returns the max chunk size after which a chunk would be considered jumbo.
      */
     uint64_t getMaxChunkSizeBytes() const {
         return _maxChunkSizeBytes.loadRelaxed();
     }
 
-    bool getShouldAutoSplit() const {
-        return _shouldAutoSplit.loadRelaxed();
+    /**
+     * Change the cluster wide auto merge settings.
+     */
+    Status changeAutoMergeSettings(OperationContext* opCtx, bool enable);
+
+    bool shouldAutoMerge() const {
+        return _shouldAutoMerge.loadRelaxed();
     }
 
     /**
@@ -273,10 +335,10 @@ private:
     Status _refreshChunkSizeSettings(OperationContext* opCtx);
 
     /**
-     * Reloads the autosplit configuration from the settings document. Fails if the settings
+     * Reloads the autoMerge configuration from the settings document. Fails if the settings
      * document cannot be read.
      */
-    Status _refreshAutoSplitSettings(OperationContext* opCtx);
+    Status _refreshAutoMergeSettings(OperationContext* opCtx);
 
     // The latest read balancer settings and a mutex to protect its swaps
     mutable stdx::mutex _balancerSettingsMutex;
@@ -284,8 +346,12 @@ private:
 
     // Max chunk size after which a chunk would be considered jumbo and won't be moved. This value
     // is read on the critical path after each write operation, that's why it is cached.
-    AtomicUInt64 _maxChunkSizeBytes;
-    AtomicBool _shouldAutoSplit;
+    AtomicWord<unsigned long long> _maxChunkSizeBytes;
+    AtomicWord<bool> _shouldAutoMerge;
+
+    // Mutex used to serialize the balancer configuration refreshes. It should be taken in exclusive
+    // mode to prevent having more than one refresh happening at the same time.
+    Lock::ResourceMutex _settingsRefreshMutex{"BalancerConfiguration::_settingsRefreshMutex"};
 };
 
 }  // namespace mongo

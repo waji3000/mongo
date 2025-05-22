@@ -1,6 +1,3 @@
-// storage_engine.cpp
-
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,8 +27,12 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <boost/optional/optional.hpp>
 
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/timestamp.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands/server_status.h"
 #include "mongo/db/operation_context.h"
@@ -41,39 +42,42 @@
 #include "mongo/db/storage/storage_options.h"
 
 namespace mongo {
-
-// TODO: Does this belong here?
 namespace {
 
 class StorageSSS : public ServerStatusSection {
 public:
-    StorageSSS() : ServerStatusSection("storageEngine") {}
+    using ServerStatusSection::ServerStatusSection;
 
-    virtual ~StorageSSS() {}
+    ~StorageSSS() override = default;
 
-    virtual bool includeByDefault() const {
+    bool includeByDefault() const override {
         return true;
     }
 
-    virtual BSONObj generateSection(OperationContext* opCtx,
-                                    const BSONElement& configElement) const {
+    BSONObj generateSection(OperationContext* opCtx,
+                            const BSONElement& configElement) const override {
         auto svcCtx = opCtx->getClient()->getServiceContext();
         auto engine = svcCtx->getStorageEngine();
+        auto oldestRequiredTimestampForCrashRecovery = engine->getOplogNeededForCrashRecovery();
         auto backupCursorHooks = BackupCursorHooks::get(svcCtx);
 
-        return BSON("name" << storageGlobalParams.engine << "supportsCommittedReads"
-                           << engine->supportsReadConcernMajority()
-                           << "supportsSnapshotReadConcern"
-                           << engine->supportsReadConcernSnapshot()
-                           << "readOnly"
-                           << storageGlobalParams.readOnly
-                           << "persistent"
-                           << !engine->isEphemeral()
-                           << "backupCursorOpen"
-                           << backupCursorHooks->isBackupCursorOpen());
-    }
+        BSONObjBuilder bob;
+        bob.append("name", storageGlobalParams.engine);
+        bob.append("supportsCommittedReads", true);
+        bob.append("oldestRequiredTimestampForCrashRecovery",
+                   oldestRequiredTimestampForCrashRecovery
+                       ? *oldestRequiredTimestampForCrashRecovery
+                       : Timestamp());
+        bob.append("dropPendingIdents", static_cast<long long>(engine->getNumDropPendingIdents()));
+        bob.append("supportsSnapshotReadConcern", engine->supportsReadConcernSnapshot());
+        bob.append("readOnly", !opCtx->getServiceContext()->userWritesAllowed());
+        bob.append("persistent", !engine->isEphemeral());
+        bob.append("backupCursorOpen", backupCursorHooks->isBackupCursorOpen());
 
-} storageSSS;
+        return bob.obj();
+    }
+};
+auto& storageSSS = *ServerStatusSectionBuilder<StorageSSS>("storageEngine").forShard();
 
 }  // namespace
 }  // namespace mongo

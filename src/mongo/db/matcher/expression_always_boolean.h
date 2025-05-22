@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,37 +29,47 @@
 
 #pragma once
 
+#include <boost/optional.hpp>
+#include <cstddef>
+#include <memory>
+#include <utility>
+#include <vector>
+
+#include "mongo/base/clonable_ptr.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/util/builder.h"
+#include "mongo/bson/util/builder_fwd.h"
 #include "mongo/db/matcher/expression.h"
+#include "mongo/db/matcher/expression_visitor.h"
+#include "mongo/db/query/query_shape/serialization_options.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 
 class AlwaysBooleanMatchExpression : public MatchExpression {
 public:
-    AlwaysBooleanMatchExpression(MatchType type, bool value)
-        : MatchExpression(type), _value(value) {}
+    AlwaysBooleanMatchExpression(MatchType type, clonable_ptr<ErrorAnnotation> annotation = nullptr)
+        : MatchExpression(type, std::move(annotation)) {}
 
-    virtual ~AlwaysBooleanMatchExpression() = default;
+    ~AlwaysBooleanMatchExpression() override = default;
 
     /**
      * The name of this MatchExpression.
      */
     virtual StringData name() const = 0;
 
-    bool matches(const MatchableDocument* doc, MatchDetails* details = nullptr) const final {
-        return _value;
+    void debugString(StringBuilder& debug, int indentationLevel = 0) const final {
+        _debugAddSpace(debug, indentationLevel);
+        debug << name() << ": 1";
+        _debugStringAttachTagInfo(&debug);
     }
 
-    bool matchesSingleElement(const BSONElement&, MatchDetails* details = nullptr) const final {
-        return _value;
-    }
-
-    void debugString(StringBuilder& debug, int level = 0) const final {
-        _debugAddSpace(debug, level);
-        debug << name() << ": 1\n";
-    }
-
-    void serialize(BSONObjBuilder* out) const final {
-        out->append(name(), 1);
+    void serialize(BSONObjBuilder* out,
+                   const SerializationOptions& opts = {},
+                   bool includePath = true) const final {
+        opts.appendLiteral(out, name(), 1);
     }
 
     bool equivalent(const MatchExpression* other) const final {
@@ -76,37 +85,50 @@ public:
     }
 
     MatchExpression* getChild(size_t i) const override {
+        MONGO_UNREACHABLE_TASSERT(6400202);
+    }
+
+    void resetChild(size_t, MatchExpression*) override {
         MONGO_UNREACHABLE;
     }
 
-    std::vector<MatchExpression*>* getChildVector() override {
+    std::vector<std::unique_ptr<MatchExpression>>* getChildVector() final {
         return nullptr;
     }
 
 private:
     ExpressionOptimizerFunc getOptimizer() const final {
-        return [](std::unique_ptr<MatchExpression> expression) { return expression; };
+        return [](std::unique_ptr<MatchExpression> expression) {
+            return expression;
+        };
     }
-
-    bool _value;
 };
 
 class AlwaysFalseMatchExpression final : public AlwaysBooleanMatchExpression {
 public:
     static constexpr StringData kName = "$alwaysFalse"_sd;
 
-    AlwaysFalseMatchExpression() : AlwaysBooleanMatchExpression(MatchType::ALWAYS_FALSE, false) {}
+    AlwaysFalseMatchExpression(clonable_ptr<ErrorAnnotation> annotation = nullptr)
+        : AlwaysBooleanMatchExpression(MatchType::ALWAYS_FALSE, std::move(annotation)) {}
 
     StringData name() const final {
         return kName;
     }
 
-    std::unique_ptr<MatchExpression> shallowClone() const final {
-        return stdx::make_unique<AlwaysFalseMatchExpression>();
+    std::unique_ptr<MatchExpression> clone() const final {
+        return std::make_unique<AlwaysFalseMatchExpression>(_errorAnnotation);
     }
 
     bool isTriviallyFalse() const final {
         return true;
+    }
+
+    void acceptVisitor(MatchExpressionMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(MatchExpressionConstVisitor* visitor) const final {
+        visitor->visit(this);
     }
 };
 
@@ -114,18 +136,27 @@ class AlwaysTrueMatchExpression final : public AlwaysBooleanMatchExpression {
 public:
     static constexpr StringData kName = "$alwaysTrue"_sd;
 
-    AlwaysTrueMatchExpression() : AlwaysBooleanMatchExpression(MatchType::ALWAYS_TRUE, true) {}
+    AlwaysTrueMatchExpression(clonable_ptr<ErrorAnnotation> annotation = nullptr)
+        : AlwaysBooleanMatchExpression(MatchType::ALWAYS_TRUE, std::move(annotation)) {}
 
     StringData name() const final {
         return kName;
     }
 
-    std::unique_ptr<MatchExpression> shallowClone() const final {
-        return stdx::make_unique<AlwaysTrueMatchExpression>();
+    std::unique_ptr<MatchExpression> clone() const final {
+        return std::make_unique<AlwaysTrueMatchExpression>(_errorAnnotation);
     }
 
     bool isTriviallyTrue() const final {
         return true;
+    }
+
+    void acceptVisitor(MatchExpressionMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(MatchExpressionConstVisitor* visitor) const final {
+        visitor->visit(this);
     }
 };
 

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,11 +29,18 @@
 
 #pragma once
 
+#include <boost/optional.hpp>
+#include <map>
+#include <set>
 #include <string>
 #include <vector>
 
 #include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/client/connection_string.h"
 #include "mongo/config.h"
+#include "mongo/crypto/sha256_block.h"
+#include "mongo/db/auth/role_name.h"
 
 namespace mongo {
 
@@ -48,19 +54,33 @@ class OptionSection;
 class Environment;
 }  // namespace optionenvironment
 
+constexpr auto kSSLCipherConfigDefault = "HIGH:!EXPORT:!aNULL@STRENGTH"_sd;
+
 struct SSLParams {
+    using TLSCATrusts = std::map<SHA256Block, std::set<RoleName>>;
+
     enum class Protocols { TLS1_0, TLS1_1, TLS1_2, TLS1_3 };
-    AtomicInt32 sslMode;            // --tlsMode - the TLS operation mode, see enum SSLModes
+    AtomicWord<int> sslMode;        // --tlsMode - the TLS operation mode, see enum SSLModes
     std::string sslPEMTempDHParam;  // --setParameter OpenSSLDiffieHellmanParameters=file : PEM file
                                     // with DH parameters.
-    std::string sslPEMKeyFile;      // --tlsPEMKeyFile
-    std::string sslPEMKeyPassword;  // --tlsPEMKeyPassword
+    std::string sslPEMKeyFile;      // --tlsCertificateKeyFile
+    std::string sslPEMKeyPassword;  // --tlsCertificateKeyFilePassword
     std::string sslClusterFile;     // --tlsInternalKeyFile
-    std::string sslClusterPassword;  // --tlsInternalKeyPassword
-    std::string sslCAFile;           // --tlsCAFile
-    std::string sslClusterCAFile;    // --tlsClusterCAFile
-    std::string sslCRLFile;          // --tlsCRLFile
-    std::string sslCipherConfig;     // --tlsCipherConfig
+    std::string sslClusterPassword;             // --tlsInternalKeyPassword
+    std::string sslCAFile;                      // --tlsCAFile
+    std::string sslClusterCAFile;               // --tlsClusterCAFile
+    std::string sslCRLFile;                     // --tlsCRLFile
+    std::string sslCipherConfig;                // --tlsCipherConfig
+    std::string sslCipherSuiteConfig;           // --tlsCipherSuiteConfig
+    std::string clusterAuthX509ExtensionValue;  // --tlsClusterAuthX509ExtensionValue
+    std::string clusterAuthX509Attributes;      // --tlsClusterAuthX509Attributes
+
+    boost::optional<TLSCATrusts> tlsCATrusts;  // --setParameter tlsCATrusts
+
+    std::string clusterAuthX509OverrideExtensionValue;  // --setParameter
+                                                        // clusterAuthX509Override.extensionValue
+    std::string
+        clusterAuthX509OverrideAttributes;  // --setParameter clusterAuthX509Override.attributes
 
     struct CertificateSelector {
         std::string subject;
@@ -80,6 +100,7 @@ struct SSLParams {
     bool sslFIPSMode = false;                     // --sslFIPSMode
     bool sslAllowInvalidCertificates = false;     // --sslAllowInvalidCertificates
     bool sslAllowInvalidHostnames = false;        // --sslAllowInvalidHostnames
+    bool sslUseSystemCA = false;                  // --setParameter tlsUseSystemCA
     bool disableNonSSLConnectionLogging =
         false;  // --setParameter disableNonSSLConnectionLogging=true
     bool disableNonSSLConnectionLoggingSet = false;
@@ -87,34 +108,103 @@ struct SSLParams {
         false;  // --setParameter suppressNoTLSPeerCertificateWarning
     bool tlsWithholdClientCertificate = false;  // --setParameter tlsWithholdClientCertificate
 
-    SSLParams() {
+    SSLParams() : sslCipherConfig(kSSLCipherConfigDefault) {
         sslMode.store(SSLMode_disabled);
     }
 
-    enum SSLModes {
+    enum SSLModes : int {
         /**
-        * Make unencrypted outgoing connections and do not accept incoming SSL-connections.
-        */
+         * Make unencrypted outgoing connections and do not accept incoming SSL-connections.
+         */
         SSLMode_disabled,
 
         /**
-        * Make unencrypted outgoing connections and accept both unencrypted and SSL-connections.
-        */
+         * Make unencrypted outgoing connections and accept both unencrypted and SSL-connections.
+         */
         SSLMode_allowSSL,
 
         /**
-        * Make outgoing SSL-connections and accept both unecrypted and SSL-connections.
-        */
+         * Make outgoing SSL-connections and accept both unecrypted and SSL-connections.
+         */
         SSLMode_preferSSL,
 
         /**
-        * Make outgoing SSL-connections and only accept incoming SSL-connections.
-        */
+         * Make outgoing SSL-connections and only accept incoming SSL-connections.
+         */
         SSLMode_requireSSL
     };
+
+    static StatusWith<SSLModes> sslModeParse(StringData strMode);
+    static StatusWith<SSLModes> tlsModeParse(StringData strMode);
+    static std::string sslModeFormat(int mode);
+    static std::string tlsModeFormat(int mode);
 };
 
 extern SSLParams sslGlobalParams;
+
+struct TLSCredentials {
+    std::string tlsPEMKeyFile;
+    std::string tlsPEMKeyPassword;
+    std::string tlsCAFile;
+    std::string tlsCRLFile;
+    bool tlsAllowInvalidHostnames = false;
+    bool tlsAllowInvalidCertificates = false;
+    std::string tlsCipherConfig;
+    std::string tlsCipherSuiteConfig;
+    std::vector<SSLParams::Protocols> tlsDisabledProtocols;
+#ifdef MONGO_CONFIG_SSL_CERTIFICATE_SELECTORS
+    SSLParams::CertificateSelector tlsCertificateSelector;
+    SSLParams::CertificateSelector tlsClusterCertificateSelector;
+#endif
+
+    TLSCredentials() : tlsCipherConfig(kSSLCipherConfigDefault) {};
+};
+
+struct ClusterConnection {
+    ConnectionString targetedClusterConnectionString;
+    std::string sslClusterPEMPayload;
+};
+
+/**
+ * Additional SSL parameters used to augment specific connections or with limited lifetimes.
+ * These fields are not suitable to be part of `sslGlobalParams`.
+ *
+ * Usage scenarios for `TransientSSLParams`:
+ * 1. Short-lived connections between clusters:
+ *    - Only `ClusterConnection` is set.
+ * 2. New connection that overrides global SSL parameters:
+ *    - Accepts TLS parameters that will be applied to the new connection, only `TLSCredentials` is
+ * set.
+ */
+class TransientSSLParams {
+public:
+    // Constructor for creating a short-lived cluster connection.
+    TransientSSLParams(const ClusterConnection& clusterConnection)
+        : clusterConnection(clusterConnection) {}
+
+    // Constructor for overriding the global TLS parameters.
+    TransientSSLParams(TLSCredentials tlsCredentials) : tlsCredentials(tlsCredentials) {}
+
+    bool createNewConnection() const {
+        return tlsCredentials.has_value();
+    }
+
+    bool createNewClusterConnection() const {
+        return clusterConnection.has_value();
+    }
+
+    const boost::optional<TLSCredentials>& getTLSCredentials() const {
+        return tlsCredentials;
+    }
+
+    const boost::optional<ClusterConnection>& getClusterConnection() const {
+        return clusterConnection;
+    }
+
+private:
+    boost::optional<TLSCredentials> tlsCredentials;
+    boost::optional<ClusterConnection> clusterConnection;
+};
 
 /**
  * Older versions of mongod/mongos accepted --sslDisabledProtocols values
@@ -132,10 +222,10 @@ Status storeSSLDisabledProtocols(
     SSLDisabledProtocolsMode mode = SSLDisabledProtocolsMode::kStandardFormat);
 
 /**
-* The global SSL configuration. This should be accessed only after global initialization has
-* completed. If it must be accessed in an initializer, the initializer should have
-* "EndStartupOptionStorage" as a prerequisite.
-*/
+ * The global SSL configuration. This should be accessed only after global initialization has
+ * completed. If it must be accessed in an initializer, the initializer should have
+ * "EndStartupOptionStorage" as a prerequisite.
+ */
 const SSLParams& getSSLGlobalParams();
 
 Status parseCertificateSelector(SSLParams::CertificateSelector* selector,

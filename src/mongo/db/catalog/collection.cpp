@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,106 +27,240 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
-
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/catalog/collection.h"
+#include "mongo/db/transaction_resources.h"
 
-#include "mongo/base/counter.h"
-#include "mongo/base/owned_pointer_map.h"
-#include "mongo/bson/ordering.h"
-#include "mongo/bson/simple_bsonelement_comparator.h"
-#include "mongo/bson/simple_bsonobj_comparator.h"
-#include "mongo/db/background.h"
-#include "mongo/db/catalog/collection_catalog_entry.h"
-#include "mongo/db/catalog/database_catalog_entry.h"
-#include "mongo/db/catalog/document_validation.h"
-#include "mongo/db/clientcursor.h"
-#include "mongo/db/commands/server_status_metric.h"
-#include "mongo/db/concurrency/d_concurrency.h"
-#include "mongo/db/curop.h"
-#include "mongo/db/index/index_access_method.h"
-#include "mongo/db/keypattern.h"
-#include "mongo/db/matcher/expression_parser.h"
-#include "mongo/db/op_observer.h"
-#include "mongo/db/operation_context.h"
-#include "mongo/db/ops/update_request.h"
-#include "mongo/db/query/collation/collator_factory_interface.h"
-#include "mongo/db/server_parameters.h"
-#include "mongo/db/service_context.h"
-#include "mongo/db/storage/key_string.h"
-#include "mongo/db/storage/record_store.h"
-#include "mongo/db/update/update_driver.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
 
-#include "mongo/db/auth/user_document_parser.h"  // XXX-ANDY
-#include "mongo/rpc/object_check.h"
-#include "mongo/util/fail_point.h"
-#include "mongo/util/log.h"
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 namespace mongo {
-// Emit the vtable in this TU
-Collection::Impl::~Impl() = default;
 
-MONGO_DEFINE_SHIM(Collection::makeImpl);
+namespace {
+/**
+ * A class that verifies there are no leftover consistent collection once it goes out of scope. Used
+ * in conjunction with ConsistentCollection.
+ */
+class CollectionsInUse {
+public:
+    CollectionsInUse() = default;
 
-MONGO_DEFINE_SHIM(Collection::parseValidationLevel);
+    ~CollectionsInUse() {
+        int leftoverCollections = 0;
 
-MONGO_DEFINE_SHIM(Collection::parseValidationAction);
-
-void Collection::TUHook::hook() noexcept {}
-
-std::string CompactOptions::toString() const {
-    std::stringstream ss;
-    ss << "paddingMode: ";
-    switch (paddingMode) {
-        case NONE:
-            ss << "NONE";
-            break;
-        case PRESERVE:
-            ss << "PRESERVE";
-            break;
-        case MANUAL:
-            ss << "MANUAL (" << paddingBytes << " + ( doc * " << paddingFactor << ") )";
-    }
-
-    ss << " validateDocuments: " << validateDocuments;
-
-    return ss.str();
-}
-
-//
-// CappedInsertNotifier
-//
-
-CappedInsertNotifier::CappedInsertNotifier() : _version(0), _dead(false) {}
-
-void CappedInsertNotifier::notifyAll() {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
-    ++_version;
-    _notifier.notify_all();
-}
-
-void CappedInsertNotifier::waitUntil(uint64_t prevVersion, Date_t deadline) const {
-    stdx::unique_lock<stdx::mutex> lk(_mutex);
-    while (!_dead && prevVersion == _version) {
-        if (stdx::cv_status::timeout == _notifier.wait_until(lk, deadline.toSystemTimePoint())) {
-            return;
+        for (const auto& [collection, count] : _collections) {
+            invariant(count >= 0);
+            if (count == 0)
+                continue;
+            leftoverCollections += count;
         }
+
+        invariant(leftoverCollections == 0,
+                  "Server encountered potential use-after free with leftover Collection*. Crashing "
+                  "server to prevent undefined errors.");
+    }
+
+    void markCollectionAsOpened(const Collection* coll) {
+        _collections[coll]++;
+    }
+
+    void markCollectionAsReleased(const Collection* coll) {
+        _collections[coll]--;
+    }
+
+    int getRefCount(const Collection* coll) {
+        return _collections[coll];
+    }
+
+private:
+    stdx::unordered_map<const Collection*, int> _collections;
+};
+
+// We only enable the safety guards in debug builds to avoid paying any performance penalty.
+#ifdef MONGO_CONFIG_DEBUG_BUILD
+const RecoveryUnit::Snapshot::Decoration<CollectionsInUse> collectionsInUse =
+    RecoveryUnit::Snapshot::declareDecoration<CollectionsInUse>();
+#endif
+
+}  // namespace
+
+#ifdef MONGO_CONFIG_DEBUG_BUILD
+ConsistentCollection::~ConsistentCollection() {
+    _releaseCollectionIfInSnapshot();
+}
+
+ConsistentCollection::ConsistentCollection(OperationContext* opCtx, const Collection* coll)
+    : _collection(coll) {
+    // If we have no operation context it means we're acting on an owned collection, we can skip the
+    // safety checks.
+    if (!opCtx) {
+        return;
+    }
+    // If there's no collection there's no need for safety checks.
+    if (!coll) {
+        return;
+    }
+    // If the collection is locked then it is safe to assume it is consistent with the snapshot
+    // since no modifications can happen to it while we hold the lock or we're the ones making them.
+    // We do not proceed with the safety check.
+    if (auto locker = shard_role_details::getLocker(opCtx);
+        locker->isCollectionLockedForMode(coll->ns(), MODE_IS)) {
+        return;
+    }
+
+    _snapshot = &shard_role_details::getRecoveryUnit(opCtx)->getSnapshot();
+    collectionsInUse(_snapshot).markCollectionAsOpened(_collection);
+}
+
+ConsistentCollection::ConsistentCollection(const ConsistentCollection& other)
+    : _collection(other._collection), _snapshot(other._snapshot) {
+    if (_snapshot) {
+        collectionsInUse(_snapshot).markCollectionAsOpened(_collection);
     }
 }
 
-void CappedInsertNotifier::kill() {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
-    _dead = true;
-    _notifier.notify_all();
+ConsistentCollection::ConsistentCollection(ConsistentCollection&& other)
+    : _collection(std::exchange(other._collection, nullptr)),
+      _snapshot(std::exchange(other._snapshot, nullptr)) {}
+
+ConsistentCollection& ConsistentCollection::operator=(const ConsistentCollection& other) {
+    if (this == &other) {
+        return *this;
+    }
+    _releaseCollectionIfInSnapshot();
+    _collection = other._collection;
+    _snapshot = other._snapshot;
+    if (_snapshot) {
+        collectionsInUse(_snapshot).markCollectionAsOpened(_collection);
+    }
+    return *this;
+}
+ConsistentCollection& ConsistentCollection::operator=(ConsistentCollection&& other) {
+    _releaseCollectionIfInSnapshot();
+    _collection = std::exchange(other._collection, nullptr);
+    _snapshot = std::exchange(other._snapshot, nullptr);
+    return *this;
 }
 
-bool CappedInsertNotifier::isDead() {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
-    return _dead;
+int ConsistentCollection::_getRefCount() const {
+    if (!_collection) {
+        return 0;
+    }
+    if (!_snapshot)
+        return 1;
+    return collectionsInUse(_snapshot).getRefCount(_collection);
+}
+
+void ConsistentCollection::_releaseCollectionIfInSnapshot() {
+    if (_snapshot) {
+        collectionsInUse(_snapshot).markCollectionAsReleased(_collection);
+    }
+}
+#endif
+
+CollectionPtr CollectionPtr::null;
+
+CollectionPtr::CollectionPtr(ConsistentCollection collection)
+    : _collection(std::move(collection)) {}
+
+CollectionPtr CollectionPtr::CollectionPtr_UNSAFE(const Collection* coll) {
+    return CollectionPtr(coll);
+}
+
+CollectionPtr::CollectionPtr(const Collection* coll)
+    : _collection(ConsistentCollection{nullptr, coll}) {}
+
+CollectionPtr::CollectionPtr(CollectionPtr&&) = default;
+CollectionPtr::~CollectionPtr() {}
+CollectionPtr& CollectionPtr::operator=(CollectionPtr&&) = default;
+
+bool CollectionPtr::yieldable() const {
+    // We only set the opCtx when this CollectionPtr is yieldable.
+    return _opCtx || !_collection;
+}
+
+void CollectionPtr::yield() const {
+    // Yield if we are yieldable and have a valid collection.
+    if (_collection) {
+        invariant(_opCtx);
+        _yieldedUUID = _collection->uuid();
+        _collection = ConsistentCollection{};
+    }
+    // Enter in 'yielded' state whether or not we held a valid collection pointer.
+    _yielded = true;
+}
+void CollectionPtr::restore() const {
+    // Restore from yield if we are yieldable and if we are in 'yielded' state.
+    invariant(_opCtx);
+    if (_yielded) {
+        // We may only do yield restore when we were holding locks that was yielded so we need to
+        // refresh from the catalog to make sure we have a valid collection pointer. This call may
+        // still return a null collection pointer if the yieldedUUID is boost::none or if the
+        // collection no longer exists.
+        _collection = _restoreFn(_opCtx, _yieldedUUID);
+        _yieldedUUID.reset();
+        _yielded = false;
+    }
+}
+
+void CollectionPtr::setShardKeyPattern(const BSONObj& shardKeyPattern) {
+    _shardKeyPattern.emplace(shardKeyPattern.getOwned());
+}
+
+const ShardKeyPattern& CollectionPtr::getShardKeyPattern() const {
+    invariant(_shardKeyPattern);
+    return *_shardKeyPattern;
 }
 
 // ----
+
+namespace {
+const auto getFactory = ServiceContext::declareDecoration<std::unique_ptr<Collection::Factory>>();
+}  // namespace
+
+Collection::Factory* Collection::Factory::get(ServiceContext* service) {
+    return getFactory(service).get();
+}
+
+Collection::Factory* Collection::Factory::get(OperationContext* opCtx) {
+    return getFactory(opCtx->getServiceContext()).get();
+}
+
+void Collection::Factory::set(ServiceContext* service,
+                              std::unique_ptr<Collection::Factory> newFactory) {
+    auto& factory = getFactory(service);
+    factory = std::move(newFactory);
+}
+
+std::pair<std::unique_ptr<CollatorInterface>, ExpressionContextCollationMatchesDefault>
+resolveCollator(OperationContext* opCtx, BSONObj userCollation, const CollectionPtr& collection) {
+    if (!collection || !collection->getDefaultCollator()) {
+        if (userCollation.isEmpty()) {
+            return {nullptr, ExpressionContextCollationMatchesDefault::kYes};
+        } else {
+            return {getUserCollator(opCtx, userCollation),
+                    // If the user explicitly provided a simple collation, we can still treat it as
+                    // 'CollationMatchesDefault::kYes', as no collation and simple collation are
+                    // functionally equivalent in the query code.
+                    (SimpleBSONObjComparator::kInstance.evaluate(userCollation ==
+                                                                 CollationSpec::kSimpleSpec))
+                        ? ExpressionContextCollationMatchesDefault::kYes
+                        : ExpressionContextCollationMatchesDefault::kNo};
+        }
+    }
+
+    auto defaultCollator = collection->getDefaultCollator()->clone();
+    if (userCollation.isEmpty()) {
+        return {std::move(defaultCollator), ExpressionContextCollationMatchesDefault::kYes};
+    }
+    auto userCollator = getUserCollator(opCtx, userCollation);
+
+    if (CollatorInterface::collatorsMatch(defaultCollator.get(), userCollator.get())) {
+        return {std::move(defaultCollator), ExpressionContextCollationMatchesDefault::kYes};
+    } else {
+        return {std::move(userCollator), ExpressionContextCollationMatchesDefault::kNo};
+    }
+}
 
 }  // namespace mongo

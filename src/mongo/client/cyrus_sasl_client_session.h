@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -40,16 +39,17 @@ namespace mongo {
  * using the Cyrus SASL library.
  */
 class CyrusSaslClientSession : public SaslClientSession {
-    MONGO_DISALLOW_COPYING(CyrusSaslClientSession);
+    CyrusSaslClientSession(const CyrusSaslClientSession&) = delete;
+    CyrusSaslClientSession& operator=(const CyrusSaslClientSession&) = delete;
 
 public:
     CyrusSaslClientSession();
-    ~CyrusSaslClientSession();
+    ~CyrusSaslClientSession() override;
 
     /**
      * Overriding to store the password data in sasl_secret_t format
      */
-    virtual void setParameter(Parameter id, StringData value);
+    void setParameter(Parameter id, StringData value) override;
 
     /**
      * Returns the value of the parameterPassword parameter in the form of a sasl_secret_t, used
@@ -59,12 +59,12 @@ public:
      */
     sasl_secret_t* getPasswordAsSecret();
 
-    virtual Status initialize();
+    Status initialize() override;
 
-    virtual Status step(StringData inputData, std::string* outputData);
+    Status step(StringData inputData, std::string* outputData) override;
 
-    virtual bool isDone() const {
-        return _done;
+    bool isSuccess() const override {
+        return _success;
     }
 
 private:
@@ -77,8 +77,8 @@ private:
     // Number of successfully completed conversation steps.
     int _step;
 
-    /// See isDone().
-    bool _done;
+    /// See isSuccess().
+    bool _success;
 
     /// Stored of password in sasl_secret_t format
     std::unique_ptr<char[]> _secret;

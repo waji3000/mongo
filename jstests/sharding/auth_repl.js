@@ -1,4 +1,6 @@
-// TODO SERVER-35447: Multiple users cannot be authenticated on one connection within a session.
+// Multiple users cannot be authenticated on one connection within a session.
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+
 TestData.disableImplicitSessions = true;
 
 var replTest = new ReplSetTest({nodes: 3, useHostName: false, keyFile: 'jstests/libs/key1'});
@@ -19,7 +21,7 @@ var testColl = testDB.user;
 // before setting up authentication
 assert.commandWorked(adminDB.runCommand({replSetGetStatus: 1}));
 
-conn.setSlaveOk();
+conn.setSecondaryOk();
 assert.commandWorked(adminDB.runCommand({replSetGetStatus: 1}));
 
 // Add admin user using direct connection to primary to simulate connection from remote host
@@ -36,21 +38,21 @@ priTestDB.createUser({user: 'a', pwd: 'a', roles: jsTest.basicUserRoles},
 assert.eq(1, testDB.auth('a', 'a'));
 
 jsTest.log('Sending an authorized query that should be ok');
-assert.writeOK(testColl.insert({x: 1}, {writeConcern: {w: nodeCount}}));
+assert.commandWorked(testColl.insert({x: 1}, {writeConcern: {w: nodeCount}}));
 
-conn.setSlaveOk(true);
-doc = testColl.findOne();
+conn.setSecondaryOk();
+let doc = testColl.findOne();
 assert(doc != null);
 
 doc = testColl.find().readPref('secondary').next();
 assert(doc != null);
 
-conn.setSlaveOk(false);
+conn.setSecondaryOk(false);
 doc = testColl.findOne();
 assert(doc != null);
 
 var queryToPriShouldFail = function() {
-    conn.setSlaveOk(false);
+    conn.setSecondaryOk(false);
 
     assert.throws(function() {
         testColl.findOne();
@@ -63,7 +65,7 @@ var queryToPriShouldFail = function() {
 };
 
 var queryToSecShouldFail = function() {
-    conn.setSlaveOk(true);
+    conn.setSecondaryOk();
 
     assert.throws(function() {
         testColl.findOne();
@@ -104,7 +106,7 @@ queryToPriShouldFail();
 assert.eq(1, testDB.auth('a', 'a'));
 
 // Find out the current cached secondary in the repl connection
-conn.setSlaveOk(true);
+conn.setSecondaryOk();
 var serverInfo = testColl.find().readPref('secondary').explain().serverInfo;
 var secNodeIdx = -1;
 var secPortStr = serverInfo.port.toString();

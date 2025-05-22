@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,10 +27,12 @@
  *    it in the license file.
  */
 
+#include <cstdint>
 #include <cstring>
 #include <iterator>
 #include <numeric>
 
+#include "mongo/base/string_data.h"
 #include "mongo/db/fts/unicode/byte_vector.h"
 #include "mongo/unittest/unittest.h"
 

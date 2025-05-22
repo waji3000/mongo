@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,11 +29,13 @@
 
 #include "mongo/base/encoded_value_storage.h"
 
+#include <cstdint>
 #include <cstring>
 
 #include "mongo/base/data_type_endian.h"
+#include "mongo/base/data_view.h"
 #include "mongo/base/static_assert.h"
-#include "mongo/platform/endian.h"
+#include "mongo/base/string_data.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
@@ -118,7 +119,7 @@ public:
 
     Value(ZeroInitTag_t zit) : EncodedValueStorage<Layout, ConstView, View>(zit) {}
 };
-}
+}  // namespace EncodedValueStorageTest
 
 TEST(EncodedValueStorage, EncodedValueStorage) {
     EncodedValueStorageTest::Value raw;

@@ -1,6 +1,3 @@
-// @file bsonmisc.h
-
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -32,8 +29,14 @@
 
 #pragma once
 
+#include <memory>
+
+#include "mongo/base/string_data.h"
 #include "mongo/bson/bsonelement.h"
 #include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/bson/bsontypes_util.h"
+#include "mongo/bson/util/builder.h"
 
 namespace mongo {
 
@@ -44,7 +47,7 @@ public:
      * string elements.  A custom string comparator may be provided, but it must outlive the
      * constructed BSONElementCmpWithoutField.
      */
-    BSONElementCmpWithoutField(const StringData::ComparatorInterface* stringComparator = nullptr)
+    BSONElementCmpWithoutField(const StringDataComparator* stringComparator = nullptr)
         : _stringComparator(stringComparator) {}
 
     bool operator()(const BSONElement& l, const BSONElement& r) const {
@@ -52,196 +55,7 @@ public:
     }
 
 private:
-    const StringData::ComparatorInterface* _stringComparator;
-};
-
-/** Use BSON macro to build a BSONObj from a stream
-
-    e.g.,
-       BSON( "name" << "joe" << "age" << 33 )
-
-    with auto-generated object id:
-       BSON( GENOID << "name" << "joe" << "age" << 33 )
-
-    The labels GT, GTE, LT, LTE, NE can be helpful for stream-oriented construction
-    of a BSONObj, particularly when assembling a Query.  For example,
-    BSON( "a" << GT << 23.4 << NE << 30 << "b" << 2 ) produces the object
-    { a: { \$gt: 23.4, \$ne: 30 }, b: 2 }.
-*/
-#define BSON(x) ((::mongo::BSONObjBuilder(64) << x).obj())
-
-/** Use BSON_ARRAY macro like BSON macro, but without keys
-
-    BSONArray arr = BSON_ARRAY( "hello" << 1 <<
-                        BSON( "foo" << BSON_ARRAY( "bar" << "baz" << "qux" ) ) );
-
- */
-#define BSON_ARRAY(x) ((::mongo::BSONArrayBuilder() << x).arr())
-
-/* Utility class to auto assign object IDs.
-   Example:
-     std::cout << BSON( GENOID << "z" << 3 ); // { _id : ..., z : 3 }
-*/
-struct GENOIDLabeler {};
-extern GENOIDLabeler GENOID;
-
-/* Utility class to add a Date element with the current time
-   Example:
-     std::cout << BSON( "created" << DATENOW ); // { created : "2009-10-09 11:41:42" }
-*/
-struct DateNowLabeler {};
-extern DateNowLabeler DATENOW;
-
-/* Utility class to assign a NULL value to a given attribute
-   Example:
-     std::cout << BSON( "a" << BSONNULL ); // { a : null }
-*/
-struct NullLabeler {};
-extern NullLabeler BSONNULL;
-
-/* Utility class to assign an Undefined value to a given attribute
-   Example:
-     std::cout << BSON( "a" << BSONUndefined ); // { a : undefined }
-*/
-struct UndefinedLabeler {};
-extern UndefinedLabeler BSONUndefined;
-
-/* Utility class to add the minKey (minus infinity) to a given attribute
-   Example:
-     std::cout << BSON( "a" << MINKEY ); // { "a" : { "$minKey" : 1 } }
-*/
-struct MinKeyLabeler {};
-extern MinKeyLabeler MINKEY;
-struct MaxKeyLabeler {};
-extern MaxKeyLabeler MAXKEY;
-
-// Utility class to implement GT, GTE, etc as described above.
-class Labeler {
-public:
-    struct Label {
-        explicit Label(const char* l) : l_(l) {}
-        const char* l_;
-    };
-    Labeler(const Label& l, BSONObjBuilderValueStream* s) : l_(l), s_(s) {}
-    template <class T>
-    BSONObjBuilder& operator<<(T value);
-
-    /* the value of the element e is appended i.e. for
-         "age" << GT << someElement
-       one gets
-         { age : { $gt : someElement's value } }
-    */
-    BSONObjBuilder& operator<<(const BSONElement& e);
-
-private:
-    const Label& l_;
-    BSONObjBuilderValueStream* s_;
-};
-
-// Utility class to allow adding a std::string to BSON as a Symbol
-struct BSONSymbol {
-    explicit BSONSymbol(StringData sym) : symbol(sym) {}
-    StringData symbol;
-};
-
-// Utility class to allow adding a std::string to BSON as Code
-struct BSONCode {
-    explicit BSONCode(StringData str) : code(str) {}
-    StringData code;
-};
-
-// Utility class to allow adding CodeWScope to BSON
-struct BSONCodeWScope {
-    explicit BSONCodeWScope(StringData str, const BSONObj& obj) : code(str), scope(obj) {}
-    StringData code;
-    BSONObj scope;
-};
-
-// Utility class to allow adding a RegEx to BSON
-struct BSONRegEx {
-    explicit BSONRegEx(StringData pat, StringData f = "") : pattern(pat), flags(f) {}
-    StringData pattern;
-    StringData flags;
-};
-
-// Utility class to allow adding binary data to BSON
-struct BSONBinData {
-    BSONBinData(const void* d, int l, BinDataType t) : data(d), length(l), type(t) {}
-    const void* data;
-    int length;
-    BinDataType type;
-};
-
-// Utility class to allow adding deprecated DBRef type to BSON
-struct BSONDBRef {
-    BSONDBRef(StringData nameSpace, const OID& o) : ns(nameSpace), oid(o) {}
-    StringData ns;
-    OID oid;
-};
-
-extern Labeler::Label GT;
-extern Labeler::Label GTE;
-extern Labeler::Label LT;
-extern Labeler::Label LTE;
-extern Labeler::Label NE;
-extern Labeler::Label NIN;
-extern Labeler::Label BSIZE;
-
-// definitions in bsonobjbuilder.h b/c of incomplete types
-
-// Utility class to implement BSON( key << val ) as described above.
-class BSONObjBuilderValueStream {
-    MONGO_DISALLOW_COPYING(BSONObjBuilderValueStream);
-
-public:
-    friend class Labeler;
-    BSONObjBuilderValueStream(BSONObjBuilder* builder);
-
-    BSONObjBuilder& operator<<(const BSONElement& e);
-
-    template <class T>
-    BSONObjBuilder& operator<<(T value);
-
-    BSONObjBuilder& operator<<(const DateNowLabeler& id);
-
-    BSONObjBuilder& operator<<(const NullLabeler& id);
-    BSONObjBuilder& operator<<(const UndefinedLabeler& id);
-
-    BSONObjBuilder& operator<<(const MinKeyLabeler& id);
-    BSONObjBuilder& operator<<(const MaxKeyLabeler& id);
-
-    Labeler operator<<(const Labeler::Label& l);
-
-    void endField(StringData nextFieldName = StringData());
-    bool subobjStarted() const {
-        return _fieldName != 0;
-    }
-
-    // The following methods provide API compatibility with BSONArrayBuilder
-    BufBuilder& subobjStart();
-    BufBuilder& subarrayStart();
-
-    // This method should only be called from inside of implementations of
-    // BSONObjBuilder& operator<<(BSONObjBuilderValueStream&, SOME_TYPE)
-    // to provide the return value.
-    BSONObjBuilder& builder() {
-        return *_builder;
-    }
-
-    /**
-     * Restores this object to its empty state.
-     */
-    void reset();
-
-private:
-    StringData _fieldName;
-    BSONObjBuilder* _builder;
-
-    bool haveSubobj() const {
-        return _subobj.get() != 0;
-    }
-    BSONObjBuilder* subobj();
-    std::unique_ptr<BSONObjBuilder> _subobj;
+    const StringDataComparator* _stringComparator;
 };
 
 /**
@@ -283,4 +97,4 @@ private:
 
 // considers order
 bool fieldsMatch(const BSONObj& lhs, const BSONObj& rhs);
-}
+}  // namespace mongo

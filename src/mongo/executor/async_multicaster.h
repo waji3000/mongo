@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,11 +29,17 @@
 
 #pragma once
 
+#include <cstddef>
+#include <memory>
+#include <string>
+#include <tuple>
 #include <vector>
 
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/executor/remote_command_response.h"
 #include "mongo/executor/task_executor.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/util/duration.h"
 #include "mongo/util/net/hostandport.h"
 
 namespace mongo {
@@ -55,7 +60,7 @@ public:
         size_t maxConcurrency = kMaxConcurrency;
     };
 
-    AsyncMulticaster(executor::TaskExecutor* executor, Options options);
+    AsyncMulticaster(std::shared_ptr<executor::TaskExecutor> executor, Options options);
 
     /**
      * Sends the cmd out to all passed servers (via the executor), observing the multicaster's
@@ -66,15 +71,15 @@ public:
      * or
      *   timeoutMillis * (servers.size() / maxConcurrency) - if not
      */
-    std::vector<Reply> multicast(const std::vector<HostAndPort> servers,
-                                 const std::string& theDbName,
+    std::vector<Reply> multicast(std::vector<HostAndPort> servers,
+                                 const DatabaseName& theDbName,
                                  const BSONObj& theCmdObj,
                                  OperationContext* opCtx,
                                  Milliseconds timeoutMillis);
 
 private:
     Options _options;
-    executor::TaskExecutor* _executor;
+    std::shared_ptr<executor::TaskExecutor> _executor;
 };
 
 }  // namespace executor

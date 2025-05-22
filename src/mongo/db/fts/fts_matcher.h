@@ -1,6 +1,3 @@
-// fts_matcher.h
-
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -32,6 +29,11 @@
 
 #pragma once
 
+#include <cstddef>
+#include <string>
+
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/fts/fts_language.h"
 #include "mongo/db/fts/fts_query_impl.h"
 #include "mongo/db/fts/fts_spec.h"
 #include "mongo/db/fts/fts_tokenizer.h"
@@ -42,7 +44,8 @@ namespace mongo {
 namespace fts {
 
 class FTSMatcher {
-    MONGO_DISALLOW_COPYING(FTSMatcher);
+    FTSMatcher(const FTSMatcher&) = delete;
+    FTSMatcher& operator=(const FTSMatcher&) = delete;
 
 public:
     FTSMatcher(const FTSQueryImpl& query, const FTSSpec& spec);
@@ -76,6 +79,16 @@ public:
      * Returns whether 'obj' contains zero negative phrases.
      */
     bool negativePhrasesMatch(const BSONObj& obj) const;
+
+    const FTSQueryImpl& query() const {
+        return _query;
+    }
+
+    const FTSSpec& spec() const {
+        return _spec;
+    }
+
+    size_t getApproximateSize() const;
 
 private:
     /**
@@ -114,5 +127,5 @@ private:
     const FTSQueryImpl _query;
     const FTSSpec _spec;
 };
-}
-}
+}  // namespace fts
+}  // namespace mongo

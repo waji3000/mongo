@@ -1,6 +1,3 @@
-// fine_clock.h
-
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -33,7 +30,7 @@
 #ifndef DB_STATS_FINE_CLOCK_HEADER
 #define DB_STATS_FINE_CLOCK_HEADER
 
-#include <time.h>  // struct timespec
+#include <ctime>  // struct timespec
 
 namespace mongo {
 
@@ -72,6 +69,6 @@ public:
         return diff;
     }
 };
-}
+}  // namespace mongo
 
 #endif  // DB_STATS_FINE_CLOCK_HEADER

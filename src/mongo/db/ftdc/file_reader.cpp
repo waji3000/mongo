@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,21 +27,26 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <cstdint>
+#include <cstring>
+#include <fstream>  // IWYU pragma: keep
+#include <string>
 
-#include "mongo/db/ftdc/file_reader.h"
+#include <boost/filesystem/operations.hpp>
+#include <boost/filesystem/path.hpp>
+#include <boost/move/utility_core.hpp>
+// IWYU pragma: no_include "boost/system/detail/error_code.hpp"
 
-#include <boost/filesystem.hpp>
-#include <fstream>
-
-#include "mongo/base/data_range_cursor.h"
+#include "mongo/base/data_range.h"
+#include "mongo/base/data_type_endian.h"
 #include "mongo/base/data_type_validated.h"
-#include "mongo/bson/bsonmisc.h"
-#include "mongo/db/ftdc/config.h"
+#include "mongo/base/data_view.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/db/ftdc/file_reader.h"
 #include "mongo/db/ftdc/util.h"
-#include "mongo/db/jsobj.h"
-#include "mongo/rpc/object_check.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/rpc/object_check.h"  // IWYU pragma: keep
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -81,9 +85,9 @@ StatusWith<bool> FTDCFileReader::hasNext() {
 
             _dateId = swId.getValue();
 
-            FTDCBSONUtil::FTDCType type = swType.getValue();
+            _type = swType.getValue();
 
-            if (type == FTDCBSONUtil::FTDCType::kMetadata) {
+            if (_type == FTDCBSONUtil::FTDCType::kMetadata) {
                 _state = State::kMetadataDoc;
 
                 auto swMetadata = FTDCBSONUtil::getBSONDocumentFromMetadataDoc(_parent);
@@ -92,7 +96,7 @@ StatusWith<bool> FTDCFileReader::hasNext() {
                 }
 
                 _metadata = swMetadata.getValue();
-            } else if (type == FTDCBSONUtil::FTDCType::kMetricChunk) {
+            } else if (_type == FTDCBSONUtil::FTDCType::kMetricChunk) {
                 _state = State::kMetricChunk;
 
                 auto swDocs = FTDCBSONUtil::getMetricsFromMetricDoc(_parent, &_decompressor);
@@ -104,6 +108,15 @@ StatusWith<bool> FTDCFileReader::hasNext() {
 
                 // There is always at least the reference document
                 _pos = 0;
+            } else if (_type == FTDCBSONUtil::FTDCType::kPeriodicMetadata) {
+                _state = State::kMetadataDoc;
+
+                auto swDeltas = FTDCBSONUtil::getDeltasFromPeriodicMetadataDoc(_parent);
+                if (!swDeltas.isOK()) {
+                    return swDeltas.getStatus();
+                }
+
+                _metadata = swDeltas.getValue().second;
             }
 
             return {true};
@@ -135,12 +148,12 @@ std::tuple<FTDCBSONUtil::FTDCType, const BSONObj&, Date_t> FTDCFileReader::next(
 
     if (_state == State::kMetadataDoc) {
         return std::tuple<FTDCBSONUtil::FTDCType, const BSONObj&, Date_t>(
-            FTDCBSONUtil::FTDCType::kMetadata, _metadata, _dateId);
+            _type, _metadata, _dateId);
     }
 
     if (_state == State::kMetricChunk) {
         return std::tuple<FTDCBSONUtil::FTDCType, const BSONObj&, Date_t>(
-            FTDCBSONUtil::FTDCType::kMetricChunk, _docs[_pos], _dateId);
+            _type, _docs[_pos], _dateId);
     }
 
     MONGO_UNREACHABLE;
@@ -163,8 +176,8 @@ StatusWith<BSONObj> FTDCFileReader::readDocument() {
         }
 
         return {ErrorCodes::FileStreamFailed,
-                str::stream() << "Failed to read 4 bytes from file \'" << _file.generic_string()
-                              << "\'"};
+                str::stream() << "Failed to read 4 bytes from file \"" << _file.generic_string()
+                              << "\""};
     }
 
     std::uint32_t bsonLength = ConstDataView(buf).read<LittleEndian<std::int32_t>>();
@@ -178,8 +191,8 @@ StatusWith<BSONObj> FTDCFileReader::readDocument() {
     // Reads past the end of the file will be caught below
     if (bsonLength > _fileSize || bsonLength < BSONObj::kMinBSONLength) {
         return {ErrorCodes::InvalidLength,
-                str::stream() << "Invalid BSON length found in file \'" << _file.generic_string()
-                              << "\'"};
+                str::stream() << "Invalid BSON length found in file \"" << _file.generic_string()
+                              << "\""};
     }
 
     // Read the BSON document
@@ -195,15 +208,14 @@ StatusWith<BSONObj> FTDCFileReader::readDocument() {
 
     if (readSize != _stream.gcount()) {
         return {ErrorCodes::FileStreamFailed,
-                str::stream() << "Failed to read " << readSize << " bytes from file \'"
-                              << _file.generic_string()
-                              << "\'"};
+                str::stream() << "Failed to read " << readSize << " bytes from file \""
+                              << _file.generic_string() << "\""};
     }
 
     ConstDataRange cdr(_buffer.data(), _buffer.data() + bsonLength);
 
     // TODO: Validated only validates objects based on a flag which is the default at the moment
-    auto swl = cdr.read<Validated<BSONObj>>();
+    auto swl = cdr.readNoThrow<Validated<BSONObj>>();
     if (!swl.isOK()) {
         return swl.getStatus();
     }
@@ -217,7 +229,14 @@ Status FTDCFileReader::open(const boost::filesystem::path& file) {
         return Status(ErrorCodes::FileStreamFailed, "Failed to open file " + file.generic_string());
     }
 
-    _fileSize = boost::filesystem::file_size(file);
+    boost::system::error_code ec;
+    _fileSize = boost::filesystem::file_size(file, ec);
+    if (ec) {
+        return {ErrorCodes::NonExistentPath,
+                str::stream() << "\"" << file.generic_string()
+                              << "\" file size could not be retrieved during open: "
+                              << ec.message()};
+    }
 
     _file = file;
 

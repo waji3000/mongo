@@ -2,20 +2,23 @@ test_kind: js_test
 
 selector:
   roots:
-  - jstestfuzz/out/*.js
+    - jstestfuzz/out/*.js
 
 executor:
   archive:
     tests: true
   config:
     shell_options:
-      nodb: ''
-      readMode: commands
+      nodb: ""
       global_vars:
         TestData:
           logComponentVerbosity:
+            network:
+              verbosity: 1
             replication:
               heartbeats: 2
               rollback: 2
             storage:
               recovery: 3
+          setParameters:
+            enableIndexBuildCommitQuorum: false

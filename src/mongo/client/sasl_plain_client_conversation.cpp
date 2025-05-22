@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,21 +27,20 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/client/sasl_plain_client_conversation.h"
+#include <boost/move/utility_core.hpp>
 
 #include "mongo/base/status_with.h"
 #include "mongo/bson/util/builder.h"
+#include "mongo/bson/util/builder_fwd.h"
 #include "mongo/client/sasl_client_session.h"
-#include "mongo/util/password_digest.h"
+#include "mongo/client/sasl_plain_client_conversation.h"
 
 namespace mongo {
 
 SaslPLAINClientConversation::SaslPLAINClientConversation(SaslClientSession* saslClientSession)
     : SaslClientConversation(saslClientSession) {}
 
-SaslPLAINClientConversation::~SaslPLAINClientConversation(){};
+SaslPLAINClientConversation::~SaslPLAINClientConversation() {};
 
 StatusWith<bool> SaslPLAINClientConversation::step(StringData inputData, std::string* outputData) {
     // Create PLAIN message on the form: user\0user\0pwd

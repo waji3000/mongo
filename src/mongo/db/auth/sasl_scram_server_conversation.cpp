@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,40 +27,59 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kAccessControl
-
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/auth/sasl_scram_server_conversation.h"
-
-#include <boost/algorithm/string/join.hpp>
+#include <algorithm>
 #include <boost/algorithm/string/replace.hpp>
+#include <boost/iterator/iterator_traits.hpp>
+#include <boost/none.hpp>
+#include <cstdint>
+#include <deque>
+#include <memory>
+#include <set>
 
-#include "mongo/base/disallow_copying.h"
-#include "mongo/base/init.h"
+#include <absl/strings/str_split.h>
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/init.h"  // IWYU pragma: keep
 #include "mongo/base/status.h"
 #include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/util/builder.h"
+#include "mongo/bson/util/builder_fwd.h"
 #include "mongo/crypto/mechanism_scram.h"
-#include "mongo/crypto/sha1_block.h"
+#include "mongo/db/auth/auth_name.h"
+#include "mongo/db/auth/authorization_manager.h"
+#include "mongo/db/auth/cluster_auth_mode.h"
+#include "mongo/db/auth/role_name.h"
+#include "mongo/db/auth/sasl_command_constants.h"
 #include "mongo/db/auth/sasl_mechanism_policies.h"
 #include "mongo/db/auth/sasl_mechanism_registry.h"
 #include "mongo/db/auth/sasl_options.h"
+#include "mongo/db/auth/sasl_scram_server_conversation.h"
+#include "mongo/db/auth/user_name.h"
+#include "mongo/db/connection_health_metrics_parameter_gen.h"
+#include "mongo/logv2/log.h"
 #include "mongo/platform/random.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/base64.h"
-#include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/read_through_cache.h"
 #include "mongo/util/sequence_util.h"
-#include "mongo/util/text.h"
+#include "mongo/util/str.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kAccessControl
 
 namespace mongo {
-
 
 template <typename Policy>
 StatusWith<std::tuple<bool, std::string>> SaslSCRAMServerMechanism<Policy>::stepImpl(
     OperationContext* opCtx, StringData inputData) {
     _step++;
 
-    if (_step > 3 || _step <= 0) {
+    const unsigned int numSteps = _totalSteps();
+
+    if (_step > numSteps || _step <= 0) {
         return Status(ErrorCodes::AuthenticationFailed,
                       str::stream() << "Invalid SCRAM authentication step: " << _step);
     }
@@ -101,8 +119,7 @@ StatusWith<std::tuple<bool, std::string>> SaslSCRAMServerMechanism<Policy>::_fir
         return Status(ErrorCodes::BadValue,
                       str::stream()
                           << "Incorrect number of arguments for first SCRAM client message, got "
-                          << got
-                          << " expected at least 3");
+                          << got << " expected at least 3");
     };
 
     /**
@@ -117,7 +134,7 @@ StatusWith<std::tuple<bool, std::string>> SaslSCRAMServerMechanism<Policy>::_fir
         return badCount(1);
     }
     const auto gs2_cbind_flag = inputData.substr(0, gs2_cbind_comma);
-    if (gs2_cbind_flag.startsWith("p=")) {
+    if (gs2_cbind_flag.starts_with("p=")) {
         return Status(ErrorCodes::BadValue, "Server does not support channel binding");
     }
 
@@ -132,7 +149,7 @@ StatusWith<std::tuple<bool, std::string>> SaslSCRAMServerMechanism<Policy>::_fir
     }
     auto authzId = inputData.substr(gs2_cbind_comma + 1, gs2_header_comma - (gs2_cbind_comma + 1));
     if (authzId.size()) {
-        if (authzId.startsWith("a=")) {
+        if (authzId.starts_with("a=")) {
             authzId = authzId.substr(2);
         } else {
             return Status(ErrorCodes::BadValue,
@@ -141,11 +158,11 @@ StatusWith<std::tuple<bool, std::string>> SaslSCRAMServerMechanism<Policy>::_fir
     }
 
     const auto client_first_message_bare = inputData.substr(gs2_header_comma + 1);
-    if (client_first_message_bare.startsWith("m=")) {
+    if (client_first_message_bare.starts_with("m=")) {
         return Status(ErrorCodes::BadValue, "SCRAM mandatory extensions are not supported");
     }
 
-    /* StringSplitter::split() will ignore consecutive delimiters.
+    /* absl::SkipEmpty() will ignore consecutive delimiters.
      * e.g. "foo,,bar" => {"foo","bar"}
      * This makes our implementation of SCRAM *slightly* more generous
      * in what it will accept than the standard calls for.
@@ -153,7 +170,9 @@ StatusWith<std::tuple<bool, std::string>> SaslSCRAMServerMechanism<Policy>::_fir
      * This does not impact _authMessage, as it's composed from the raw
      * string input, rather than the output of the split operation.
      */
-    const auto input = StringSplitter::split(client_first_message_bare.toString(), ",");
+    const std::vector<std::string> input = absl::StrSplit(
+        toStdStringViewForInterop(client_first_message_bare), ",", absl::SkipEmpty());
+
 
     if (input.size() < 2) {
         // gs2-header is not included in this count, so add it back in.
@@ -170,8 +189,7 @@ StatusWith<std::tuple<bool, std::string>> SaslSCRAMServerMechanism<Policy>::_fir
     if (!authzId.empty() && ServerMechanismBase::_principalName != authzId) {
         return Status(ErrorCodes::BadValue,
                       str::stream() << "SCRAM user name " << ServerMechanismBase::_principalName
-                                    << " does not match authzid "
-                                    << authzId);
+                                    << " does not match authzid " << authzId);
     }
 
     if (!str::startsWith(input[1], "r=") || input[1].size() < 6) {
@@ -183,20 +201,45 @@ StatusWith<std::tuple<bool, std::string>> SaslSCRAMServerMechanism<Policy>::_fir
     UserName user(ServerMechanismBase::ServerMechanismBase::_principalName,
                   ServerMechanismBase::getAuthenticationDatabase());
 
+    const auto isInternalUser = (user == (*internalSecurity.getUser())->getName());
+    const auto clusterAuthMode = ClusterAuthMode::get(opCtx->getServiceContext());
+
     // SERVER-16534, some mechanisms must be enabled for authenticating the internal user, so that
     // cluster members may communicate with each other. Hence ignore disabled auth mechanism
     // for the internal user.
-    if (Policy::isInternalAuthMech() &&
-        !sequenceContains(saslGlobalParams.authenticationMechanisms, Policy::getName()) &&
-        user != internalSecurity.user->getName()) {
-        return Status(ErrorCodes::BadValue,
-                      str::stream() << Policy::getName() << " authentication is disabled");
+    if (Policy::isInternalAuthMech()) {
+        if (isInternalUser) {
+            if (!clusterAuthMode.allowsKeyFile()) {
+                // We can no longer accept keyfiles.
+                return Status(ErrorCodes::BadValue,
+                              str::stream() << Policy::getName()
+                                            << " is disallowed for cluster authentication");
+            }
+        } else {
+            if (!sequenceContains(saslGlobalParams.authenticationMechanisms, Policy::getName())) {
+                return Status(ErrorCodes::BadValue,
+                              str::stream() << Policy::getName() << " authentication is disabled");
+            }
+        }
     }
 
     // The authentication database is also the source database for the user.
-    auto authManager = AuthorizationManager::get(opCtx->getServiceContext());
+    auto authManager = AuthorizationManager::get(opCtx->getService());
 
-    auto swUser = authManager->acquireUser(opCtx, user);
+    auto swUser = [&]() {
+        if (gEnableDetailedConnectionHealthMetricLogLines.load()) {
+            ScopedCallbackTimer timer([&](Microseconds elapsed) {
+                LOGV2(6788604,
+                      "Auth metrics report",
+                      "metric"_attr = "acquireUser",
+                      "micros"_attr = elapsed.count());
+            });
+        }
+
+        return authManager->acquireUser(opCtx,
+                                        std::make_unique<UserRequestGeneral>(user, boost::none));
+    }();
+
     if (!swUser.isOK()) {
         return swUser.getStatus();
     }
@@ -210,48 +253,51 @@ StatusWith<std::tuple<bool, std::string>> SaslSCRAMServerMechanism<Policy>::_fir
     if (!scramCredentials.isValid()) {
         // Check for authentication attempts of the __system user on
         // systems started without a keyfile.
-        if (userName == internalSecurity.user->getName()) {
+        if (isInternalUser) {
             return Status(ErrorCodes::AuthenticationFailed,
                           "It is not possible to authenticate as the __system user "
                           "on servers started without a --keyFile parameter");
+        } else if (scramCredentials.empty()) {
+            return {ErrorCodes::MechanismUnavailable,
+                    str::stream() << "Unable to use " << Policy::getName()
+                                  << " based authentication for user without any "
+                                  << Policy::getName() << " credentials registered"};
         } else {
-            return Status(ErrorCodes::AuthenticationFailed,
-                          "Unable to perform SCRAM authentication for a user with missing "
-                          "or invalid SCRAM credentials");
+            return {ErrorCodes::AuthenticationFailed,
+                    str::stream() << "Unable to validate " << Policy::getName()
+                                  << " authentication due to corrupted stored credentials"};
         }
     }
 
-    _secrets.push_back(scram::Secrets<HashBlock>("",
-                                                 base64::decode(scramCredentials.storedKey),
-                                                 base64::decode(scramCredentials.serverKey)));
+    _secrets.push_back(scram::Secrets<HashBlock, scram::UnlockedSecretsPolicy>(
+        "",
+        base64::decode(scramCredentials.storedKey),
+        base64::decode(scramCredentials.serverKey)));
 
-    if (userName == internalSecurity.user->getName() && internalSecurity.alternateCredentials) {
+    if (userName == (*internalSecurity.getUser())->getName() &&
+        internalSecurity.alternateCredentials) {
         auto altCredentials = internalSecurity.alternateCredentials->scram<HashBlock>();
-        _secrets.push_back(scram::Secrets<HashBlock>("",
-                                                     base64::decode(altCredentials.storedKey),
-                                                     base64::decode(altCredentials.serverKey)));
+        _secrets.push_back(scram::Secrets<HashBlock, scram::UnlockedSecretsPolicy>(
+            "",
+            base64::decode(altCredentials.storedKey),
+            base64::decode(altCredentials.serverKey)));
     }
 
     // Generate server-first-message
     // Create text-based nonce as base64 encoding of a binary blob of length multiple of 3
     const int nonceLenQWords = 3;
     uint64_t binaryNonce[nonceLenQWords];
+    SecureRandom().fill(binaryNonce, sizeof(binaryNonce));
 
-    std::unique_ptr<SecureRandom> sr(SecureRandom::create());
-
-    binaryNonce[0] = sr->nextInt64();
-    binaryNonce[1] = sr->nextInt64();
-    binaryNonce[2] = sr->nextInt64();
-
-    _nonce =
-        clientNonce + base64::encode(reinterpret_cast<char*>(binaryNonce), sizeof(binaryNonce));
+    _nonce = clientNonce +
+        base64::encode(StringData(reinterpret_cast<char*>(binaryNonce), sizeof(binaryNonce)));
     StringBuilder sb;
     sb << "r=" << _nonce << ",s=" << scramCredentials.salt
        << ",i=" << scramCredentials.iterationCount;
     std::string outputData = sb.str();
 
     // add client-first-message-bare and server-first-message to _authMessage
-    _authMessage = client_first_message_bare.toString() + "," + outputData;
+    _authMessage = str::stream() << client_first_message_bare.toString() << "," << outputData;
 
     return std::make_tuple(false, std::move(outputData));
 }
@@ -267,7 +313,7 @@ StatusWith<std::tuple<bool, std::string>> SaslSCRAMServerMechanism<Policy>::_fir
  * e=message
  *
  * NOTE: we are ignoring the channel binding part of the message
-**/
+ **/
 template <typename Policy>
 StatusWith<std::tuple<bool, std::string>> SaslSCRAMServerMechanism<Policy>::_secondStep(
     OperationContext* opCtx, StringData inputData) {
@@ -275,8 +321,7 @@ StatusWith<std::tuple<bool, std::string>> SaslSCRAMServerMechanism<Policy>::_sec
         return Status(ErrorCodes::BadValue,
                       str::stream()
                           << "Incorrect number of arguments for second SCRAM client message, got "
-                          << got
-                          << " expected at least 3");
+                          << got << " expected at least 3");
     };
 
     /**
@@ -293,13 +338,15 @@ StatusWith<std::tuple<bool, std::string>> SaslSCRAMServerMechanism<Policy>::_sec
     _authMessage += "," + client_final_message_without_proof.toString();
 
     const auto last_field = inputData.substr(last_comma + 1);
-    if ((last_field.size() < 3) || !last_field.startsWith("p=")) {
+    if ((last_field.size() < 3) || !last_field.starts_with("p=")) {
         return Status(ErrorCodes::BadValue,
                       str::stream() << "Incorrect SCRAM ClientProof: " << last_field);
     }
     const auto proof = last_field.substr(2);
 
-    const auto input = StringSplitter::split(client_final_message_without_proof.toString(), ",");
+    const std::vector<std::string> input = absl::StrSplit(
+        toStdStringViewForInterop(client_final_message_without_proof), ",", absl::SkipEmpty());
+
     if (input.size() < 2) {
         // Add count for proof back on.
         return badCount(input.size() + 1);
@@ -322,9 +369,7 @@ StatusWith<std::tuple<bool, std::string>> SaslSCRAMServerMechanism<Policy>::_sec
         return Status(ErrorCodes::BadValue,
                       str::stream()
                           << "Unmatched SCRAM nonce received from client in second step, expected "
-                          << _nonce
-                          << " but received "
-                          << nonce);
+                          << _nonce << " but received " << nonce);
     }
 
     // Do server side computations, compare storedKeys and generate client-final-message
@@ -337,25 +382,38 @@ StatusWith<std::tuple<bool, std::string>> SaslSCRAMServerMechanism<Policy>::_sec
 
     const auto decodedProof = base64::decode(proof.toString());
     std::string serverSignature;
-    const auto checkSecret = [&](const scram::Secrets<HashBlock>& secret) {
-        if (!secret.verifyClientProof(_authMessage, decodedProof))
-            return false;
+    const auto checkSecret =
+        [&](const scram::Secrets<HashBlock, scram::UnlockedSecretsPolicy>& secret) {
+            if (!secret.verifyClientProof(_authMessage, decodedProof))
+                return false;
 
-        serverSignature = secret.generateServerSignature(_authMessage);
-        return true;
-    };
+            serverSignature = secret.generateServerSignature(_authMessage);
+            return true;
+        };
 
     if (!std::any_of(_secrets.begin(), _secrets.end(), checkSecret)) {
         return Status(ErrorCodes::AuthenticationFailed,
                       "SCRAM authentication failed, storedKey mismatch");
     }
 
-    invariant(!serverSignature.empty());
-    StringBuilder sb;
     // ServerSignature := HMAC(ServerKey, AuthMessage)
-    sb << "v=" << serverSignature;
+    invariant(!serverSignature.empty());
+    std::string reply("v=" + serverSignature);
+    return std::make_tuple(_skipEmptyExchange, reply);
+}
 
-    return std::make_tuple(false, sb.str());
+template <typename Policy>
+Status SaslSCRAMServerMechanism<Policy>::setOptions(BSONObj options) {
+    auto see = options[saslCommandOptionSkipEmptyExchange];
+    if (!see.eoo()) {
+        if (!see.isBoolean()) {
+            return {ErrorCodes::BadValue,
+                    str::stream() << saslCommandOptionSkipEmptyExchange << " must be boolean"};
+        }
+        _skipEmptyExchange = see.boolean();
+    }
+
+    return Status::OK();
 }
 
 template class SaslSCRAMServerMechanism<SCRAMSHA1Policy>;

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,13 +29,21 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
 #include <boost/optional.hpp>
 
-#include "mongo/base/disallow_copying.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
 #include "mongo/bson/oid.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/repl/read_concern_args.h"
+#include "mongo/db/repl/read_concern_level.h"
+#include "mongo/db/service_context.h"
+#include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/stdx/condition_variable.h"
 #include "mongo/stdx/mutex.h"
+#include "mongo/util/hierarchical_acquisition.h"
 
 namespace mongo {
 
@@ -49,7 +56,8 @@ class StatusWith;
  * Decoration on ServiceContext used by any process in a sharded cluster to access the cluster ID.
  */
 class ClusterIdentityLoader {
-    MONGO_DISALLOW_COPYING(ClusterIdentityLoader);
+    ClusterIdentityLoader(const ClusterIdentityLoader&) = delete;
+    ClusterIdentityLoader& operator=(const ClusterIdentityLoader&) = delete;
 
 public:
     ClusterIdentityLoader() = default;
@@ -73,7 +81,9 @@ public:
      * If another thread is already in the process of loading the cluster ID, concurrent calls will
      * wait for that thread to finish and then return its results.
      */
-    Status loadClusterId(OperationContext* opCtx, const repl::ReadConcernLevel& readConcernLevel);
+    Status loadClusterId(OperationContext* opCtx,
+                         ShardingCatalogClient* catalogClient,
+                         const repl::ReadConcernLevel& readConcernLevel);
 
     /**
      * Called if the config.version document is rolled back.  Notifies the ClusterIdentityLoader
@@ -93,6 +103,7 @@ private:
      * the version document, and returns it.
      */
     StatusWith<OID> _fetchClusterIdFromConfig(OperationContext* opCtx,
+                                              ShardingCatalogClient* catalogClient,
                                               const repl::ReadConcernLevel& readConcernLevel);
 
     stdx::mutex _mutex;

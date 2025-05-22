@@ -2,28 +2,28 @@
  * Tests that initial sync does not fail if it inserts documents which don't validate.
  */
 
-(function() {
-    var name = 'initial_sync_document_validation';
-    var replSet = new ReplSetTest({
-        name: name,
-        nodes: 2,
-    });
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
-    replSet.startSet();
-    replSet.initiate();
-    var primary = replSet.getPrimary();
-    var secondary = replSet.getSecondary();
+var name = 'initial_sync_document_validation';
+var replSet = new ReplSetTest({
+    name: name,
+    nodes: 2,
+});
 
-    var coll = primary.getDB('test').getCollection(name);
-    assert.writeOK(coll.insert({_id: 0, x: 1}));
-    assert.commandWorked(coll.runCommand("collMod", {"validator": {a: {$exists: true}}}));
+replSet.startSet();
+replSet.initiate();
+var primary = replSet.getPrimary();
+var secondary = replSet.getSecondary();
 
-    secondary = replSet.restart(secondary, {startClean: true});
-    replSet.awaitReplication();
-    replSet.awaitSecondaryNodes();
+var coll = primary.getDB('test').getCollection(name);
+assert.commandWorked(coll.insert({_id: 0, x: 1}));
+assert.commandWorked(coll.runCommand("collMod", {"validator": {a: {$exists: true}}}));
 
-    assert.eq(1, secondary.getDB("test")[name].count());
-    assert.docEq({_id: 0, x: 1}, secondary.getDB("test")[name].findOne());
+secondary = replSet.restart(secondary, {startClean: true});
+replSet.awaitReplication();
+replSet.awaitSecondaryNodes();
 
-    replSet.stopSet();
-})();
+assert.eq(1, secondary.getDB("test")[name].count());
+assert.docEq({_id: 0, x: 1}, secondary.getDB("test")[name].findOne());
+
+replSet.stopSet();

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,22 +27,17 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/write_concern_options.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
 
 namespace mongo {
 
-const WriteConcernOptions ShardingCatalogClient::kMajorityWriteConcern(
-    WriteConcernOptions::kMajority,
-    // Note: Even though we're setting UNSET here, kMajority implies JOURNAL if journaling is
-    // supported by mongod and writeConcernMajorityJournalDefault is set to true in the
-    // ReplSetConfig.
-    WriteConcernOptions::SyncMode::UNSET,
-    WriteConcernOptions::kWriteConcernTimeoutSharding);
+WriteConcernOptions ShardingCatalogClient::writeConcernLocalHavingUpstreamWaiter() {
+    return WriteConcernOptions{1, WriteConcernOptions::SyncMode::UNSET, Seconds(0)};
+}
 
-const WriteConcernOptions ShardingCatalogClient::kLocalWriteConcern(
-    1, WriteConcernOptions::SyncMode::UNSET, Seconds(0));
+
+// An empty namespace is used as a reserved value to persist initialization metadata of
+// config.placementHistory.
+const NamespaceString ShardingCatalogClient::kConfigPlacementHistoryInitializationMarker{};
 
 }  // namespace mongo

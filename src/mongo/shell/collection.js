@@ -8,10 +8,21 @@ if ((typeof DBCollection) == "undefined") {
         this._db = db;
         this._shortName = shortName;
         this._fullName = fullName;
-
         this.verify();
     };
 }
+
+DBCollection.prototype.compact = function(extra = {}) {
+    return this._db.getMongo().compact(this._fullName, extra);
+};
+
+DBCollection.prototype.cleanup = function(extra = {}) {
+    return this._db.getMongo().cleanup(this._fullName, extra);
+};
+
+DBCollection.prototype._getCompactionTokens = function() {
+    return this._db.getMongo()._getCompactionTokens(this._fullName);
+};
 
 DBCollection.prototype.verify = function() {
     assert(this._fullName, "no fullName");
@@ -37,6 +48,9 @@ DBCollection.prototype.help = function() {
         ".bulkWrite( operations, <optional params> ) - bulk execute write operations, optional parameters are: w, wtimeout, j");
     print(
         "\tdb." + shortName +
+        ".checkMetadataConsistency() - return metadata inconsistency information found in the collection.");
+    print(
+        "\tdb." + shortName +
         ".count( query = {}, <optional params> ) - count the number of documents that matches the query, optional parameters are: limit, skip, hint, maxTimeMS");
     print(
         "\tdb." + shortName +
@@ -60,9 +74,12 @@ DBCollection.prototype.help = function() {
     print("\tdb." + shortName + ".drop() drop the collection");
     print("\tdb." + shortName + ".dropIndex(index) - e.g. db." + shortName +
           ".dropIndex( \"indexName\" ) or db." + shortName + ".dropIndex( { \"indexKey\" : 1 } )");
+    print("\tdb." + shortName + ".hideIndex(index) - e.g. db." + shortName +
+          ".hideIndex( \"indexName\" ) or db." + shortName + ".hideIndex( { \"indexKey\" : 1 } )");
+    print("\tdb." + shortName + ".unhideIndex(index) - e.g. db." + shortName +
+          ".unhideIndex( \"indexName\" ) or db." + shortName +
+          ".unhideIndex( { \"indexKey\" : 1 } )");
     print("\tdb." + shortName + ".dropIndexes()");
-    print("\tdb." + shortName +
-          ".ensureIndex(keypattern[,options]) - DEPRECATED, use createIndex() instead");
     print("\tdb." + shortName + ".explain().help() - show explain help");
     print("\tdb." + shortName + ".reIndex()");
     print(
@@ -83,7 +100,7 @@ DBCollection.prototype.help = function() {
         ".findOneAndReplace( filter, replacement, <optional params> ) - replace first matching document, optional parameters are: projection, sort, maxTimeMS, upsert, returnNewDocument");
     print(
         "\tdb." + shortName +
-        ".findOneAndUpdate( filter, update, <optional params> ) - update first matching document, optional parameters are: projection, sort, maxTimeMS, upsert, returnNewDocument");
+        ".findOneAndUpdate( filter, <update object or pipeline>, <optional params> ) - update first matching document, optional parameters are: projection, sort, maxTimeMS, upsert, returnNewDocument");
     print("\tdb." + shortName + ".getDB() get DB object associated with collection");
     print("\tdb." + shortName + ".getPlanCache() get query plan cache associated with collection");
     print("\tdb." + shortName + ".getIndexes()");
@@ -120,20 +137,23 @@ DBCollection.prototype.help = function() {
     print("\tdb." + shortName + ".totalSize() - storage allocated for all data and indexes");
     print(
         "\tdb." + shortName +
-        ".update( query, object[, upsert_bool, multi_bool] ) - instead of two flags, you can pass an object with fields: upsert, multi");
+        ".update( query, <update object or pipeline>[, upsert_bool, multi_bool] ) - instead of two flags, you can pass an object with fields: upsert, multi, hint, let");
     print(
         "\tdb." + shortName +
-        ".updateOne( filter, update, <optional params> ) - update the first matching document, optional parameters are: upsert, w, wtimeout, j");
+        ".updateOne( filter, <update object or pipeline>, <optional params> ) - update the first matching document, optional parameters are: upsert, w, wtimeout, j, hint, let");
     print(
         "\tdb." + shortName +
-        ".updateMany( filter, update, <optional params> ) - update all matching documents, optional parameters are: upsert, w, wtimeout, j");
+        ".updateMany( filter, <update object or pipeline>, <optional params> ) - update all matching documents, optional parameters are: upsert, w, wtimeout, j, hint, let");
     print("\tdb." + shortName + ".validate( <full> ) - SLOW");
     print("\tdb." + shortName + ".getShardVersion() - only for use with sharding");
     print("\tdb." + shortName +
           ".getShardDistribution() - prints statistics about data distribution in the cluster");
+    print("\tdb." + shortName + ".getShardKey() - prints the shard key for this collection");
     print(
         "\tdb." + shortName +
         ".getSplitKeysForChunks( <maxChunkSize> ) - calculates split points over all chunks and returns splitter function");
+    print("\tdb." + shortName + ".disableBalancing() - disables the balancer for this collection");
+    print("\tdb." + shortName + ".enableBalancing() - enables the balancer for this collection");
     print(
         "\tdb." + shortName +
         ".getWriteConcern() - returns the write concern used for any operations on this collection, inherited from server/db if set");
@@ -145,6 +165,8 @@ DBCollection.prototype.help = function() {
         ".unsetWriteConcern( <write concern doc> ) - unsets the write concern for writes to the collection");
     print("\tdb." + shortName +
           ".latencyStats() - display operation latency histograms for this collection");
+    print("\tdb." + shortName + ".disableAutoMerger() - disable auto-merging on this collection");
+    print("\tdb." + shortName + ".enableAutoMerger() - enable auto-merge on this collection");
     return __magicNoPrint;
 };
 
@@ -167,7 +189,7 @@ DBCollection.prototype._makeCommand = function(cmd, params) {
 };
 
 DBCollection.prototype._dbCommand = function(cmd, params) {
-    if (typeof(cmd) === "object")
+    if (typeof (cmd) === "object")
         return this._db._dbCommand(cmd, {}, this.getQueryOptions());
 
     return this._db._dbCommand(this._makeCommand(cmd, params), {}, this.getQueryOptions());
@@ -175,7 +197,7 @@ DBCollection.prototype._dbCommand = function(cmd, params) {
 
 // Like _dbCommand, but applies $readPreference
 DBCollection.prototype._dbReadCommand = function(cmd, params) {
-    if (typeof(cmd) === "object")
+    if (typeof (cmd) === "object")
         return this._db._dbReadCommand(cmd, {}, this.getQueryOptions());
 
     return this._db._dbReadCommand(this._makeCommand(cmd, params), {}, this.getQueryOptions());
@@ -210,16 +232,18 @@ DBCollection.prototype._massageObject = function(q) {
     }
 
     throw Error("don't know how to massage : " + type);
-
 };
 
-DBCollection.prototype.find = function(query, fields, limit, skip, batchSize, options) {
+DBCollection.prototype.find = function(filter, projection, limit, skip, batchSize, options) {
+    // Verify that API version parameters are not supplied via the shell helper.
+    assert.noAPIParams(options);
+
     var cursor = new DBQuery(this._mongo,
                              this._db,
                              this,
                              this._fullName,
-                             this._massageObject(query),
-                             fields,
+                             this._massageObject(filter),
+                             projection,
                              limit,
                              skip,
                              batchSize,
@@ -228,13 +252,14 @@ DBCollection.prototype.find = function(query, fields, limit, skip, batchSize, op
     {
         const session = this.getDB().getSession();
 
-        const readPreference = session._serverSession.client.getReadPreference(session);
+        const readPreference = session._getSessionAwareClient().getReadPreference(session);
         if (readPreference !== null) {
             cursor.readPref(readPreference.mode, readPreference.tags);
         }
 
-        const readConcern = session._serverSession.client.getReadConcern(session);
-        if (readConcern !== null) {
+        const client = session._getSessionAwareClient();
+        const readConcern = client.getReadConcern(session);
+        if (readConcern !== null && client.canUseReadConcern(session, cursor._convertToCommand())) {
             cursor.readConcern(readConcern.level);
         }
     }
@@ -242,8 +267,10 @@ DBCollection.prototype.find = function(query, fields, limit, skip, batchSize, op
     return cursor;
 };
 
-DBCollection.prototype.findOne = function(query, fields, options, readConcern, collation) {
-    var cursor = this.find(query, fields, -1 /* limit */, 0 /* skip*/, 0 /* batchSize */, options);
+DBCollection.prototype.findOne = function(
+    filter, projection, options, readConcern, collation, rawData) {
+    var cursor =
+        this.find(filter, projection, -1 /* limit */, 0 /* skip*/, 0 /* batchSize */, options);
 
     if (readConcern) {
         cursor = cursor.readConcern(readConcern);
@@ -251,6 +278,10 @@ DBCollection.prototype.findOne = function(query, fields, options, readConcern, c
 
     if (collation) {
         cursor = cursor.collation(collation);
+    }
+
+    if (rawData) {
+        cursor = cursor.rawData();
     }
 
     if (!cursor.hasNext())
@@ -270,13 +301,15 @@ DBCollection.prototype.insert = function(obj, options) {
     if (!obj)
         throw Error("no object passed to insert!");
 
+    options = typeof (options) === 'undefined' ? {} : options;
+
     var flags = 0;
 
     var wc = undefined;
-    var allowDottedFields = false;
+    var rawData = undefined;
     if (options === undefined) {
         // do nothing
-    } else if (typeof(options) == 'object') {
+    } else if (typeof (options) == 'object') {
         if (options.ordered === undefined) {
             // do nothing, like above
         } else {
@@ -285,8 +318,9 @@ DBCollection.prototype.insert = function(obj, options) {
 
         if (options.writeConcern)
             wc = options.writeConcern;
-        if (options.allowdotted)
-            allowDottedFields = true;
+
+        if (options.rawData)
+            rawData = options.rawData;
     } else {
         flags = options;
     }
@@ -295,57 +329,38 @@ DBCollection.prototype.insert = function(obj, options) {
     var ordered = ((flags & 1) == 0);
 
     if (!wc)
-        wc = this.getWriteConcern();
+        wc = this._createWriteConcern(options);
 
     var result = undefined;
-    var startTime =
-        (typeof(_verboseShell) === 'undefined' || !_verboseShell) ? 0 : new Date().getTime();
 
-    if (this.getMongo().writeMode() != "legacy") {
-        // Bit 1 of option flag is continueOnError. Bit 0 (stop on error) is the default.
-        var bulk = ordered ? this.initializeOrderedBulkOp() : this.initializeUnorderedBulkOp();
-        var isMultiInsert = Array.isArray(obj);
+    // Bit 1 of option flag is continueOnError. Bit 0 (stop on error) is the default.
+    var bulk = ordered ? this.initializeOrderedBulkOp() : this.initializeUnorderedBulkOp();
+    if (rawData)
+        bulk.setRawData(rawData);
+    var isMultiInsert = Array.isArray(obj);
 
-        if (isMultiInsert) {
-            obj.forEach(function(doc) {
-                bulk.insert(doc);
-            });
-        } else {
-            bulk.insert(obj);
-        }
-
-        try {
-            result = bulk.execute(wc);
-            if (!isMultiInsert)
-                result = result.toSingleResult();
-        } catch (ex) {
-            if (ex instanceof BulkWriteError) {
-                result = isMultiInsert ? ex.toResult() : ex.toSingleResult();
-            } else if (ex instanceof WriteCommandError) {
-                result = ex;
-            } else {
-                // Other exceptions rethrown as-is.
-                throw ex;
-            }
-        }
+    if (isMultiInsert) {
+        obj.forEach(function(doc) {
+            bulk.insert(doc);
+        });
     } else {
-        if (typeof(obj._id) == "undefined" && !Array.isArray(obj)) {
-            var tmp = obj;  // don't want to modify input
-            obj = {_id: new ObjectId()};
-            for (var key in tmp) {
-                obj[key] = tmp[key];
-            }
-        }
-
-        this.getMongo().insert(this._fullName, obj, flags);
-
-        // enforce write concern, if required
-        if (wc)
-            result = this.runCommand("getLastError", wc instanceof WriteConcern ? wc.toJSON() : wc);
+        bulk.insert(obj);
     }
 
-    this._lastID = obj._id;
-    this._printExtraInfo("Inserted", startTime);
+    try {
+        result = bulk.execute(wc);
+        if (!isMultiInsert)
+            result = result.toSingleResult();
+    } catch (ex) {
+        if (ex instanceof BulkWriteError) {
+            result = isMultiInsert ? ex.toResult() : ex.toSingleResult();
+        } else if (ex instanceof WriteCommandError) {
+            result = ex;
+        } else {
+            // Other exceptions rethrown as-is.
+            throw ex;
+        }
+    }
     return result;
 };
 
@@ -361,11 +376,16 @@ DBCollection.prototype._parseRemove = function(t, justOne) {
 
     var wc = undefined;
     var collation = undefined;
-    if (typeof(justOne) === "object") {
+    let letParams = undefined;
+    let rawData = undefined;
+
+    if (typeof (justOne) === "object") {
         var opts = justOne;
         wc = opts.writeConcern;
         justOne = opts.justOne;
         collation = opts.collation;
+        letParams = opts.let;
+        rawData = opts.rawData;
     }
 
     // Normalize "justOne" to a bool.
@@ -376,7 +396,14 @@ DBCollection.prototype._parseRemove = function(t, justOne) {
         wc = this.getWriteConcern();
     }
 
-    return {"query": query, "justOne": justOne, "wc": wc, "collation": collation};
+    return {
+        "query": query,
+        "justOne": justOne,
+        "wc": wc,
+        "collation": collation,
+        "let": letParams,
+        "rawData": rawData,
+    };
 };
 
 // Returns a WriteResult if write command succeeded, but may contain write errors.
@@ -387,71 +414,68 @@ DBCollection.prototype.remove = function(t, justOne) {
     var justOne = parsed.justOne;
     var wc = parsed.wc;
     var collation = parsed.collation;
+    var letParams = parsed.let;
+    let rawData = parsed.rawData;
 
     var result = undefined;
-    var startTime =
-        (typeof(_verboseShell) === 'undefined' || !_verboseShell) ? 0 : new Date().getTime();
+    var bulk = this.initializeOrderedBulkOp();
 
-    if (this.getMongo().writeMode() != "legacy") {
-        var bulk = this.initializeOrderedBulkOp();
-        var removeOp = bulk.find(query);
-
-        if (collation) {
-            removeOp.collation(collation);
-        }
-
-        if (justOne) {
-            removeOp.removeOne();
-        } else {
-            removeOp.remove();
-        }
-
-        try {
-            result = bulk.execute(wc).toSingleResult();
-        } catch (ex) {
-            if (ex instanceof BulkWriteError) {
-                result = ex.toSingleResult();
-            } else if (ex instanceof WriteCommandError) {
-                result = ex;
-            } else {
-                // Other exceptions thrown
-                throw ex;
-            }
-        }
-    } else {
-        if (collation) {
-            throw new Error("collation requires use of write commands");
-        }
-
-        this.getMongo().remove(this._fullName, query, justOne);
-
-        // enforce write concern, if required
-        if (wc)
-            result = this.runCommand("getLastError", wc instanceof WriteConcern ? wc.toJSON() : wc);
+    if (letParams) {
+        bulk.setLetParams(letParams);
     }
 
-    this._printExtraInfo("Removed", startTime);
+    if (rawData) {
+        bulk.setRawData(rawData);
+    }
+
+    var removeOp = bulk.find(query);
+
+    if (collation) {
+        removeOp.collation(collation);
+    }
+
+    if (justOne) {
+        removeOp.removeOne();
+    } else {
+        removeOp.remove();
+    }
+
+    try {
+        result = bulk.execute(wc).toSingleResult();
+    } catch (ex) {
+        if (ex instanceof BulkWriteError) {
+            result = ex.toSingleResult();
+        } else if (ex instanceof WriteCommandError) {
+            result = ex;
+        } else {
+            // Other exceptions thrown
+            throw ex;
+        }
+    }
     return result;
 };
 
 /**
- * Does validation of the update args. Throws if the parse is not successful, otherwise
- * returns a document containing fields for query, obj, upsert, multi, wc, collation, and
- * arrayFilters.
+ * Does validation of the update args. Throws if the parse is not successful, otherwise returns a
+ * document containing fields for query, updateSpec, upsert, multi, wc, collation, and arrayFilters.
  *
  * Throws if the arguments are invalid.
  */
-DBCollection.prototype._parseUpdate = function(query, obj, upsert, multi) {
+DBCollection.prototype._parseUpdate = function(query, updateSpec, upsert, multi) {
     if (!query)
         throw Error("need a query");
-    if (!obj)
-        throw Error("need an object");
+    if (!updateSpec)
+        throw Error("need an update object or pipeline");
 
     var wc = undefined;
     var collation = undefined;
     var arrayFilters = undefined;
+    let hint = undefined;
+    let letParams = undefined;
+    let rawData = undefined;
+
     // can pass options via object for improved readability
-    if (typeof(upsert) === "object") {
+    if (typeof (upsert) === "object") {
         if (multi) {
             throw Error("Fourth argument must be empty when specifying " +
                         "upsert and multi with an object.");
@@ -463,6 +487,13 @@ DBCollection.prototype._parseUpdate = function(query, obj, upsert, multi) {
         upsert = opts.upsert;
         collation = opts.collation;
         arrayFilters = opts.arrayFilters;
+        hint = opts.hint;
+        letParams = opts.let;
+        rawData = opts.rawData;
+        if (opts.sort) {
+            throw new Error(
+                "This sort will not do anything. Please call update without a sort or defer to calling updateOne with a sort.");
+        }
     }
 
     // Normalize 'upsert' and 'multi' to booleans.
@@ -475,83 +506,84 @@ DBCollection.prototype._parseUpdate = function(query, obj, upsert, multi) {
 
     return {
         "query": query,
-        "obj": obj,
+        "updateSpec": updateSpec,
+        "hint": hint,
         "upsert": upsert,
         "multi": multi,
         "wc": wc,
         "collation": collation,
-        "arrayFilters": arrayFilters
+        "arrayFilters": arrayFilters,
+        "let": letParams,
+        "rawData": rawData,
     };
 };
 
 // Returns a WriteResult if write command succeeded, but may contain write errors.
 // Returns a WriteCommandError if the write command responded with ok:0.
-DBCollection.prototype.update = function(query, obj, upsert, multi) {
-    var parsed = this._parseUpdate(query, obj, upsert, multi);
+DBCollection.prototype.update = function(query, updateSpec, upsert, multi) {
+    var parsed = this._parseUpdate(query, updateSpec, upsert, multi);
     var query = parsed.query;
-    var obj = parsed.obj;
+    var updateSpec = parsed.updateSpec;
+    const hint = parsed.hint;
     var upsert = parsed.upsert;
     var multi = parsed.multi;
     var wc = parsed.wc;
     var collation = parsed.collation;
     var arrayFilters = parsed.arrayFilters;
+    let letParams = parsed.let;
+    let rawData = parsed.rawData;
 
     var result = undefined;
-    var startTime =
-        (typeof(_verboseShell) === 'undefined' || !_verboseShell) ? 0 : new Date().getTime();
+    var bulk = this.initializeOrderedBulkOp();
 
-    if (this.getMongo().writeMode() != "legacy") {
-        var bulk = this.initializeOrderedBulkOp();
-        var updateOp = bulk.find(query);
-
-        if (upsert) {
-            updateOp = updateOp.upsert();
-        }
-
-        if (collation) {
-            updateOp.collation(collation);
-        }
-
-        if (arrayFilters) {
-            updateOp.arrayFilters(arrayFilters);
-        }
-
-        if (multi) {
-            updateOp.update(obj);
-        } else {
-            updateOp.updateOne(obj);
-        }
-
-        try {
-            result = bulk.execute(wc).toSingleResult();
-        } catch (ex) {
-            if (ex instanceof BulkWriteError) {
-                result = ex.toSingleResult();
-            } else if (ex instanceof WriteCommandError) {
-                result = ex;
-            } else {
-                // Other exceptions thrown
-                throw ex;
-            }
-        }
-    } else {
-        if (collation) {
-            throw new Error("collation requires use of write commands");
-        }
-
-        if (arrayFilters) {
-            throw new Error("arrayFilters requires use of write commands");
-        }
-
-        this.getMongo().update(this._fullName, query, obj, upsert, multi);
-
-        // Enforce write concern, if required
-        if (wc) {
-            result = this.runCommand("getLastError", wc instanceof WriteConcern ? wc.toJSON() : wc);
-        }
+    if (letParams) {
+        bulk.setLetParams(letParams);
     }
 
-    this._printExtraInfo("Updated", startTime);
+    if (rawData) {
+        bulk.setRawData(rawData);
+    }
+
+    var updateOp = bulk.find(query);
+
+    if (hint) {
+        updateOp.hint(hint);
+    }
+
+    if (upsert) {
+        updateOp = updateOp.upsert();
+    }
+
+    if (collation) {
+        updateOp.collation(collation);
+    }
+
+    if (arrayFilters) {
+        updateOp.arrayFilters(arrayFilters);
+    }
+
+    if (rawData) {
+        bulk.setRawData(rawData);
+    }
+
+    if (multi) {
+        updateOp.update(updateSpec);
+    } else {
+        updateOp.updateOne(updateSpec);
+    }
+
+    try {
+        result = bulk.execute(wc).toSingleResult();
+    } catch (ex) {
+        if (ex instanceof BulkWriteError) {
+            result = ex.toSingleResult();
+        } else if (ex instanceof WriteCommandError) {
+            result = ex;
+        } else {
+            // Other exceptions thrown
+            throw ex;
+        }
+    }
     return result;
 };
 
@@ -559,10 +591,10 @@ DBCollection.prototype.save = function(obj, opts) {
     if (obj == null)
         throw Error("can't save a null");
 
-    if (typeof(obj) == "number" || typeof(obj) == "string")
-        throw Error("can't save a number or string");
+    if (typeof (obj) == "number" || typeof (obj) == "string" || Array.isArray(obj))
+        throw Error("can't save a number, a string or an array");
 
-    if (typeof(obj._id) == "undefined") {
+    if (typeof (obj._id) == "undefined") {
         obj._id = new ObjectId();
         return this.insert(obj, opts);
     } else {
@@ -590,11 +622,11 @@ DBCollection.prototype._indexSpec = function(keys, options) {
     var ret = {ns: this._fullName, key: keys, name: this._genIndexName(keys)};
 
     if (!options) {
-    } else if (typeof(options) == "string")
+    } else if (typeof (options) == "string")
         ret.name = options;
-    else if (typeof(options) == "boolean")
+    else if (typeof (options) == "boolean")
         ret.unique = true;
-    else if (typeof(options) == "object") {
+    else if (typeof (options) == "object") {
         if (Array.isArray(options)) {
             if (options.length > 3) {
                 throw new Error("Index options that are supplied in array form may only specify" +
@@ -602,9 +634,9 @@ DBCollection.prototype._indexSpec = function(keys, options) {
             }
             var nb = 0;
             for (var i = 0; i < options.length; i++) {
-                if (typeof(options[i]) == "string")
+                if (typeof (options[i]) == "string")
                     ret.name = options[i];
-                else if (typeof(options[i]) == "boolean") {
+                else if (typeof (options[i]) == "boolean") {
                     if (options[i]) {
                         if (nb == 0)
                             ret.unique = true;
@@ -618,17 +650,25 @@ DBCollection.prototype._indexSpec = function(keys, options) {
             Object.extend(ret, options);
         }
     } else {
-        throw Error("can't handle: " + typeof(options));
+        throw Error("can't handle: " + typeof (options));
     }
 
     return ret;
 };
 
-DBCollection.prototype.createIndex = function(keys, options) {
-    return this.createIndexes([keys], options);
+DBCollection.prototype.createIndex = function(keys, options, commitQuorum) {
+    if (arguments.length > 3) {
+        throw new Error("createIndex accepts up to 3 arguments");
+    }
+
+    return this.createIndexes([keys], options, commitQuorum);
 };
 
-DBCollection.prototype.createIndexes = function(keys, options) {
+DBCollection.prototype.createIndexes = function(keys, options, commitQuorum) {
+    if (arguments.length > 3) {
+        throw new Error("createIndexes accepts up to 3 arguments");
+    }
+
     if (!Array.isArray(keys)) {
         throw new Error("createIndexes first argument should be an array");
     }
@@ -641,21 +681,12 @@ DBCollection.prototype.createIndexes = function(keys, options) {
     for (var i = 0; i < indexSpecs.length; i++) {
         delete (indexSpecs[i].ns);  // ns is passed to the first element in the command.
     }
-    return this._db.runCommand({createIndexes: this.getName(), indexes: indexSpecs});
-};
 
-DBCollection.prototype.ensureIndex = function(keys, options) {
-    var result = this.createIndex(keys, options);
-
-    if (this.getMongo().writeMode() != "legacy") {
-        return result;
+    if (commitQuorum === undefined) {
+        return this._db.runCommand({createIndexes: this.getName(), indexes: indexSpecs});
     }
-
-    err = this.getDB().getLastErrorObj();
-    if (err.err) {
-        return err;
-    }
-    // nothing returned on success
+    return this._db.runCommand(
+        {createIndexes: this.getName(), indexes: indexSpecs, commitQuorum: commitQuorum});
 };
 
 DBCollection.prototype.reIndex = function() {
@@ -664,7 +695,7 @@ DBCollection.prototype.reIndex = function() {
 
 DBCollection.prototype.dropIndexes = function(indexNames) {
     indexNames = indexNames || '*';
-    var res = this._db.runCommand({deleteIndexes: this.getName(), index: indexNames});
+    var res = this._db.runCommand({dropIndexes: this.getName(), index: indexNames});
     assert(res, "no result from dropIndex result");
     if (res.ok)
         return res;
@@ -677,7 +708,7 @@ DBCollection.prototype.dropIndexes = function(indexNames) {
 
 DBCollection.prototype.drop = function(options = {}) {
     const cmdObj = Object.assign({drop: this.getName()}, options);
-    ret = this._db.runCommand(cmdObj);
+    const ret = this._db.runCommand(cmdObj);
     if (!ret.ok) {
         if (ret.errmsg == "ns not found")
             return false;
@@ -700,7 +731,7 @@ DBCollection.prototype.findAndModify = function(args) {
 
         const session = this.getDB().getSession();
         if (serverSupportsRetryableWrites && session.getOptions().shouldRetryWrites() &&
-            session._serverSession.canRetryWrites(cmd)) {
+            _ServerSession.canRetryWrites(cmd)) {
             cmd = session._serverSession.assignTransactionNumber(cmd);
         }
     }
@@ -736,45 +767,17 @@ DBCollection.prototype.renameCollection = function(newName, dropTarget) {
     });
 };
 
-// Display verbose information about the operation
-DBCollection.prototype._printExtraInfo = function(action, startTime) {
-    if (typeof _verboseShell === 'undefined' || !_verboseShell) {
-        __callLastError = true;
-        return;
+DBCollection.prototype.validate = function(options) {
+    if (typeof (options) != 'object' && typeof (options) != 'undefined') {
+        return "expected optional options to be of the following format: {full: <bool>, background: <bool>}.";
     }
 
-    // explicit w:1 so that replset getLastErrorDefaults aren't used here which would be bad.
-    var res = this._db.getLastErrorCmd(1);
-    if (res) {
-        if (res.err != undefined && res.err != null) {
-            // error occurred, display it
-            print(res.err);
-            return;
-        }
-
-        var info = action + " ";
-        // hack for inserted because res.n is 0
-        info += action != "Inserted" ? res.n : 1;
-        if (res.n > 0 && res.updatedExisting != undefined)
-            info += " " + (res.updatedExisting ? "existing" : "new");
-        info += " record(s)";
-        var time = new Date().getTime() - startTime;
-        info += " in " + time + "ms";
-        print(info);
-    }
-};
-
-DBCollection.prototype.validate = function(full) {
     var cmd = {validate: this.getName()};
-
-    if (typeof(full) == 'object')  // support arbitrary options here
-        Object.extend(cmd, full);
-    else
-        cmd.full = full;
+    Object.assign(cmd, options || {});
 
     var res = this._db.runCommand(cmd);
 
-    if (typeof(res.valid) == 'undefined') {
+    if (typeof (res.valid) == 'undefined') {
         // old-style format just put everything in a string. Now using proper fields
 
         res.valid = false;
@@ -800,8 +803,8 @@ DBCollection.prototype.getShardVersion = function() {
     return this._db._adminCommand({getShardVersion: this._fullName});
 };
 
-DBCollection.prototype.getIndexes = function(filter) {
-    var res = this.runCommand("listIndexes", filter);
+DBCollection.prototype.getIndexes = function() {
+    var res = this.runCommand("listIndexes");
 
     if (!res.ok) {
         if (res.code == ErrorCodes.NamespaceNotFound) {
@@ -829,7 +832,7 @@ DBCollection.prototype.hashAllDocs = function() {
     var res = this._dbCommand(cmd);
     var hash = res.collections[this._shortName];
     assert(hash);
-    assert(typeof(hash) == "string");
+    assert(typeof (hash) == "string");
     return hash;
 };
 
@@ -845,8 +848,50 @@ DBCollection.prototype.hashAllDocs = function() {
  */
 DBCollection.prototype.dropIndex = function(index) {
     assert(index, "need to specify index to dropIndex");
-    var res = this._dbCommand("deleteIndexes", {index: index});
+
+    // Need an extra check for array because 'Array' is an 'object', but not every 'object' is an
+    // 'Array'.
+    if (typeof index != "string" && typeof index != "object" || index instanceof Array) {
+        throw new Error(
+            "The index to drop must be either the index name or the index specification document");
+    }
+
+    if (typeof index == "string" && index === "*") {
+        throw new Error(
+            "To drop indexes in the collection using '*', use db.collection.dropIndexes()");
+    }
+
+    var res = this._dbCommand("dropIndexes", {index: index});
     return res;
+};
+
+/**
+ * Hide an index from the query planner.
+ */
+DBCollection.prototype._hiddenIndex = function(index, hidden) {
+    assert(index, "please specify index to hide");
+
+    // Need an extra check for array because 'Array' is an 'object', but not every 'object' is an
+    // 'Array'.
+    var indexField = {};
+    if (typeof index == "string") {
+        indexField = {name: index, hidden: hidden};
+    } else if (typeof index == "object") {
+        indexField = {keyPattern: index, hidden: hidden};
+    } else {
+        throw new Error("Index must be either the index name or the index specification document");
+    }
+    var cmd = {"collMod": this._shortName, index: indexField};
+    var res = this._db.runCommand(cmd);
+    return res;
+};
+
+DBCollection.prototype.hideIndex = function(index) {
+    return this._hiddenIndex(index, true);
+};
+
+DBCollection.prototype.unhideIndex = function(index) {
+    return this._hiddenIndex(index, false);
 };
 
 DBCollection.prototype.getCollection = function(subName) {
@@ -854,14 +899,14 @@ DBCollection.prototype.getCollection = function(subName) {
 };
 
 /**
-  * scale: The scale at which to deliver results. Unless specified, this command returns all data
-  *        in bytes.
-  * indexDetails: Includes indexDetails field in results. Default: false.
-  * indexDetailsKey: If indexDetails is true, filter contents in indexDetails by this index key.
-  * indexDetailsname: If indexDetails is true, filter contents in indexDetails by this index name.
-  *
-  * It is an error to provide both indexDetailsKey and indexDetailsName.
-  */
+ * scale: The scale at which to deliver results. Unless specified, this command returns all data
+ *        in bytes.
+ * indexDetails: Includes indexDetails field in results. Default: false.
+ * indexDetailsKey: If indexDetails is true, filter contents in indexDetails by this index key.
+ * indexDetailsname: If indexDetails is true, filter contents in indexDetails by this index name.
+ *
+ * It is an error to provide both indexDetailsKey and indexDetailsName.
+ */
 DBCollection.prototype.stats = function(args) {
     'use strict';
 
@@ -953,7 +998,12 @@ DBCollection.prototype.convertToCapped = function(bytes) {
     return this._dbCommand({convertToCapped: this._shortName, size: bytes});
 };
 
-DBCollection.prototype.exists = function() {
+/*
+ * Returns metadata for the collection using listCollections.
+ *
+ * If the collection does not exists return null.
+ */
+DBCollection.prototype.getMetadata = function() {
     var res = this._db.runCommand("listCollections", {filter: {name: this._shortName}});
     if (res.ok) {
         const cursor = new DBCommandCursor(this._db, res);
@@ -965,9 +1015,21 @@ DBCollection.prototype.exists = function() {
     throw _getErrorWithCode(res, "listCollections failed: " + tojson(res));
 };
 
+DBCollection.prototype.exists = function() {
+    return this.getMetadata();
+};
+
 DBCollection.prototype.isCapped = function() {
-    var e = this.exists();
-    return (e && e.options && e.options.capped) ? true : false;
+    const m = this.getMetadata();
+    return (m && m.options && m.options.capped) ? true : false;
+};
+
+DBCollection.prototype.getUUID = function() {
+    const m = this.getMetadata();
+    if (!m) {
+        throw Error(`Collection '${this}' does not exist.`);
+    }
+    return m.info.uuid;
 };
 
 //
@@ -987,44 +1049,6 @@ DBCollection.prototype.aggregate = function(pipeline, aggregateOptions) {
     return this._db._runAggregate(cmdObj, aggregateOptions);
 };
 
-MapReduceResult = function(db, o) {
-    Object.extend(this, o);
-    this._o = o;
-    this._keys = Object.keySet(o);
-    this._db = db;
-    if (this.result != null) {
-        this._coll = this._db.getCollection(this.result);
-    }
-};
-
-MapReduceResult.prototype._simpleKeys = function() {
-    return this._o;
-};
-
-MapReduceResult.prototype.find = function() {
-    if (this.results)
-        return this.results;
-    return DBCollection.prototype.find.apply(this._coll, arguments);
-};
-
-MapReduceResult.prototype.drop = function() {
-    if (this._coll) {
-        return this._coll.drop();
-    }
-};
-
-/**
-* just for debugging really
-*/
-MapReduceResult.prototype.convertToSingleObject = function() {
-    var z = {};
-    var it = this.results != null ? this.results : this._coll.find();
-    it.forEach(function(a) {
-        z[a._id] = a.value;
-    });
-    return z;
-};
-
 DBCollection.prototype.convertToSingleObject = function(valueField) {
     var z = {};
     this.find().forEach(function(a) {
@@ -1034,33 +1058,32 @@ DBCollection.prototype.convertToSingleObject = function(valueField) {
 };
 
 /**
-* @param optional object of optional fields;
-*/
+ * @param optional object of optional fields;
+ */
 DBCollection.prototype.mapReduce = function(map, reduce, optionsOrOutString) {
     var c = {mapreduce: this._shortName, map: map, reduce: reduce};
     assert(optionsOrOutString, "need to supply an optionsOrOutString");
 
-    if (typeof(optionsOrOutString) == "string")
+    if (typeof (optionsOrOutString) == "string")
         c["out"] = optionsOrOutString;
     else
         Object.extend(c, optionsOrOutString);
 
-    var raw;
+    var output;
 
     if (c["out"].hasOwnProperty("inline") && c["out"]["inline"] === 1) {
         // if inline output is specified, we need to apply readPreference on the command
         // as it could be run on a secondary
-        raw = this._db.runReadCommand(c);
+        output = this._db.runReadCommand(c);
     } else {
-        raw = this._db.runCommand(c);
+        output = this._db.runCommand(c);
     }
 
-    if (!raw.ok) {
-        __mrerror__ = raw;
-        throw _getErrorWithCode(raw, "map reduce failed:" + tojson(raw));
+    if (!output.ok) {
+        __mrerror__ = output;  // eslint-disable-line
+        throw _getErrorWithCode(output, "map reduce failed:" + tojson(output));
     }
-    return new MapReduceResult(this._db, raw);
-
+    return output;
 };
 
 DBCollection.prototype.toString = function() {
@@ -1086,88 +1109,116 @@ DBCollection.autocomplete = function(obj) {
     return ret;
 };
 
-// Sharding additions
+/**
+ * Return true if the collection has been sharded.
+ *
+ * @method
+ * @return {boolean}
+ */
+DBCollection.prototype._isSharded = function() {
+    // Checking for 'dropped: {$ne: true}' to ensure mongo shell compatibility with earlier versions
+    // of the server
+    return !!this._db.getSiblingDB("config").collections.countDocuments(
+        {_id: this._fullName, dropped: {$ne: true}});
+};
 
-/*
-Usage :
-
-mongo <mongos>
-> load('path-to-file/shardingAdditions.js')
-Loading custom sharding extensions...
-true
-
-> var collection = db.getMongo().getCollection("foo.bar")
-> collection.getShardDistribution() // prints statistics related to the collection's data
-distribution
-
-> collection.getSplitKeysForChunks() // generates split points for all chunks in the collection,
-based on the
-                                     // default maxChunkSize or alternately a specified chunk size
-> collection.getSplitKeysForChunks( 10 ) // Mb
-
-> var splitter = collection.getSplitKeysForChunks() // by default, the chunks are not split, the
-keys are just
-                                                    // found.  A splitter function is returned which
-will actually
-                                                    // do the splits.
-
-> splitter() // ! Actually executes the splits on the cluster !
-
-*/
-
+/**
+ * Prints statistics related to the collection's data distribution
+ */
 DBCollection.prototype.getShardDistribution = function() {
+    var config = this.getDB().getSiblingDB("config");
 
-    var stats = this.stats();
-
-    if (!stats.sharded) {
+    if (!this._isSharded()) {
         print("Collection " + this + " is not sharded.");
         return;
     }
 
-    var config = this.getDB().getSiblingDB("config");
+    var collStats = this.aggregate({"$collStats": {storageStats: {}}});
 
-    var numChunks = 0;
+    var totals = {numChunks: 0, size: 0, count: 0};
+    var conciseShardsStats = [];
 
-    for (var shard in stats.shards) {
-        var shardDoc = config.shards.findOne({_id: shard});
+    collStats.forEach(function(extShardStats) {
+        // Extract and store only the relevant subset of the stats for this shard
+        var newVersion = config.collections.countDocuments(
+            {_id: extShardStats.ns, timestamp: {$exists: true}}, {limit: 1});
+        var collUuid = config.collections.findOne({_id: extShardStats.ns}).uuid;
+        const shardStats = {
+            shardId: extShardStats.shard,
+            host: config.shards.findOne({_id: extShardStats.shard}).host,
+            size: extShardStats.storageStats.size,
+            count: extShardStats.storageStats.count,
+            numChunks: (newVersion ? config.chunks.countDocuments(
+                                         {uuid: collUuid, shard: extShardStats.shard})
+                                   : config.chunks.countDocuments(
+                                         {ns: extShardStats.ns, shard: extShardStats.shard})),
+            avgObjSize: extShardStats.storageStats.avgObjSize
+        };
 
-        print("\nShard " + shard + " at " + shardDoc.host);
+        print("\nShard " + shardStats.shardId + " at " + shardStats.host);
 
-        var shardStats = stats.shards[shard];
-
-        var chunks = config.chunks.find({_id: sh._collRE(this), shard: shard}).toArray();
-
-        numChunks += chunks.length;
-
-        var estChunkData = shardStats.size / chunks.length;
-        var estChunkCount = Math.floor(shardStats.count / chunks.length);
-
+        var estChunkData =
+            (shardStats.numChunks == 0) ? 0 : (shardStats.size / shardStats.numChunks);
+        var estChunkCount =
+            (shardStats.numChunks == 0) ? 0 : Math.floor(shardStats.count / shardStats.numChunks);
         print(" data : " + sh._dataFormat(shardStats.size) + " docs : " + shardStats.count +
-              " chunks : " + chunks.length);
+              " chunks : " + shardStats.numChunks);
         print(" estimated data per chunk : " + sh._dataFormat(estChunkData));
         print(" estimated docs per chunk : " + estChunkCount);
-    }
+
+        totals.size += shardStats.size;
+        totals.count += shardStats.count;
+        totals.numChunks += shardStats.numChunks;
+
+        conciseShardsStats.push(shardStats);
+    });
 
     print("\nTotals");
-    print(" data : " + sh._dataFormat(stats.size) + " docs : " + stats.count + " chunks : " +
-          numChunks);
-    for (var shard in stats.shards) {
-        var shardStats = stats.shards[shard];
+    print(" data : " + sh._dataFormat(totals.size) + " docs : " + totals.count +
+          " chunks : " + totals.numChunks);
+    for (const shardStats of conciseShardsStats) {
+        var estDataPercent =
+            (totals.size == 0) ? 0 : (Math.floor(shardStats.size / totals.size * 10000) / 100);
+        var estDocPercent =
+            (totals.count == 0) ? 0 : (Math.floor(shardStats.count / totals.count * 10000) / 100);
 
-        var estDataPercent = Math.floor(shardStats.size / stats.size * 10000) / 100;
-        var estDocPercent = Math.floor(shardStats.count / stats.count * 10000) / 100;
-
-        print(" Shard " + shard + " contains " + estDataPercent + "% data, " + estDocPercent +
-              "% docs in cluster, " + "avg obj size on shard : " +
-              sh._dataFormat(stats.shards[shard].avgObjSize));
+        print(" Shard " + shardStats.shardId + " contains " + estDataPercent + "% data, " +
+              estDocPercent + "% docs in cluster, " +
+              "avg obj size on shard : " + sh._dataFormat(shardStats.avgObjSize));
     }
 
     print("\n");
-
 };
 
-DBCollection.prototype.getSplitKeysForChunks = function(chunkSize) {
+/**
+ * Prints shard key for this collection
+ */
+DBCollection.prototype.getShardKey = function() {
+    if (!this._isSharded()) {
+        throw Error("Collection " + this + " is not sharded.");
+    }
 
+    var config = this.getDB().getSiblingDB("config");
+    const coll = config.collections.findOne({_id: this._fullName});
+    return coll.key;
+};
+
+/*
+
+Generates split points for all chunks in the collection, based on the default maxChunkSize
+> collection.getSplitKeysForChunks()
+
+or alternately a specified chunk size in Mb.
+> collection.getSplitKeysForChunks( 10 )
+
+By default, the chunks are not split, the keys are just found. A splitter function is returned which
+will actually do the splits.
+> var splitter = collection.getSplitKeysForChunks()
+> splitter()
+
+*/
+
+DBCollection.prototype.getSplitKeysForChunks = function(chunkSize) {
     var stats = this.stats();
 
     if (!stats.sharded) {
@@ -1235,7 +1286,6 @@ DBCollection.prototype.getSplitKeysForChunks = function(chunkSize) {
     var admin = this.getDB().getSiblingDB("admin");
     var coll = this;
     var splitFunction = function() {
-
         // Turn off the balancer, just to be safe
         print("Turning off balancer...");
         config.settings.update({_id: "balancer"}, {$set: {stopped: true}}, true);
@@ -1262,28 +1312,95 @@ DBCollection.prototype.getSplitKeysForChunks = function(chunkSize) {
     };
 
     print("\nGenerated " + numSplits + " split keys, run output function to perform splits.\n" +
-          " ex : \n" + "  > var splitter = <collection>.getSplitKeysForChunks()\n" +
+          " ex : \n" +
+          "  > var splitter = <collection>.getSplitKeysForChunks()\n" +
           "  > splitter() // Execute splits on cluster !\n");
 
     return splitFunction;
+};
 
+/**
+ * Enable balancing for this collection. Uses the configureCollectionBalancing command
+ * with the enableBalancing paramater if FCV >= 8.1 and directly writes to config.collections if FCV
+ * < 8.1.
+ * TODO: SERVER-94845 remove FCV check when 9.0 becomes the last LTS
+ */
+DBCollection.prototype.enableBalancing = function() {
+    if (!this._isSharded()) {
+        throw Error("Collection " + this + " is not sharded.");
+    }
+
+    var adminDb = this.getDB().getSiblingDB("admin");
+    const fcvDoc = adminDb.runCommand({
+        getParameter: 1,
+        featureCompatibilityVersion: 1,
+    });
+    if (MongoRunner.compareBinVersions(
+            fcvDoc.featureCompatibilityVersion.version,
+            "8.1",
+            ) >= 0) {
+        return adminDb.runCommand(
+            {configureCollectionBalancing: this._fullName, enableBalancing: true});
+    } else {
+        var configDb = this.getDB().getSiblingDB("config");
+        return assert.commandWorked(
+            configDb.collections.update({_id: this._fullName}, {$set: {"noBalance": false}}));
+    }
+};
+
+/**
+ * Disable balancing for this collection. Uses the configureCollectionBalancing command
+ * with the enableBalancing paramater if FCV >= 8.1 and directly writes to config.collections if FCV
+ * < 8.1.
+ * TODO: SERVER-94845 remove FCV check when 9.0 becomes the last LTS
+ */
+DBCollection.prototype.disableBalancing = function() {
+    if (!this._isSharded()) {
+        throw Error("Collection " + this + " is not sharded.");
+    }
+    var adminDb = this.getDB().getSiblingDB("admin");
+    const fcvDoc = adminDb.runCommand({
+        getParameter: 1,
+        featureCompatibilityVersion: 1,
+    });
+    if (MongoRunner.compareBinVersions(
+            fcvDoc.featureCompatibilityVersion.version,
+            "8.1",
+            ) >= 0) {
+        return adminDb.runCommand(
+            {configureCollectionBalancing: this._fullName, enableBalancing: false});
+    } else {
+        var configDb = this.getDB().getSiblingDB("config");
+        return assert.commandWorked(
+            configDb.collections.update({_id: this._fullName}, {$set: {"noBalance": true}}));
+    }
 };
 
 DBCollection.prototype.setSlaveOk = function(value) {
-    if (value == undefined)
-        value = true;
-    this._slaveOk = value;
+    print(
+        "WARNING: setSlaveOk() is deprecated and may be removed in the next major release. Please use setSecondaryOk() instead.");
+    this.setSecondaryOk(value);
 };
 
 DBCollection.prototype.getSlaveOk = function() {
-    if (this._slaveOk != undefined)
-        return this._slaveOk;
-    return this._db.getSlaveOk();
+    print(
+        "WARNING: getSlaveOk() is deprecated and may be removed in the next major release. Please use getSecondaryOk() instead.");
+    return this.getSecondaryOk();
+};
+
+DBCollection.prototype.setSecondaryOk = function(value = true) {
+    this._secondaryOk = value;
+};
+
+DBCollection.prototype.getSecondaryOk = function() {
+    if (this._secondaryOk !== undefined)
+        return this._secondaryOk;
+    return this._db.getSecondaryOk();
 };
 
 DBCollection.prototype.getQueryOptions = function() {
     // inherit this method from DB but use apply so
-    // that slaveOk will be set if is overridden on this DBCollection
+    // that secondaryOk will be set if is overridden on this DBCollection
     return this._db.getQueryOptions.apply(this, arguments);
 };
 
@@ -1319,47 +1436,73 @@ DBCollection.prototype.unsetWriteConcern = function() {
     delete this._writeConcern;
 };
 
+/**
+ * disable auto-merging on this collection
+ */
+DBCollection.prototype.disableAutoMerger = function() {
+    return this._db._adminCommand(
+        {configureCollectionBalancing: this._fullName, enableAutoMerger: false});
+};
+
+/**
+ * enable auto-merge on this collection
+ */
+DBCollection.prototype.enableAutoMerger = function() {
+    return this._db._adminCommand(
+        {configureCollectionBalancing: this._fullName, enableAutoMerger: true});
+};
+
 //
 // CRUD specification read methods
 //
 
 /**
-* Count number of matching documents in the db to a query.
-*
-* @method
-* @param {object} query The query for the count.
-* @param {object} [options=null] Optional settings.
-* @param {number} [options.limit=null] The limit of documents to count.
-* @param {number} [options.skip=null] The number of documents to skip for the count.
-* @param {string|object} [options.hint=null] An index name hint or specification for the query.
-* @param {number} [options.maxTimeMS=null] The maximum amount of time to allow the query to run.
-* @param {string} [options.readConcern=null] The level of readConcern passed to the count command
-* @param {object} [options.collation=null] The collation that should be used for string comparisons
-* for this count op.
-* @return {number}
-*
-*/
+ * Count number of matching documents in the db to a query.
+ *
+ * @method
+ * @param {object} query The query for the count.
+ * @param {object} [options=null] Optional settings.
+ * @param {number} [options.limit=null] The limit of documents to count.
+ * @param {number} [options.skip=null] The number of documents to skip for the count.
+ * @param {string|object} [options.hint=null] An index name hint or specification for the query.
+ * @param {number} [options.maxTimeMS=null] The maximum amount of time to allow the query to run.
+ * @param {string} [options.readConcern=null] The level of readConcern passed to the count command
+ * @param {object} [options.collation=null] The collation that should be used for string comparisons
+ * for this count op.
+ * @param {boolean} [options.rawData=null] Whether to operate on the underlying data format of the
+ *     collection.
+ * @return {number}
+ *
+ */
 DBCollection.prototype.count = function(query, options) {
-    query = this.find(query);
-
-    // Apply options and return the result of the find
-    return QueryHelpers._applyCountOptions(query, options).count(true);
+    const cmd =
+        Object.assign({count: this.getName(), query: this._massageObject(query || {})}, options);
+    if (cmd.readConcern) {
+        cmd.readConcern = {level: cmd.readConcern};
+    }
+    const res = this._db.runReadCommand(cmd);
+    if (!res.ok) {
+        throw _getErrorWithCode(res, "count failed: " + tojson(res));
+    }
+    return res.n;
 };
 
 /**
-* Count number of matching documents in the db to a query using aggregation.
-*
-* @method
-* @param {object} query The query for the count.
-* @param {object} [options=null] Optional settings.
-* @param {number} [options.limit=null] The limit of documents to count.
-* @param {number} [options.skip=null] The number of documents to skip for the count.
-* @param {string|object} [options.hint=null] An index name hint or specification for the query.
-* @param {number} [options.maxTimeMS=null] The maximum amount of time to allow the query to run.
-* @param {object} [options.collation=null] The collation that should be used for string comparisons
-* for this count op.
-* @return {number}
-*/
+ * Count number of matching documents in the db to a query using aggregation.
+ *
+ * @method
+ * @param {object} query The query for the count.
+ * @param {object} [options=null] Optional settings.
+ * @param {number} [options.limit=null] The limit of documents to count.
+ * @param {number} [options.skip=null] The number of documents to skip for the count.
+ * @param {string|object} [options.hint=null] An index name hint or specification for the query.
+ * @param {number} [options.maxTimeMS=null] The maximum amount of time to allow the query to run.
+ * @param {object} [options.collation=null] The collation that should be used for string comparisons
+ * for this count op.
+ * @param {boolean} [options.rawData=null] Whether to operate on the underlying data format of the
+ *     collection.
+ * @return {number}
+ */
 DBCollection.prototype.countDocuments = function(query, options) {
     "use strict";
     let pipeline = [{"$match": query}];
@@ -1388,21 +1531,29 @@ DBCollection.prototype.countDocuments = function(query, options) {
     if (options.collation) {
         aggregateOptions.collation = options.collation;
     }
+    if (options.rawData) {
+        aggregateOptions.rawData = options.rawData;
+    }
 
     // Format cursor into an array.
     const res = this.aggregate(pipeline, aggregateOptions).toArray();
+    if (res.length) {
+        return res[0].n;
+    }
 
-    return res[0].n;
+    return 0;
 };
 
 /**
-* Estimates the count of documents in a collection using collection metadata.
-*
-* @method
-* @param {object} [options=null] Optional settings.
-* @param {number} [options.maxTimeMS=null] The maximum amount of time to allow the query to run.
-* @return {number}
-*/
+ * Estimates the count of documents in a collection using collection metadata.
+ *
+ * @method
+ * @param {object} [options=null] Optional settings.
+ * @param {number} [options.maxTimeMS=null] The maximum amount of time to allow the query to run.
+ * @param {boolean} [options.rawData=null] Whether to operate on the underlying data format of the
+ *     collection.
+ * @return {number}
+ */
 DBCollection.prototype.estimatedDocumentCount = function(options) {
     "use strict";
     let cmd = {count: this.getName()};
@@ -1412,11 +1563,14 @@ DBCollection.prototype.estimatedDocumentCount = function(options) {
     if (options.maxTimeMS) {
         cmd.maxTimeMS = options.maxTimeMS;
     }
+    if (options.rawData) {
+        cmd.rawData = options.rawData;
+    }
 
     const res = this.runCommand(cmd);
 
     if (!res.ok) {
-        throw _getErrorWithCode(res, "Error estimating document count: " + tojson(ret));
+        throw _getErrorWithCode(res, "Error estimating document count: " + tojson(res));
     }
 
     // Return the 'n' field, which should be the count of documents.
@@ -1424,17 +1578,17 @@ DBCollection.prototype.estimatedDocumentCount = function(options) {
 };
 
 /**
-* The distinct command returns returns a list of distinct values for the given key across a
-*collection.
-*
-* @method
-* @param {string} key Field of the document to find distinct values for.
-* @param {object} query The query for filtering the set of documents to which we apply the distinct
-*filter.
-* @param {object} [options=null] Optional settings.
-* @param {number} [options.maxTimeMS=null] The maximum amount of time to allow the query to run.
-* @return {object}
-*/
+ * The distinct command returns returns a list of distinct values for the given key across a
+ *collection.
+ *
+ * @method
+ * @param {string} key Field of the document to find distinct values for.
+ * @param {object} query The query for filtering the set of documents to which we apply the distinct
+ *filter.
+ * @param {object} [options=null] Optional settings.
+ * @param {number} [options.maxTimeMS=null] The maximum amount of time to allow the query to run.
+ * @return {object}
+ */
 DBCollection.prototype.distinct = function(keyString, query, options) {
     var opts = Object.extend({}, options || {});
     var keyStringType = typeof keyString;
@@ -1462,6 +1616,14 @@ DBCollection.prototype.distinct = function(keyString, query, options) {
         cmd.collation = opts.collation;
     }
 
+    if (opts.hint) {
+        cmd.hint = opts.hint;
+    }
+
+    if (opts.rawData) {
+        cmd.rawData = opts.rawData;
+    }
+
     // Execute distinct command
     var res = this.runReadCommand(cmd);
     if (!res.ok) {
@@ -1483,10 +1645,16 @@ DBCollection.prototype.latencyStats = function(options) {
 DBCollection.prototype.watch = function(pipeline, options) {
     pipeline = pipeline || [];
     assert(pipeline instanceof Array, "'pipeline' argument must be an array");
-    let changeStreamStage;
-    [changeStreamStage, aggOptions] = this.getMongo()._extractChangeStreamOptions(options);
-    pipeline.unshift(changeStreamStage);
-    return this.aggregate(pipeline, aggOptions);
+    const [changeStreamStage, aggOptions] = this.getMongo()._extractChangeStreamOptions(options);
+    return this.aggregate([changeStreamStage, ...pipeline], aggOptions);
+};
+
+DBCollection.prototype.checkMetadataConsistency = function(options = {}) {
+    assert(options instanceof Object,
+           `'options' parameter expected to be type object but found: ${typeof options}`);
+    const res = assert.commandWorked(
+        this._db.runCommand(Object.extend({checkMetadataConsistency: this.getName()}, options)));
+    return new DBCommandCursor(this._db, res);
 };
 
 /**
@@ -1495,7 +1663,7 @@ DBCollection.prototype.watch = function(pipeline, options) {
  * Proxy for planCache* commands.
  */
 if ((typeof PlanCache) == "undefined") {
-    PlanCache = function(collection) {
+    globalThis.PlanCache = function(collection) {
         this._collection = collection;
     };
 }
@@ -1524,16 +1692,14 @@ PlanCache.prototype.help = function() {
     var shortName = this.getName();
     print("PlanCache help");
     print("\tdb." + shortName + ".getPlanCache().help() - show PlanCache help");
-    print("\tdb." + shortName + ".getPlanCache().listQueryShapes() - " +
-          "displays all query shapes in a collection");
     print("\tdb." + shortName + ".getPlanCache().clear() - " +
           "drops all cached queries in a collection");
     print("\tdb." + shortName +
           ".getPlanCache().clearPlansByQuery(query[, projection, sort, collation]) - " +
           "drops query shape from plan cache");
-    print("\tdb." + shortName +
-          ".getPlanCache().getPlansByQuery(query[, projection, sort, collation]) - " +
-          "displays the cached plans for a query shape");
+    print("\tdb." + shortName + ".getPlanCache().list([pipeline]) - " +
+          "displays a serialization of the plan cache for this collection, " +
+          "after applying an optional aggregation pipeline");
     return __magicNoPrint;
 };
 
@@ -1548,7 +1714,7 @@ PlanCache.prototype._parseQueryShape = function(query, projection, sort, collati
     // Accept query shape object as only argument.
     // Query shape must contain 'query', 'projection', and 'sort', and may optionally contain
     // 'collation'. 'collation' must be non-empty if present.
-    if (typeof(query) == 'object' && projection == undefined && sort == undefined &&
+    if (typeof (query) == 'object' && projection == undefined && sort == undefined &&
         collation == undefined) {
         var keysSorted = Object.keys(query).sort();
         // Expected keys must be sorted for the comparison to work.
@@ -1610,26 +1776,11 @@ PlanCache.prototype._runCommandThrowOnError = function(cmd, params) {
 };
 
 /**
- * Lists query shapes in a collection.
- */
-PlanCache.prototype.listQueryShapes = function() {
-    return this._runCommandThrowOnError("planCacheListQueryShapes", {}).shapes;
-};
-
-/**
  * Clears plan cache in a collection.
  */
 PlanCache.prototype.clear = function() {
     this._runCommandThrowOnError("planCacheClear", {});
     return;
-};
-
-/**
- * List plans for a query shape.
- */
-PlanCache.prototype.getPlansByQuery = function(query, projection, sort, collation) {
-    return this._runCommandThrowOnError("planCacheListPlans",
-                                        this._parseQueryShape(query, projection, sort, collation));
 };
 
 /**
@@ -1639,4 +1790,14 @@ PlanCache.prototype.clearPlansByQuery = function(query, projection, sort, collat
     this._runCommandThrowOnError("planCacheClear",
                                  this._parseQueryShape(query, projection, sort, collation));
     return;
+};
+
+/**
+ * Returns an array of plan cache data for the collection, after applying the given optional
+ * aggregation pipeline.
+ */
+PlanCache.prototype.list = function(pipeline) {
+    const additionalPipeline = pipeline || [];
+    const completePipeline = [{$planCacheStats: {}}].concat(additionalPipeline);
+    return this._collection.aggregate(completePipeline).toArray();
 };

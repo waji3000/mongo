@@ -1,14 +1,13 @@
-'use strict';
+import {Cluster} from "jstests/concurrency/fsm_libs/cluster.js";
+import {parseConfig} from "jstests/concurrency/fsm_libs/parse_config.js";
+import {SpecificSecondaryReaderMongo} from "jstests/libs/specific_secondary_reader_mongo.js";
 
-load('jstests/concurrency/fsm_libs/assert.js');
-load('jstests/concurrency/fsm_libs/cluster.js');       // for Cluster.isStandalone
-load('jstests/concurrency/fsm_libs/parse_config.js');  // for parseConfig
-load('jstests/libs/specific_secondary_reader_mongo.js');
+const AsyncFunction = Object.getPrototypeOf(async function() {}).constructor;
 
-var workerThread = (function() {
-
+export const workerThread = (function() {
     // workloads = list of workload filenames
     // args.tid = the thread identifier
+    // args.tenantId = the tenant id
     // args.data = map of workload -> 'this' parameter passed to the FSM state functions
     // args.host = the address to make a new connection to
     // args.latch = CountDownLatch instance for starting all threads
@@ -17,11 +16,10 @@ var workerThread = (function() {
     // args.cluster = connection strings for all cluster nodes (see cluster.js for format)
     // args.clusterOptions = the configuration of the cluster
     // args.seed = seed for the random number generator
-    // args.globalAssertLevel = the global assertion level to use
     // args.errorLatch = CountDownLatch instance that threads count down when they error
     // args.sessionOptions = the options to start a session with
     // run = callback that takes a map of workloads to their associated $config
-    function main(workloads, args, run) {
+    async function main(workloads, args, run) {
         var myDB;
         var configs = {};
         var connectionString = 'mongodb://' + args.host + '/?appName=tid:' + args.tid;
@@ -29,18 +27,33 @@ var workerThread = (function() {
             connectionString += '&replicaSet=' + args.replSetName;
         }
 
-        globalAssertLevel = args.globalAssertLevel;
-
         // The global 'TestData' object may still be undefined if the concurrency suite isn't being
         // run by resmoke.py (e.g. if it is being run via a parallel shell in the backup/restore
         // tests).
         TestData = (TestData !== undefined) ? TestData : {};
 
         try {
+            // Running a callback passed through testData before running fsm worker threads.
+            // Can be added to yml files as the following example:
+            // fsmPreOverridesLoadedCallback: '
+            //     testingReplication = true;
+            //     await import("jstests/libs/override_methods/network_error_and_txn_override.js");
+            //     ...
+            // '
+            if (TestData.fsmPreOverridesLoadedCallback) {
+                if (typeof TestData.fsmPreOverridesLoadedCallback !== 'string') {
+                    throw new Error(`TestData.fsmPreOverridesLoadedCallback must be a string, not ${
+                        typeof TestData.fsmPreOverridesLoadedCallback}`);
+                }
+
+                const fn = new AsyncFunction(TestData.fsmPreOverridesLoadedCallback);
+                await fn();
+            }
+
             if (typeof db !== 'undefined') {
                 // The implicit database connection created within the thread's scope
                 // is unneeded, so forcibly clean it up.
-                db = null;
+                globalThis.db = undefined;
                 gc();
             }
 
@@ -51,14 +64,24 @@ var workerThread = (function() {
                 mongo = new Mongo(connectionString);
             }
 
+            if (typeof args.tenantId !== 'undefined') {
+                TestData.tenantId = args.tenantId;
+                await import("jstests/libs/override_methods/simulate_atlas_proxy.js");
+            }
+
+            // Retry operations that fail due to in-progress background operations. Load this early
+            // so that later overrides can be retried.
+            await import(
+                "jstests/libs/override_methods/index_builds/implicitly_retry_on_background_op_in_progress.js");
+
             if (typeof args.sessionOptions !== 'undefined') {
                 let initialClusterTime;
                 let initialOperationTime;
 
                 // JavaScript objects backed by C++ objects (e.g. BSON values from a command
-                // response) do not serialize correctly when passed through the ScopedThread
+                // response) do not serialize correctly when passed through the Thread
                 // constructor. To work around this behavior, we instead pass a stringified form
-                // of the JavaScript object through the ScopedThread constructor and use eval()
+                // of the JavaScript object through the Thread constructor and use eval()
                 // to rehydrate it.
                 if (typeof args.sessionOptions.initialClusterTime === 'string') {
                     initialClusterTime = eval('(' + args.sessionOptions.initialClusterTime + ')');
@@ -86,11 +109,11 @@ var workerThread = (function() {
                     // the right thing based on the DB.
                     session.getOptions().setReadPreference(undefined);
 
-                    // We load() set_read_preference_secondary.js in order to avoid running
+                    // We import set_read_preference_secondary.js in order to avoid running
                     // commands against the "admin" and "config" databases via mongos with
                     // readPreference={mode: "secondary"} when there's only a single node in
                     // the CSRS.
-                    load('jstests/libs/override_methods/set_read_preference_secondary.js');
+                    await import("jstests/libs/override_methods/set_read_preference_secondary.js");
                 }
 
                 if (typeof initialClusterTime !== 'undefined') {
@@ -110,7 +133,8 @@ var workerThread = (function() {
                 let connectionDesc = '';
                 // In sharded environments, mongos is acting as a proxy for the mongo shell and
                 // therefore has a different outbound port than the 'whatsmyuri' command returns.
-                if (!Cluster.isSharded(args.clusterOptions)) {
+                if (!Cluster.isSharded(args.clusterOptions) &&
+                    !TestData.testingReplicaSetEndpoint) {
                     let res = assert.commandWorked(myDB.runCommand({whatsmyuri: 1}));
                     const myUri = res.you;
 
@@ -125,6 +149,35 @@ var workerThread = (function() {
                     printArgs.unshift(prefix);
                     return printOriginal.apply(this, printArgs);
                 };
+
+                jsTestLog = function(msg) {
+                    if (typeof msg === "object") {
+                        msg = tojson(msg);
+                    }
+                    assert.eq(typeof (msg), "string", "Received: " + msg);
+                    let msgs = msg.split("\n");
+                    msgs = msgs.map(msg => '[tid:' + args.tid + '] ' + msg);
+                    const printMsgs = ["----", ...msgs, "----"].map(s => `[jsTest] ${s}`);
+                    printOriginal(`\n\n${printMsgs.join("\n")}\n\n`);
+                };
+            }
+
+            if (TestData.shardsAddedRemoved) {
+                await import(
+                    "jstests/libs/override_methods/implicitly_retry_on_shard_transition_errors.js");
+            }
+
+            if (TestData.runningWithConfigStepdowns || TestData.runningWithShardStepdowns ||
+                TestData.killShards) {
+                await import(
+                    "jstests/libs/override_methods/implicitly_retry_crud_on_no_progress_made.js");
+            }
+
+            if (TestData.runningWithBalancer && !TestData.shardsAddedRemoved) {
+                // Skipping the import on shard transitions because it's already imported under
+                // implicitly_retry_on_shard_transition_errors.js
+                await import(
+                    "jstests/libs/override_methods/implicitly_retry_on_migration_in_progress.js");
             }
 
             if (Cluster.isReplication(args.clusterOptions)) {
@@ -139,7 +192,9 @@ var workerThread = (function() {
                     };
                     Object.assign(TestData, newOptions);
 
-                    load('jstests/libs/override_methods/auto_retry_on_network_error.js');
+                    assert(!TestData.hasOwnProperty('networkErrorAndTxnOverrideConfig'), TestData);
+                    TestData.networkErrorAndTxnOverrideConfig = {retryOnNetworkErrors: true};
+                    await import("jstests/libs/override_methods/network_error_and_txn_override.js");
                 }
 
                 // Operations that run after a "dropDatabase" command has been issued may fail with
@@ -149,15 +204,16 @@ var workerThread = (function() {
                 // implicitly_retry_on_database_drop_pending.js file to make it so that the clients
                 // started by the concurrency framework automatically retry their operation in the
                 // face of this particular error response.
-                load('jstests/libs/override_methods/implicitly_retry_on_database_drop_pending.js');
+                await import(
+                    "jstests/libs/override_methods/implicitly_retry_on_database_drop_pending.js");
             }
 
             if (TestData.defaultReadConcernLevel || TestData.defaultWriteConcern) {
-                load('jstests/libs/override_methods/set_read_and_write_concerns.js');
+                await import("jstests/libs/override_methods/set_read_and_write_concerns.js");
             }
 
-            workloads.forEach(function(workload) {
-                load(workload);                     // for $config
+            for (const workload of workloads) {
+                const {$config} = await import(workload);
                 var config = parseConfig($config);  // to normalize
 
                 // Copy any modifications that were made to $config.data
@@ -177,21 +233,11 @@ var workerThread = (function() {
 
                 // Object.extend() defines all properties added to the destination object as
                 // configurable, enumerable, and writable. To prevent workloads from changing
-                // the iterations and threadCount properties in their state functions, we redefine
-                // them here as non-configurable, non-enumerable, and non-writable.
+                // the iterations and threadCount properties in their state functions, we
+                // redefine them here as non-configurable and non-writable.
                 Object.defineProperties(data, {
-                    'iterations': {
-                        configurable: false,
-                        enumerable: false,
-                        writable: false,
-                        value: data.iterations
-                    },
-                    'threadCount': {
-                        configurable: false,
-                        enumerable: false,
-                        writable: false,
-                        value: data.threadCount
-                    }
+                    'iterations': {configurable: false, writable: false, value: data.iterations},
+                    'threadCount': {configurable: false, writable: false, value: data.threadCount}
                 });
 
                 data.tid = args.tid;
@@ -204,9 +250,12 @@ var workerThread = (function() {
                     passConnectionCache: config.passConnectionCache,
                     startState: config.startState,
                     states: config.states,
-                    transitions: config.transitions
+                    tid: args.tid,
+                    transitions: config.transitions,
+                    errorLatch: args.errorLatch,
+                    numThreads: args.numThreads,
                 };
-            });
+            }
 
             args.latch.countDown();
 
@@ -218,9 +267,10 @@ var workerThread = (function() {
                 args.latch.await();  // wait for all threads to start
 
                 Random.setRandomSeed(args.seed);
-                run(configs);
+                await run(configs);
                 return {ok: 1};
             } catch (e) {
+                jsTest.log('Thread failed. Other threads will stop execution on next iteration.');
                 args.errorLatch.countDown();
                 return {
                     ok: 0,
@@ -231,6 +281,19 @@ var workerThread = (function() {
                 };
             }
         } finally {
+            // Kill this worker thread's session to ensure any possible idle cursors left open by
+            // the workload are closed.
+            // TODO SERVER-74993: Remove this.
+            try {
+                var session = myDB.getSession();
+                if (session) {
+                    myDB.runCommand({killSessions: [session.getSessionId()]});
+                }
+            } catch (e) {
+                // Ignore errors from killSessions.
+                jsTest.log('Error running killSessions: ' + e);
+            }
+
             // Avoid retention of connection object
             configs = null;
             myDB = null;

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,11 +27,29 @@
  *    it in the license file.
  */
 
-#include "mongo/db/fts/fts_spec.h"
+#include <map>
+#include <string>
+#include <utility>
 
-#include "mongo/db/bson/dotted_path_support.h"
-#include "mongo/util/mongoutils/str.h"
-#include "mongo/util/stringutils.h"
+#include <absl/container/node_hash_map.h>
+#include <boost/move/utility_core.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/bson/dotted_path/dotted_path_support.h"
+#include "mongo/db/fts/fts_language.h"
+#include "mongo/db/fts/fts_spec.h"
+#include "mongo/db/fts/fts_util.h"
+#include "mongo/db/fts/stemmer.h"
+#include "mongo/db/fts/stop_words.h"
+#include "mongo/db/fts/tokenizer.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -43,27 +60,20 @@ namespace fts {
 // text indexes.
 //
 
-using std::map;
-using std::string;
-using namespace mongoutils;
-
-namespace dps = ::mongo::dotted_path_support;
-
 namespace {
 void _addFTSStuff(BSONObjBuilder* b) {
     b->append("_fts", INDEX_NAME);
     b->append("_ftsx", 1);
 }
-}
+}  // namespace
 
 const FTSLanguage& FTSSpec::_getLanguageToUseV1(const BSONObj& userDoc) const {
     BSONElement e = userDoc[_languageOverrideField];
     if (e.type() == String) {
-        const char* x = e.valuestrsafe();
-        if (strlen(x) > 0) {
-            StatusWithFTSLanguage swl = FTSLanguage::make(x, TEXT_INDEX_VERSION_1);
-            dassert(swl.isOK());  // make() w/ TEXT_INDEX_VERSION_1 guaranteed to not fail.
-            return *swl.getValue();
+        StringData x = e.valueStringData();
+        if (e.size() > 0) {
+            // make() w/ TEXT_INDEX_VERSION_1 guaranteed to not fail.
+            return FTSLanguage::make(x, TEXT_INDEX_VERSION_1);
         }
     }
     return *_defaultLanguage;
@@ -83,7 +93,7 @@ void FTSSpec::_scoreStringV1(const Tools& tools,
         if (t.type != Token::TEXT)
             continue;
 
-        string term = tolowerString(t.data);
+        std::string term = str::toLower(t.data);
         if (tools.stopwords->isStopWord(term))
             continue;
         term = tools.stemmer->stem(term).toString();
@@ -101,7 +111,7 @@ void FTSSpec::_scoreStringV1(const Tools& tools,
     }
 
     for (ScoreHelperMap::const_iterator i = terms.begin(); i != terms.end(); ++i) {
-        const string& term = i->first;
+        const std::string& term = i->first;
         const ScoreHelperStruct& data = i->second;
 
         // in order to adjust weights as a function of term count as it
@@ -114,12 +124,12 @@ void FTSSpec::_scoreStringV1(const Tools& tools,
         // if term is identical to the raw form of the
         // field (untokenized) give it a small boost.
         double adjustment = 1;
-        if (raw.size() == term.length() && raw.equalCaseInsensitive(term))
+        if (str::equalCaseInsensitive(raw, term))
             adjustment += 0.1;
 
         double& score = (*docScores)[term];
         score += (weight * data.freq * coeff * adjustment);
-        verify(score <= MAX_WEIGHT);
+        MONGO_verify(score <= MAX_WEIGHT);
     }
 }
 
@@ -151,7 +161,7 @@ void FTSSpec::_scoreRecurseV1(const Tools& tools,
         if (x.type() == String) {
             double w = 1;
             _weightV1(x.fieldName(), &w);
-            _scoreStringV1(tools, x.valuestr(), term_freqs, w);
+            _scoreStringV1(tools, x.valueStringData(), term_freqs, w);
         } else if (x.isABSONObj()) {
             _scoreRecurseV1(tools, x.Obj(), term_freqs);
         }
@@ -175,7 +185,7 @@ void FTSSpec::_scoreDocumentV1(const BSONObj& obj, TermFrequencyMap* term_freqs)
     for (Weights::const_iterator i = _weights.begin(); i != _weights.end(); i++) {
         const char* leftOverName = i->first.c_str();
         // name of field
-        BSONElement e = dps::extractElementAtPath(obj, leftOverName);
+        BSONElement e = ::mongo::bson::extractElementAtDottedPath(obj, leftOverName);
         // weight associated to name of field
         double weight = i->second;
 
@@ -186,18 +196,18 @@ void FTSSpec::_scoreDocumentV1(const BSONObj& obj, TermFrequencyMap* term_freqs)
             while (j.more()) {
                 BSONElement x = j.next();
                 if (leftOverName[0] && x.isABSONObj())
-                    x = dps::extractElementAtPath(x.Obj(), leftOverName);
+                    x = ::mongo::bson::extractElementAtDottedPath(x.Obj(), leftOverName);
                 if (x.type() == String)
-                    _scoreStringV1(tools, x.valuestr(), term_freqs, weight);
+                    _scoreStringV1(tools, x.valueStringData(), term_freqs, weight);
             }
         } else if (e.type() == String) {
-            _scoreStringV1(tools, e.valuestr(), term_freqs, weight);
+            _scoreStringV1(tools, e.valueStringData(), term_freqs, weight);
         }
     }
 }
 
 StatusWith<BSONObj> FTSSpec::_fixSpecV1(const BSONObj& spec) {
-    map<string, int> m;
+    std::map<std::string, int> m;
 
     BSONObj keyPattern;
     {
@@ -207,11 +217,11 @@ StatusWith<BSONObj> FTSSpec::_fixSpecV1(const BSONObj& spec) {
         BSONObjIterator i(spec["key"].Obj());
         while (i.more()) {
             BSONElement e = i.next();
-            if (str::equals(e.fieldName(), "_fts") || str::equals(e.fieldName(), "_ftsx")) {
+            if ((e.fieldNameStringData() == "_fts") || (e.fieldNameStringData() == "_ftsx")) {
                 addedFtsStuff = true;
                 b.append(e);
             } else if (e.type() == String &&
-                       (str::equals("fts", e.valuestr()) || str::equals("text", e.valuestr()))) {
+                       (e.valueStringData() == "fts" || e.valueStringData() == "text")) {
                 if (!addedFtsStuff) {
                     _addFTSStuff(&b);
                     addedFtsStuff = true;
@@ -242,24 +252,22 @@ StatusWith<BSONObj> FTSSpec::_fixSpecV1(const BSONObj& spec) {
     BSONObj weights;
     {
         BSONObjBuilder b;
-        for (map<string, int>::iterator i = m.begin(); i != m.end(); ++i) {
-            if (i->second <= 0 || i->second >= MAX_WORD_WEIGHT) {
+        for (const auto& kv : m) {
+            if (kv.second <= 0 || kv.second >= MAX_WORD_WEIGHT) {
                 return {ErrorCodes::CannotCreateIndex,
                         str::stream() << "text index weight must be in the exclusive interval (0,"
-                                      << MAX_WORD_WEIGHT
-                                      << ") but found: "
-                                      << i->second};
+                                      << MAX_WORD_WEIGHT << ") but found: " << kv.second};
             }
-            b.append(i->first, i->second);
+            b.append(kv.first, kv.second);
         }
         weights = b.obj();
     }
 
-    string default_language(spec.getStringField("default_language"));
+    std::string default_language(spec.getStringField("default_language"));
     if (default_language.empty())
         default_language = "english";
 
-    string language_override(spec.getStringField("language_override"));
+    std::string language_override(spec.getStringField("language_override"));
     if (language_override.empty())
         language_override = "language";
 
@@ -270,20 +278,21 @@ StatusWith<BSONObj> FTSSpec::_fixSpecV1(const BSONObj& spec) {
     BSONObjIterator i(spec);
     while (i.more()) {
         BSONElement e = i.next();
-        if (str::equals(e.fieldName(), "key")) {
+        StringData fieldName = e.fieldNameStringData();
+        if (fieldName == "key") {
             b.append("key", keyPattern);
-        } else if (str::equals(e.fieldName(), "weights")) {
+        } else if (fieldName == "weights") {
             b.append("weights", weights);
             weights = BSONObj();
-        } else if (str::equals(e.fieldName(), "default_language")) {
+        } else if (fieldName == "default_language") {
             b.append("default_language", default_language);
             default_language = "";
-        } else if (str::equals(e.fieldName(), "language_override")) {
+        } else if (fieldName == "language_override") {
             b.append("language_override", language_override);
             language_override = "";
-        } else if (str::equals(e.fieldName(), "v")) {
+        } else if (fieldName == "v") {
             version = e.numberInt();
-        } else if (str::equals(e.fieldName(), "textIndexVersion")) {
+        } else if (fieldName == "textIndexVersion") {
             textIndexVersion = e.numberInt();
             if (textIndexVersion != 1) {
                 return {ErrorCodes::CannotCreateIndex,
@@ -308,5 +317,5 @@ StatusWith<BSONObj> FTSSpec::_fixSpecV1(const BSONObj& spec) {
 
     return b.obj();
 }
-}
-}
+}  // namespace fts
+}  // namespace mongo

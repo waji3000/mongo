@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -31,17 +30,19 @@
 #pragma once
 
 #include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
 #include <cstddef>
 #include <cstdint>
 #include <tuple>
 #include <vector>
 
-#include "mongo/base/disallow_copying.h"
+#include "mongo/base/data_range.h"
 #include "mongo/base/status_with.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/bson/util/builder.h"
 #include "mongo/db/ftdc/block_compressor.h"
 #include "mongo/db/ftdc/config.h"
-#include "mongo/db/jsobj.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo {
 
@@ -62,7 +63,8 @@ namespace mongo {
  * across all documents in the series of documents.
  */
 class FTDCCompressor {
-    MONGO_DISALLOW_COPYING(FTDCCompressor);
+    FTDCCompressor(const FTDCCompressor&) = delete;
+    FTDCCompressor& operator=(const FTDCCompressor&) = delete;
 
 public:
     /**

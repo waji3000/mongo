@@ -29,7 +29,7 @@ global:
     cpp_namespace: "mongo"
 
 imports:
-    - "mongo/idl/basic_types.idl"
+    - "mongo/db/basic_types.idl"
     - "mongo/s/sharding_types.idl"
 
 structs:
@@ -40,35 +40,34 @@ structs:
                 description: "The id of the shard"
                 type: shard_id
 
+    PrepareReply:
+        description: "Reply to prepareTransactionCommand"
+        is_command_reply: true
+        fields:
+            prepareTimestamp:
+                description: "Timestamp of prepare transaction operation. Optional for backward compatibility only."
+                type: timestamp
+                optional: true
+            affectedNamespaces:
+                description: "List of namespaces, affected by the transaction. Optional for backward compatibility only."
+                type: array<namespacestring>
+                optional: true
+
 commands:
     prepareTransaction:
         description: "Parser for the 'prepareTransaction' command."
+        command_name: prepareTransaction
         strict: true
         namespace: ignored
-
-    voteCommitTransaction:
-        description: "Parser for the 'voteCommitTransaction' command."
-        namespace: ignored
-        fields:
-            shardId:
-                description: "The shard name of the sender"
-                type: shard_id
-            prepareTimestamp:
-                description: "Timestamp at which the sender prepared the transaction"
-                type: timestamp
-
-    voteAbortTransaction:
-        description: "Parser for the 'voteAbortTransaction' command."
-        namespace: ignored
-        fields:
-            shardId:
-                description: "The shard name of the sender"
-                type: shard_id
+        api_version: ""
+        reply_type: PrepareReply
 
     coordinateCommitTransaction:
         description: "Parser for the 'coordinateCommitTransaction' command."
+        command_name: coordinateCommitTransaction
         strict: false
         namespace: ignored
+        api_version: ""
         fields:
             participants:
                 description: "An array of shard participants that must be included in the commit."

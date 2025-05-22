@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,21 +27,26 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kControl;
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/util/exit.h"
-
-#include <boost/optional.hpp>
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+// IWYU pragma: no_include "cxxabi.h"
+#include <mutex>
 #include <stack>
+#include <thread>
 
+#include "mongo/logv2/log.h"
+#include "mongo/platform/atomic_word.h"
 #include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/functional.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/stdx/thread.h"
-#include "mongo/util/log.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/exit.h"
+#include "mongo/util/exit_code.h"
 #include "mongo/util/quick_exit.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
+
 
 namespace mongo {
 
@@ -52,18 +56,15 @@ stdx::mutex shutdownMutex;
 stdx::condition_variable shutdownTasksComplete;
 boost::optional<ExitCode> shutdownExitCode;
 bool shutdownTasksInProgress = false;
-AtomicUInt32 shutdownFlag;
-std::stack<stdx::function<void()>> shutdownTasks;
+AtomicWord<unsigned> shutdownFlag;
+std::stack<ShutdownTask> shutdownTasks;
 stdx::thread::id shutdownTasksThreadId;
 
-void runTasks(decltype(shutdownTasks) tasks) {
+void runRegisteredShutdownTasks(decltype(shutdownTasks) tasks,
+                                const ShutdownTaskArgs& shutdownArgs) noexcept {
     while (!tasks.empty()) {
         const auto& task = tasks.top();
-        try {
-            task();
-        } catch (...) {
-            std::terminate();
-        }
+        task(shutdownArgs);
         tasks.pop();
     }
 }
@@ -72,8 +73,8 @@ void runTasks(decltype(shutdownTasks) tasks) {
 // prevent multiple threads from attempting to log that they are exiting. The quickExit() function
 // has its own 'quickExitMutex' to prohibit multiple threads from attempting to call _exit().
 MONGO_COMPILER_NORETURN void logAndQuickExit_inlock() {
-    ExitCode code = shutdownExitCode.get();
-    log() << "shutting down with code:" << code;
+    ExitCode code = shutdownExitCode.value();
+    LOGV2(23138, "Shutting down", "exitCode"_attr = code);
     quickExit(code);
 }
 
@@ -94,16 +95,16 @@ ExitCode waitForShutdown() {
         return shutdownStarted && !shutdownTasksInProgress;
     });
 
-    return shutdownExitCode.get();
+    return shutdownExitCode.value();
 }
 
-void registerShutdownTask(stdx::function<void()> task) {
+void registerShutdownTask(ShutdownTask task) {
     stdx::lock_guard<stdx::mutex> lock(shutdownMutex);
     invariant(!globalInShutdownDeprecated());
     shutdownTasks.emplace(std::move(task));
 }
 
-void shutdown(ExitCode code) {
+void shutdown(ExitCode code, const ShutdownTaskArgs& shutdownArgs) {
     decltype(shutdownTasks) localTasks;
 
     {
@@ -116,12 +117,12 @@ void shutdown(ExitCode code) {
             // Re-entrant calls to shutdown are not allowed.
             invariant(shutdownTasksThreadId != stdx::this_thread::get_id());
 
-            ExitCode originallyRequestedCode = shutdownExitCode.get();
+            ExitCode originallyRequestedCode = shutdownExitCode.value();
             if (code != originallyRequestedCode) {
-                log() << "While running shutdown tasks with the intent to exit with code "
-                      << originallyRequestedCode << ", an additional shutdown request arrived with "
-                                                    "the intent to exit with a different exit code "
-                      << code << "; ignoring the conflicting exit code";
+                LOGV2(23139,
+                      "Conflicting exit code at shutdown",
+                      "originalExitCode"_attr = originallyRequestedCode,
+                      "newExitCode"_attr = code);
             }
 
             // Wait for the shutdown tasks to complete
@@ -139,7 +140,7 @@ void shutdown(ExitCode code) {
         localTasks.swap(shutdownTasks);
     }
 
-    runTasks(std::move(localTasks));
+    runRegisteredShutdownTasks(std::move(localTasks), shutdownArgs);
 
     {
         stdx::lock_guard<stdx::mutex> lock(shutdownMutex);
@@ -151,7 +152,7 @@ void shutdown(ExitCode code) {
     }
 }
 
-void shutdownNoTerminate() {
+void shutdownNoTerminate(const ShutdownTaskArgs& shutdownArgs) {
     decltype(shutdownTasks) localTasks;
 
     {
@@ -167,15 +168,14 @@ void shutdownNoTerminate() {
         localTasks.swap(shutdownTasks);
     }
 
-    runTasks(std::move(localTasks));
+    runRegisteredShutdownTasks(std::move(localTasks), shutdownArgs);
 
     {
         stdx::lock_guard<stdx::mutex> lock(shutdownMutex);
         shutdownTasksInProgress = false;
-        shutdownExitCode.emplace(EXIT_CLEAN);
+        shutdownExitCode.emplace(ExitCode::clean);
     }
 
     shutdownTasksComplete.notify_all();
 }
-
 }  // namespace mongo

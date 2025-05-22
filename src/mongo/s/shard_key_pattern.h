@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,21 +29,20 @@
 
 #pragma once
 
+#include <cstddef>
 #include <memory>
+#include <string>
+#include <utility>
 #include <vector>
 
 #include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
-#include "mongo/db/jsobj.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/field_ref.h"
 #include "mongo/db/keypattern.h"
-#include "mongo/db/matcher/matchable.h"
-#include "mongo/db/query/index_bounds.h"
 
 namespace mongo {
-
-class CanonicalQuery;
-class FieldRef;
-class OperationContext;
 
 /**
  * Helper struct when generating flattened bounds below
@@ -67,13 +65,15 @@ typedef std::vector<std::pair<BSONObj, BSONObj>> BoundList;
  */
 class ShardKeyPattern {
 public:
-    // Maximum size of shard key
-    static constexpr int kMaxShardKeySizeBytes = 512;
-
     /**
-     * Helper to check shard key size and generate an appropriate error message.
+     * A struct to represent the index key data. The 'data' field represents the actual key data and
+     * the 'pattern' represents the index key pattern. For an index pattern {a: 1, b: 'hashed'} the
+     * key data would look like {"": "value", "": NumberLong(12345)}.
      */
-    static Status checkShardKeySize(const BSONObj& shardKey);
+    struct IndexKeyData {
+        BSONObj data;
+        BSONObj pattern;
+    };
 
     /**
      * Validates whether the specified shard key is valid to be written as part of the sharding
@@ -97,21 +97,56 @@ public:
      */
     static bool isHashedPatternEl(const BSONElement& el);
 
+    /**
+     * Returns the BSONElement pointing to the hashed field. Returns empty BSONElement if not found.
+     */
+    static BSONElement extractHashedField(BSONObj keyPattern);
+
+    /**
+     * Check if the given BSONElement is of type 'MinKey', 'MaxKey' or 'NumberLong', which are the
+     * only acceptable values for hashed fields.
+     */
+    static bool isValidHashedValue(const BSONElement& el);
+
     bool isHashedPattern() const;
 
-    const KeyPattern& getKeyPattern() const;
+    bool isHashedOnField(StringData fieldName) const;
 
-    const std::vector<std::unique_ptr<FieldRef>>& getKeyPatternFields() const;
+    bool hasHashedPrefix() const;
+
+    BSONElement getHashedField() const {
+        return _hashedField;
+    }
+
+    const KeyPattern& getKeyPattern() const {
+        return _keyPattern;
+    }
+
+    const std::vector<std::unique_ptr<FieldRef>>& getKeyPatternFields() const {
+        return _keyPatternPaths;
+    }
 
     const BSONObj& toBSON() const;
 
     std::string toString() const;
 
     /**
+     * Converts the passed in key pattern into a KeyString.
+     * Note: this function strips the field names when creating the KeyString.
+     */
+    static std::string toKeyString(const BSONObj& shardKey);
+
+    /**
      * Returns true if the provided document is a shard key - i.e. has the same fields as the
      * shard key pattern and valid shard key values.
      */
     bool isShardKey(const BSONObj& shardKey) const;
+
+    /**
+     * Returns true if the new shard key pattern extends this shard key pattern - i.e. contains this
+     * shard key pattern as a prefix (begins with the same field names in the same order).
+     */
+    bool isExtendedBy(const ShardKeyPattern& newShardKeyPattern) const;
 
     /**
      * Given a shard key, return it in normal form where the fields are in the same order as
@@ -122,12 +157,47 @@ public:
     BSONObj normalizeShardKey(const BSONObj& shardKey) const;
 
     /**
-     * Given a MatchableDocument, extracts the shard key corresponding to the key pattern.
-     * For each path in the shard key pattern, extracts a value from the matchable document.
+     * Given one or more index keys, potentially from more than one index, extracts the shard key
+     * corresponding to the shard key pattern.
      *
-     * Paths to shard key fields must not contain arrays at any level, and shard keys may not
-     * be array fields, undefined, or non-storable sub-documents.  If the shard key pattern is
-     * a hashed key pattern, this method performs the hashing.
+     * All the shard key fields must be present in at least one of the index keys. A missing shard
+     * key field will result in an invariant.
+     */
+    BSONObj extractShardKeyFromIndexKeyData(const std::vector<IndexKeyData>& indexKeyData) const;
+
+    /**
+     * Given a document key expressed in dotted notation, extracts its shard key, applying hashing
+     * if necessary.
+     * Note: For a shardKeyPattern {a.b: 1, c: 1}
+     *  The documentKey for the document {a: {b: 10}, c: 20} is {a.b: 10, c: 20}
+     *  The documentKey for the document {a: {b: 10, d: 20}, c: 30} is {a.b: 10, c: 30}
+     *  The documentKey for the document {a: {b: {d: 10}}, c: 30} is {a.b: {d: 10}, c: 30}
+     *
+     * Examples:
+     *  If 'this' KeyPattern is {a: 1}
+     *   {a: 10, b: 20} --> returns {a: 10}
+     *   {b: 20} --> returns {a: null}
+     *   {a: {b: 10}} --> returns {a: {b: 10}}
+     *   {a: [1,2]} --> returns {}
+     *  If 'this' KeyPattern is {a.b: 1, c: 1}
+     *   {a.b: 10, c: 20} --> returns {a.b: 10, c: 20}
+     *   {a.b: 10} --> returns {a.b: 10, c: null}
+     *   {a.b: {z: 10}, c: 20} --> returns {a.b: {z: 10}, c: 20}
+     *  If 'this' KeyPattern is {a : "hashed"}
+     *   {a: 10, b: 20} --> returns {a: NumberLong("7766103514953448109")}
+     *   {b: 20} --> returns {a: NumberLong("2338878944348059895")}
+     */
+    BSONObj extractShardKeyFromDocumentKey(const BSONObj& documentKey) const;
+    BSONObj extractShardKeyFromDocumentKeyThrows(const BSONObj& documentKey) const;
+
+    /**
+     * Given a document, extracts the shard key corresponding to the key pattern. Paths to shard key
+     * fields must not contain arrays at any level, and shard keys may not be array fields or
+     * non-storable sub-documents.  If the shard key pattern is a hashed key pattern, this method
+     * performs the hashing.
+     *
+     * If any shard key fields are missing from the document, the extraction will treat these
+     * fields as null.
      *
      * If a shard key cannot be extracted, returns an empty BSONObj().
      *
@@ -142,104 +212,50 @@ public:
      *  If 'this' KeyPattern is { 'a.b' : 1 }
      *   { a : { b : "hi" } } --> returns { 'a.b' : "hi" }
      *   { a : [{ b : "hi" }] } --> returns {}
-     */
-    BSONObj extractShardKeyFromMatchable(const MatchableDocument& matchable) const;
-
-    /**
-     * Given a document, extracts the shard key corresponding to the key pattern.
-     * See above.
+     *  If 'this' KeyPattern is { a: 1 , b: 1 }
+     *   { a: 1 } --> returns { a: 1, b: null }
+     *   { b: 1 } --> returns { a: null, b: 1 }
      */
     BSONObj extractShardKeyFromDoc(const BSONObj& doc) const;
+    BSONObj extractShardKeyFromDocThrows(const BSONObj& doc) const;
 
     /**
-     * Returns the set of shard key fields which are absent from the given document. Note that the
-     * vector returned by this method contains StringData elements pointing into ShardKeyPattern's
-     * underlying BSONObj. If the fieldnames are required to survive beyond the lifetime of this
-     * ShardKeyPattern, callers should create their own copies.
+     * Returns the document with missing shard key values set to null.
      */
-    std::vector<StringData> findMissingShardKeyFieldsFromDoc(const BSONObj doc) const;
+    BSONObj emplaceMissingShardKeyValuesForDocument(BSONObj doc) const;
 
     /**
-     * Given a simple BSON query, extracts the shard key corresponding to the key pattern
-     * from equality matches in the query.  The query expression *must not* be a complex query
-     * with sorts or other attributes.
-     *
-     * Logically, the equalities in the BSON query can be serialized into a BSON document and
-     * then a shard key is extracted from this equality document.
-     *
-     * NOTE: BSON queries and BSON documents look similar but are different languages.  Use the
-     * correct shard key extraction function.
-     *
-     * Returns !OK status if the query cannot be parsed.  Returns an empty BSONObj() if there is
-     * no shard key found in the query equalities.
-     *
-     * Examples:
-     *  If the key pattern is { a : 1 }
-     *   { a : "hi", b : 4 } --> returns { a : "hi" }
-     *   { a : { $eq : "hi" }, b : 4 } --> returns { a : "hi" }
-     *   { $and : [{a : { $eq : "hi" }}, { b : 4 }] } --> returns { a : "hi" }
-     *  If the key pattern is { 'a.b' : 1 }
-     *   { a : { b : "hi" } } --> returns { 'a.b' : "hi" }
-     *   { 'a.b' : "hi" } --> returns { 'a.b' : "hi" }
-     *   { a : { b : { $eq : "hi" } } } --> returns {} because the query language treats this as
-     *                                                 a : { $eq : { b : ... } }
-     */
-    StatusWith<BSONObj> extractShardKeyFromQuery(OperationContext* opCtx,
-                                                 const BSONObj& basicQuery) const;
-    BSONObj extractShardKeyFromQuery(const CanonicalQuery& query) const;
-
-    /**
-     * Returns true if the shard key pattern can ensure that the unique index pattern is
-     * respected across all shards.
+     * Returns true if the shard key pattern can ensure that the index uniqueness is respected
+     * across all shards.
      *
      * Primarily this just checks whether the shard key pattern field names are equal to or a
-     * prefix of the unique index pattern field names.  Since documents with the same fields in
-     * the shard key pattern are guaranteed to go to the same shard, and all documents must
-     * contain the full shard key, a unique index with a shard key pattern prefix can be sure
-     * when resolving duplicates that documents on other shards will have different shard keys,
-     * and so are not duplicates.
+     * prefix of the 'unique' or 'prepareUnique' index pattern field names. Since documents with the
+     * same fields in the shard key pattern are guaranteed to go to the same shard, and all
+     * documents must contain the full shard key, an index with {unique: true} or {prepareUnique:
+     * true} and a shard key pattern prefix can be sure when resolving duplicates that documents on
+     * other shards will have different shard keys, and so are not duplicates.
      *
      * Hashed shard key patterns are similar to ordinary patterns in that they guarantee similar
      * shard keys go to the same shard.
      *
      * Examples:
-     *     shard key {a : 1} is compatible with a unique index on {_id : 1}
-     *     shard key {a : 1} is compatible with a unique index on {a : 1 , b : 1}
-     *     shard key {a : 1} is compatible with a unique index on {a : -1 , b : 1 }
-     *     shard key {a : "hashed"} is compatible with a unique index on {a : 1}
-     *     shard key {a : 1} is not compatible with a unique index on {b : 1}
-     *     shard key {a : "hashed" , b : 1 } is not compatible with unique index on { b : 1 }
+     *     shard key {a : 1} is compatible with a unique/prepareUnique index on {_id : 1}
+     *     shard key {a : 1} is compatible with a unique/prepareUnique index on {a : 1, b : 1}
+     *     shard key {a : 1} is compatible with a unique/prepareUnique index on {a : -1, b : 1}
+     *     shard key {a : "hashed"} is compatible with a unique/prepareUnique index on {a : 1}
+     *     shard key {a : 1} is not compatible with a unique/prepareUnique index on {b : 1}
+     *     shard key {a : "hashed", b : 1} is not compatible with unique/prepareUnique index on
+     *     {b : 1}
      *
      * All unique index patterns starting with _id are assumed to be enforceable by the fact
      * that _ids must be unique, and so all unique _id prefixed indexes are compatible with
      * any shard key pattern.
      *
-     * NOTE: We assume 'uniqueIndexPattern' is a valid unique index pattern - a pattern like
-     * { k : "hashed" } is not capable of being a unique index and is an invalid argument to
-     * this method.
+     * NOTE: We assume 'indexPattern' is a valid unique/prepareUnique index pattern - a pattern like
+     * { k : "hashed" } is not capable of being a unique/prepareUnique index and is an invalid
+     * argument to this method.
      */
-    bool isUniqueIndexCompatible(const BSONObj& uniqueIndexPattern) const;
-
-    /**
-     * Return an ordered list of bounds generated using this KeyPattern and the
-     * bounds from the IndexBounds.  This function is used in sharding to
-     * determine where to route queries according to the shard key pattern.
-     *
-     * Examples:
-     *
-     * Key { a: 1 }, Bounds a: [0] => { a: 0 } -> { a: 0 }
-     * Key { a: 1 }, Bounds a: [2, 3) => { a: 2 } -> { a: 3 }  // bound inclusion ignored.
-     *
-     * The bounds returned by this function may be a superset of those defined
-     * by the constraints.  For instance, if this KeyPattern is {a : 1, b: 1}
-     * Bounds: { a : {$in : [1,2]} , b : {$in : [3,4,5]} }
-     *         => {a : 1 , b : 3} -> {a : 1 , b : 5}, {a : 2 , b : 3} -> {a : 2 , b : 5}
-     *
-     * If the IndexBounds are not defined for all the fields in this keypattern, which
-     * means some fields are unsatisfied, an empty BoundList could return.
-     *
-     */
-    BoundList flattenBounds(const IndexBounds& indexBounds) const;
+    bool isIndexUniquenessCompatible(const BSONObj& indexPattern) const;
 
     /**
      * Returns true if the key pattern has an "_id" field of any flavor.
@@ -248,6 +264,10 @@ public:
         return _hasId;
     };
 
+    size_t getApproximateSize() const;
+
+    static bool isValidShardKeyElementForStorage(const BSONElement& element);
+
 private:
     KeyPattern _keyPattern;
 
@@ -255,6 +275,7 @@ private:
     std::vector<std::unique_ptr<FieldRef>> _keyPatternPaths;
 
     bool _hasId;
+    BSONElement _hashedField;
 };
 
 }  // namespace mongo

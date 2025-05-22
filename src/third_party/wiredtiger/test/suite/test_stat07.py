@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Public Domain 2014-2018 MongoDB, Inc.
+# Public Domain 2014-present MongoDB, Inc.
 # Public Domain 2008-2014 WiredTiger, Inc.
 #
 # This is free and unencumbered software released into the public domain.
@@ -71,14 +71,11 @@ class test_stat_cursor_config(wttest.WiredTigerTestCase):
             stat_cur.reset()
             while stat_cur.next() == 0:
                 [desc, pvalue, value] = stat_cur.get_values()
-                self.assertEquals(value, 0)
+                self.assertEqual(value, 0)
                 found = True
-            self.assertEquals(found, True)
+            self.assertEqual(found, True)
 
         else:
             msg = '/database statistics configuration/'
             self.assertRaisesWithMessage(wiredtiger.WiredTigerError, lambda:
                 self.session.open_cursor('statistics:session', None, config), msg)
-
-if __name__ == '__main__':
-    wttest.run()

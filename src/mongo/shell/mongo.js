@@ -1,11 +1,6 @@
 // mongo.js
 
-// NOTE 'Mongo' may be defined here or in MongoJS.cpp.  Add code to init, not to this constructor.
-if (typeof Mongo == "undefined") {
-    Mongo = function(host) {
-        this.init(host);
-    };
-}
+// Defined in mongojs.cpp
 
 if (!Mongo.prototype) {
     throw Error("Mongo.prototype not defined");
@@ -28,18 +23,24 @@ if (!Mongo.prototype.update)
         throw Error("update not implemented");
     };
 
-if (typeof mongoInject == "function") {
-    mongoInject(Mongo.prototype);
-}
-
 Mongo.prototype.setSlaveOk = function(value) {
-    if (value == undefined)
-        value = true;
-    this.slaveOk = value;
+    print(
+        "WARNING: setSlaveOk() is deprecated and may be removed in the next major release. Please use setSecondaryOk() instead.");
+    this.setSecondaryOk(value);
 };
 
 Mongo.prototype.getSlaveOk = function() {
-    return this.slaveOk || false;
+    print(
+        "WARNING: getSlaveOk() is deprecated and may be removed in the next major release. Please use getSecondaryOk() instead.");
+    return this.getSecondaryOk();
+};
+
+Mongo.prototype.setSecondaryOk = function(value = true) {
+    this.secondaryOk = value;
+};
+
+Mongo.prototype.getSecondaryOk = function() {
+    return this.secondaryOk || false;
 };
 
 Mongo.prototype.getDB = function(name) {
@@ -50,7 +51,7 @@ Mongo.prototype.getDB = function(name) {
     // There is a weird issue where typeof(db._name) !== "string" when the db name
     // is created from objects returned from native C++ methods.
     // This hack ensures that the db._name is always a string.
-    if (typeof(name) === "object") {
+    if (typeof (name) === "object") {
         name = name.toString();
     }
     return new DB(this, name);
@@ -61,7 +62,7 @@ Mongo.prototype._getDatabaseNamesFromPrivileges = function() {
 
     const ret = this.adminCommand({connectionStatus: 1, showPrivileges: 1});
     if (!ret.ok) {
-        throw _getErrorWithCode(res, "Failed to acquire database information from privileges");
+        throw _getErrorWithCode(ret, "Failed to acquire database information from privileges");
     }
 
     const privileges = (ret.authInfo || {}).authenticatedUserPrivileges;
@@ -86,55 +87,87 @@ Mongo.prototype._getDatabaseNamesFromPrivileges = function() {
 };
 
 Mongo.prototype.getDBs = function(driverSession = this._getDefaultSession(),
-                                  filter = {},
+                                  filter = undefined,
                                   nameOnly = undefined,
                                   authorizedDatabases = undefined) {
-    'use strict';
+    return function(driverSession, filter, nameOnly, authorizedDatabases) {
+        'use strict';
 
-    let cmdObj = {listDatabases: 1};
-    if (filter) {
-        cmdObj.filter = filter;
-    }
-    if (nameOnly !== undefined) {
-        cmdObj.nameOnly = nameOnly;
-    }
-    if (authorizedDatabases !== undefined) {
-        cmdObj.authorizedDatabases = authorizedDatabases;
-    }
+        const multitenancyRes = this.adminCommand({getParameter: 1, multitenancySupport: 1});
+        const multitenancy = multitenancyRes.ok && multitenancyRes["multitenancySupport"];
 
-    if (driverSession._isExplicit || !jsTest.options().disableImplicitSessions) {
-        cmdObj = driverSession._serverSession.injectSessionId(cmdObj);
-    }
-
-    const res = this.adminCommand(cmdObj);
-    if (!res.ok) {
-        // If "Unauthorized" was returned by the back end and we haven't explicitly
-        // asked for anything difficult to provide from userspace, then we can
-        // fallback on inspecting the user's permissions.
-        // This means that:
-        //   * filter should be empty, as reimplementing that logic is out of scope.
-        //   * nameOnly should not be false as we can't infer size information.
-        //   * authorizedDatabases should not be false as those are the only DBs we can infer.
-        // Note that if the above are true and we get Unauthorized, that also means
-        // that we MUST be talking to a pre-4.0 mongod.
-        if ((res.code === ErrorCodes.Unauthorized) && !filter && (nameOnly !== false) &&
-            (authorizedDatabases !== false)) {
-            return this._getDatabaseNamesFromPrivileges();
+        // Calling listDatases is only valid if we have a security token in multitenancy mode.
+        // Otherwise we call listDatabasesForAllTenants which list db.name and db.tenantId
+        // separately. The result never has a tenant prefix.
+        let cmdObj = multitenancy && !this._securityToken ? {listDatabasesForAllTenants: 1}
+                                                          : {listDatabases: 1};
+        if (filter !== undefined) {
+            cmdObj.filter = filter;
         }
-        throw _getErrorWithCode(res, "listDatabases failed:" + tojson(res));
-    }
+        if (nameOnly !== undefined) {
+            cmdObj.nameOnly = nameOnly;
+        }
+        if (authorizedDatabases !== undefined) {
+            cmdObj.authorizedDatabases = authorizedDatabases;
+        }
 
-    if (nameOnly) {
-        return res.databases.map(function(db) {
-            return db.name;
-        });
-    }
+        if (driverSession._isExplicit || !jsTest.options().disableImplicitSessions) {
+            cmdObj = driverSession._serverSession.injectSessionId(cmdObj);
+        }
 
-    return res;
+        const res = this.adminCommand(cmdObj);
+        if (!res.ok) {
+            // If "Unauthorized" was returned by the back end and we haven't explicitly
+            // asked for anything difficult to provide from userspace, then we can
+            // fallback on inspecting the user's permissions.
+            // This means that:
+            //   * filter must be undefined, as reimplementing that logic is out of scope.
+            //   * nameOnly must not be false as we can't infer size information.
+            //   * authorizedDatabases must not be false as those are the only DBs we can infer.
+            // Note that if the above are valid and we get Unauthorized, that also means
+            // that we MUST be talking to a pre-4.0 mongod.
+            //
+            // Like the server response mode, this path will return a simple list of
+            // names if nameOnly is specified as true.
+            // If nameOnly is undefined, we come as close as we can to what the
+            // server would return by supplying the databases key of the returned
+            // object.  Other information is unavailable.
+            if ((res.code === ErrorCodes.Unauthorized) && (filter === undefined) &&
+                (nameOnly !== false) && (authorizedDatabases !== false)) {
+                const names = this._getDatabaseNamesFromPrivileges();
+                if (nameOnly === true) {
+                    return names;
+                } else {
+                    return {
+                        databases: names.map(function(x) {
+                            return {name: x};
+                        }),
+                    };
+                }
+            }
+            throw _getErrorWithCode(res, "listDatabases failed:" + tojson(res));
+        }
+
+        if (nameOnly) {
+            return res.databases.map(function(db) {
+                return db.name;
+            });
+        }
+
+        return res;
+    }.call(this, driverSession, filter, nameOnly, authorizedDatabases);
 };
 
 Mongo.prototype.adminCommand = function(cmd) {
     return this.getDB("admin").runCommand(cmd);
+};
+
+Mongo.prototype._setSecurityToken = function(token) {
+    this._securityToken = token;
+};
+
+Mongo.prototype.runCommand = function(dbname, cmd, options) {
+    return this._runCommandImpl(dbname, cmd, options, this._securityToken);
 };
 
 /**
@@ -158,7 +191,7 @@ Mongo.prototype.getLogComponents = function(driverSession = this._getDefaultSess
  */
 Mongo.prototype.setLogLevel = function(
     logLevel, component, driverSession = this._getDefaultSession()) {
-    componentNames = [];
+    let componentNames = [];
     if (typeof component === "string") {
         componentNames = component.split(".");
     } else if (component !== undefined) {
@@ -211,13 +244,12 @@ Mongo.prototype.tojson = Mongo.prototype.toString;
  * @param mode {string} read preference mode to use. Pass null to disable read
  *     preference.
  * @param tagSet {Array.<Object>} optional. The list of tags to use, order matters.
- *     Note that this object only keeps a shallow copy of this array.
  */
 Mongo.prototype.setReadPref = function(mode, tagSet) {
-    if ((this._readPrefMode === "primary") && (typeof(tagSet) !== "undefined") &&
-        (Object.keys(tagSet).length > 0)) {
+    if (this._readPrefMode === "primary" && typeof tagSet !== "undefined" &&
+        Object.keys(tagSet).length > 0) {
         // we allow empty arrays/objects or no tagSet for compatibility reasons
-        throw Error("Can not supply tagSet with readPref mode primary");
+        throw Error("Cannot supply tagSet with readPref mode \"primary\"");
     }
     this._setReadPrefUnsafe(mode, tagSet);
 };
@@ -238,15 +270,19 @@ Mongo.prototype.getReadPrefTagSet = function() {
 
 // Returns a readPreference object of the type expected by mongos.
 Mongo.prototype.getReadPref = function() {
-    var obj = {}, mode, tagSet;
-    if (typeof(mode = this.getReadPrefMode()) === "string") {
+    let obj = {};
+
+    const mode = this.getReadPrefMode();
+    if (typeof (mode) === "string") {
         obj.mode = mode;
     } else {
         return null;
     }
+
     // Server Selection Spec: - if readPref mode is "primary" then the tags field MUST
     // be absent. Ensured by setReadPref.
-    if (Array.isArray(tagSet = this.getReadPrefTagSet())) {
+    const tagSet = this.getReadPrefTagSet();
+    if (Array.isArray(tagSet)) {
         obj.tags = tagSet;
     }
 
@@ -275,7 +311,7 @@ Mongo.prototype.getReadConcern = function() {
     return this._readConcernLevel;
 };
 
-connect = function(url, user, pass) {
+globalThis.connect = function(url, user, pass, apiParameters) {
     if (url instanceof MongoURI) {
         user = url.user;
         pass = url.password;
@@ -325,7 +361,23 @@ connect = function(url, user, pass) {
         safeURL = url.substring(0, protocolPos + 3) + url.substring(atPos + 1);
     }
     chatty("connecting to: " + safeURL);
-    var m = new Mongo(url);
+    try {
+        var m = new Mongo(url, undefined /* encryptedDBClientCallback */, apiParameters);
+    } catch (e) {
+        var dest;
+        if (url.indexOf(".query.mongodb.net") != -1) {
+            dest = "MongoDB Atlas Data Lake";
+        } else if (url.indexOf(".mongodb.net") != -1) {
+            dest = "MongoDB Atlas cluster";
+        }
+
+        if (dest) {
+            print(`\n\n*** You have failed to connect to a ${dest}. Please ensure` +
+                  " that your IP allowlist allows connections from your network.\n\n");
+        }
+
+        throw e;
+    }
     var db = m.getDB(m.defaultDB);
 
     if (user && pass) {
@@ -352,115 +404,15 @@ connect = function(url, user, pass) {
         if (serverVersion.slice(0, 3) != shellVersion.slice(0, 3)) {
             chatty("WARNING: shell and server versions do not match");
         }
+    } catch (e) {
+        if (e.code == ErrorCodes.Unauthorized) {
+            chatty("WARNING: shell could not get the server version: " + e.message);
+        }
     } finally {
         TestData = originalTestData;
     }
 
     return db;
-};
-
-/** deprecated, use writeMode below
- *
- */
-Mongo.prototype.useWriteCommands = function() {
-    return (this.writeMode() != "legacy");
-};
-
-Mongo.prototype.forceWriteMode = function(mode) {
-    this._writeMode = mode;
-};
-
-Mongo.prototype.hasWriteCommands = function() {
-    var hasWriteCommands = (this.getMinWireVersion() <= 2 && 2 <= this.getMaxWireVersion());
-    return hasWriteCommands;
-};
-
-Mongo.prototype.hasExplainCommand = function() {
-    var hasExplain = (this.getMinWireVersion() <= 3 && 3 <= this.getMaxWireVersion());
-    return hasExplain;
-};
-
-/**
- * {String} Returns the current mode set. Will be commands/legacy/compatibility
- *
- * Sends isMaster to determine if the connection is capable of using bulk write operations, and
- * caches the result.
- */
-
-Mongo.prototype.writeMode = function() {
-
-    if ('_writeMode' in this) {
-        return this._writeMode;
-    }
-
-    // get default from shell params
-    if (_writeMode)
-        this._writeMode = _writeMode();
-
-    // can't use "commands" mode unless server version is good.
-    if (this.hasWriteCommands()) {
-        // good with whatever is already set
-    } else if (this._writeMode == "commands") {
-        this._writeMode = "compatibility";
-    }
-
-    return this._writeMode;
-};
-
-/**
- * Returns true if the shell is configured to use find/getMore commands rather than the C++ client.
- *
- * Currently, the C++ client will always use OP_QUERY find and OP_GET_MORE.
- */
-Mongo.prototype.useReadCommands = function() {
-    return (this.readMode() === "commands");
-};
-
-/**
- * For testing, forces the shell to use the readMode specified in 'mode'. Must be either "commands"
- * (use the find/getMore commands), "legacy" (use legacy OP_QUERY/OP_GET_MORE wire protocol reads),
- * or "compatibility" (auto-detect mode based on wire version).
- */
-Mongo.prototype.forceReadMode = function(mode) {
-    if (mode !== "commands" && mode !== "compatibility" && mode !== "legacy") {
-        throw new Error("Mode must be one of {commands, compatibility, legacy}, but got: " + mode);
-    }
-
-    this._readMode = mode;
-};
-
-/**
- * Get the readMode string (either "commands" for find/getMore commands, "legacy" for OP_QUERY find
- * and OP_GET_MORE, or "compatibility" for detecting based on wire version).
- */
-Mongo.prototype.readMode = function() {
-    // Get the readMode from the shell params if we don't have one yet.
-    if (typeof _readMode === "function" && !this.hasOwnProperty("_readMode")) {
-        this._readMode = _readMode();
-    }
-
-    if (this.hasOwnProperty("_readMode") && this._readMode !== "compatibility") {
-        // We already have determined our read mode. Just return it.
-        return this._readMode;
-    } else {
-        // We're in compatibility mode. Determine whether the server supports the find/getMore
-        // commands. If it does, use commands mode. If not, degrade to legacy mode.
-        try {
-            var hasReadCommands = (this.getMinWireVersion() <= 4 && 4 <= this.getMaxWireVersion());
-            if (hasReadCommands) {
-                this._readMode = "commands";
-            } else {
-                this._readMode = "legacy";
-            }
-        } catch (e) {
-            // We failed trying to determine whether the remote node supports the find/getMore
-            // commands. In this case, we keep _readMode as "compatibility" and the shell should
-            // issue legacy reads. Next time around we will issue another isMaster to try to
-            // determine the readMode decisively.
-        }
-    }
-
-    return this._readMode;
 };
 
 //
@@ -516,8 +468,9 @@ Mongo.prototype.startSession = function startSession(options = {}) {
 
     // Only log this message if we are running a test
     if (typeof TestData === "object" && TestData.testName) {
-        jsTest.log("New session started with sessionID: " +
-                   tojson(newDriverSession.getSessionId()));
+        print("New session started with sessionID: " +
+              tojsononeline(newDriverSession.getSessionId()) +
+              " and options: " + tojsononeline(options));
     }
 
     return newDriverSession;
@@ -537,7 +490,7 @@ Mongo.prototype._getDefaultSession = function getDefaultSession() {
                     this._setDummyDefaultSession();
                 } else {
                     print("ERROR: Implicit session failed: " + e.message);
-                    throw(e);
+                    throw (e);
                 }
             }
         } else {
@@ -611,6 +564,48 @@ Mongo.prototype._extractChangeStreamOptions = function(options) {
         delete options.startAtOperationTime;
     }
 
+    if (options.hasOwnProperty("fullDocumentBeforeChange")) {
+        changeStreamOptions.fullDocumentBeforeChange = options.fullDocumentBeforeChange;
+        delete options.fullDocumentBeforeChange;
+    }
+
+    if (options.hasOwnProperty("allChangesForCluster")) {
+        changeStreamOptions.allChangesForCluster = options.allChangesForCluster;
+        delete options.allChangesForCluster;
+    }
+
+    if (options.hasOwnProperty("allowToRunOnConfigDB")) {
+        changeStreamOptions.allowToRunOnConfigDB = options.allowToRunOnConfigDB;
+        delete options.allowToRunOnConfigDB;
+    }
+
+    if (options.hasOwnProperty("allowToRunOnSystemNS")) {
+        changeStreamOptions.allowToRunOnSystemNS = options.allowToRunOnSystemNS;
+        delete options.allowToRunOnSystemNS;
+    }
+
+    if (options.hasOwnProperty("showExpandedEvents")) {
+        changeStreamOptions.showExpandedEvents = options.showExpandedEvents;
+        delete options.showExpandedEvents;
+    }
+
+    if (options.hasOwnProperty("showSystemEvents")) {
+        changeStreamOptions.showSystemEvents = options.showSystemEvents;
+        delete options.showSystemEvents;
+    }
+
+    if (options.hasOwnProperty("showRawUpdateDescription")) {
+        changeStreamOptions.showRawUpdateDescription = options.showRawUpdateDescription;
+        delete options.showRawUpdateDescription;
+    }
+
+    // If no maxAwaitTimeMS is set in the options, we set a high wait timeout, so that there won't
+    // be any issues with no data being available on the server side due to limited processing
+    // resources during testing.
+    if (!options.hasOwnProperty("maxAwaitTimeMS") && TestData && TestData.inEvergreen) {
+        options.maxAwaitTimeMS = 15 * 1000;
+    }
+
     return [{$changeStream: changeStreamOptions}, options];
 };
 
@@ -618,9 +613,8 @@ Mongo.prototype.watch = function(pipeline, options) {
     pipeline = pipeline || [];
     assert(pipeline instanceof Array, "'pipeline' argument must be an array");
 
-    let changeStreamStage;
-    [changeStreamStage, aggOptions] = this._extractChangeStreamOptions(options);
+    const [changeStreamStage, aggOptions] = this._extractChangeStreamOptions(options);
     changeStreamStage.$changeStream.allChangesForCluster = true;
-    pipeline.unshift(changeStreamStage);
-    return this.getDB("admin")._runAggregate({aggregate: 1, pipeline: pipeline}, aggOptions);
+    return this.getDB("admin")._runAggregate(
+        {aggregate: 1, pipeline: [changeStreamStage, ...pipeline]}, aggOptions);
 };

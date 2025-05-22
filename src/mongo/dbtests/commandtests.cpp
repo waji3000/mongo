@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,33 +27,53 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <absl/container/node_hash_map.h>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
 
-#include <unordered_set>
-
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
 #include "mongo/db/client.h"
-#include "mongo/db/commands.h"
-#include "mongo/db/concurrency/d_concurrency.h"
+#include "mongo/db/database_name.h"
 #include "mongo/db/dbdirectclient.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/dbtests/dbtests.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/tenant_id.h"
+#include "mongo/dbtests/dbtests.h"  // IWYU pragma: keep
+#include "mongo/logv2/log.h"
 #include "mongo/rpc/op_msg.h"
+#include "mongo/rpc/protocol.h"
+#include "mongo/rpc/reply_interface.h"
+#include "mongo/rpc/unique_message.h"
+#include "mongo/stdx/type_traits.h"
+#include "mongo/unittest/unittest.h"
+#include "mongo/util/string_map.h"
 
-using namespace mongo;
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
+namespace mongo {
 namespace CommandTests {
 
 TEST(CommandTests, InputDocumentSequeceWorksEndToEnd) {
     const auto opCtxHolder = cc().makeOperationContext();
     auto opCtx = opCtxHolder.get();
 
-    NamespaceString ns("test", "doc_seq");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("test", "doc_seq");
     DBDirectClient db(opCtx);
-    db.dropCollection(ns.ns());
-    ASSERT_EQ(db.count(ns.ns()), 0u);
+    db.dropCollection(nss);
+    ASSERT_EQ(db.count(nss), 0u);
 
     OpMsgRequest request;
-    request.body = BSON("insert" << ns.coll() << "$db" << ns.db());
+    request.body = BSON("insert" << nss.coll() << "$db" << nss.db_forTest());
     request.sequences = {{"documents",
                           {
                               BSON("_id" << 1),
@@ -67,7 +86,7 @@ TEST(CommandTests, InputDocumentSequeceWorksEndToEnd) {
     const auto reply = db.runCommand(std::move(request));
     ASSERT_EQ(int(reply->getProtocol()), int(rpc::Protocol::kOpMsg));
     ASSERT_BSONOBJ_EQ(reply->getCommandReply(), BSON("n" << 5 << "ok" << 1.0));
-    ASSERT_EQ(db.count(ns.ns()), 5u);
+    ASSERT_EQ(db.count(nss), 5u);
 }
 
 using std::string;
@@ -78,14 +97,14 @@ using std::string;
 class Base {
 public:
     Base() : db(&_opCtx) {
-        db.dropCollection(ns());
+        db.dropCollection(nss());
     }
 
-    const char* ns() {
-        return "test.testCollection";
+    NamespaceString nss() {
+        return NamespaceString::createNamespaceString_forTest("test.testCollection");
     }
-    const char* nsDb() {
-        return "test";
+    DatabaseName nsDb() {
+        return DatabaseName::createDatabaseName_forTest(boost::none, "test");
     }
     const char* nsColl() {
         return "testCollection";
@@ -100,12 +119,13 @@ public:
 namespace FileMD5 {
 struct Base {
     Base() : db(&_opCtx) {
-        db.dropCollection(ns());
-        ASSERT_OK(dbtests::createIndex(&_opCtx, ns(), BSON("files_id" << 1 << "n" << 1)));
+        db.dropCollection(nss());
+        ASSERT_OK(
+            dbtests::createIndex(&_opCtx, nss().ns_forTest(), BSON("files_id" << 1 << "n" << 1)));
     }
 
-    const char* ns() {
-        return "test.fs.chunks";
+    NamespaceString nss() {
+        return NamespaceString::createNamespaceString_forTest("test.fs.chunks");
     }
 
     const ServiceContext::UniqueOperationContext _txnPtr = cc().makeOperationContext();
@@ -120,7 +140,7 @@ struct Type0 : Base {
             b.append("files_id", 0);
             b.append("n", 0);
             b.appendBinData("data", 6, BinDataGeneral, "hello ");
-            db.insert(ns(), b.obj());
+            db.insert(nss(), b.obj());
         }
         {
             BSONObjBuilder b;
@@ -128,12 +148,14 @@ struct Type0 : Base {
             b.append("files_id", 0);
             b.append("n", 1);
             b.appendBinData("data", 5, BinDataGeneral, "world");
-            db.insert(ns(), b.obj());
+            db.insert(nss(), b.obj());
         }
 
         BSONObj result;
-        ASSERT(db.runCommand("test", BSON("filemd5" << 0), result));
-        ASSERT_EQUALS(string("5eb63bbbe01eeed093cb22bb8f5acdc3"), result["md5"].valuestr());
+        ASSERT(db.runCommand(DatabaseName::createDatabaseName_forTest(boost::none, "test"),
+                             BSON("filemd5" << 0),
+                             result));
+        ASSERT_EQUALS(string("5eb63bbbe01eeed093cb22bb8f5acdc3"), result.getStringField("md5"));
     }
 };
 struct Type2 : Base {
@@ -144,7 +166,7 @@ struct Type2 : Base {
             b.append("files_id", 0);
             b.append("n", 0);
             b.appendBinDataArrayDeprecated("data", "hello ", 6);
-            db.insert(ns(), b.obj());
+            db.insert(nss(), b.obj());
         }
         {
             BSONObjBuilder b;
@@ -152,15 +174,17 @@ struct Type2 : Base {
             b.append("files_id", 0);
             b.append("n", 1);
             b.appendBinDataArrayDeprecated("data", "world", 5);
-            db.insert(ns(), b.obj());
+            db.insert(nss(), b.obj());
         }
 
         BSONObj result;
-        ASSERT(db.runCommand("test", BSON("filemd5" << 0), result));
-        ASSERT_EQUALS(string("5eb63bbbe01eeed093cb22bb8f5acdc3"), result["md5"].valuestr());
+        ASSERT(db.runCommand(DatabaseName::createDatabaseName_forTest(boost::none, "test"),
+                             BSON("filemd5" << 0),
+                             result));
+        ASSERT_EQUALS(string("5eb63bbbe01eeed093cb22bb8f5acdc3"), result.getStringField("md5"));
     }
 };
-}
+}  // namespace FileMD5
 
 namespace SymbolArgument {
 // SERVER-16260
@@ -171,14 +195,14 @@ namespace SymbolArgument {
 class Drop : Base {
 public:
     void run() {
-        ASSERT(db.createCollection(ns()));
+        ASSERT(db.createCollection(nss()));
         {
             BSONObjBuilder cmd;
             cmd.appendSymbol("drop", nsColl());  // Use Symbol for SERVER-16260
 
             BSONObj result;
             bool ok = db.runCommand(nsDb(), cmd.obj(), result);
-            log() << result.jsonString();
+            LOGV2(24181, "{result_jsonString}", "result_jsonString"_attr = result.jsonString());
             ASSERT(ok);
         }
     }
@@ -187,7 +211,7 @@ public:
 class DropIndexes : Base {
 public:
     void run() {
-        ASSERT(db.createCollection(ns()));
+        ASSERT(db.createCollection(nss()));
 
         BSONObjBuilder cmd;
         cmd.appendSymbol("dropIndexes", nsColl());  // Use Symbol for SERVER-16260
@@ -195,7 +219,7 @@ public:
 
         BSONObj result;
         bool ok = db.runCommand(nsDb(), cmd.obj(), result);
-        log() << result.jsonString();
+        LOGV2(24182, "{result_jsonString}", "result_jsonString"_attr = result.jsonString());
         ASSERT(ok);
     }
 };
@@ -203,7 +227,7 @@ public:
 class CreateIndexWithNoKey : Base {
 public:
     void run() {
-        ASSERT(db.createCollection(ns()));
+        ASSERT(db.createCollection(nss()));
 
         BSONObjBuilder indexSpec;
 
@@ -216,7 +240,7 @@ public:
 
         BSONObj result;
         bool ok = db.runCommand(nsDb(), cmd.obj(), result);
-        log() << result.jsonString();
+        LOGV2(24183, "{result_jsonString}", "result_jsonString"_attr = result.jsonString());
         ASSERT(!ok);
     }
 };
@@ -224,7 +248,7 @@ public:
 class CreateIndexWithDuplicateKey : Base {
 public:
     void run() {
-        ASSERT(db.createCollection(ns()));
+        ASSERT(db.createCollection(nss()));
 
         BSONObjBuilder indexSpec;
         indexSpec.append("key", BSON("a" << 1 << "a" << 1 << "b" << 1));
@@ -238,7 +262,30 @@ public:
 
         BSONObj result;
         bool ok = db.runCommand(nsDb(), cmd.obj(), result);
-        log() << result.jsonString();
+        LOGV2(24184, "{result_jsonString}", "result_jsonString"_attr = result.jsonString());
+        ASSERT(!ok);
+    }
+};
+
+
+class CreateIndexWithEmptyStringAsValue : Base {
+public:
+    void run() {
+        ASSERT(db.createCollection(nss()));
+
+        BSONObjBuilder indexSpec;
+        indexSpec.append("key", BSON("a" << ""));
+
+        BSONArrayBuilder indexes;
+        indexes.append(indexSpec.obj());
+
+        BSONObjBuilder cmd;
+        cmd.append("createIndexes", nsColl());
+        cmd.append("indexes", indexes.arr());
+
+        BSONObj result;
+        bool ok = db.runCommand(nsDb(), cmd.obj(), result);
+        LOGV2(24185, "{result_jsonString}", "result_jsonString"_attr = result.jsonString());
         ASSERT(!ok);
     }
 };
@@ -246,13 +293,13 @@ public:
 class FindAndModify : Base {
 public:
     void run() {
-        ASSERT(db.createCollection(ns()));
+        ASSERT(db.createCollection(nss()));
         {
             BSONObjBuilder b;
             b.genOID();
             b.append("name", "Tom");
             b.append("rating", 0);
-            db.insert(ns(), b.obj());
+            db.insert(nss(), b.obj());
         }
 
         BSONObjBuilder cmd;
@@ -262,81 +309,11 @@ public:
 
         BSONObj result;
         bool ok = db.runCommand(nsDb(), cmd.obj(), result);
-        log() << result.jsonString();
+        LOGV2(24186, "{result_jsonString}", "result_jsonString"_attr = result.jsonString());
         ASSERT(ok);
         // TODO(kangas) test that Tom's score is 1
     }
 };
-
-class GeoSearch : Base {
-public:
-    void run() {
-        // Subset of geo_haystack1.js
-
-        int n = 0;
-        for (int x = 0; x < 20; x++) {
-            for (int y = 0; y < 20; y++) {
-                db.insert(ns(), BSON("_id" << n << "loc" << BSON_ARRAY(x << y) << "z" << n % 5));
-                n++;
-            }
-        }
-
-        // Build geoHaystack index. Can's use db.ensureIndex, no way to pass "bucketSize".
-        // So run createIndexes command instead.
-        //
-        // Shell example:
-        // t.ensureIndex( { loc : "geoHaystack" , z : 1 }, { bucketSize : .7 } );
-
-        {
-            BSONObjBuilder cmd;
-            cmd.append("createIndexes", nsColl());
-            cmd.append("indexes",
-                       BSON_ARRAY(BSON("key" << BSON("loc"
-                                                     << "geoHaystack"
-                                                     << "z"
-                                                     << 1.0)
-                                             << "name"
-                                             << "loc_geoHaystack_z_1"
-                                             << "bucketSize"
-                                             << static_cast<double>(0.7))));
-
-            BSONObj result;
-            ASSERT(db.runCommand(nsDb(), cmd.obj(), result));
-        }
-
-        {
-            BSONObjBuilder cmd;
-            cmd.appendSymbol("geoSearch", nsColl());  // Use Symbol for SERVER-16260
-            cmd.append("near", BSON_ARRAY(7 << 8));
-            cmd.append("maxDistance", 3);
-            cmd.append("search", BSON("z" << 3));
-
-            BSONObj result;
-            bool ok = db.runCommand(nsDb(), cmd.obj(), result);
-            log() << result.jsonString();
-            ASSERT(ok);
-        }
-    }
-};
-
-class Touch : Base {
-public:
-    void run() {
-        ASSERT(db.createCollection(ns()));
-        {
-            BSONObjBuilder cmd;
-            cmd.appendSymbol("touch", nsColl());  // Use Symbol for SERVER-16260
-            cmd.append("data", true);
-            cmd.append("index", true);
-
-            BSONObj result;
-            bool ok = db.runCommand(nsDb(), cmd.obj(), result);
-            log() << result.jsonString();
-            ASSERT(ok || result["code"].Int() == ErrorCodes::CommandNotSupported);
-        }
-    }
-};
-
 }  // namespace SymbolArgument
 
 /**
@@ -349,32 +326,33 @@ public:
         bool ok = db.runCommand(nsDb(), BSON("rolesInfo" << 1), result);
         ASSERT(ok);
 
-        stdx::unordered_set<std::string> observedFields;
+        StringSet observedFields;
         for (const auto& field : result) {
-            ASSERT(observedFields.find(field) == observedFields.end());
+            ASSERT(observedFields.find(field.fieldNameStringData()) == observedFields.end());
             observedFields.insert(field);
         }
     }
 };
 
-class All : public Suite {
+class All : public unittest::OldStyleSuiteSpecification {
 public:
-    All() : Suite("commands") {}
+    All() : OldStyleSuiteSpecification("commands") {}
 
-    void setupTests() {
+    void setupTests() override {
         add<FileMD5::Type0>();
         add<FileMD5::Type2>();
         add<FileMD5::Type2>();
         add<SymbolArgument::DropIndexes>();
         add<SymbolArgument::FindAndModify>();
-        add<SymbolArgument::Touch>();
         add<SymbolArgument::Drop>();
-        add<SymbolArgument::GeoSearch>();
         add<SymbolArgument::CreateIndexWithNoKey>();
         add<SymbolArgument::CreateIndexWithDuplicateKey>();
+        add<SymbolArgument::CreateIndexWithEmptyStringAsValue>();
         add<RolesInfoShouldNotReturnDuplicateFieldNames>();
     }
 };
 
-SuiteInstance<All> all;
-}
+unittest::OldStyleSuiteInitializer<All> all;
+
+}  // namespace CommandTests
+}  // namespace mongo

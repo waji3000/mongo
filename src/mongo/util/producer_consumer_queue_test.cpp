@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,20 +27,30 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <array>
+#include <boost/move/utility_core.hpp>
+#include <fmt/format.h>
+#include <ostream>
+#include <thread>
+#include <tuple>
+#include <type_traits>
 
-#include "mongo/unittest/unittest.h"
+#include <boost/optional/optional.hpp>
 
-#include "mongo/util/producer_consumer_queue.h"
-
+#include "mongo/base/string_data.h"
+#include "mongo/db/client.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/service_context.h"
-#include "mongo/stdx/condition_variable.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/stdx/thread.h"
+#include "mongo/unittest/unittest.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/clock_source.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/producer_consumer_queue.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo {
-
 namespace {
 
 using namespace producer_consumer_queue_detail;
@@ -57,7 +66,7 @@ public:
     template <typename Callback>
     stdx::thread runThread(StringData name, Callback&& cb) {
         return stdx::thread([this, name, cb] {
-            auto client = _serviceCtx->makeClient(name.toString());
+            auto client = _serviceCtx->getService()->makeClient(name.toString());
             auto opCtx = client->makeOperationContext();
 
             cb(opCtx.get());
@@ -84,7 +93,7 @@ public:
     template <typename Callback>
     stdx::thread runThread(StringData name, Callback&& cb) {
         return stdx::thread([this, name, cb] {
-            auto client = _serviceCtx->makeClient(name.toString());
+            auto client = _serviceCtx->getService()->makeClient(name.toString());
             auto opCtx = client->makeOperationContext();
 
             opCtx->runWithDeadline(
@@ -107,24 +116,24 @@ private:
 template <bool requiresMultiProducer, bool requiresMultiConsumer, typename Callback>
 std::enable_if_t<!requiresMultiProducer && !requiresMultiConsumer> runCallbackWithPerms(
     Callback&& cb) {
-    std::forward<Callback>(cb)(std::true_type{}, std::true_type{});
-    std::forward<Callback>(cb)(std::true_type{}, std::false_type{});
-    std::forward<Callback>(cb)(std::false_type{}, std::true_type{});
-    std::forward<Callback>(cb)(std::false_type{}, std::false_type{});
+    cb(std::true_type{}, std::true_type{});
+    cb(std::true_type{}, std::false_type{});
+    cb(std::false_type{}, std::true_type{});
+    cb(std::false_type{}, std::false_type{});
 }
 
 template <bool requiresMultiProducer, bool requiresMultiConsumer, typename Callback>
 std::enable_if_t<requiresMultiProducer && !requiresMultiConsumer> runCallbackWithPerms(
     Callback&& cb) {
-    std::forward<Callback>(cb)(std::true_type{}, std::true_type{});
-    std::forward<Callback>(cb)(std::true_type{}, std::false_type{});
+    cb(std::true_type{}, std::true_type{});
+    cb(std::true_type{}, std::false_type{});
 }
 
 template <bool requiresMultiProducer, bool requiresMultiConsumer, typename Callback>
 std::enable_if_t<!requiresMultiProducer && requiresMultiConsumer> runCallbackWithPerms(
     Callback&& cb) {
-    std::forward<Callback>(cb)(std::true_type{}, std::true_type{});
-    std::forward<Callback>(cb)(std::false_type{}, std::true_type{});
+    cb(std::true_type{}, std::true_type{});
+    cb(std::false_type{}, std::true_type{});
 }
 
 template <bool requiresMultiProducer, bool requiresMultiConsumer, typename Callback>
@@ -135,6 +144,8 @@ std::enable_if_t<requiresMultiProducer && requiresMultiConsumer> runCallbackWith
 
 class ProducerConsumerQueueTest : public unittest::Test {
 public:
+    ProducerConsumerQueueTest() = default;
+
     template <bool requiresMultiProducer, bool requiresMultiConsumer, typename Callback>
     void runPermutations(Callback&& callback) {
         runCallbackWithPerms<requiresMultiProducer, requiresMultiConsumer>([&](auto x_, auto y_) {
@@ -222,7 +233,7 @@ private:
         __VA_ARGS__(name##CB{});                \
     }                                           \
     template <typename Helper>                  \
-    void name##CB::operator()(Helper&& helper)
+    void name##CB::operator()(Helper && helper)
 
 PRODUCER_CONSUMER_QUEUE_TEST(basicPushPop, runPermutations<false, false>) {
     typename Helper::template ProducerConsumerQueue<MoveOnly> pcq{};
@@ -275,11 +286,14 @@ PRODUCER_CONSUMER_QUEUE_TEST(closeProducerEndImmediate, runPermutations<false, f
 
                        ASSERT_THROWS_CODE(
                            pcq.pop(opCtx), DBException, ErrorCodes::ProducerConsumerQueueConsumed);
+                       ASSERT_THROWS_CODE(pcq.waitForNonEmpty(opCtx),
+                                          DBException,
+                                          ErrorCodes::ProducerConsumerQueueConsumed);
                    })
         .join();
 }
 
-PRODUCER_CONSUMER_QUEUE_TEST(closeProducerEndBlocking, runPermutations<false, false>) {
+PRODUCER_CONSUMER_QUEUE_TEST(closeProducerEndBlockingPop, runPermutations<false, false>) {
     typename Helper::template ProducerConsumerQueue<MoveOnly> pcq{};
 
     auto consumer = helper.runThread("Consumer", [&](OperationContext* opCtx) {
@@ -291,23 +305,61 @@ PRODUCER_CONSUMER_QUEUE_TEST(closeProducerEndBlocking, runPermutations<false, fa
     consumer.join();
 }
 
+PRODUCER_CONSUMER_QUEUE_TEST(closeProducerEndBlockingWaitForNonEmpty,
+                             runPermutations<false, false>) {
+    typename Helper::template ProducerConsumerQueue<MoveOnly> pcq{};
+
+    auto consumer = helper.runThread("Consumer", [&](OperationContext* opCtx) {
+        ASSERT_THROWS_CODE(
+            pcq.waitForNonEmpty(opCtx), DBException, ErrorCodes::ProducerConsumerQueueConsumed);
+    });
+
+    pcq.closeProducerEnd();
+
+    consumer.join();
+}
+
 PRODUCER_CONSUMER_QUEUE_TEST(popsWithTimeout, runTimeoutPermutations<false, false>) {
+    typename Helper::template ProducerConsumerQueue<MoveOnly> pcq{};
+
+    helper
+        .runThread(
+            "Consumer",
+            [&](OperationContext* opCtx) {
+                ASSERT_THROWS_CODE(pcq.pop(opCtx), DBException, ErrorCodes::ExceededTimeLimit);
+
+                ASSERT_THROWS_CODE(pcq.popMany(opCtx), DBException, ErrorCodes::ExceededTimeLimit);
+
+                ASSERT_THROWS_CODE(
+                    pcq.popManyUpTo(1000, opCtx), DBException, ErrorCodes::ExceededTimeLimit);
+            })
+        .join();
+
+    ASSERT_EQUALS(pcq.getStats().queueDepth, 0ul);
+}
+
+PRODUCER_CONSUMER_QUEUE_TEST(waitForNonEmptyBasic, runPermutations<false, false>) {
+    typename Helper::template ProducerConsumerQueue<MoveOnly> pcq{};
+
+    helper.runThread("Producer", [&](OperationContext* opCtx) { pcq.push(MoveOnly(1), opCtx); })
+        .join();
+
+    ASSERT_EQUALS(pcq.getStats().queueDepth, 1ul);
+
+    helper.runThread("Consumer", [&](OperationContext* opCtx) { pcq.waitForNonEmpty(opCtx); })
+        .join();
+
+    ASSERT_EQUALS(pcq.getStats().queueDepth, 1ul);
+}
+
+PRODUCER_CONSUMER_QUEUE_TEST(waitForNonEmptyWithTimeout, runTimeoutPermutations<false, false>) {
     typename Helper::template ProducerConsumerQueue<MoveOnly> pcq{};
 
     helper
         .runThread("Consumer",
                    [&](OperationContext* opCtx) {
                        ASSERT_THROWS_CODE(
-                           pcq.pop(opCtx), DBException, ErrorCodes::ExceededTimeLimit);
-
-                       std::vector<MoveOnly> vec;
-                       ASSERT_THROWS_CODE(pcq.popMany(std::back_inserter(vec), opCtx),
-                                          DBException,
-                                          ErrorCodes::ExceededTimeLimit);
-
-                       ASSERT_THROWS_CODE(pcq.popManyUpTo(1000, std::back_inserter(vec), opCtx),
-                                          DBException,
-                                          ErrorCodes::ExceededTimeLimit);
+                           pcq.waitForNonEmpty(opCtx), DBException, ErrorCodes::ExceededTimeLimit);
                    })
         .join();
 
@@ -323,7 +375,7 @@ PRODUCER_CONSUMER_QUEUE_TEST(pushesWithTimeout, runTimeoutPermutations<false, fa
     {
         MoveOnly mo(1);
         pcq.push(std::move(mo));
-        ASSERT(mo.movedFrom());
+        ASSERT(mo.movedFrom());  // NOLINT(bugprone-use-after-move)
     }
 
     helper
@@ -508,9 +560,8 @@ PRODUCER_CONSUMER_QUEUE_TEST(popManyPopWithBlocking, runPermutations<false, fals
 
     auto consumer = helper.runThread("Consumer", [&](OperationContext* opCtx) {
         for (int i = 0; i < 10; i = i + 2) {
-            std::vector<MoveOnly> out;
-
-            pcq.popMany(std::back_inserter(out), opCtx);
+            std::deque<MoveOnly> out;
+            std::tie(out, std::ignore) = pcq.popMany(opCtx);
 
             ASSERT_EQUALS(out.size(), 2ul);
             ASSERT_EQUALS(out[0], MoveOnly(i));
@@ -543,10 +594,10 @@ PRODUCER_CONSUMER_QUEUE_TEST(popManyUpToPopWithBlocking, runPermutations<false, 
 
     auto consumer = helper.runThread("Consumer", [&](OperationContext* opCtx) {
         for (int i = 0; i < 10; i = i + 2) {
-            std::vector<MoveOnly> out;
-
+            std::deque<MoveOnly> out;
             size_t spent;
-            std::tie(spent, std::ignore) = pcq.popManyUpTo(2, std::back_inserter(out), opCtx);
+
+            std::tie(out, spent) = pcq.popManyUpTo(2, opCtx);
 
             ASSERT_EQUALS(spent, 2ul);
             ASSERT_EQUALS(out.size(), 2ul);
@@ -578,32 +629,41 @@ PRODUCER_CONSUMER_QUEUE_TEST(popManyUpToPopWithBlockingWithSpecialCost,
 
     auto consumer = helper.runThread("Consumer", [&](OperationContext* opCtx) {
         {
-            std::vector<MoveOnly> out;
+            std::deque<MoveOnly> out;
             size_t spent;
-            std::tie(spent, std::ignore) = pcq.popManyUpTo(5, std::back_inserter(out), opCtx);
+            std::tie(out, spent) = pcq.popManyUpTo(5, opCtx);
 
-            ASSERT_EQUALS(spent, 6ul);
-            ASSERT_EQUALS(out.size(), 3ul);
+            ASSERT_EQUALS(spent, 3ul);
+            ASSERT_EQUALS(out.size(), 2ul);
             ASSERT_EQUALS(out[0], MoveOnly(1));
             ASSERT_EQUALS(out[1], MoveOnly(2));
-            ASSERT_EQUALS(out[2], MoveOnly(3));
         }
 
         {
-            std::vector<MoveOnly> out;
+            std::deque<MoveOnly> out;
             size_t spent;
-            std::tie(spent, std::ignore) = pcq.popManyUpTo(15, std::back_inserter(out), opCtx);
+            std::tie(out, spent) = pcq.popManyUpTo(15, opCtx);
 
-            ASSERT_EQUALS(spent, 9ul);
-            ASSERT_EQUALS(out.size(), 2ul);
-            ASSERT_EQUALS(out[0], MoveOnly(4));
-            ASSERT_EQUALS(out[1], MoveOnly(5));
+            ASSERT_EQUALS(spent, 12ul);
+            ASSERT_EQUALS(out.size(), 3ul);
+            ASSERT_EQUALS(out[0], MoveOnly(3));
+            ASSERT_EQUALS(out[1], MoveOnly(4));
+            ASSERT_EQUALS(out[2], MoveOnly(5));
+        }
+
+        {
+            std::deque<MoveOnly> out;
+            size_t spent;
+            std::tie(out, spent) = pcq.popManyUpTo(5, opCtx);
+
+            ASSERT_EQUALS(spent, 0ul);
+            ASSERT_EQUALS(out.size(), 0ul);
         }
     });
 
     auto producer = helper.runThread("Producer", [&](OperationContext* opCtx) {
         std::vector<MoveOnly> vec;
-        for (int i = 1; i < 6; ++i) {
+        for (int i = 1; i <= 6; ++i) {
             vec.emplace_back(MoveOnly(i));
         }
 
@@ -613,7 +673,7 @@ PRODUCER_CONSUMER_QUEUE_TEST(popManyUpToPopWithBlockingWithSpecialCost,
     consumer.join();
     producer.join();
 
-    ASSERT_EQUALS(pcq.getStats().queueDepth, 0ul);
+    ASSERT_EQUALS(pcq.getStats().queueDepth, 6ul);
 }
 
 PRODUCER_CONSUMER_QUEUE_TEST(singleProducerMultiConsumer, runPermutations<false, true>) {
@@ -808,9 +868,15 @@ PRODUCER_CONSUMER_QUEUE_TEST(pipeCompiles, runPermutations<false, false>) {
     //
     // At some point this was working with a single move, and this pattern helped me catch some
     // lifetime screw ups
-    auto producer = [](auto p) { return std::move(p); }(std::move(pipe.producer));
-    auto controller = [](auto c) { return std::move(c); }(std::move(pipe.controller));
-    auto consumer = [](auto c) { return std::move(c); }(std::move(pipe.consumer));
+    auto producer = [](auto p) {
+        return std::move(p);
+    }(std::move(pipe.producer));
+    auto controller = [](auto c) {
+        return std::move(c);
+    }(std::move(pipe.controller));
+    auto consumer = [](auto c) {
+        return std::move(c);
+    }(std::move(pipe.consumer));
 
     producer.push(MoveOnly(1));
     std::array<MoveOnly, 1> container({MoveOnly(1)});
@@ -818,9 +884,8 @@ PRODUCER_CONSUMER_QUEUE_TEST(pipeCompiles, runPermutations<false, false>) {
     ASSERT(producer.tryPush(MoveOnly(1)));
 
     ASSERT_EQUALS(consumer.pop(), MoveOnly(1));
-    std::vector<MoveOnly> out;
-    ASSERT_EQUALS(consumer.popManyUpTo(1ul, std::back_inserter(out)).first, 1ul);
-    ASSERT_EQUALS(consumer.popMany(std::back_inserter(out)).first, 1ul);
+    ASSERT_EQUALS(consumer.popManyUpTo(1ul).second, 1ul);
+    ASSERT_EQUALS(consumer.popMany().second, 1ul);
     ASSERT_FALSE(consumer.tryPop());
 
     producer.close();
@@ -859,7 +924,7 @@ PRODUCER_CONSUMER_QUEUE_TEST(pipeProducerEndClosesAfterProducersLeave,
     ASSERT_EQUALS(consumer.pop(), MoveOnly(2));
 
     auto thread3 =
-        helper.runThread("Producer3", [producer = std::move(producer)](OperationContext * opCtx) {
+        helper.runThread("Producer3", [producer = std::move(producer)](OperationContext* opCtx) {
             producer.push(MoveOnly(3), opCtx);
         });
 
@@ -880,7 +945,7 @@ PRODUCER_CONSUMER_QUEUE_TEST(pipeConsumerEndClosesAfterConsumersLeave,
         helper.runThread("Consumer2", [consumer](OperationContext* opCtx) { consumer.pop(opCtx); });
 
     auto thread3 =
-        helper.runThread("Consumer3", [consumer = std::move(consumer)](OperationContext * opCtx) {
+        helper.runThread("Consumer3", [consumer = std::move(consumer)](OperationContext* opCtx) {
             consumer.pop(opCtx);
         });
 

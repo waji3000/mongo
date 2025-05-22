@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,19 +27,30 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
-
-#include "mongo/platform/basic.h"
-
-#include "mongo/scripting/mozjs/engine.h"
-
+#include <absl/meta/type_traits.h>
+#include <boost/filesystem/operations.hpp>
+#include <boost/filesystem/path.hpp>
+#include <boost/optional/optional.hpp>
+#include <cstdint>
+#include <fmt/format.h>
+#include <js-config.h>
 #include <js/Initialization.h>
+#include <utility>
+#include <vector>
 
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/server_parameters.h"
+#include "mongo/db/service_context.h"
+#include "mongo/logv2/log.h"
+#include "mongo/platform/compiler.h"
+#include "mongo/scripting/mozjs/engine.h"
+#include "mongo/scripting/mozjs/engine_gen.h"
 #include "mongo/scripting/mozjs/implscope.h"
 #include "mongo/scripting/mozjs/proxyscope.h"
-#include "mongo/util/log.h"
+#include "mongo/util/assert_util.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 namespace js {
 void DisableExtraThreads();
@@ -49,18 +59,15 @@ void DisableExtraThreads();
 namespace mongo {
 
 namespace {
+auto operationMozJSScopeDecoration = OperationContext::declareDecoration<mozjs::MozJSImplScope*>();
+}
 
-MONGO_EXPORT_SERVER_PARAMETER(disableJavaScriptJIT, bool, true);
-MONGO_EXPORT_SERVER_PARAMETER(javascriptProtection, bool, false);
-MONGO_EXPORT_SERVER_PARAMETER(jsHeapLimitMB, int, 1100);
-
-}  // namespace
-
-void ScriptEngine::setup() {
-    if (getGlobalScriptEngine())
+void ScriptEngine::setup(ExecutionEnvironment environment) {
+    if (getGlobalScriptEngine()) {
         return;
+    }
 
-    setGlobalScriptEngine(new mozjs::MozJSScriptEngine());
+    setGlobalScriptEngine(new mozjs::MozJSScriptEngine(environment));
 
     if (hasGlobalServiceContext()) {
         getGlobalServiceContext()->registerKillOpListener(getGlobalScriptEngine());
@@ -68,12 +75,13 @@ void ScriptEngine::setup() {
 }
 
 std::string ScriptEngine::getInterpreterVersionString() {
-    return "MozJS-" BOOST_PP_STRINGIZE(MOZJS_MAJOR_VERSION);
+    return fmt::format("MozJS-{}", MOZJS_MAJOR_VERSION);
 }
 
 namespace mozjs {
 
-MozJSScriptEngine::MozJSScriptEngine() {
+MozJSScriptEngine::MozJSScriptEngine(ExecutionEnvironment environment)
+    : _executionEnvironment(environment), _loadPath(boost::filesystem::current_path().string()) {
     uassert(ErrorCodes::JSInterpreterFailure, "Failed to JS_Init()", JS_Init());
     js::DisableExtraThreads();
 }
@@ -86,94 +94,81 @@ mongo::Scope* MozJSScriptEngine::createScope() {
     return new MozJSProxyScope(this);
 }
 
-mongo::Scope* MozJSScriptEngine::createScopeForCurrentThread() {
-    return new MozJSImplScope(this);
+mongo::Scope* MozJSScriptEngine::createScopeForCurrentThread(boost::optional<int> jsHeapLimitMB) {
+    return new MozJSImplScope(this, jsHeapLimitMB);
 }
 
-void MozJSScriptEngine::interrupt(unsigned opId) {
-    stdx::lock_guard<stdx::mutex> intLock(_globalInterruptLock);
-    OpIdToScopeMap::iterator iScope = _opToScopeMap.find(opId);
-    if (iScope == _opToScopeMap.end()) {
-        // got interrupt request for a scope that no longer exists
-        LOG(1) << "received interrupt request for unknown op: " << opId << printKnownOps_inlock();
-        return;
+void MozJSScriptEngine::interrupt(ClientLock&, OperationContext* opCtx) {
+    if (opCtx && (*opCtx)[operationMozJSScopeDecoration]) {
+        (*opCtx)[operationMozJSScopeDecoration]->kill();
+        LOGV2_DEBUG(22808, 2, "Interrupting op", "opId"_attr = opCtx->getOpID());
+    } else if (opCtx) {
+        LOGV2_DEBUG(
+            22790, 2, "Received interrupt request for unknown op", "opId"_attr = opCtx->getOpID());
+    } else {
+        LOGV2_DEBUG(8972600, 2, "Received interrupt request for unknown op without opId");
     }
-
-    LOG(1) << "interrupting op: " << opId << printKnownOps_inlock();
-    iScope->second->kill();
 }
 
-std::string MozJSScriptEngine::printKnownOps_inlock() {
-    str::stream out;
-
-    if (shouldLog(logger::LogSeverity::Debug(2))) {
-        out << "  known ops: \n";
-
-        for (auto&& iSc : _opToScopeMap) {
-            out << "  " << iSc.first << "\n";
+void MozJSScriptEngine::interruptAll(ServiceContextLock& svcCtxLock) {
+    ServiceContext::LockedClientsCursor cursor(&*svcCtxLock);
+    while (auto client = cursor.next()) {
+        stdx::lock_guard lk(*client);
+        if (auto opCtx = client->getOperationContext();
+            opCtx && (*opCtx)[operationMozJSScopeDecoration]) {
+            (*opCtx)[operationMozJSScopeDecoration]->kill();
         }
     }
-
-    return out;
-}
-
-void MozJSScriptEngine::interruptAll() {
-    stdx::lock_guard<stdx::mutex> interruptLock(_globalInterruptLock);
-
-    for (auto&& iScope : _opToScopeMap) {
-        iScope.second->kill();
-    }
-}
-
-void MozJSScriptEngine::enableJIT(bool value) {
-    disableJavaScriptJIT.store(!value);
-}
-
-bool MozJSScriptEngine::isJITEnabled() const {
-    return !disableJavaScriptJIT.load();
 }
 
 void MozJSScriptEngine::enableJavaScriptProtection(bool value) {
-    javascriptProtection.store(value);
+    gJavascriptProtection.store(value);
 }
 
 bool MozJSScriptEngine::isJavaScriptProtectionEnabled() const {
-    return javascriptProtection.load();
+    return gJavascriptProtection.load();
 }
 
 int MozJSScriptEngine::getJSHeapLimitMB() const {
-    return jsHeapLimitMB.load();
+    return gJSHeapLimitMB.load();
 }
 
 void MozJSScriptEngine::setJSHeapLimitMB(int limit) {
-    jsHeapLimitMB.store(limit);
+    gJSHeapLimitMB.store(limit);
+}
+
+std::string MozJSScriptEngine::getLoadPath() const {
+    return _loadPath;
+}
+
+void MozJSScriptEngine::setLoadPath(const std::string& loadPath) {
+    _loadPath = loadPath;
 }
 
 void MozJSScriptEngine::registerOperation(OperationContext* opCtx, MozJSImplScope* scope) {
-    stdx::lock_guard<stdx::mutex> giLock(_globalInterruptLock);
+    LOGV2_DEBUG(22785,
+                2,
+                "scope registered for op",
+                "scope"_attr = reinterpret_cast<uint64_t>(scope),
+                "opId"_attr = opCtx->getOpID());
 
-    auto opId = opCtx->getOpID();
+    stdx::lock_guard lk(*opCtx->getClient());
+    (*opCtx)[operationMozJSScopeDecoration] = scope;
 
-    _opToScopeMap[opId] = scope;
-
-    LOG(2) << "SMScope " << static_cast<const void*>(scope) << " registered for op " << opId;
-    Status status = opCtx->checkForInterruptNoAssert();
-    if (!status.isOK()) {
+    if (auto status = opCtx->checkForInterruptNoAssert(); !status.isOK()) {
         scope->kill();
     }
 }
 
-void MozJSScriptEngine::unregisterOperation(unsigned int opId) {
-    stdx::lock_guard<stdx::mutex> giLock(_globalInterruptLock);
+void MozJSScriptEngine::unregisterOperation(OperationContext* opCtx) {
+    LOGV2_DEBUG(22786,
+                2,
+                "scope unregistered for op",
+                "scope"_attr = reinterpret_cast<uint64_t>(this),
+                "opId"_attr = opCtx->getOpID());
 
-    LOG(2) << "ImplScope " << static_cast<const void*>(this) << " unregistered for op " << opId;
-
-    if (opId != 0) {
-        // scope is currently associated with an operation id
-        auto it = _opToScopeMap.find(opId);
-        if (it != _opToScopeMap.end())
-            _opToScopeMap.erase(it);
-    }
+    stdx::lock_guard lk(*opCtx->getClient());
+    (*opCtx)[operationMozJSScopeDecoration] = nullptr;
 }
 
 }  // namespace mozjs

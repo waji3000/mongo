@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Public Domain 2014-2018 MongoDB, Inc.
+# Public Domain 2014-present MongoDB, Inc.
 # Public Domain 2008-2014 WiredTiger, Inc.
 #
 # This is free and unencumbered software released into the public domain.
@@ -55,7 +55,7 @@ def expectException(expr):
         raise Exception("missing expected exception")
 
 context = Context()
-conn = wiredtiger_open("WT_TEST", "create,cache_size=1G")
+conn = context.wiredtiger_open("create,cache_size=1G")
 s = conn.open_session()
 tname0 = tablename(0)
 tname1 = tablename(1)
@@ -66,7 +66,8 @@ ops = Operation(Operation.OP_INSERT, Table(tname0), Key(Key.KEYGEN_APPEND, 10), 
 workload = Workload(context, Thread(ops))
 
 print('RUN1')
-workload.run(conn)
+ret = workload.run(conn)
+assert ret == 0, ret
 show(tname0)
 
 # The context has memory of how many keys are in all the tables.
@@ -78,12 +79,13 @@ s.truncate(tname0, None, None)
 op = Operation(Operation.OP_INSERT, Table(tname0), Key(Key.KEYGEN_APPEND, 10), Value(100))
 op2 = Operation(Operation.OP_INSERT, Table(tname1), Key(Key.KEYGEN_APPEND, 20), Value(30))
 o = op2 * 10
-print 'op is: ' + str(op)
-print 'multiplying op is: ' + str(o)
+print('op is: ' + str(op))
+print('multiplying op is: ' + str(o))
 thread0 = Thread(o + op + op)
 workload = Workload(context, thread0)
 print('RUN2')
-workload.run(conn)
+ret = workload.run(conn)
+assert ret == 0, ret
 show(tname0)
 show(tname1)
 
@@ -97,7 +99,8 @@ op += Operation(Operation.OP_INSERT, Table(tname0), Key(Key.KEYGEN_APPEND, 10), 
 thread0 = Thread(op * 10 + op2 * 20)
 workload = Workload(context, thread0)
 print('RUN3')
-workload.run(conn)
+ret = workload.run(conn)
+assert ret == 0, ret
 show(tname0)
 show(tname1)
 

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,18 +27,25 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <js/Array.h>
+#include <js/Object.h>
+#include <js/RootingAPI.h>
+#include <js/ValueArray.h>
+#include <string>
 
-#include "mongo/scripting/mozjs/nativefunction.h"
+#include <js/CallArgs.h>
+#include <js/PropertySpec.h>
+#include <js/TypeDecls.h>
 
-#include <cstdio>
-
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/scripting/mozjs/implscope.h"
+#include "mongo/scripting/mozjs/nativefunction.h"
 #include "mongo/scripting/mozjs/objectwrapper.h"
 #include "mongo/scripting/mozjs/valuereader.h"
-#include "mongo/scripting/mozjs/valuewriter.h"
-#include "mongo/scripting/mozjs/wrapconstrainedmethod.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/scripting/mozjs/wrapconstrainedmethod.h"  // IWYU pragma: keep
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 namespace mozjs {
@@ -48,7 +54,8 @@ const char* const NativeFunctionInfo::inheritFrom = "Function";
 const char* const NativeFunctionInfo::className = "NativeFunction";
 
 const JSFunctionSpec NativeFunctionInfo::methods[2] = {
-    MONGO_ATTACH_JS_CONSTRAINED_METHOD(toString, NativeFunctionInfo), JS_FS_END,
+    MONGO_ATTACH_JS_CONSTRAINED_METHOD(toString, NativeFunctionInfo),
+    JS_FS_END,
 };
 
 namespace {
@@ -65,7 +72,8 @@ public:
 };
 
 NativeHolder* getHolder(JS::CallArgs args) {
-    return static_cast<NativeHolder*>(JS_GetPrivate(&args.callee()));
+    return JS::GetMaybePtrFromReservedSlot<NativeHolder>(&args.callee(),
+                                                         NativeFunctionInfo::NativeHolderSlot);
 }
 
 }  // namespace
@@ -79,9 +87,9 @@ void NativeFunctionInfo::call(JSContext* cx, JS::CallArgs args) {
         return;
     }
 
-    JS::RootedObject robj(cx, JS_NewArrayObject(cx, args));
+    JS::RootedObject robj(cx, JS::NewArrayObject(cx, args));
     if (!robj) {
-        uasserted(ErrorCodes::JSInterpreterFailure, "Failed to JS_NewArrayObject");
+        uasserted(ErrorCodes::JSInterpreterFailure, "Failed to JS::NewArrayObject");
     }
 
     BSONObj out = holder->_func(ObjectWrapper(cx, robj).toBSON(), holder->_ctx);
@@ -89,11 +97,11 @@ void NativeFunctionInfo::call(JSContext* cx, JS::CallArgs args) {
     ValueReader(cx, args.rval()).fromBSONElement(out.firstElement(), out, false);
 }
 
-void NativeFunctionInfo::finalize(JSFreeOp* fop, JSObject* obj) {
-    auto holder = static_cast<NativeHolder*>(JS_GetPrivate(obj));
+void NativeFunctionInfo::finalize(JS::GCContext* gcCtx, JSObject* obj) {
+    auto holder = JS::GetMaybePtrFromReservedSlot<NativeHolder>(obj, NativeHolderSlot);
 
     if (holder)
-        getScope(fop)->trackedDelete(holder);
+        getScope(gcCtx)->trackedDelete(holder);
 }
 
 void NativeFunctionInfo::Functions::toString::call(JSContext* cx, JS::CallArgs args) {
@@ -113,8 +121,8 @@ void NativeFunctionInfo::make(JSContext* cx,
     auto scope = getScope(cx);
 
     scope->getProto<NativeFunctionInfo>().newObject(obj);
-
-    JS_SetPrivate(obj, scope->trackedNew<NativeHolder>(function, data));
+    JS::SetReservedSlot(
+        obj, NativeHolderSlot, JS::PrivateValue(scope->trackedNew<NativeHolder>(function, data)));
 }
 
 }  // namespace mozjs

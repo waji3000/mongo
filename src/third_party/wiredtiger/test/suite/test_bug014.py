@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Public Domain 2014-2018 MongoDB, Inc.
+# Public Domain 2014-present MongoDB, Inc.
 # Public Domain 2008-2014 WiredTiger, Inc.
 #
 # This is free and unencumbered software released into the public domain.
@@ -26,18 +26,29 @@
 # ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
 # OTHER DEALINGS IN THE SOFTWARE.
 
-import wiredtiger, wttest
+import wttest
 from wtdataset import SimpleDataSet
+from wtscenario import make_scenarios
 from helper import copy_wiredtiger_home
 
 # test_bug014.py
 #    JIRA WT-2115: fast-delete pages can be incorrectly lost due to a crash.
 class test_bug014(wttest.WiredTigerTestCase):
+    key_format_values = [
+        ('column', dict(key_format='r', value_format='S')),
+        ('column_fix', dict(key_format='r', value_format='8t')),
+        ('row_string', dict(key_format='S', value_format='S')),
+    ]
+
+    scenarios = make_scenarios(key_format_values)
+
     def test_bug014(self):
         # Populate a table with 1000 keys on small pages.
         uri = 'table:test_bug014'
         ds = SimpleDataSet(self, uri, 1000,
-                           config='allocation_size=512,leaf_page_max=512')
+            key_format=self.key_format, value_format=self.value_format,
+            config='allocation_size=512,leaf_page_max=512')
+
         ds.populate()
 
         # Reopen it so we can fast-delete pages.
@@ -59,7 +70,7 @@ class test_bug014(wttest.WiredTigerTestCase):
         ckpt_session.close()
 
         # Simulate a crash by copying to a new directory.
-        copy_wiredtiger_home(".", "RESTART")
+        copy_wiredtiger_home(self, ".", "RESTART")
 
         # Open the new directory.
         conn = self.setUpConnectionOpen("RESTART")
@@ -72,6 +83,3 @@ class test_bug014(wttest.WiredTigerTestCase):
             self.assertEqual(cursor.search(), 0)
 
         conn.close()
-
-if __name__ == '__main__':
-    wttest.run()

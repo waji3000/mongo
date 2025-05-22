@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,9 +27,8 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include "mongo/bson/bson_depth.h"
+#include "mongo/bson/util/builder_fwd.h"
 #include "mongo/db/pipeline/field_path.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/assert_util.h"
@@ -39,7 +37,6 @@ namespace mongo {
 namespace {
 
 using std::string;
-using std::vector;
 
 /** FieldPath constructed from empty string. */
 TEST(FieldPathTest, Empty) {
@@ -188,6 +185,65 @@ TEST(FieldPathTest, ConstructorAssertsOnDeeplyNestedArrayPath) {
     ASSERT_THROWS_CODE(makeArrayFieldPathOfDepth(BSONDepth::getMaxAllowableDepth() + 1),
                        AssertionException,
                        ErrorCodes::Overflow);
+}
+
+// Test FieldPath::getSubpath().
+TEST(FieldPathTest, GetSubpath) {
+    FieldPath path = FieldPath("foo.bar.baz");
+    ASSERT_EQUALS("foo", path.getSubpath(0));
+    ASSERT_EQUALS("foo.bar", path.getSubpath(1));
+    ASSERT_EQUALS("foo.bar.baz", path.getSubpath(2));
+}
+
+void checkConcatWorks(const FieldPath& head, const FieldPath& tail) {
+    FieldPath concat = head.concat(tail);
+    ASSERT(concat == FieldPath::getFullyQualifiedPath(head.fullPath(), tail.fullPath()));
+    ASSERT_EQ(concat.getPathLength(), head.getPathLength() + tail.getPathLength());
+
+    const auto expectedTail = head.getPathLength() == 1
+        ? tail
+        : FieldPath::getFullyQualifiedPath(head.tail().fullPath(), tail.fullPath());
+    ASSERT(FieldPath(concat.tail()) == expectedTail);
+
+    ASSERT_EQ(concat.front(), head.front());
+    ASSERT_EQ(concat.back(), tail.back());
+    for (size_t i = 0; i < concat.getPathLength(); i++) {
+        const auto expected = (i < head.getPathLength())
+            ? head.getFieldName(i)
+            : tail.getFieldName(i - head.getPathLength());
+        ASSERT_EQ(concat.getFieldName(i), expected);
+    }
+}
+
+TEST(FieldPathTest, Concat) {
+    checkConcatWorks("abc", "cde");
+    checkConcatWorks("abc.ef", "cde.ab");
+    checkConcatWorks("abc.$id", "cde");
+    checkConcatWorks("abc", "$id.x");
+    checkConcatWorks("some.long.path.with.many.parts", "another.long.ish.path");
+    checkConcatWorks("$db", "$id");
+    checkConcatWorks("$db.$id", "$id.$db");
+}
+
+TEST(FieldPathTest, ConcatFailsIfExceedsMaxDepth) {
+    std::string firstHalfStr;
+    std::string secondHalfStr;
+    int pathLength = 201;
+    int firstHalfMax = 99;
+    int secondHalfMax = pathLength - 1;
+    for (int i = 0; i <= firstHalfMax; ++i) {
+        firstHalfStr.append(std::to_string(pathLength - i));
+        firstHalfStr.append(".");
+    }
+    firstHalfStr.append(std::to_string(firstHalfMax + 1));
+    for (int i = 101; i < secondHalfMax; ++i) {
+        secondHalfStr.append(std::to_string(pathLength - i));
+        secondHalfStr.append(".");
+    }
+    secondHalfStr.append(std::to_string(pathLength));
+    FieldPath firstHalf(firstHalfStr);
+    FieldPath secondHalf(secondHalfStr);
+    ASSERT_THROWS_CODE(firstHalf.concat(secondHalf), AssertionException, ErrorCodes::Overflow);
 }
 }  // namespace
 }  // namespace mongo

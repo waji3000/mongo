@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -32,14 +31,17 @@
 
 #include <type_traits>
 
+#include "mongo/base/error_codes.h"
 #include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/duration.h"
 #include "mongo/util/functional.h"
+#include "mongo/util/lockable_adapter.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
 
-class Date_t;
+class Waitable;
 
 /**
  * An interface for getting the current wall clock time.
@@ -48,14 +50,54 @@ class ClockSource {
     // We need a type trait to differentiate waitable ptr args from predicates.
     //
     // This returns true for non-pointers and function pointers
-    template <typename Pred>
-    struct CouldBePredicate
-        : public std::integral_constant<bool,
-                                        !std::is_pointer<Pred>::value ||
-                                            std::is_function<std::remove_pointer_t<Pred>>::value> {
+    template <typename PredicateT>
+    struct CouldBePredicate : public std::integral_constant<
+                                  bool,
+                                  !std::is_pointer<PredicateT>::value ||
+                                      std::is_function<std::remove_pointer_t<PredicateT>>::value> {
     };
 
+    static constexpr auto kMaxTimeoutForArtificialClocks = Seconds(1);
+
 public:
+    /**
+     * A StopWatch tracks the time that its ClockSource believes has passed since the creation of
+     * the StopWatch or since 'restart' has been invoked.
+     *
+     * For microsecond accurate metrics, use a Timer instead.
+     */
+    class StopWatch {
+    public:
+        StopWatch(ClockSource* clockSource, Date_t start)
+            : _clockSource{clockSource}, _start{start} {}
+        StopWatch(ClockSource* clockSource) : StopWatch(clockSource, clockSource->now()) {}
+        StopWatch(/** SystemClockSource::get() */);
+
+        Date_t now() {
+            return _clockSource->now();
+        }
+
+        ClockSource* getClockSource() noexcept {
+            return _clockSource;
+        }
+
+        auto start() const noexcept {
+            return _start;
+        }
+
+        auto elapsed() {
+            return now() - _start;
+        }
+
+        auto restart() {
+            _start = now();
+        }
+
+    private:
+        ClockSource* _clockSource;
+        Date_t _start;
+    };
+
     virtual ~ClockSource() = default;
 
     /**
@@ -69,13 +111,13 @@ public:
     virtual Date_t now() = 0;
 
     /**
-     * Schedules "action" to run sometime after this clock source reaches "when".
+     * Schedules `action` to run sometime after this clock source reaches `when`.
      *
-     * Returns InternalError if this clock source does not implement setAlarm. May also
-     * return ShutdownInProgress during shutdown. Other errors are also allowed.
+     * Throws `InternalError` if this clock source does not implement `setAlarm`. May also throw
+     * other errors.
      */
-    virtual Status setAlarm(Date_t when, unique_function<void()> action) {
-        return {ErrorCodes::InternalError, "This clock source does not implement setAlarm."};
+    virtual void setAlarm(Date_t when, unique_function<void()> action) {
+        iasserted({ErrorCodes::InternalError, "This clock source does not implement setAlarm."});
     }
 
     /**
@@ -90,9 +132,13 @@ public:
     /**
      * Like cv.wait_until(m, deadline), but uses this ClockSource instead of
      * stdx::chrono::system_clock to measure the passage of time.
+     *
+     * Note that this can suffer spurious wakeups like cw.wait_until() and, when used with a mocked
+     * clock source, may sleep in system time for kMaxTimeoutForArtificialClocks due to unfortunate
+     * implementation details.
      */
     stdx::cv_status waitForConditionUntil(stdx::condition_variable& cv,
-                                          stdx::unique_lock<stdx::mutex>& m,
+                                          BasicLockableAdapter m,
                                           Date_t deadline,
                                           Waitable* waitable = nullptr);
 
@@ -100,11 +146,13 @@ public:
      * Like cv.wait_until(m, deadline, pred), but uses this ClockSource instead of
      * stdx::chrono::system_clock to measure the passage of time.
      */
-    template <typename Pred, std::enable_if_t<CouldBePredicate<Pred>::value, int> = 0>
+    template <typename LockT,
+              typename PredicateT,
+              std::enable_if_t<CouldBePredicate<PredicateT>::value, int> = 0>
     bool waitForConditionUntil(stdx::condition_variable& cv,
-                               stdx::unique_lock<stdx::mutex>& m,
+                               LockT& m,
                                Date_t deadline,
-                               const Pred& pred,
+                               const PredicateT& pred,
                                Waitable* waitable = nullptr) {
         while (!pred()) {
             if (waitForConditionUntil(cv, m, deadline, waitable) == stdx::cv_status::timeout) {
@@ -118,15 +166,23 @@ public:
      * Like cv.wait_for(m, duration, pred), but uses this ClockSource instead of
      * stdx::chrono::system_clock to measure the passage of time.
      */
-    template <typename Duration,
-              typename Pred,
-              std::enable_if_t<CouldBePredicate<Pred>::value, int> = 0>
+    template <typename LockT,
+              typename Duration,
+              typename PredicateT,
+              std::enable_if_t<CouldBePredicate<PredicateT>::value, int> = 0>
     bool waitForConditionFor(stdx::condition_variable& cv,
-                             stdx::unique_lock<stdx::mutex>& m,
+                             LockT& m,
                              Duration duration,
-                             const Pred& pred,
+                             const PredicateT& pred,
                              Waitable* waitable = nullptr) {
         return waitForConditionUntil(cv, m, now() + duration, pred, waitable);
+    }
+
+    /**
+     * Return a StopWatch that uses this ClockSource to track time
+     */
+    StopWatch makeStopWatch() {
+        return StopWatch(this);
     }
 
 protected:

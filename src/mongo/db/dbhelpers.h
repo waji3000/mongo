@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,20 +29,22 @@
 
 #pragma once
 
-#include <boost/filesystem/path.hpp>
 #include <memory>
 
+#include "mongo/base/status.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/query/write_ops/update_result.h"
 #include "mongo/db/record_id.h"
-#include "mongo/db/storage/data_protector.h"
 
 namespace mongo {
 
 class Collection;
+class CollectionPtr;
 class Database;
-class DataProtector;
 class OperationContext;
-class QueryRequest;
+class FindCommandRequest;
+class CollectionAcquisition;
 
 /**
  * db helpers are helper functions and classes that let us easily manipulate the local
@@ -52,51 +53,53 @@ class QueryRequest;
  * all helpers assume locking is handled above them
  */
 struct Helpers {
-    class RemoveSaver;
-
-    /* fetch a single object from collection ns that matches query.
-       set your db SavedContext first.
-
-       @param query - the query to perform.  note this is the low level portion of query so
-                      "orderby : ..." won't work.
-
-       @param requireIndex if true, assert if no index for the query.  a way to guard against
-       writing a slow query.
-
-       @return true if object found
-    */
+    /**
+     * Executes the given match expression ('query') and returns true if there is at least one
+     * matching document. The first found matching document is returned via the 'result' output
+     * parameter.
+     *
+     * Performs the read successfully regardless of a replica set node's state, meaning that the
+     * node does not need to be primary or secondary.
+     */
     static bool findOne(OperationContext* opCtx,
-                        Collection* collection,
+                        const CollectionPtr& collection,
                         const BSONObj& query,
-                        BSONObj& result,
-                        bool requireIndex = false);
-
-    static RecordId findOne(OperationContext* opCtx,
-                            Collection* collection,
-                            const BSONObj& query,
-                            bool requireIndex);
-
-    static RecordId findOne(OperationContext* opCtx,
-                            Collection* collection,
-                            std::unique_ptr<QueryRequest> qr,
-                            bool requireIndex);
+                        BSONObj& result);
 
     /**
-     * @param foundIndex if passed in will be set to 1 if ns and index found
-     * @return true if object found
+     * If `invariantOnError` is true, an error (e.g: no document found) will crash the process.
+     * Otherwise the empty BSONObj will be returned.
+     */
+    static BSONObj findOneForTesting(OperationContext* opCtx,
+                                     const CollectionPtr& collection,
+                                     const BSONObj& query,
+                                     bool invariantOnError = true);
+
+    /**
+     * Similar to the 'findOne()' overload above, except returns the RecordId of the first matching
+     * document, or a null RecordId if no such document exists.
+     */
+    static RecordId findOne(OperationContext* opCtx,
+                            const CollectionPtr& collection,
+                            const BSONObj& query);
+    static RecordId findOne(OperationContext* opCtx,
+                            const CollectionPtr& collection,
+                            std::unique_ptr<FindCommandRequest> qr);
+
+    /**
+     * Returns true if a matching document was found.
      */
     static bool findById(OperationContext* opCtx,
-                         Database* db,
-                         StringData ns,
+                         const NamespaceString& nss,
                          BSONObj query,
-                         BSONObj& result,
-                         bool* nsFound = 0,
-                         bool* indexFound = 0);
+                         BSONObj& result);
 
     /* TODO: should this move into Collection?
      * uasserts if no _id index.
      * @return null loc if not found */
-    static RecordId findById(OperationContext* opCtx, Collection* collection, const BSONObj& query);
+    static RecordId findById(OperationContext* opCtx,
+                             const CollectionPtr& collection,
+                             const BSONObj& query);
 
     /**
      * Get the first object generated from a forward natural-order scan on "ns".  Callers do not
@@ -107,28 +110,59 @@ struct Helpers {
      *
      * Returns false if there is no such object.
      */
-    static bool getSingleton(OperationContext* opCtx, const char* ns, BSONObj& result);
+    static bool getSingleton(OperationContext* opCtx, const NamespaceString& nss, BSONObj& result);
 
     /**
      * Same as getSingleton, but with a reverse natural-order scan on "ns".
      */
-    static bool getLast(OperationContext* opCtx, const char* ns, BSONObj& result);
+    static bool getLast(OperationContext* opCtx, const NamespaceString& nss, BSONObj& result);
 
     /**
      * Performs an upsert of "obj" into the collection "ns", with an empty update predicate.
      * Callers must have "ns" locked.
      */
-    static void putSingleton(OperationContext* opCtx, const char* ns, BSONObj obj);
+    static void putSingleton(OperationContext* opCtx, CollectionAcquisition& coll, BSONObj obj);
 
     /**
-     * you have to lock
+     * Callers are expected to hold the collection lock.
      * you do not have to have Context set
      * o has to have an _id field or will assert
      */
-    static void upsert(OperationContext* opCtx,
-                       const std::string& ns,
-                       const BSONObj& o,
+    static UpdateResult upsert(OperationContext* opCtx,
+                               CollectionAcquisition& coll,
+                               const BSONObj& o,
+                               bool fromMigrate = false);
+
+    /**
+     * Performs an upsert of 'updateMod' if we don't match the given 'filter'.
+     * Callers are expected to hold the collection lock.
+     * Note: Query yielding is turned off, so both read and writes are performed
+     * on the same storage snapshot.
+     */
+    static UpdateResult upsert(OperationContext* opCtx,
+                               CollectionAcquisition& coll,
+                               const BSONObj& filter,
+                               const BSONObj& updateMod,
+                               bool fromMigrate = false);
+
+    /**
+     * Performs an update of 'updateMod' for the entry matching the given 'filter'.
+     * Callers are expected to hold the collection lock.
+     * Note: Query yielding is turned off, so both read and writes are performed
+     * on the same storage snapshot.
+     */
+    static void update(OperationContext* opCtx,
+                       CollectionAcquisition& coll,
+                       const BSONObj& filter,
+                       const BSONObj& updateMod,
                        bool fromMigrate = false);
+
+    /**
+     * Inserts document 'doc' into collection 'coll'.
+     */
+    static Status insert(OperationContext* opCtx,
+                         const CollectionAcquisition& coll,
+                         const BSONObj& doc);
 
     // TODO: this should be somewhere else probably
     /* Takes object o, and returns a new object with the
@@ -149,47 +183,25 @@ struct Helpers {
      * You do not need to set the database before calling.
      * Does not oplog the operation.
      */
-    static void emptyCollection(OperationContext* opCtx, const NamespaceString& nss);
+    static void emptyCollection(OperationContext* opCtx, const CollectionAcquisition& coll);
 
-    /**
-     * for saving deleted bson objects to a flat file
+    /*
+     * Finds the doc and then runs a no-op update by running an update using the doc just read. Used
+     * in order to force a conflict if a concurrent storage transaction writes to the doc we're
+     * reading.
+     *
+     * This no-op update has no associated timestamp. This results in a mixed-mode update chain
+     * within WT that is problematic with durable history. Callers must not commit the
+     * `WriteUnitOfWork` when there are no other writes that set the timestamp.
+     *
+     * Callers must hold the collection lock in MODE_IX.
+     * Uasserts if no _id index.
+     * Returns true if object found
      */
-    class RemoveSaver {
-        MONGO_DISALLOW_COPYING(RemoveSaver);
-
-    public:
-        RemoveSaver(const std::string& type, const std::string& ns, const std::string& why);
-        ~RemoveSaver();
-
-        /**
-         * Writes document to file. File is created lazily before writing the first document.
-         * Returns error status if the file could not be created or if there were errors writing
-         * to the file.
-         */
-        Status goingToDelete(const BSONObj& o);
-
-        /**
-         * A path object describing the directory containing the file with deleted documents.
-         */
-        const auto& root() const& {
-            return _root;
-        }
-        void root() && = delete;
-
-        /**
-         * A path object describing the actual file containing BSON documents.
-         */
-        const auto& file() const& {
-            return _file;
-        }
-        void file() && = delete;
-
-    private:
-        boost::filesystem::path _root;
-        boost::filesystem::path _file;
-        std::unique_ptr<DataProtector> _protector;
-        std::unique_ptr<std::ostream> _out;
-    };
+    static bool findByIdAndNoopUpdate(OperationContext* opCtx,
+                                      const CollectionPtr& collection,
+                                      const BSONObj& idQuery,
+                                      BSONObj& result);
 };
 
 }  // namespace mongo

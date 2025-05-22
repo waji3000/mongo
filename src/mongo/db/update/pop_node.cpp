@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,16 +27,21 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
 
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsontypes.h"
 #include "mongo/db/update/pop_node.h"
-
-#include "mongo/db/matcher/expression_parser.h"
+#include "mongo/db/update/storage_validation.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
 Status PopNode::init(BSONElement modExpr, const boost::intrusive_ptr<ExpressionContext>& expCtx) {
-    auto popVal = MatchExpressionParser::parseIntegerElementToLong(modExpr);
+    auto popVal = modExpr.parseIntegerElementToLong();
     if (!popVal.isOK()) {
         return popVal.getStatus();
     }
@@ -49,14 +53,13 @@ Status PopNode::init(BSONElement modExpr, const boost::intrusive_ptr<ExpressionC
     return Status::OK();
 }
 
-ModifierNode::ModifyResult PopNode::updateExistingElement(
-    mutablebson::Element* element, std::shared_ptr<FieldRef> elementPath) const {
+ModifierNode::ModifyResult PopNode::updateExistingElement(mutablebson::Element* element,
+                                                          const FieldRef& elementPath) const {
     invariant(element->ok());
     uassert(ErrorCodes::TypeMismatch,
-            str::stream() << "Path '" << elementPath->dottedField()
+            str::stream() << "Path '" << elementPath.dottedField()
                           << "' contains an element of non-array type '"
-                          << typeName(element->getType())
-                          << "'",
+                          << typeName(element->getType()) << "'",
             element->getType() == BSONType::Array);
 
     if (!element->hasChildren()) {
@@ -74,11 +77,22 @@ void PopNode::validateUpdate(mutablebson::ConstElement updatedElement,
                              mutablebson::ConstElement leftSibling,
                              mutablebson::ConstElement rightSibling,
                              std::uint32_t recursionLevel,
-                             ModifyResult modifyResult) const {
-    invariant(modifyResult == ModifyResult::kNormalUpdate);
+                             ModifyResult modifyResult,
+                             const bool validateForStorage,
+                             bool* containsDotsAndDollarsField) const {
+    invariant(modifyResult.type == ModifyResult::kNormalUpdate);
 
     // Removing elements from an array cannot increase BSON depth or modify a DBRef, so we can
-    // override validateUpdate to do nothing.
+    // override validateUpdate to not validate storage constraints but we still want to know if
+    // there is any field name containing '.'/'$'.
+    bool doRecursiveCheck = true;
+    storage_validation::scanDocument(updatedElement,
+                                     doRecursiveCheck,
+                                     recursionLevel,
+                                     false, /* allowTopLevelDollarPrefixedFields */
+                                     false, /* Should validate for storage */
+                                     false, /* isEmbeddedInIdField */
+                                     containsDotsAndDollarsField);
 }
 
 }  // namespace mongo

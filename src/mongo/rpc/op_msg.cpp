@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,21 +27,43 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
-
-#include "mongo/platform/basic.h"
-
-#include "mongo/rpc/op_msg.h"
 
 #include <bitset>
+#include <boost/cstdint.hpp>
+#include <fmt/format.h>
+#include <memory>
 #include <set>
 
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+
 #include "mongo/base/data_type_endian.h"
-#include "mongo/db/bson/dotted_path_support.h"
-#include "mongo/rpc/object_check.h"
+#include "mongo/base/data_type_validated.h"
+#include "mongo/base/data_view.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/dotted_path/dotted_path_support.h"
+#include "mongo/config.h"  // IWYU pragma: keep
+#include "mongo/db/feature_flag.h"
+#include "mongo/db/multitenancy_gen.h"
+#include "mongo/db/server_feature_flags_gen.h"
+#include "mongo/db/server_options.h"
+#include "mongo/db/tenant_id.h"
+#include "mongo/logv2/log.h"
+#include "mongo/rpc/object_check.h"  // IWYU pragma: keep
+#include "mongo/rpc/op_msg.h"
 #include "mongo/util/bufreader.h"
+#include "mongo/util/database_name_util.h"
+#include "mongo/util/debug_util.h"
 #include "mongo/util/hex.h"
-#include "mongo/util/log.h"
+#include "mongo/util/str.h"
+
+#ifdef MONGO_CONFIG_WIREDTIGER_ENABLED
+#include <wiredtiger.h>
+#endif
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
+
 
 namespace mongo {
 namespace {
@@ -57,8 +78,23 @@ bool containsUnknownRequiredFlags(uint32_t flags) {
 enum class Section : uint8_t {
     kBody = 0,
     kDocSequence = 1,
+    kSecurityToken = 2,
 };
 
+constexpr int kCrc32Size = 4;
+
+#ifdef MONGO_CONFIG_WIREDTIGER_ENABLED
+// All fields including size, requestId, and responseTo must already be set. The size must
+// already include the final 4-byte checksum.
+uint32_t calculateChecksum(const Message& message) {
+    if (message.operation() != dbMsg) {
+        return 0;
+    }
+
+    invariant(OpMsg::isFlagSet(message, OpMsg::kChecksumPresent));
+    return wiredtiger_crc32c_func()(message.singleData().view2ptr(), message.size() - kCrc32Size);
+}
+#endif  // MONGO_CONFIG_WIREDTIGER_ENABLED
 }  // namespace
 
 uint32_t OpMsg::flags(const Message& message) {
@@ -77,7 +113,39 @@ void OpMsg::replaceFlags(Message* message, uint32_t flags) {
     DataView(message->singleData().data()).write<LittleEndian<uint32_t>>(flags);
 }
 
-OpMsg OpMsg::parse(const Message& message) try {
+uint32_t OpMsg::getChecksum(const Message& message) {
+    invariant(message.operation() == dbMsg);
+    invariant(isFlagSet(message, kChecksumPresent));
+    uassert(51252,
+            "Invalid message size for an OpMsg containing a checksum",
+            // Check that the message size is at least the size of a crc-32 checksum and
+            // the 32-bit flags section.
+            message.dataSize() > static_cast<int>(kCrc32Size + sizeof(uint32_t)));
+    return BufReader(message.singleData().view2ptr() + message.size() - kCrc32Size, kCrc32Size)
+        .read<LittleEndian<uint32_t>>();
+}
+
+void OpMsg::appendChecksum(Message* message) {
+#ifdef MONGO_CONFIG_WIREDTIGER_ENABLED
+    if (message->operation() != dbMsg) {
+        return;
+    }
+
+    invariant(!isFlagSet(*message, kChecksumPresent));
+    setFlag(message, kChecksumPresent);
+    const size_t newSize = message->size() + kCrc32Size;
+    if (message->capacity() < newSize) {
+        message->realloc(newSize);
+    }
+
+    // Everything before the checksum, including the final size, is covered by the checksum.
+    message->header().setLen(newSize);
+    DataView(message->singleData().view2ptr() + newSize - kCrc32Size)
+        .write<LittleEndian<uint32_t>>(calculateChecksum(*message));
+#endif
+}
+
+OpMsg OpMsg::parse(const Message& message, Client* client) try {
     // It is the caller's responsibility to call the correct parser for a given message type.
     invariant(!message.empty());
     invariant(message.operation() == dbMsg);
@@ -88,17 +156,24 @@ OpMsg OpMsg::parse(const Message& message) try {
                           << std::bitset<32>(flags).to_string(),
             !containsUnknownRequiredFlags(flags));
 
-    constexpr int kCrc32Size = 4;
-    const bool haveChecksum = flags & kChecksumPresent;
-    const int checksumSize = haveChecksum ? kCrc32Size : 0;
+    auto dataSize = message.dataSize() - sizeof(flags);
+    boost::optional<uint32_t> checksum;
+    if (flags & kChecksumPresent) {
+        checksum = getChecksum(message);
+        uassert(51251,
+                "Invalid message size for an OpMsg containing a checksum",
+                dataSize > kCrc32Size);
+        dataSize -= kCrc32Size;
+    }
 
     // The sections begin after the flags and before the checksum (if present).
-    BufReader sectionsBuf(message.singleData().data() + sizeof(flags),
-                          message.dataSize() - sizeof(flags) - checksumSize);
+    BufReader sectionsBuf(message.singleData().data() + sizeof(flags), dataSize);
 
-    // TODO some validation may make more sense in the IDL parser. I've tagged them with comments.
+    // TODO some validation may make more sense in the IDL parser. I've tagged them with
+    // comments.
     bool haveBody = false;
     OpMsg msg;
+    StringData securityToken;
     while (!sectionsBuf.atEof()) {
         const auto sectionKind = sectionsBuf.read<Section>();
         switch (sectionKind) {
@@ -110,9 +185,10 @@ OpMsg OpMsg::parse(const Message& message) try {
             }
 
             case Section::kDocSequence: {
-                // We use an O(N^2) algorithm here and an O(N*M) algorithm below. These are fastest
-                // for the current small values of N, but would be problematic if it is large.
-                // If we need more document sequences, raise the limit and use a better algorithm.
+                // We use an O(N^2) algorithm here and an O(N*M) algorithm below. These are
+                // fastest for the current small values of N, but would be problematic if it is
+                // large. If we need more document sequences, raise the limit and use a better
+                // algorithm.
                 uassert(ErrorCodes::TooManyDocumentSequences,
                         "Too many document sequences in OP_MSG",
                         msg.sequences.size() < 2);  // Limit is <=2 since we are about to add one.
@@ -133,6 +209,16 @@ OpMsg OpMsg::parse(const Message& message) try {
                 break;
             }
 
+            case Section::kSecurityToken: {
+                // if op_msg is parsed by mongoBridge, bridge has a backup check since multitenancy
+                // should be false
+                uassert(ErrorCodes::Unauthorized,
+                        "Unsupported Security Token provided",
+                        gMultitenancySupport || serverGlobalParams.isMongoBridge);
+                securityToken = sectionsBuf.readCStr();
+                break;
+            }
+
             default:
                 // Using uint32_t so we append as a decimal number rather than as a char.
                 uasserted(40432, str::stream() << "Unknown section kind " << uint32_t(sectionKind));
@@ -145,31 +231,149 @@ OpMsg OpMsg::parse(const Message& message) try {
     // Technically this is O(N*M) but N is at most 2.
     for (const auto& docSeq : msg.sequences) {
         const char* name = docSeq.name.c_str();  // Pointer is redirected by next call.
-        auto inBody =
-            !dotted_path_support::extractElementAtPathOrArrayAlongPath(msg.body, name).eoo();
+        auto inBody = !bson::extractElementAtOrArrayAlongDottedPath(msg.body, name).eoo();
         uassert(40433,
                 str::stream() << "Duplicate field between body and document sequence "
                               << docSeq.name,
                 !inBody);
     }
 
+#ifdef MONGO_CONFIG_WIREDTIGER_ENABLED
+    if (checksum) {
+        uassert(ErrorCodes::ChecksumMismatch,
+                "OP_MSG checksum does not match contents",
+                *checksum == calculateChecksum(message));
+    }
+#endif
+    if (gMultitenancySupport) {
+        msg.validatedTenancyScope =
+            auth::ValidatedTenancyScopeFactory::parse(client, securityToken);
+    }
+
     return msg;
 } catch (const DBException& ex) {
-    LOG(1) << "invalid message: " << ex.code() << " " << redact(ex) << " -- "
-           << redact(hexdump(message.singleData().view2ptr(), message.size()));
+    LOGV2_DEBUG(
+        22632,
+        1,
+        "invalid message: {ex_code} {ex} -- {hexdump_message_singleData_view2ptr_message_size}",
+        "ex_code"_attr = ex.code(),
+        "ex"_attr = redact(ex),
+        // Using std::min to reduce the size of the output and ensure we do not throw in hexdump()
+        // because of the exceeded length.
+        "hexdump_message_singleData_view2ptr_message_size"_attr =
+            redact(hexdump(message.singleData().view2ptr(),
+                           std::min(static_cast<size_t>(message.size()), kHexDumpMaxSize - 1))));
     throw;
 }
 
-Message OpMsg::serialize() const {
-    OpMsgBuilder builder;
+DatabaseName OpMsgRequest::parseDbName() const {
+    auto elem = body["$db"];
+    uassert(40571, "OP_MSG requests require a $db argument", !elem.eoo());
+
+    auto dbName = elem.checkAndGetStringData();
+    return DatabaseNameUtil::deserialize(getValidatedTenantId(), dbName, getSerializationContext());
+}
+
+SerializationContext OpMsgRequest::getSerializationContext() const {
+    if (!gMultitenancySupport) {
+        return SerializationContext::stateDefault();
+    }
+    auto serializationCtx = SerializationContext::stateCommandRequest();
+    if (validatedTenancyScope) {
+        serializationCtx.setPrefixState(validatedTenancyScope->isFromAtlasProxy());
+    }
+    return serializationCtx;
+}
+
+namespace {
+std::string compactStr(const std::string& input) {
+    if (input.length() > 2024) {
+        return input.substr(0, 1000) + " ... " + input.substr(input.length() - 1000);
+    }
+    return input;
+}
+}  // namespace
+void validateExtraFields(const DatabaseName& dbName,
+                         const BSONObj& body,
+                         const BSONObj& extraFields) {
+    int bodySize = body.objsize();
+    int extraFieldsSize = extraFields.objsize();
+
+    // Log a warning if the sum of the sizes of 'body' and 'extraFields' exceeds
+    // 'BSONObjMaxInternalSize'.
+    if (bodySize + extraFieldsSize > BSONObjMaxInternalSize) {
+        LOGV2_WARNING(
+            6491800,
+            "Request body exceeded limit with body.objsize() = {bodySize} bytes, "
+            "extraFields.objsize() = {extraFieldsSize} bytes, body.toString() = {body}, db = "
+            "{db}, extraFields.toString() = {extraFields}",
+            "bodySize"_attr = bodySize,
+            "extraFieldsSize"_attr = extraFieldsSize,
+            "body"_attr = compactStr(body.toString()),
+            "db"_attr = dbName.toStringForErrorMsg(),
+            "extraFields"_attr = compactStr(extraFields.toString()));
+    };
+}
+
+OpMsgRequest OpMsgRequestBuilder::create(
+    boost::optional<auth::ValidatedTenancyScope> validatedTenancyScope,
+    const DatabaseName& dbName,
+    BSONObj body,
+    const BSONObj& extraFields) {
+    validateExtraFields(dbName, body, extraFields);
+
+    OpMsgRequest request;
+    const bool hasValidVts = validatedTenancyScope && validatedTenancyScope->isValid();
+    request.body = [&]() {
+        BSONObjBuilder builder(std::move(body));
+        builder.appendElements(extraFields);
+
+        const SerializationContext sc = hasValidVts
+            ? SerializationContext::stateCommandRequest(validatedTenancyScope->hasTenantId(),
+                                                        validatedTenancyScope->isFromAtlasProxy())
+            : SerializationContext::stateCommandRequest();
+        builder.append("$db", DatabaseNameUtil::serialize(dbName, sc));
+        return builder.obj();
+    }();
+
+    if (hasValidVts) {
+        request.validatedTenancyScope = std::move(validatedTenancyScope);
+    }
+
+    return request;
+}
+
+namespace {
+void serializeHelper(const std::vector<OpMsg::DocumentSequence>& sequences,
+                     const BSONObj& body,
+                     const boost::optional<auth::ValidatedTenancyScope>& validatedTenancyScope,
+                     OpMsgBuilder* output) {
+    if (validatedTenancyScope) {
+        auto securityToken = validatedTenancyScope->getOriginalToken();
+        if (!securityToken.empty()) {
+            output->setSecurityToken(securityToken);
+        }
+    }
     for (auto&& seq : sequences) {
-        auto docSeq = builder.beginDocSequence(seq.name);
+        auto docSeq = output->beginDocSequence(seq.name);
         for (auto&& obj : seq.objs) {
             docSeq.append(obj);
         }
     }
-    builder.beginBody().appendElements(body);
+    output->beginBody().appendElements(body);
+}
+}  // namespace
+
+Message OpMsg::serialize() const {
+    OpMsgBuilder builder;
+    serializeHelper(sequences, body, validatedTenancyScope, &builder);
     return builder.finish();
+}
+
+Message OpMsg::serializeWithoutSizeChecking() const {
+    OpMsgBuilder builder;
+    serializeHelper(sequences, body, validatedTenancyScope, &builder);
+    return builder.finishWithoutSizeChecking();
 }
 
 void OpMsg::shareOwnershipWith(const ConstSharedBuffer& buffer) {
@@ -185,15 +389,21 @@ void OpMsg::shareOwnershipWith(const ConstSharedBuffer& buffer) {
     }
 }
 
+void OpMsgBuilder::setSecurityToken(StringData token) {
+    invariant(_state == kEmpty);
+    _buf.appendStruct(Section::kSecurityToken);
+    _buf.appendCStr(token);
+}
+
 auto OpMsgBuilder::beginDocSequence(StringData name) -> DocSequenceBuilder {
-    invariant(_state == kEmpty || _state == kDocSequence);
+    invariant((_state == kEmpty) || (_state == kDocSequence));
     invariant(!_openBuilder);
     _openBuilder = true;
     _state = kDocSequence;
     _buf.appendStruct(Section::kDocSequence);
     int sizeOffset = _buf.len();
     _buf.skip(sizeof(int32_t));  // section size.
-    _buf.appendStr(name, true);
+    _buf.appendCStr(name);
     return DocSequenceBuilder(this, &_buf, sizeOffset);
 }
 
@@ -207,7 +417,7 @@ void OpMsgBuilder::finishDocumentStream(DocSequenceBuilder* docSequenceBuilder) 
 }
 
 BSONObjBuilder OpMsgBuilder::beginBody() {
-    invariant(_state == kEmpty || _state == kDocSequence);
+    invariant((_state == kEmpty) || (_state == kDocSequence));
     _state = kBody;
     _buf.appendStruct(Section::kBody);
     invariant(_bodyStart == 0);
@@ -221,16 +431,29 @@ BSONObjBuilder OpMsgBuilder::resumeBody() {
     return BSONObjBuilder(BSONObjBuilder::ResumeBuildingTag(), _buf, _bodyStart);
 }
 
-AtomicBool OpMsgBuilder::disableDupeFieldCheck_forTest{false};
+AtomicWord<bool> OpMsgBuilder::disableDupeFieldCheck_forTest{false};
 
 Message OpMsgBuilder::finish() {
+    const auto size = _buf.len();
+    uassert(ErrorCodes::BSONObjectTooLarge,
+            str::stream() << "BSON size limit hit while building Message. Size: " << size << " (0x"
+                          << unsignedHex(size) << "); maxSize: " << BSONObjMaxInternalSize << "("
+                          << (BSONObjMaxInternalSize / (1024 * 1024)) << "MB)",
+            size <= BSONObjMaxInternalSize);
+
+    return finishWithoutSizeChecking();
+}
+
+Message OpMsgBuilder::finishWithoutSizeChecking() {
     if (kDebugBuild && !disableDupeFieldCheck_forTest.load()) {
         std::set<StringData> seenFields;
         for (auto elem : resumeBody().asTempObj()) {
             if (!(seenFields.insert(elem.fieldNameStringData()).second)) {
-                severe() << "OP_MSG with duplicate field '" << elem.fieldNameStringData()
-                         << "' : " << redact(resumeBody().asTempObj());
-                fassert(40474, false);
+                LOGV2_FATAL(40474,
+                            "OP_MSG with duplicate field '{elem_fieldNameStringData}' : "
+                            "{resumeBody_asTempObj}",
+                            "elem_fieldNameStringData"_attr = elem.fieldNameStringData(),
+                            "resumeBody_asTempObj"_attr = redact(resumeBody().asTempObj()));
             }
         }
     }

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -29,14 +28,11 @@
  */
 
 #include "mongo/bson/timestamp.h"
-#include "mongo/bson/bsontypes.h"
 
-#include <cstdint>
-#include <ctime>
 #include <iostream>
 #include <limits>
-#include <sstream>
 
+#include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/util/time_support.h"
 
@@ -48,14 +44,6 @@ Timestamp Timestamp::max() {
     unsigned int t = static_cast<unsigned int>(std::numeric_limits<uint32_t>::max());
     unsigned int i = std::numeric_limits<uint32_t>::max();
     return Timestamp(t, i);
-}
-
-void Timestamp::append(BufBuilder& builder, const StringData& fieldName) const {
-    // No endian conversions needed, since we store in-memory representation
-    // in little endian format, regardless of target endian.
-    builder.appendNum(static_cast<char>(bsonTimestamp));
-    builder.appendStr(fieldName);
-    builder.appendNum(asULL());
 }
 
 std::string Timestamp::toStringPretty() const {
@@ -75,4 +63,4 @@ BSONObj Timestamp::toBSON() const {
     bldr.append("", *this);
     return bldr.obj();
 }
-}
+}  // namespace mongo

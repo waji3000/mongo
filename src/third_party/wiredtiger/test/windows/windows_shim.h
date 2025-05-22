@@ -1,5 +1,5 @@
 /*-
- * Public Domain 2014-2018 MongoDB, Inc.
+ * Public Domain 2014-present MongoDB, Inc.
  * Public Domain 2008-2014 WiredTiger, Inc.
  *
  * This is free and unencumbered software released into the public domain.
@@ -25,35 +25,67 @@
  * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
  * OTHER DEALINGS IN THE SOFTWARE.
  */
+
+#pragma once
+
 #include "wt_internal.h"
 
-#include <direct.h>						/* _mkdir */
+#include <sys/utime.h>
+#include <direct.h> /* _mkdir */
 
 /* Windows does not define constants for access() */
-#define	R_OK	04
-#define	X_OK	R_OK
+#define R_OK 04
+#define X_OK R_OK
 
 /* snprintf does not exist on <= VS 2013 */
 #if _MSC_VER < 1900
-#define	snprintf __wt_snprintf
+#define snprintf __wt_snprintf
 #endif
 
-#define	strcasecmp	stricmp
+#define strcasecmp stricmp
+
+/*
+ * Emulate <linux/limits.h>
+ */
+#ifndef PATH_MAX
+#define PATH_MAX 1024
+#endif
 
 /*
  * Emulate <sys/stat.h>
  */
-#define	mkdir(path, mode) _mkdir(path)
+#define mkdir(path, mode) _mkdir(path)
+#define S_ISDIR(mode) ((mode & _S_IFDIR) == _S_IFDIR)
 
 /*
  * Emulate <sys/time.h>
  */
 struct timeval {
-	time_t tv_sec;
-	int64_t tv_usec;
+    time_t tv_sec;
+    int64_t tv_usec;
 };
 
-int gettimeofday(struct timeval* tp, void* tzp);
+int gettimeofday(struct timeval *tp, void *tzp);
+
+/*
+ * Emulate <sys/types.h>
+ */
+typedef int pid_t;
+
+/*
+ * Emulate <glob.h>
+ */
+#define GLOB_NOSPACE 1 /* Ran out of memory. */
+#define GLOB_ABORTED 2 /* Read error. */
+#define GLOB_NOMATCH 3 /* No matches found. */
+
+typedef struct {
+    size_t gl_pathc;
+    char **gl_pathv;
+} glob_t;
+
+int glob(const char *pattern, int flags, int (*error_func)(const char *, int), glob_t *buffer);
+int globfree(glob_t *buffer);
 
 /*
  * Emulate <unistd.h>
@@ -63,20 +95,19 @@ typedef uint32_t useconds_t;
 int sleep(int seconds);
 int usleep(useconds_t useconds);
 
-#define	lseek(fd, offset, origin)					\
-	_lseek(fd, (long)(offset), origin)
-#define	write(fd, buffer, count)					\
-	_write(fd, buffer, (unsigned int)(count))
+#define lseek(fd, offset, origin) _lseek(fd, (long)(offset), origin)
+#define read(fd, buffer, count) _read(fd, buffer, (unsigned int)(count))
+#define write(fd, buffer, count) _write(fd, buffer, (unsigned int)(count))
 
 /*
  * Emulate the <pthread.h> support we need for tests and example code.
  */
-typedef CRITICAL_SECTION  pthread_mutex_t;
+typedef CRITICAL_SECTION pthread_mutex_t;
 typedef CONDITION_VARIABLE pthread_cond_t;
 
 struct rwlock_wrapper {
-	SRWLOCK rwlock;
-	DWORD exclusive_locked;
+    SRWLOCK rwlock;
+    DWORD exclusive_locked;
 };
 
 struct rwlock_wrapper;
@@ -87,8 +118,7 @@ typedef HANDLE pthread_t;
 typedef int pthread_rwlockattr_t;
 typedef int pthread_attr_t;
 
-int pthread_create(
-	pthread_t *, const pthread_attr_t *, void *(*)(void *), void *);
+int pthread_create(pthread_t *, const pthread_attr_t *, void *(*)(void *), void *);
 int pthread_join(pthread_t, void **);
 int pthread_rwlock_destroy(pthread_rwlock_t *);
 int pthread_rwlock_init(pthread_rwlock_t *, const pthread_rwlockattr_t *);
@@ -97,3 +127,8 @@ int pthread_rwlock_tryrdlock(pthread_rwlock_t *);
 int pthread_rwlock_trywrlock(pthread_rwlock_t *);
 int pthread_rwlock_unlock(pthread_rwlock_t *);
 int pthread_rwlock_wrlock(pthread_rwlock_t *);
+
+/*
+ * Other useful Windows-specific functionality.
+ */
+const char *last_windows_error_message(void);

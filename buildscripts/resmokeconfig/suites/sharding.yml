@@ -2,10 +2,14 @@ test_kind: js_test
 
 selector:
   roots:
-  - jstests/sharding/*.js
+    - jstests/sharding/**/*.js
+  exclude_files:
+    - jstests/sharding/**/libs/**/*.js
 
 executor:
+  archive:
+    tests:
+      - jstests/sharding/*reshard*.js
   config:
     shell_options:
-      nodb: ''
-      readMode: commands
+      nodb: ""

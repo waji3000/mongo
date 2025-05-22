@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,63 +27,75 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <vector>
 
-#include "mongo/db/pipeline/accumulator.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
 
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/pipeline/accumulation_statement.h"
+#include "mongo/db/pipeline/accumulator.h"
 #include "mongo/db/pipeline/expression_context.h"
-#include "mongo/db/pipeline/value.h"
+#include "mongo/db/pipeline/window_function/window_function_expression.h"
+#include "mongo/db/pipeline/window_function/window_function_push.h"
+#include "mongo/db/query/query_knobs_gen.h"
+#include "mongo/platform/atomic_word.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
-using boost::intrusive_ptr;
 using std::vector;
 
-REGISTER_ACCUMULATOR(push, AccumulatorPush::create);
-
-const char* AccumulatorPush::getOpName() const {
-    return "$push";
-}
+REGISTER_ACCUMULATOR(push, genericParseSingleExpressionAccumulator<AccumulatorPush>);
+REGISTER_STABLE_REMOVABLE_WINDOW_FUNCTION(push, AccumulatorPush, WindowFunctionPush);
 
 void AccumulatorPush::processInternal(const Value& input, bool merging) {
     if (!merging) {
         if (!input.missing()) {
-            vpValue.push_back(input);
-            _memUsageBytes += input.getApproximateSize();
+            _array.push_back(input);
+            _memUsageTracker.add(input.getApproximateSize());
+            uassert(ErrorCodes::ExceededMemoryLimit,
+                    str::stream()
+                        << "$push used too much memory and cannot spill to disk. Memory limit: "
+                        << _memUsageTracker.maxAllowedMemoryUsageBytes() << " bytes",
+                    _memUsageTracker.withinMemoryLimit());
         }
     } else {
-        // If we're merging, we need to take apart the arrays we
-        // receive and put their elements into the array we are collecting.
-        // If we didn't, then we'd get an array of arrays, with one array
-        // from each merge source.
-        verify(input.getType() == Array);
+        // If we're merging, we need to take apart the arrays we receive and put their elements into
+        // the array we are collecting.  If we didn't, then we'd get an array of arrays, with one
+        // array from each merge source.
+        assertMergingInputType(input, Array);
 
         const vector<Value>& vec = input.getArray();
-        vpValue.insert(vpValue.end(), vec.begin(), vec.end());
-
-        for (size_t i = 0; i < vec.size(); i++) {
-            _memUsageBytes += vec[i].getApproximateSize();
+        for (auto&& val : vec) {
+            _memUsageTracker.add(val.getApproximateSize());
+            uassert(ErrorCodes::ExceededMemoryLimit,
+                    str::stream()
+                        << "$push used too much memory and cannot spill to disk. Memory limit: "
+                        << _memUsageTracker.maxAllowedMemoryUsageBytes() << " bytes",
+                    _memUsageTracker.withinMemoryLimit());
         }
+        _array.insert(_array.end(), vec.begin(), vec.end());
     }
 }
 
 Value AccumulatorPush::getValue(bool toBeMerged) {
-    return Value(vpValue);
+    return Value(_array);
 }
 
-AccumulatorPush::AccumulatorPush(const boost::intrusive_ptr<ExpressionContext>& expCtx)
-    : Accumulator(expCtx) {
-    _memUsageBytes = sizeof(*this);
+AccumulatorPush::AccumulatorPush(ExpressionContext* const expCtx,
+                                 boost::optional<int> maxMemoryUsageBytes)
+    : AccumulatorState(expCtx, maxMemoryUsageBytes.value_or(internalQueryMaxPushBytes.load())) {
+    _memUsageTracker.set(sizeof(*this));
 }
 
 void AccumulatorPush::reset() {
-    vector<Value>().swap(vpValue);
-    _memUsageBytes = sizeof(*this);
+    vector<Value>().swap(_array);
+    _memUsageTracker.set(sizeof(*this));
 }
-
-intrusive_ptr<Accumulator> AccumulatorPush::create(
-    const boost::intrusive_ptr<ExpressionContext>& expCtx) {
-    return new AccumulatorPush(expCtx);
-}
-}
+}  // namespace mongo

@@ -3,7 +3,7 @@
 // On error inserting documents, traces back and shows where the document was dropped
 //
 
-function traceMissingDoc(coll, doc, mongos) {
+export function traceMissingDoc(coll, doc, mongos) {
     if (mongos)
         coll = mongos.getCollection(coll + "");
     else
@@ -74,9 +74,9 @@ function traceMissingDoc(coll, doc, mongos) {
 
     allOps.sort(compareOps);
 
-    print("Ops found for doc " + tojson(doc) + " on each shard:\n");
+    jsTest.log.info("Ops found on each shard", {doc});
     for (var i = 0; i < allOps.length; i++) {
-        printjson(allOps[i]);
+        jsTest.log.info({ops: allOps[i]});
     }
 
     return allOps;

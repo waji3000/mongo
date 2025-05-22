@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,27 +27,29 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <string>
 
-#include "mongo/base/init.h"
-#include "mongo/db/auth/action_set.h"
-#include "mongo/db/auth/action_type.h"
-#include "mongo/db/auth/authorization_manager.h"
-#include "mongo/db/auth/authorization_session.h"
-#include "mongo/db/auth/privilege.h"
-#include "mongo/db/client.h"
+#include "mongo/base/init.h"  // IWYU pragma: keep
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/jsobj.h"
-#include "mongo/db/logical_session_cache.h"
-#include "mongo/db/logical_session_id.h"
-#include "mongo/db/logical_session_id_helpers.h"
+#include "mongo/db/database_name.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/stats/top.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/session/logical_session_cache.h"
+#include "mongo/db/session/logical_session_id_gen.h"
+#include "mongo/db/session/logical_session_id_helpers.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/clock_source.h"
 
 namespace mongo {
+namespace {
 
 class StartSessionCommand final : public BasicCommand {
-    MONGO_DISALLOW_COPYING(StartSessionCommand);
+    StartSessionCommand(const StartSessionCommand&) = delete;
+    StartSessionCommand& operator=(const StartSessionCommand&) = delete;
 
 public:
     StartSessionCommand() : BasicCommand("startSession") {}
@@ -56,37 +57,47 @@ public:
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kAlways;
     }
+
     bool adminOnly() const override {
         return false;
     }
+
     bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
+
     std::string help() const override {
         return "start a logical session";
     }
+
     Status checkAuthForOperation(OperationContext* opCtx,
-                                 const std::string& dbname,
-                                 const BSONObj& cmdObj) const override {
+                                 const DatabaseName&,
+                                 const BSONObj&) const override {
         return Status::OK();
     }
 
-    virtual bool run(OperationContext* opCtx,
-                     const std::string& db,
-                     const BSONObj& cmdObj,
-                     BSONObjBuilder& result) override {
-        auto client = opCtx->getClient();
-        ServiceContext* serviceContext = client->getServiceContext();
+    bool allowedWithSecurityToken() const final {
+        return true;
+    }
 
-        auto lsCache = LogicalSessionCache::get(serviceContext);
-        boost::optional<LogicalSessionRecord> record =
-            makeLogicalSessionRecord(opCtx, lsCache->now());
-        uassertStatusOK(lsCache->startSession(opCtx, record.get()));
+    bool run(OperationContext* opCtx,
+             const DatabaseName&,
+             const BSONObj& cmdObj,
+             BSONObjBuilder& result) override {
+        const auto service = opCtx->getServiceContext();
+        const auto lsCache = LogicalSessionCache::get(service);
 
-        makeLogicalSessionToClient(record->getId()).serialize(&result);
+        auto newSessionRecord =
+            makeLogicalSessionRecord(opCtx, service->getFastClockSource()->now());
+
+        uassertStatusOK(lsCache->startSession(opCtx, newSessionRecord));
+
+        makeLogicalSessionToClient(newSessionRecord.getId()).serialize(&result);
 
         return true;
     }
-} startSessionCommand;
+};
+MONGO_REGISTER_COMMAND(StartSessionCommand).forRouter().forShard();
 
+}  // namespace
 }  // namespace mongo

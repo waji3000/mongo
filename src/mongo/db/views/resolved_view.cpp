@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,14 +27,32 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+// IWYU pragma: no_include "ext/alloc_traits.h"
 
 #include "mongo/db/views/resolved_view.h"
 
-#include "mongo/base/init.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/init.h"  // IWYU pragma: keep
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobjbuilder.h"
-#include "mongo/db/pipeline/aggregation_request.h"
-#include "mongo/rpc/get_status_from_command_result.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/db/pipeline/document_source_coll_stats.h"
+#include "mongo/db/pipeline/document_source_index_stats.h"
+#include "mongo/db/pipeline/document_source_internal_convert_bucket_index_stats.h"
+#include "mongo/db/pipeline/document_source_internal_unpack_bucket.h"
+#include "mongo/db/pipeline/search/search_helper_bson_obj.h"
+#include "mongo/db/query/explain_options.h"
+#include "mongo/db/timeseries/timeseries_constants.h"
+#include "mongo/db/timeseries/timeseries_index_schema_conversion_functions.h"
+#include "mongo/idl/idl_parser.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/serialization_context.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -70,15 +87,71 @@ ResolvedView ResolvedView::fromBSON(const BSONObj& commandResponseObj) {
         collationSpec = collationElt.embeddedObject().getOwned();
     }
 
-    return {NamespaceString(viewDef["ns"].valueStringData()),
+    boost::optional<TimeseriesOptions> timeseriesOptions = boost::none;
+    if (auto tsOptionsElt = viewDef[kTimeseriesOptions]) {
+        if (tsOptionsElt.isABSONObj()) {
+            timeseriesOptions = TimeseriesOptions::parse(IDLParserContext{"ResolvedView::fromBSON"},
+                                                         tsOptionsElt.Obj());
+        }
+    }
+
+    boost::optional<bool> mixedSchema = boost::none;
+    if (auto mixedSchemaElem = viewDef[kTimeseriesMayContainMixedData]) {
+        uassert(6067204,
+                str::stream() << "view definition must have " << kTimeseriesMayContainMixedData
+                              << " of type bool or no such field",
+                mixedSchemaElem.type() == BSONType::Bool);
+
+        mixedSchema = boost::optional<bool>(mixedSchemaElem.boolean());
+    }
+
+    boost::optional<bool> usesExtendedRange = boost::none;
+    if (auto usesExtendedRangeElem = viewDef[kTimeseriesUsesExtendedRange]) {
+        uassert(6646910,
+                str::stream() << "view definition must have " << kTimeseriesUsesExtendedRange
+                              << " of type bool or no such field",
+                usesExtendedRangeElem.type() == BSONType::Bool);
+
+        usesExtendedRange = boost::optional<bool>(usesExtendedRangeElem.boolean());
+    }
+
+    boost::optional<bool> fixedBuckets = boost::none;
+    if (auto fixedBucketsElem = viewDef[kTimeseriesfixedBuckets]) {
+        uassert(7823304,
+                str::stream() << "view definition must have " << kTimeseriesfixedBuckets
+                              << " of type bool or no such field",
+                fixedBucketsElem.type() == BSONType::Bool);
+
+        fixedBuckets = boost::optional<bool>(fixedBucketsElem.boolean());
+    }
+
+    return {NamespaceStringUtil::deserializeForErrorMsg(viewDef["ns"].valueStringData()),
             std::move(pipeline),
-            std::move(collationSpec)};
+            std::move(collationSpec),
+            std::move(timeseriesOptions),
+            std::move(mixedSchema),
+            std::move(usesExtendedRange),
+            std::move(fixedBuckets)};
 }
 
 void ResolvedView::serialize(BSONObjBuilder* builder) const {
     BSONObjBuilder subObj(builder->subobjStart("resolvedView"));
-    subObj.append("ns", _namespace.ns());
+    subObj.append("ns", _namespace.toStringForErrorMsg());
     subObj.append("pipeline", _pipeline);
+    if (_timeseriesOptions) {
+        BSONObjBuilder tsObj(builder->subobjStart(kTimeseriesOptions));
+        _timeseriesOptions->serialize(&tsObj);
+    }
+    // Only serialize if it doesn't contain mixed data.
+    if ((_timeseriesMayContainMixedData && !(*_timeseriesMayContainMixedData)))
+        subObj.append(kTimeseriesMayContainMixedData, *_timeseriesMayContainMixedData);
+
+    if ((_timeseriesUsesExtendedRange && (*_timeseriesUsesExtendedRange)))
+        subObj.append(kTimeseriesUsesExtendedRange, *_timeseriesUsesExtendedRange);
+
+    if ((_timeseriesfixedBuckets && (*_timeseriesfixedBuckets)))
+        subObj.append(kTimeseriesfixedBuckets, *_timeseriesfixedBuckets);
+
     if (!_defaultCollation.isEmpty()) {
         subObj.append("collation", _defaultCollation);
     }
@@ -88,31 +161,145 @@ std::shared_ptr<const ErrorExtraInfo> ResolvedView::parse(const BSONObj& cmdRepl
     return std::make_shared<ResolvedView>(fromBSON(cmdReply));
 }
 
-AggregationRequest ResolvedView::asExpandedViewAggregation(
-    const AggregationRequest& request) const {
-    // Perform the aggregation on the resolved namespace.  The new pipeline consists of two parts:
-    // first, 'pipeline' in this ResolvedView; then, the pipeline in 'request'.
-    std::vector<BSONObj> resolvedPipeline;
-    resolvedPipeline.reserve(_pipeline.size() + request.getPipeline().size());
-    resolvedPipeline.insert(resolvedPipeline.end(), _pipeline.begin(), _pipeline.end());
-    resolvedPipeline.insert(
-        resolvedPipeline.end(), request.getPipeline().begin(), request.getPipeline().end());
 
-    AggregationRequest expandedRequest{_namespace, resolvedPipeline};
+ResolvedView ResolvedView::parseFromBSON(const BSONElement& elem) {
+    uassert(936370, "resolvedView must be an object", elem.type() == BSONType::Object);
+    BSONObjBuilder localBuilder;
+    localBuilder.append("resolvedView", elem.Obj());
+    return fromBSON(localBuilder.done());
+}
+
+void ResolvedView::serializeToBSON(StringData fieldName, BSONObjBuilder* builder) const {
+    serialize(builder);
+}
+
+void ResolvedView::handleTimeseriesRewrites(std::vector<BSONObj>* resolvedPipeline) const {
+    // Stages that are constrained to be the first stage of the pipeline ($collStats, $indexStats)
+    // require special handling since $_internalUnpackBucket is the first stage.
+    if (resolvedPipeline->size() >= 2 &&
+        (*resolvedPipeline)[0][DocumentSourceInternalUnpackBucket::kStageNameInternal] &&
+        ((*resolvedPipeline)[1][DocumentSourceIndexStats::kStageName] ||
+         (*resolvedPipeline)[1][DocumentSourceCollStats::kStageName])) {
+        //  Normally for a regular read, $_internalUnpackBucket unpacks the buckets entries into
+        //  time-series document format and then passes the time-series documents on through the
+        //  pipeline. Instead, for $indexStats, we need to read the buckets collection's index
+        //  stats unmodified and then pass the results through an additional stage to specially
+        //  convert them to the time-series collection's schema, and then onward. We grab the
+        //  $_internalUnpackBucket stage's time-series collection schema options and pass them
+        //  into the $_internalConvertBucketIndexStats stage to use for schema conversion.
+        if ((*resolvedPipeline)[1][DocumentSourceIndexStats::kStageName]) {
+            auto unpackStage = (*resolvedPipeline)[0];
+            (*resolvedPipeline)[0] = (*resolvedPipeline)[1];
+            BSONObjBuilder builder;
+            for (const auto& elem :
+                 unpackStage[DocumentSourceInternalUnpackBucket::kStageNameInternal].Obj()) {
+                if (elem.fieldNameStringData() == timeseries::kTimeFieldName ||
+                    elem.fieldNameStringData() == timeseries::kMetaFieldName) {
+                    builder.append(elem);
+                }
+            }
+            (*resolvedPipeline)[1] =
+                BSON(DocumentSourceInternalConvertBucketIndexStats::kStageName << builder.obj());
+        } else {
+            auto collStatsStage = (*resolvedPipeline)[1];
+            BSONObjBuilder builder;
+            for (const auto& elem : collStatsStage[DocumentSourceCollStats::kStageName].Obj()) {
+                builder.append(elem);
+            }
+            builder.append("$_requestOnTimeseriesView", true);
+            (*resolvedPipeline)[1] = BSON(DocumentSourceCollStats::kStageName << builder.obj());
+            // For $collStats, we directly read the collection stats from the buckets
+            // collection, and skip $_internalUnpackBucket.
+            resolvedPipeline->erase(resolvedPipeline->begin());
+        }
+    } else {
+        auto unpackStage = (*resolvedPipeline)[0];
+
+        BSONObjBuilder builder;
+        for (const auto& elem :
+             unpackStage[DocumentSourceInternalUnpackBucket::kStageNameInternal].Obj()) {
+            builder.append(elem);
+        }
+        builder.append(DocumentSourceInternalUnpackBucket::kAssumeNoMixedSchemaData,
+                       ((_timeseriesMayContainMixedData && !(*_timeseriesMayContainMixedData))));
+
+        builder.append(DocumentSourceInternalUnpackBucket::kUsesExtendedRange,
+                       ((_timeseriesUsesExtendedRange && *_timeseriesUsesExtendedRange)));
+
+        builder.append(DocumentSourceInternalUnpackBucket::kFixedBuckets,
+                       ((_timeseriesfixedBuckets && *_timeseriesfixedBuckets)));
+
+        (*resolvedPipeline)[0] =
+            BSON(DocumentSourceInternalUnpackBucket::kStageNameInternal << builder.obj());
+    }
+}
+
+AggregateCommandRequest ResolvedView::asExpandedViewAggregation(
+    const VersionContext& vCtx, const AggregateCommandRequest& request) const {
+    std::vector<BSONObj> resolvedPipeline;
+    // Mongot user pipelines are a unique case: $_internalSearchIdLookup applies the view pipeline.
+    // For this reason, we do not expand the aggregation request to include the view pipeline.
+    if (search_helper_bson_obj::isMongotPipeline(request.getPipeline()) &&
+        feature_flags::gFeatureFlagMongotIndexedViews.isEnabledUseLatestFCVWhenUninitialized(
+            vCtx, serverGlobalParams.featureCompatibility.acquireFCVSnapshot())) {
+        resolvedPipeline.reserve(request.getPipeline().size());
+        resolvedPipeline.insert(
+            resolvedPipeline.end(), request.getPipeline().begin(), request.getPipeline().end());
+    } else {
+        // The new pipeline consists of two parts: first, 'pipeline' in this ResolvedView; then, the
+        // pipeline in 'request'.
+        resolvedPipeline.reserve(_pipeline.size() + request.getPipeline().size());
+        resolvedPipeline.insert(resolvedPipeline.end(), _pipeline.begin(), _pipeline.end());
+        resolvedPipeline.insert(
+            resolvedPipeline.end(), request.getPipeline().begin(), request.getPipeline().end());
+    }
+
+    if (resolvedPipeline.size() >= 1 &&
+        resolvedPipeline[0][DocumentSourceInternalUnpackBucket::kStageNameInternal]) {
+        handleTimeseriesRewrites(&resolvedPipeline);
+    }
+
+    AggregateCommandRequest expandedRequest{
+        _namespace, std::move(resolvedPipeline), request.getSerializationContext()};
 
     if (request.getExplain()) {
         expandedRequest.setExplain(request.getExplain());
     } else {
-        expandedRequest.setBatchSize(request.getBatchSize());
+        expandedRequest.setCursor(request.getCursor());
     }
 
-    expandedRequest.setHint(request.getHint());
-    expandedRequest.setComment(request.getComment());
+    // If we have an index hint on a time-series view, we may need to rewrite the index spec to
+    // match the index on the underlying buckets collection.
+    if (request.getHint() && _timeseriesOptions) {
+        BSONObj original = *request.getHint();
+        BSONObj rewritten = original;
+        // Only convert if we are given an index spec, not an index name or a $natural hint.
+        if (timeseries::isHintIndexKey(original)) {
+            auto converted = timeseries::createBucketsIndexSpecFromTimeseriesIndexSpec(
+                *_timeseriesOptions, original);
+            if (converted.isOK()) {
+                rewritten = converted.getValue();
+            }
+        }
+        expandedRequest.setHint(rewritten);
+    } else {
+        expandedRequest.setHint(request.getHint());
+    }
+
+    // If query settings were present in the original request, they should be present in the
+    // 'expandedRequest'.
+    if (request.getQuerySettings()) {
+        expandedRequest.setQuerySettings(request.getQuerySettings());
+    }
+
     expandedRequest.setMaxTimeMS(request.getMaxTimeMS());
     expandedRequest.setReadConcern(request.getReadConcern());
     expandedRequest.setUnwrappedReadPref(request.getUnwrappedReadPref());
-    expandedRequest.setBypassDocumentValidation(request.shouldBypassDocumentValidation());
-    expandedRequest.setAllowDiskUse(request.shouldAllowDiskUse());
+    expandedRequest.setBypassDocumentValidation(request.getBypassDocumentValidation());
+    expandedRequest.setAllowDiskUse(request.getAllowDiskUse());
+    expandedRequest.setIsMapReduceCommand(request.getIsMapReduceCommand());
+    expandedRequest.setLet(request.getLet());
+    expandedRequest.setIncludeQueryStatsMetrics(request.getIncludeQueryStatsMetrics());
 
     // Operations on a view must always use the default collation of the view. We must have already
     // checked that if the user's request specifies a collation, it matches the collation of the

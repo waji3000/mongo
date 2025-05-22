@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,19 +27,29 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
 
-#include "mongo/platform/basic.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <wiredtiger.h>
 
-#include "mongo/db/storage/wiredtiger/wiredtiger_snapshot_manager.h"
+#include <boost/optional/optional.hpp>
 
-#include "mongo/db/server_options.h"
+#include "mongo/base/error_codes.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_begin_transaction_block.h"
-#include "mongo/db/storage/wiredtiger/wiredtiger_oplog_manager.h"
-#include "mongo/db/storage/wiredtiger/wiredtiger_util.h"
-#include "mongo/util/log.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_recovery_unit.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_snapshot_manager.h"
+#include "mongo/platform/compiler.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/time_support.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
+
 
 namespace mongo {
+namespace {
+MONGO_FAIL_POINT_DEFINE(hangBeforeMajorityReadTransactionStarted);
+}
 
 void WiredTigerSnapshotManager::setCommittedSnapshot(const Timestamp& timestamp) {
     stdx::lock_guard<stdx::mutex> lock(_committedSnapshotMutex);
@@ -49,58 +58,59 @@ void WiredTigerSnapshotManager::setCommittedSnapshot(const Timestamp& timestamp)
     _committedSnapshot = timestamp;
 }
 
-void WiredTigerSnapshotManager::setLocalSnapshot(const Timestamp& timestamp) {
-    stdx::lock_guard<stdx::mutex> lock(_localSnapshotMutex);
-    _localSnapshot = timestamp;
+void WiredTigerSnapshotManager::setLastApplied(const Timestamp& timestamp) {
+    stdx::lock_guard<stdx::mutex> lock(_lastAppliedMutex);
+    if (timestamp.isNull())
+        _lastApplied = boost::none;
+    else
+        _lastApplied = timestamp;
 }
 
-boost::optional<Timestamp> WiredTigerSnapshotManager::getLocalSnapshot() {
-    stdx::lock_guard<stdx::mutex> lock(_localSnapshotMutex);
-    return _localSnapshot;
+boost::optional<Timestamp> WiredTigerSnapshotManager::getLastApplied() {
+    stdx::lock_guard<stdx::mutex> lock(_lastAppliedMutex);
+    return _lastApplied;
 }
 
-void WiredTigerSnapshotManager::dropAllSnapshots() {
+void WiredTigerSnapshotManager::clearCommittedSnapshot() {
     stdx::lock_guard<stdx::mutex> lock(_committedSnapshotMutex);
     _committedSnapshot = boost::none;
 }
 
 boost::optional<Timestamp> WiredTigerSnapshotManager::getMinSnapshotForNextCommittedRead() const {
-    if (!serverGlobalParams.enableMajorityReadConcern) {
-        return boost::none;
-    }
-
     stdx::lock_guard<stdx::mutex> lock(_committedSnapshotMutex);
     return _committedSnapshot;
 }
 
 Timestamp WiredTigerSnapshotManager::beginTransactionOnCommittedSnapshot(
-    WT_SESSION* session, WiredTigerBeginTxnBlock::IgnorePrepared ignorePrepared) const {
-    WiredTigerBeginTxnBlock txnOpen(session, ignorePrepared);
+    WiredTigerSession* session,
+    PrepareConflictBehavior prepareConflictBehavior,
+    bool roundUpPreparedTimestamps,
+    RecoveryUnit::UntimestampedWriteAssertionLevel untimestampedWriteAssertion) const {
 
-    stdx::lock_guard<stdx::mutex> lock(_committedSnapshotMutex);
-    uassert(ErrorCodes::ReadConcernMajorityNotAvailableYet,
-            "Committed view disappeared while running operation",
-            _committedSnapshot);
+    auto committedSnapshot = [this]() {
+        stdx::lock_guard<stdx::mutex> lock(_committedSnapshotMutex);
+        uassert(ErrorCodes::ReadConcernMajorityNotAvailableYet,
+                "Committed view disappeared while running operation",
+                _committedSnapshot);
+        return _committedSnapshot.value();
+    }();
 
-    auto status = txnOpen.setTimestamp(_committedSnapshot.get());
+    if (MONGO_unlikely(hangBeforeMajorityReadTransactionStarted.shouldFail())) {
+        sleepmillis(100);
+    }
+
+    // We need to round up our read timestamp in case the oldest timestamp has advanced past the
+    // committedSnapshot we just read.
+    WiredTigerBeginTxnBlock txnOpen(session,
+                                    prepareConflictBehavior,
+                                    roundUpPreparedTimestamps,
+                                    RoundUpReadTimestamp::kRound,
+                                    untimestampedWriteAssertion);
+    auto status = txnOpen.setReadSnapshot(committedSnapshot);
     fassert(30635, status);
 
     txnOpen.done();
-    return *_committedSnapshot;
-}
-
-Timestamp WiredTigerSnapshotManager::beginTransactionOnLocalSnapshot(
-    WT_SESSION* session, WiredTigerBeginTxnBlock::IgnorePrepared ignorePrepared) const {
-    WiredTigerBeginTxnBlock txnOpen(session, ignorePrepared);
-
-    stdx::lock_guard<stdx::mutex> lock(_localSnapshotMutex);
-    invariant(_localSnapshot);
-    LOG(3) << "begin_transaction on local snapshot " << _localSnapshot.get().toString();
-    auto status = txnOpen.setTimestamp(_localSnapshot.get());
-    fassert(50775, status);
-
-    txnOpen.done();
-    return *_localSnapshot;
+    return committedSnapshot;
 }
 
 }  // namespace mongo

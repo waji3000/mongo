@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,17 +27,32 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+// IWYU pragma: no_include "ext/alloc_traits.h"
+#include <memory>
+#include <vector>
 
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/json.h"
+#include "mongo/db/matcher/expression.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/query/collation/collator_interface_mock.h"
-#include "mongo/db/query/query_planner.h"
+#include "mongo/db/query/index_entry.h"
+#include "mongo/db/query/query_planner_params.h"
 #include "mongo/db/query/query_planner_test_fixture.h"
+#include "mongo/db/service_context.h"
+#include "mongo/unittest/unittest.h"
 
 namespace mongo {
 namespace {
 
+const static NamespaceString kNs = NamespaceString::createNamespaceString_forTest("db.dummyNs");
+
 TEST_F(QueryPlannerTest, PartialIndexEq) {
-    params.options = QueryPlannerParams::NO_TABLE_SCAN;
+    params.mainCollectionInfo.options = QueryPlannerParams::NO_TABLE_SCAN;
     BSONObj filterObj(fromjson("{a: {$gt: 0}}"));
     std::unique_ptr<MatchExpression> filterExpr = parseMatchExpression(filterObj);
     addIndex(fromjson("{a: 1}"), filterExpr.get());
@@ -50,66 +64,66 @@ TEST_F(QueryPlannerTest, PartialIndexEq) {
         "{filter: null, pattern: {a: 1}, "
         "bounds: {a: [[1, 1, true, true]]}}}}}");
 
-    runQuery(fromjson("{a: -1}"));
-    assertNumSolutions(0U);
+    runInvalidQuery(fromjson("{a: -1}"));
+    assertNoSolutions();
 }
 
 TEST_F(QueryPlannerTest, PartialIndexNot) {
-    params.options = QueryPlannerParams::NO_TABLE_SCAN;
+    params.mainCollectionInfo.options = QueryPlannerParams::NO_TABLE_SCAN;
     BSONObj filterObj(fromjson("{a: {$gt: 0}}"));
     std::unique_ptr<MatchExpression> filterExpr = parseMatchExpression(filterObj);
     addIndex(fromjson("{a: 1}"), filterExpr.get());
 
-    runQuery(fromjson("{a: {$ne: 1}}"));
-    assertNumSolutions(0U);
+    runInvalidQuery(fromjson("{a: {$ne: 1}}"));
+    assertNoSolutions();
 
-    runQuery(fromjson("{a: {$ne: -1}}"));
-    assertNumSolutions(0U);
+    runInvalidQuery(fromjson("{a: {$ne: -1}}"));
+    assertNoSolutions();
 
-    runQuery(fromjson("{a: {$not: {$lte: 0}}}"));
-    assertNumSolutions(0U);
+    runInvalidQuery(fromjson("{a: {$not: {$lte: 0}}}"));
+    assertNoSolutions();
 }
 
 TEST_F(QueryPlannerTest, PartialIndexElemMatchObj) {
-    params.options = QueryPlannerParams::NO_TABLE_SCAN;
+    params.mainCollectionInfo.options = QueryPlannerParams::NO_TABLE_SCAN;
     BSONObj filterObj(fromjson("{'a.b': {$gt: 0}}"));
     std::unique_ptr<MatchExpression> filterExpr = parseMatchExpression(filterObj);
     addIndex(fromjson("{'a.b': 1}"), filterExpr.get());
 
     // The following query could in theory use the partial index, but we don't support it right now.
-    runQuery(fromjson("{a: {$elemMatch: {b: 1}}}"));
-    assertNumSolutions(0U);
+    runInvalidQuery(fromjson("{a: {$elemMatch: {b: 1}}}"));
+    assertNoSolutions();
 
-    runQuery(fromjson("{a: {$elemMatch: {b: -1}}}"));
-    assertNumSolutions(0U);
+    runInvalidQuery(fromjson("{a: {$elemMatch: {b: -1}}}"));
+    assertNoSolutions();
 }
 
 TEST_F(QueryPlannerTest, PartialIndexElemMatchObjContainingOr) {
-    params.options = QueryPlannerParams::NO_TABLE_SCAN;
+    params.mainCollectionInfo.options = QueryPlannerParams::NO_TABLE_SCAN;
     BSONObj filterObj(fromjson("{'a.b': {$gt: 0}}"));
     std::unique_ptr<MatchExpression> filterExpr = parseMatchExpression(filterObj);
     addIndex(fromjson("{'a.b': 1}"), filterExpr.get());
 
     // The following query could in theory use the partial index, but we don't support it right now.
-    runQuery(fromjson("{a: {$elemMatch: {$or: [{b: 1}, {b: 2}]}}}"));
-    assertNumSolutions(0U);
+    runInvalidQuery(fromjson("{a: {$elemMatch: {$or: [{b: 1}, {b: 2}]}}}"));
+    assertNoSolutions();
 }
 
 TEST_F(QueryPlannerTest, PartialIndexElemMatchObjWithBadSubobjectFilter) {
-    params.options = QueryPlannerParams::NO_TABLE_SCAN;
+    params.mainCollectionInfo.options = QueryPlannerParams::NO_TABLE_SCAN;
     BSONObj filterObj(fromjson("{b: {$gt: 0}}"));
     std::unique_ptr<MatchExpression> filterExpr = parseMatchExpression(filterObj);
     addIndex(fromjson("{'a.b': 1}"), filterExpr.get());
 
-    runQuery(fromjson("{a: {$elemMatch: {$or: [{b: 1}, {b: 2}]}}}"));
-    assertNumSolutions(0U);
+    runInvalidQuery(fromjson("{a: {$elemMatch: {$or: [{b: 1}, {b: 2}]}}}"));
+    assertNoSolutions();
 
-    runQuery(fromjson("{a: {$elemMatch: {b: {$in: [1, 2]}}}}"));
-    assertNumSolutions(0U);
+    runInvalidQuery(fromjson("{a: {$elemMatch: {b: {$in: [1, 2]}}}}"));
+    assertNoSolutions();
 }
 
 TEST_F(QueryPlannerTest, PartialIndexAndSingleAssignment) {
-    params.options = QueryPlannerParams::NO_TABLE_SCAN;
+    params.mainCollectionInfo.options = QueryPlannerParams::NO_TABLE_SCAN;
     BSONObj filterObj(fromjson("{f: {$gt: 0}}"));
     std::unique_ptr<MatchExpression> filterExpr = parseMatchExpression(filterObj);
     addIndex(fromjson("{a: 1}"), filterExpr.get());
@@ -121,12 +135,12 @@ TEST_F(QueryPlannerTest, PartialIndexAndSingleAssignment) {
         "{filter: null, pattern: {a: 1}, "
         "bounds: {a: [[1, 1, true, true]]}}}}}");
 
-    runQuery(fromjson("{a: 1, f: -1}"));
-    assertNumSolutions(0U);
+    runInvalidQuery(fromjson("{a: 1, f: -1}"));
+    assertNoSolutions();
 }
 
 TEST_F(QueryPlannerTest, PartialIndexAndMultipleAssignments) {
-    params.options = QueryPlannerParams::NO_TABLE_SCAN;
+    params.mainCollectionInfo.options = QueryPlannerParams::NO_TABLE_SCAN;
     BSONObj filterObj(fromjson("{f: {$gt: 0}}"));
     std::unique_ptr<MatchExpression> filterExpr = parseMatchExpression(filterObj);
     addIndex(fromjson("{a: 1}"), filterExpr.get());
@@ -138,12 +152,12 @@ TEST_F(QueryPlannerTest, PartialIndexAndMultipleAssignments) {
         "{filter: null, pattern: {a: 1}, "
         "bounds: {a: [[0, 10, true, true]]}}}}}");
 
-    runQuery(fromjson("{a: {$gte: 0, $lte: 10}, f: -1}"));
-    assertNumSolutions(0U);
+    runInvalidQuery(fromjson("{a: {$gte: 0, $lte: 10}, f: -1}"));
+    assertNoSolutions();
 }
 
 TEST_F(QueryPlannerTest, PartialIndexOr) {
-    params.options = QueryPlannerParams::NO_TABLE_SCAN;
+    params.mainCollectionInfo.options = QueryPlannerParams::NO_TABLE_SCAN;
     BSONObj filterObj(fromjson("{a: {$gt: 0}}"));
     std::unique_ptr<MatchExpression> filterExpr = parseMatchExpression(filterObj);
     addIndex(fromjson("{a: 1}"), filterExpr.get());
@@ -157,12 +171,12 @@ TEST_F(QueryPlannerTest, PartialIndexOr) {
         "{ixscan: {filter: null, pattern: {_id: 1}, "
         "bounds: {_id: [[0, 0, true, true]]}}}]}}}}");
 
-    runQuery(fromjson("{$or: [{a: -1}, {_id: 0}]}"));
-    assertNumSolutions(0U);
+    runInvalidQuery(fromjson("{$or: [{a: -1}, {_id: 0}]}"));
+    assertNoSolutions();
 }
 
 TEST_F(QueryPlannerTest, PartialIndexOrContainingAnd) {
-    params.options = QueryPlannerParams::NO_TABLE_SCAN;
+    params.mainCollectionInfo.options = QueryPlannerParams::NO_TABLE_SCAN;
     BSONObj filterObj(fromjson("{f: {$gt: 0}}"));
     std::unique_ptr<MatchExpression> filterExpr = parseMatchExpression(filterObj);
     addIndex(fromjson("{a: 1}"), filterExpr.get());
@@ -177,12 +191,12 @@ TEST_F(QueryPlannerTest, PartialIndexOrContainingAnd) {
         "{ixscan: {filter: null, pattern: {_id: 1}, "
         "bounds: {_id: [[0, 0, true, true]]}}}]}}}}");
 
-    runQuery(fromjson("{$or: [{a: 1, f: -1}, {_id: 0}]}"));
-    assertNumSolutions(0U);
+    runInvalidQuery(fromjson("{$or: [{a: 1, f: -1}, {_id: 0}]}"));
+    assertNoSolutions();
 }
 
 TEST_F(QueryPlannerTest, PartialIndexOrContainingAndMultipleAssignments) {
-    params.options = QueryPlannerParams::NO_TABLE_SCAN;
+    params.mainCollectionInfo.options = QueryPlannerParams::NO_TABLE_SCAN;
     BSONObj filterObj(fromjson("{a: {$gt: 0}}"));
     std::unique_ptr<MatchExpression> filterExpr = parseMatchExpression(filterObj);
     addIndex(fromjson("{a: 1}"), filterExpr.get());
@@ -214,13 +228,13 @@ TEST_F(QueryPlannerTest, PartialIndexOrContainingAndMultipleAssignments) {
         "{ixscan: {filter: null, pattern: {a: 1}, "
         "bounds: {a: [[2, 2, true, true]]}}}]}}}}");
 
-    runQuery(fromjson("{$or: [{_id: 0, a: -1}, {a: -2}]}"));
-    assertNumSolutions(0U);
+    runInvalidQuery(fromjson("{$or: [{_id: 0, a: -1}, {a: -2}]}"));
+    assertNoSolutions();
 }
 
 
 TEST_F(QueryPlannerTest, PartialIndexAndContainingOrContainingAnd) {
-    params.options = QueryPlannerParams::NO_TABLE_SCAN;
+    params.mainCollectionInfo.options = QueryPlannerParams::NO_TABLE_SCAN;
     BSONObj filterObj(fromjson("{f: {$gt: 0}}"));
     std::unique_ptr<MatchExpression> filterExpr = parseMatchExpression(filterObj);
     addIndex(fromjson("{a: 1}"), filterExpr.get());
@@ -235,12 +249,12 @@ TEST_F(QueryPlannerTest, PartialIndexAndContainingOrContainingAnd) {
         "{ixscan: {filter: null, pattern: {_id: 1}, "
         "bounds: {_id: [[0, 0, true, true]]}}}]}}}}");
 
-    runQuery(fromjson("{x: 1, $or: [{a: 1, f: -1}, {_id: 0}]}"));
-    assertNumSolutions(0U);
+    runInvalidQuery(fromjson("{x: 1, $or: [{a: 1, f: -1}, {_id: 0}]}"));
+    assertNoSolutions();
 }
 
 TEST_F(QueryPlannerTest, PartialIndexAndContainingOrContainingAndSatisfyingPredOutside) {
-    params.options = QueryPlannerParams::NO_TABLE_SCAN;
+    params.mainCollectionInfo.options = QueryPlannerParams::NO_TABLE_SCAN;
     BSONObj filterObj(fromjson("{f: {$gt: 0}, g: {$gt: 0}}"));
     std::unique_ptr<MatchExpression> filterExpr = parseMatchExpression(filterObj);
     addIndex(fromjson("{a: 1}"), filterExpr.get());
@@ -256,12 +270,12 @@ TEST_F(QueryPlannerTest, PartialIndexAndContainingOrContainingAndSatisfyingPredO
         "bounds: {_id: [[0, 0, true, true]]}}}]}}}}");
 
     // The following query could in theory use the partial index, but we don't support it right now.
-    runQuery(fromjson("{f: 1, x: 1, $or: [{a: 1, g: 1}, {_id: 0}]}"));
-    assertNumSolutions(0U);
+    runInvalidQuery(fromjson("{f: 1, x: 1, $or: [{a: 1, g: 1}, {_id: 0}]}"));
+    assertNoSolutions();
 }
 
 TEST_F(QueryPlannerTest, PartialIndexOrContainingAndContainingOr) {
-    params.options = QueryPlannerParams::NO_TABLE_SCAN;
+    params.mainCollectionInfo.options = QueryPlannerParams::NO_TABLE_SCAN;
     BSONObj filterObj(fromjson("{a: {$gt: 0}}"));
     std::unique_ptr<MatchExpression> filterExpr = parseMatchExpression(filterObj);
     addIndex(fromjson("{a: 1}"), filterExpr.get());
@@ -278,12 +292,12 @@ TEST_F(QueryPlannerTest, PartialIndexOrContainingAndContainingOr) {
         "{ixscan: {filter: null, pattern: {_id: 1}, "
         "bounds: {_id: [[1, 1, true, true]]}}}]}}}}");
 
-    runQuery(fromjson("{$or: [{x: 1, $or: [{a: -1}, {_id: 2}]}, {_id: 1}]}"));
-    assertNumSolutions(0U);
+    runInvalidQuery(fromjson("{$or: [{x: 1, $or: [{a: -1}, {_id: 2}]}, {_id: 1}]}"));
+    assertNoSolutions();
 }
 
 TEST_F(QueryPlannerTest, PartialIndexProvidingSort) {
-    params.options = QueryPlannerParams::NO_TABLE_SCAN;
+    params.mainCollectionInfo.options = QueryPlannerParams::NO_TABLE_SCAN;
     BSONObj filterObj(fromjson("{f: {$gt: 0}}"));
     std::unique_ptr<MatchExpression> filterExpr = parseMatchExpression(filterObj);
     addIndex(fromjson("{a: 1}"), filterExpr.get());
@@ -295,25 +309,25 @@ TEST_F(QueryPlannerTest, PartialIndexProvidingSort) {
         "{filter: null, pattern: {a: 1}, "
         "bounds: {a: [['MinKey', 'MaxKey', true, true]]}}}}}");
 
-    runQuerySortProj(fromjson("{f: -1}"), fromjson("{a: 1}"), BSONObj());
-    assertNumSolutions(0U);
+    runInvalidQuerySortProj(fromjson("{f: -1}"), fromjson("{a: 1}"), BSONObj());
+    assertNoSolutions();
 }
 
 TEST_F(QueryPlannerTest, PartialIndexOrContainingNot) {
-    params.options = QueryPlannerParams::NO_TABLE_SCAN;
+    params.mainCollectionInfo.options = QueryPlannerParams::NO_TABLE_SCAN;
     BSONObj filterObj(fromjson("{a: {$gt: 0}}"));
     std::unique_ptr<MatchExpression> filterExpr = parseMatchExpression(filterObj);
     addIndex(fromjson("{a: 1}"), filterExpr.get());
 
-    runQuery(fromjson("{$or: [{a: {$ne: 1}}, {_id: 1}]}"));
-    assertNumSolutions(0U);
+    runInvalidQuery(fromjson("{$or: [{a: {$ne: 1}}, {_id: 1}]}"));
+    assertNoSolutions();
 
-    runQuery(fromjson("{$or: [{a: {$ne: -1}}, {_id: 1}]}"));
-    assertNumSolutions(0U);
+    runInvalidQuery(fromjson("{$or: [{a: {$ne: -1}}, {_id: 1}]}"));
+    assertNoSolutions();
 }
 
 TEST_F(QueryPlannerTest, PartialIndexMultipleSameAnd) {
-    params.options = QueryPlannerParams::NO_TABLE_SCAN;
+    params.mainCollectionInfo.options = QueryPlannerParams::NO_TABLE_SCAN;
     BSONObj filterObjA(fromjson("{f: {$gt: 0}}"));
     std::unique_ptr<MatchExpression> filterExprA = parseMatchExpression(filterObjA);
     addIndex(fromjson("{a: 1}"), filterExprA.get());
@@ -339,12 +353,12 @@ TEST_F(QueryPlannerTest, PartialIndexMultipleSameAnd) {
         "{filter: null, pattern: {a: 1}, "
         "bounds: {a: [[1, 1, true, true]]}}}}}");
 
-    runQuery(fromjson("{a: 1, b: 1, f: -1, g: -1}"));
-    assertNumSolutions(0U);
+    runInvalidQuery(fromjson("{a: 1, b: 1, f: -1, g: -1}"));
+    assertNoSolutions();
 }
 
 TEST_F(QueryPlannerTest, PartialIndexMultipleSameAndCompoundSharedPrefix) {
-    params.options = QueryPlannerParams::NO_TABLE_SCAN;
+    params.mainCollectionInfo.options = QueryPlannerParams::NO_TABLE_SCAN;
     BSONObj filterObj(fromjson("{f: {$gt: 0}}"));
     std::unique_ptr<MatchExpression> filterExpr = parseMatchExpression(filterObj);
     addIndex(fromjson("{a: 1, b: 1}"), filterExpr.get());
@@ -363,12 +377,12 @@ TEST_F(QueryPlannerTest, PartialIndexMultipleSameAndCompoundSharedPrefix) {
         "bounds: {a: [[1, 1, true, true]], "
         "c: [['MinKey', 'MaxKey', true, true]]}}}}}");
 
-    runQuery(fromjson("{a: 1, f: -1}"));
-    assertNumSolutions(0U);
+    runInvalidQuery(fromjson("{a: 1, f: -1}"));
+    assertNoSolutions();
 }
 
 TEST_F(QueryPlannerTest, PartialIndexMultipleSameOr) {
-    params.options = QueryPlannerParams::NO_TABLE_SCAN;
+    params.mainCollectionInfo.options = QueryPlannerParams::NO_TABLE_SCAN;
     BSONObj filterObjA(fromjson("{f: {$gt: 0}}"));
     std::unique_ptr<MatchExpression> filterExprA = parseMatchExpression(filterObjA);
     addIndex(fromjson("{a: 1}"), filterExprA.get());
@@ -387,15 +401,15 @@ TEST_F(QueryPlannerTest, PartialIndexMultipleSameOr) {
         "{filter: null, pattern: {b: 1}, "
         "bounds: {b: [[1, 1, true, true]]}}}}}]}}");
 
-    runQuery(fromjson("{$or: [{a: 1, f: 1}, {b: 1, g: -1}]}"));
-    assertNumSolutions(0U);
+    runInvalidQuery(fromjson("{$or: [{a: 1, f: 1}, {b: 1, g: -1}]}"));
+    assertNoSolutions();
 
-    runQuery(fromjson("{$or: [{a: 1, f: -1}, {b: 1, g: -1}]}"));
-    assertNumSolutions(0U);
+    runInvalidQuery(fromjson("{$or: [{a: 1, f: -1}, {b: 1, g: -1}]}"));
+    assertNoSolutions();
 }
 
 TEST_F(QueryPlannerTest, PartialIndexAndCompoundIndex) {
-    params.options = QueryPlannerParams::NO_TABLE_SCAN;
+    params.mainCollectionInfo.options = QueryPlannerParams::NO_TABLE_SCAN;
     BSONObj filterObj(fromjson("{f: {$gt: 0}}"));
     std::unique_ptr<MatchExpression> filterExpr = parseMatchExpression(filterObj);
     addIndex(fromjson("{a: 1, b: 1}"), filterExpr.get());
@@ -408,12 +422,12 @@ TEST_F(QueryPlannerTest, PartialIndexAndCompoundIndex) {
         "bounds: {a: [[1, 1, true, true]], "
         "b: [[1, 1, true, true]]}}}}}");
 
-    runQuery(fromjson("{a: 1, b: 1, f: -1}"));
-    assertNumSolutions(0U);
+    runInvalidQuery(fromjson("{a: 1, b: 1, f: -1}"));
+    assertNoSolutions();
 }
 
 TEST_F(QueryPlannerTest, PartialIndexOrCompoundIndex) {
-    params.options = QueryPlannerParams::NO_TABLE_SCAN;
+    params.mainCollectionInfo.options = QueryPlannerParams::NO_TABLE_SCAN;
     BSONObj filterObj(fromjson("{f: {$gt: 0}}"));
     std::unique_ptr<MatchExpression> filterExpr = parseMatchExpression(filterObj);
     addIndex(fromjson("{a: 1, b: 1}"), filterExpr.get());
@@ -428,30 +442,37 @@ TEST_F(QueryPlannerTest, PartialIndexOrCompoundIndex) {
         "{ixscan: {filter: null, pattern: {_id: 1}, "
         "bounds: {_id: [[1, 1, true, true]]}}}]}}}}");
 
-    runQuery(fromjson("{$or: [{a: 1, b: 1, f: -1}, {_id: 1}]}"));
-    assertNumSolutions(0U);
+    runInvalidQuery(fromjson("{$or: [{a: 1, b: 1, f: -1}, {_id: 1}]}"));
+    assertNoSolutions();
 }
 
 TEST_F(QueryPlannerTest, PartialIndexNor) {
-    params.options = QueryPlannerParams::NO_TABLE_SCAN;
+    params.mainCollectionInfo.options = QueryPlannerParams::NO_TABLE_SCAN;
     BSONObj filterObj(fromjson("{f: {$gt: 0}}"));
     std::unique_ptr<MatchExpression> filterExpr = parseMatchExpression(filterObj);
     addIndex(fromjson("{a: 1}"), filterExpr.get());
 
     // The following query could in theory use the partial index, but we don't support it right now.
-    runQuery(fromjson("{$nor: [{a: 1, f: 1}, {_id: 1}]}"));
-    assertNumSolutions(0U);
+    runInvalidQuery(fromjson("{$nor: [{a: 1, f: 1}, {_id: 1}]}"));
+    assertNoSolutions();
 
-    runQuery(fromjson("{$nor: [{a: 1, f: -1}, {_id: 1}]}"));
-    assertNumSolutions(0U);
+    runInvalidQuery(fromjson("{$nor: [{a: 1, f: -1}, {_id: 1}]}"));
+    assertNoSolutions();
 }
 
 TEST_F(QueryPlannerTest, PartialIndexStringComparisonMatchingCollators) {
-    params.options = QueryPlannerParams::NO_TABLE_SCAN;
+    params.mainCollectionInfo.options = QueryPlannerParams::NO_TABLE_SCAN;
     BSONObj filterObj(fromjson("{a: {$gt: 'cba'}}"));
-    CollatorInterfaceMock collator(CollatorInterfaceMock::MockType::kReverseString);
-    std::unique_ptr<MatchExpression> filterExpr = parseMatchExpression(filterObj, &collator);
-    addIndex(fromjson("{a: 1}"), filterExpr.get(), &collator);
+
+    auto expCtxForPartialFilter = ExpressionContextBuilder{}
+                                      .opCtx(opCtx.get())
+                                      .collator(std::make_unique<CollatorInterfaceMock>(
+                                          CollatorInterfaceMock::MockType::kReverseString))
+                                      .ns(kNs)
+                                      .build();
+    std::unique_ptr<MatchExpression> filterExpr =
+        parseMatchExpression(filterObj, expCtxForPartialFilter);
+    addIndex(fromjson("{a: 1}"), filterExpr.get(), expCtxForPartialFilter->getCollator());
 
     runQueryAsCommand(
         fromjson("{find: 'testns', filter: {a: 'abc'}, collation: {locale: 'reverse'}}"));
@@ -461,17 +482,24 @@ TEST_F(QueryPlannerTest, PartialIndexStringComparisonMatchingCollators) {
         "{filter: null, pattern: {a: 1}, "
         "bounds: {a: [['cba', 'cba', true, true]]}}}}}");
 
-    runQueryAsCommand(
+    runInvalidQueryAsCommand(
         fromjson("{find: 'testns', filter: {a: 'zaa'}, collation: {locale: 'reverse'}}"));
-    assertNumSolutions(0U);
+    assertNoSolutions();
 }
 
 TEST_F(QueryPlannerTest, PartialIndexNoStringComparisonNonMatchingCollators) {
-    params.options = QueryPlannerParams::NO_TABLE_SCAN;
+    params.mainCollectionInfo.options = QueryPlannerParams::NO_TABLE_SCAN;
     BSONObj filterObj(fromjson("{a: {$gt: 0}}"));
-    CollatorInterfaceMock collator(CollatorInterfaceMock::MockType::kAlwaysEqual);
-    std::unique_ptr<MatchExpression> filterExpr = parseMatchExpression(filterObj, &collator);
-    addIndex(fromjson("{a: 1}"), filterExpr.get(), &collator);
+
+    auto expCtxForPartialFilter = ExpressionContextBuilder{}
+                                      .opCtx(opCtx.get())
+                                      .collator(std::make_unique<CollatorInterfaceMock>(
+                                          CollatorInterfaceMock::MockType::kReverseString))
+                                      .ns(kNs)
+                                      .build();
+    std::unique_ptr<MatchExpression> filterExpr =
+        parseMatchExpression(filterObj, expCtxForPartialFilter);
+    addIndex(fromjson("{a: 1}"), filterExpr.get(), expCtxForPartialFilter->getCollator());
 
     runQueryAsCommand(fromjson("{find: 'testns', filter: {a: 1}, collation: {locale: 'reverse'}}"));
     assertNumSolutions(1U);
@@ -482,13 +510,57 @@ TEST_F(QueryPlannerTest, PartialIndexNoStringComparisonNonMatchingCollators) {
 }
 
 TEST_F(QueryPlannerTest, InternalExprEqCannotUsePartialIndex) {
-    params.options = QueryPlannerParams::NO_TABLE_SCAN;
+    params.mainCollectionInfo.options = QueryPlannerParams::NO_TABLE_SCAN;
     BSONObj filterObj(fromjson("{a: {$gte: 0}}"));
     auto filterExpr = parseMatchExpression(filterObj);
     addIndex(fromjson("{a: 1}"), filterExpr.get());
 
-    runQueryAsCommand(fromjson("{find: 'testns', filter: {a: {$_internalExprEq: 1}}}"));
-    assertNumSolutions(0U);
+    runInvalidQueryAsCommand(fromjson("{find: 'testns', filter: {a: {$_internalExprEq: 1}}}"));
+    assertNoSolutions();
+}
+
+TEST_F(QueryPlannerTest, MultipleOverlappingPartialIndexes) {
+    params.mainCollectionInfo.options = QueryPlannerParams::NO_TABLE_SCAN;
+
+    // Create two partial indexes with an overlapping range on the same key pattern.
+    BSONObj minus5To5 = fromjson("{a: {$gte: -5, $lte: 5}}");
+    BSONObj gte0 = fromjson("{a: {$gte: 0}}");
+    std::unique_ptr<MatchExpression> minus5To5Filter = parseMatchExpression(minus5To5);
+    std::unique_ptr<MatchExpression> gte0Filter = parseMatchExpression(gte0);
+    addIndex(fromjson("{a: 1}"), minus5To5Filter.get());
+    params.mainCollectionInfo.indexes.back().identifier = CoreIndexInfo::Identifier{"minus5To5"};
+    addIndex(fromjson("{a: 1}"), gte0Filter.get());
+    params.mainCollectionInfo.indexes.back().identifier = CoreIndexInfo::Identifier{"gte0"};
+
+    // Test that both indexes are eligible when the query falls within the intersecting range.
+    runQuery(fromjson("{a: 1}"));
+    assertNumSolutions(2U);
+    assertSolutionExists(
+        "{fetch: {filter: null, node: {ixscan: "
+        "{filter: null, pattern: {a: 1}, name: 'minus5To5', "
+        "bounds: {a: [[1, 1, true, true]]}}}}}");
+    assertSolutionExists(
+        "{fetch: {filter: null, node: {ixscan: "
+        "{filter: null, pattern: {a: 1}, name: 'gte0', "
+        "bounds: {a: [[1, 1, true, true]]}}}}}");
+
+    // Test that only a single index is eligible when the query falls within a single range.
+    runQuery(fromjson("{a: -5}"));
+    assertNumSolutions(1U);
+    assertSolutionExists(
+        "{fetch: {filter: null, node: {ixscan: "
+        "{filter: null, pattern: {a: 1}, name: 'minus5To5', "
+        "bounds: {a: [[-5, -5, true, true]]}}}}}");
+    runQuery(fromjson("{a: 10}"));
+    assertNumSolutions(1U);
+    assertSolutionExists(
+        "{fetch: {filter: null, node: {ixscan: "
+        "{filter: null, pattern: {a: 1}, name: 'gte0', "
+        "bounds: {a: [[10, 10, true, true]]}}}}}");
+
+    // Test that neither index is eligible when the query falls outside both ranges.
+    runInvalidQuery(fromjson("{a: -10}"));
+    assertNoSolutions();
 }
 
 }  // namespace

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,10 +29,13 @@
 
 #pragma once
 
+#include <memory>
+
+#include "mongo/base/status.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/repl/optime.h"
-#include "mongo/stdx/functional.h"
 #include "mongo/stdx/mutex.h"
-#include "mongo/util/time_support.h"
+#include "mongo/util/duration.h"
 
 namespace mongo {
 namespace repl {
@@ -44,7 +46,8 @@ namespace repl {
  * coordinator's optime has not changed since the last time it did a write.
  */
 class NoopWriter {
-    MONGO_DISALLOW_COPYING(NoopWriter);
+    NoopWriter(const NoopWriter&) = delete;
+    NoopWriter& operator=(const NoopWriter&) = delete;
 
 public:
     NoopWriter(Seconds waitTime);

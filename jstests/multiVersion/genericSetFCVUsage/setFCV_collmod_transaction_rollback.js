@@ -2,51 +2,35 @@
  * Ensure that transaction rollback succeeds after an interrupted index ttl update or upgrade
  * collMod command.
  */
-(function() {
-    'use strict';
+let dbpath = MongoRunner.dataPath + "setFCV_collmod_transaction_rollback";
+resetDbpath(dbpath);
 
-    load("jstests/libs/feature_compatibility_version.js");
+const latest = "latest";
 
-    let dbpath = MongoRunner.dataPath + "setFCV_collmod_transaction_rollback";
-    resetDbpath(dbpath);
+let conn = MongoRunner.runMongod({dbpath: dbpath, binVersion: latest});
+assert.neq(
+    null, conn, "mongod was unable to start up with version=" + latest + " and no data files");
+let adminDB = conn.getDB("admin");
 
-    const latest = "latest";
+var collName = "collModTest";
+var coll = adminDB.getCollection(collName);
+var ttlBeforeRollback = 50;
 
-    let conn = MongoRunner.runMongod({dbpath: dbpath, binVersion: latest});
-    assert.neq(
-        null, conn, "mongod was unable to start up with version=" + latest + " and no data files");
-    let adminDB = conn.getDB("admin");
+assert.commandWorked(
+    coll.createIndex({b: 1}, {"name": "index1", "expireAfterSeconds": ttlBeforeRollback}));
 
-    var collName = "collModTest";
-    var coll = adminDB.getCollection(collName);
-    var ttlBeforeRollback = 50;
+// The failpoint causes an interrupt in the collMod's WriteUnitOfWork, thus triggers a rollback.
+assert.commandWorked(
+    adminDB.adminCommand({configureFailPoint: "assertAfterIndexUpdate", mode: "alwaysOn"}));
 
-    assert.commandWorked(
-        coll.createIndex({b: 1}, {"name": "index1", "expireAfterSeconds": ttlBeforeRollback}));
+// Test transaction rollback after index ttl update collMod.
+assert.commandFailedWithCode(
+    adminDB.runCommand(
+        {"collMod": collName, "index": {"name": "index1", "expireAfterSeconds": 100}}),
+    50970);
 
-    // The failpoint causes an interrupt in the collMod's WriteUnitOfWork, thus triggers a rollback.
-    assert.commandWorked(
-        adminDB.adminCommand({configureFailPoint: "assertAfterIndexUpdate", mode: "alwaysOn"}));
+const index = coll.getIndexes();
+var ttlAfterRollback = index[1].expireAfterSeconds;
+assert.eq(ttlAfterRollback, ttlBeforeRollback);
 
-    // Test transaction rollback after index ttl update collMod.
-    assert.commandFailedWithCode(
-        adminDB.runCommand(
-            {"collMod": collName, "index": {"name": "index1", "expireAfterSeconds": 100}}),
-        50970);
-
-    const index = coll.getIndexes();
-    var ttlAfterRollback = index[1].expireAfterSeconds;
-    assert.eq(ttlAfterRollback, ttlBeforeRollback);
-
-    // SERVER-37634 should remove this test post 4.2.
-    // Test transaction rollback after unique index upgrade collMod.
-    assert.commandWorked(adminDB.adminCommand({setFeatureCompatibilityVersion: lastStableFCV}));
-
-    assert.commandWorked(coll.createIndex({a: 1}, {unique: true}));
-    assert.writeOK(coll.insert({_id: 0, a: 1}));
-
-    assert.commandFailedWithCode(adminDB.adminCommand({setFeatureCompatibilityVersion: latestFCV}),
-                                 50971);
-
-    MongoRunner.stopMongod(conn);
-})();
+MongoRunner.stopMongod(conn);

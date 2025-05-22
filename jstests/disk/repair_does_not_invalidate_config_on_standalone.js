@@ -4,39 +4,42 @@
  * @tags: [requires_wiredtiger]
  */
 
-(function() {
+import {
+    assertRepairSucceeds,
+    assertStartAndStopStandaloneOnExistingDbpath,
+    getUriForColl,
+} from "jstests/disk/libs/wt_file_helper.js";
 
-    load('jstests/disk/libs/wt_file_helper.js');
+const baseName = "repair_does_not_invalidate_config_on_standalone";
+const dbName = baseName;
+const collName = "test";
 
-    const baseName = "repair_does_not_invalidate_config_on_standalone";
-    const dbName = baseName;
-    const collName = "test";
+const dbpath = MongoRunner.dataPath + baseName + "/";
+resetDbpath(dbpath);
 
-    const dbpath = MongoRunner.dataPath + baseName + "/";
-    resetDbpath(dbpath);
+let mongod = MongoRunner.runMongod({dbpath: dbpath});
+const port = mongod.port;
 
-    let mongod = MongoRunner.runMongod({dbpath: dbpath});
-    const port = mongod.port;
+let testColl = mongod.getDB(dbName)[collName];
 
-    let testColl = mongod.getDB(dbName)[collName];
+assert.commandWorked(testColl.insert({_id: 0, foo: "bar"}));
+// SERVER-50534: Also verify that running --repair with a view doesn't crash.
+assert.commandWorked(mongod.getDB(dbName).createView("viewName", collName, []));
 
-    assert.commandWorked(testColl.insert({_id: 0, foo: "bar"}));
+let collUri = getUriForColl(testColl);
+let collFile = dbpath + "/" + collUri + ".wt";
 
-    let collUri = getUriForColl(testColl);
-    let collFile = dbpath + "/" + collUri + ".wt";
+MongoRunner.stopMongod(mongod);
 
-    MongoRunner.stopMongod(mongod);
+jsTestLog("Deleting collection file: " + collFile);
+removeFile(collFile);
 
-    jsTestLog("Deleting collection file: " + collFile);
-    removeFile(collFile);
+assertRepairSucceeds(dbpath, port);
 
-    assertRepairSucceeds(dbpath, port);
+assertStartAndStopStandaloneOnExistingDbpath(dbpath, port, function(node) {
+    let nodeDB = node.getDB(dbName);
+    assert(nodeDB[collName].exists());
+    assert.eq(nodeDB[collName].find().itcount(), 0);
 
-    assertStartAndStopStandaloneOnExistingDbpath(dbpath, port, function(node) {
-        let nodeDB = node.getDB(dbName);
-        assert(nodeDB[collName].exists());
-        assert.eq(nodeDB[collName].find().itcount(), 0);
-
-        assert(!nodeDB.getSiblingDB("local")["system.replset"].exists());
-    });
-})();
+    assert(!nodeDB.getSiblingDB("local")["system.replset"].exists());
+});

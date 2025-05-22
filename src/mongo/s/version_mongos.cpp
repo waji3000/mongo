@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,31 +27,29 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
 
 #include "mongo/s/version_mongos.h"
 
 #include <iostream>
+#include <string>
 
 #include "mongo/db/log_process_details.h"
-#include "mongo/db/server_options.h"
-#include "mongo/platform/process_id.h"
-#include "mongo/util/debug_util.h"
-#include "mongo/util/log.h"
 #include "mongo/util/version.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
+
 
 namespace mongo {
 
-void printShardingVersionInfo(bool out) {
-    auto&& vii = VersionInfoInterface::instance();
-    if (out) {
-        setPlainConsoleLogger();
-        log() << mongosVersion(vii);
-        vii.logBuildInfo();
+void logMongosVersionInfo(std::ostream* os) {
+    if (os) {
+        auto&& vii = VersionInfoInterface::instance();
+        *os << mongosVersion(vii) << std::endl;
+        vii.logBuildInfo(os);
+        *os << std::endl;
     } else {
-        log() << mongosVersion(vii);
-        vii.logBuildInfo();
-        logProcessDetails();
+        logProcessDetails(nullptr);
     }
 }
+
 }  // namespace mongo

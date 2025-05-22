@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,22 +27,34 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
 
-#include "mongo/scripting/mozjs/global.h"
-
+#include <cstddef>
+#include <cstdint>
+#include <js/CallArgs.h>
 #include <js/Conversions.h>
+#include <js/RootingAPI.h>
+#include <js/TypeDecls.h>
+#include <ostream>
 
-#include "mongo/base/init.h"
-#include "mongo/logger/logger.h"
-#include "mongo/logger/logstream_builder.h"
+#include <js/PropertySpec.h>
+
+#include "mongo/base/init.h"  // IWYU pragma: keep
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/logv2/log.h"
 #include "mongo/scripting/engine.h"
+#include "mongo/scripting/mozjs/global.h"
 #include "mongo/scripting/mozjs/implscope.h"
 #include "mongo/scripting/mozjs/jsstringwrapper.h"
-#include "mongo/scripting/mozjs/objectwrapper.h"
 #include "mongo/scripting/mozjs/valuereader.h"
 #include "mongo/scripting/mozjs/valuewriter.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/buildinfo.h"
+#include "mongo/util/duration.h"
 #include "mongo/util/version.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
+
 
 namespace mongo {
 namespace mozjs {
@@ -60,15 +71,8 @@ const JSFunctionSpec GlobalInfo::freeFunctions[7] = {
 
 const char* const GlobalInfo::className = "Global";
 
-namespace {
-
-logger::MessageLogDomain* jsPrintLogDomain;
-
-}  // namespace
-
 void GlobalInfo::Functions::print::call(JSContext* cx, JS::CallArgs args) {
-    logger::LogstreamBuilder builder(jsPrintLogDomain, getThreadName(), logger::LogSeverity::Log());
-    std::ostream& ss = builder.stream();
+    std::ostringstream ss;
 
     bool first = true;
     for (size_t i = 0; i < args.length(); i++) {
@@ -86,9 +90,14 @@ void GlobalInfo::Functions::print::call(JSContext* cx, JS::CallArgs args) {
         JSStringWrapper jsstr(cx, JS::ToString(cx, args.get(i)));
         ss << jsstr.toStringData();
     }
-    ss << std::endl;
 
     args.rval().setUndefined();
+
+    LOGV2_INFO_OPTIONS(
+        20162,
+        logv2::LogOptions(logv2::LogTag::kPlainShell, logv2::LogTruncation::Disabled),
+        "{jsPrint}",
+        "jsPrint"_attr = ss.str());
 }
 
 void GlobalInfo::Functions::version::call(JSContext* cx, JS::CallArgs args) {
@@ -98,7 +107,7 @@ void GlobalInfo::Functions::version::call(JSContext* cx, JS::CallArgs args) {
 
 void GlobalInfo::Functions::buildInfo::call(JSContext* cx, JS::CallArgs args) {
     BSONObjBuilder b;
-    VersionInfoInterface::instance().appendBuildInfo(&b);
+    getBuildInfo().serialize(&b);
     ValueReader(cx, args.rval()).fromBSON(b.obj(), nullptr, false);
 }
 
@@ -124,11 +133,6 @@ void GlobalInfo::Functions::sleep::call(JSContext* cx, JS::CallArgs args) {
     scope->sleep(Milliseconds(duration));
 
     args.rval().setUndefined();
-}
-
-MONGO_INITIALIZER(JavascriptPrintDomain)(InitializerContext*) {
-    jsPrintLogDomain = logger::globalLogManager()->getNamedDomain("javascriptOutput");
-    return Status::OK();
 }
 
 }  // namespace mozjs

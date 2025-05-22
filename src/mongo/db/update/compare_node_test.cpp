@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,27 +27,32 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <string>
+#include <utility>
 
-#include "mongo/db/update/compare_node.h"
+#include <boost/smart_ptr/intrusive_ptr.hpp>
 
-#include "mongo/bson/mutable/algorithm.h"
-#include "mongo/bson/mutable/mutable_bson_test_utils.h"
-#include "mongo/db/json.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/json.h"
+#include "mongo/db/exec/mutable_bson/algorithm.h"
+#include "mongo/db/exec/mutable_bson/document.h"
 #include "mongo/db/pipeline/expression_context_for_test.h"
 #include "mongo/db/query/collation/collator_interface_mock.h"
+#include "mongo/db/update/compare_node.h"
+#include "mongo/db/update/update_executor.h"
 #include "mongo/db/update/update_node_test_fixture.h"
 #include "mongo/unittest/death_test.h"
 #include "mongo/unittest/unittest.h"
+#include "mongo/util/intrusive_counter.h"
 
 namespace mongo {
 namespace {
 
-using CompareNodeTest = UpdateNodeTest;
-using mongo::mutablebson::Element;
-using mongo::mutablebson::countChildren;
+using CompareNodeTest = UpdateTestFixture;
 
-DEATH_TEST(CompareNodeTest, InitFailsForEmptyElement, "Invariant failure modExpr.ok()") {
+DEATH_TEST_REGEX(CompareNodeTest,
+                 InitFailsForEmptyElement,
+                 R"#(Invariant failure.*modExpr.ok\(\))#") {
     auto update = fromjson("{$max: {}}");
     boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
     CompareNode node(CompareNode::CompareMode::kMax);
@@ -62,14 +66,15 @@ TEST_F(CompareNodeTest, ApplyMaxSameNumber) {
     ASSERT_OK(node.init(update["$max"]["a"], expCtx));
 
     mutablebson::Document doc(fromjson("{a: 1}"));
-    setPathTaken("a");
+    setPathTaken(makeRuntimeUpdatePathForTest("a"));
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()["a"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_TRUE(result.noop);
-    ASSERT_FALSE(result.indexesAffected);
+    ASSERT_FALSE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{a: 1}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(fromjson("{}"), getLogDoc());
+
+    assertOplogEntryIsNoop();
 }
 
 TEST_F(CompareNodeTest, ApplyMinSameNumber) {
@@ -79,14 +84,15 @@ TEST_F(CompareNodeTest, ApplyMinSameNumber) {
     ASSERT_OK(node.init(update["$min"]["a"], expCtx));
 
     mutablebson::Document doc(fromjson("{a: 1}"));
-    setPathTaken("a");
+    setPathTaken(makeRuntimeUpdatePathForTest("a"));
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()["a"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_TRUE(result.noop);
-    ASSERT_FALSE(result.indexesAffected);
+    ASSERT_FALSE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{a: 1}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(fromjson("{}"), getLogDoc());
+
+    assertOplogEntryIsNoop();
 }
 
 TEST_F(CompareNodeTest, ApplyMaxNumberIsLess) {
@@ -96,14 +102,15 @@ TEST_F(CompareNodeTest, ApplyMaxNumberIsLess) {
     ASSERT_OK(node.init(update["$max"]["a"], expCtx));
 
     mutablebson::Document doc(fromjson("{a: 1}"));
-    setPathTaken("a");
+    setPathTaken(makeRuntimeUpdatePathForTest("a"));
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()["a"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_TRUE(result.noop);
-    ASSERT_FALSE(result.indexesAffected);
+    ASSERT_FALSE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{a: 1}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(fromjson("{}"), getLogDoc());
+
+    assertOplogEntryIsNoop();
 }
 
 TEST_F(CompareNodeTest, ApplyMinNumberIsMore) {
@@ -113,14 +120,15 @@ TEST_F(CompareNodeTest, ApplyMinNumberIsMore) {
     ASSERT_OK(node.init(update["$min"]["a"], expCtx));
 
     mutablebson::Document doc(fromjson("{a: 1}"));
-    setPathTaken("a");
+    setPathTaken(makeRuntimeUpdatePathForTest("a"));
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()["a"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_TRUE(result.noop);
-    ASSERT_FALSE(result.indexesAffected);
+    ASSERT_FALSE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{a: 1}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(fromjson("{}"), getLogDoc());
+
+    assertOplogEntryIsNoop();
 }
 
 TEST_F(CompareNodeTest, ApplyMaxSameValInt) {
@@ -130,14 +138,15 @@ TEST_F(CompareNodeTest, ApplyMaxSameValInt) {
     ASSERT_OK(node.init(update["$max"]["a"], expCtx));
 
     mutablebson::Document doc(fromjson("{a: 1.0}"));
-    setPathTaken("a");
+    setPathTaken(makeRuntimeUpdatePathForTest("a"));
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()["a"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_TRUE(result.noop);
-    ASSERT_FALSE(result.indexesAffected);
+    ASSERT_FALSE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{a: 1.0}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(fromjson("{}"), getLogDoc());
+
+    assertOplogEntryIsNoop();
 }
 
 TEST_F(CompareNodeTest, ApplyMaxSameValIntZero) {
@@ -147,14 +156,15 @@ TEST_F(CompareNodeTest, ApplyMaxSameValIntZero) {
     ASSERT_OK(node.init(update["$max"]["a"], expCtx));
 
     mutablebson::Document doc(fromjson("{a: 0.0}"));
-    setPathTaken("a");
+    setPathTaken(makeRuntimeUpdatePathForTest("a"));
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()["a"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_TRUE(result.noop);
-    ASSERT_FALSE(result.indexesAffected);
+    ASSERT_FALSE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{a: 0.0}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(fromjson("{}"), getLogDoc());
+
+    assertOplogEntryIsNoop();
 }
 
 TEST_F(CompareNodeTest, ApplyMinSameValIntZero) {
@@ -164,14 +174,15 @@ TEST_F(CompareNodeTest, ApplyMinSameValIntZero) {
     ASSERT_OK(node.init(update["$min"]["a"], expCtx));
 
     mutablebson::Document doc(fromjson("{a: 0.0}"));
-    setPathTaken("a");
+    setPathTaken(makeRuntimeUpdatePathForTest("a"));
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()["a"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_TRUE(result.noop);
-    ASSERT_FALSE(result.indexesAffected);
+    ASSERT_FALSE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{a: 0.0}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(fromjson("{}"), getLogDoc());
+
+    assertOplogEntryIsNoop();
 }
 
 TEST_F(CompareNodeTest, ApplyMissingFieldMinNumber) {
@@ -183,12 +194,13 @@ TEST_F(CompareNodeTest, ApplyMissingFieldMinNumber) {
     mutablebson::Document doc(fromjson("{}"));
     setPathToCreate("a");
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()));
+    auto result = node.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
-    ASSERT_TRUE(result.indexesAffected);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{a: 0}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(fromjson("{$set: {a: 0}}"), getLogDoc());
+
+    assertOplogEntry(fromjson("{$v:2, diff: {i: {a: 0}}}"));
 }
 
 TEST_F(CompareNodeTest, ApplyExistingNumberMinNumber) {
@@ -198,14 +210,15 @@ TEST_F(CompareNodeTest, ApplyExistingNumberMinNumber) {
     ASSERT_OK(node.init(update["$min"]["a"], expCtx));
 
     mutablebson::Document doc(fromjson("{a: 1}"));
-    setPathTaken("a");
+    setPathTaken(makeRuntimeUpdatePathForTest("a"));
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()["a"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
-    ASSERT_TRUE(result.indexesAffected);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{a: 0}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(fromjson("{$set: {a: 0}}"), getLogDoc());
+
+    assertOplogEntry(fromjson("{$v:2, diff: {u: {a: 0}}}"));
 }
 
 TEST_F(CompareNodeTest, ApplyMissingFieldMaxNumber) {
@@ -217,12 +230,13 @@ TEST_F(CompareNodeTest, ApplyMissingFieldMaxNumber) {
     mutablebson::Document doc(fromjson("{}"));
     setPathToCreate("a");
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()));
+    auto result = node.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
-    ASSERT_TRUE(result.indexesAffected);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{a: 0}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(fromjson("{$set: {a: 0}}"), getLogDoc());
+
+    assertOplogEntry(fromjson("{$v:2, diff: {i: {a: 0}}}"));
 }
 
 TEST_F(CompareNodeTest, ApplyExistingNumberMaxNumber) {
@@ -232,14 +246,15 @@ TEST_F(CompareNodeTest, ApplyExistingNumberMaxNumber) {
     ASSERT_OK(node.init(update["$max"]["a"], expCtx));
 
     mutablebson::Document doc(fromjson("{a: 1}"));
-    setPathTaken("a");
+    setPathTaken(makeRuntimeUpdatePathForTest("a"));
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()["a"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
-    ASSERT_TRUE(result.indexesAffected);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{a: 2}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(fromjson("{$set: {a: 2}}"), getLogDoc());
+
+    assertOplogEntry(fromjson("{$v:2, diff: {u: {a: 2}}}"));
 }
 
 TEST_F(CompareNodeTest, ApplyExistingDateMaxDate) {
@@ -249,14 +264,15 @@ TEST_F(CompareNodeTest, ApplyExistingDateMaxDate) {
     ASSERT_OK(node.init(update["$max"]["a"], expCtx));
 
     mutablebson::Document doc(fromjson("{a: {$date: 0}}"));
-    setPathTaken("a");
+    setPathTaken(makeRuntimeUpdatePathForTest("a"));
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()["a"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
-    ASSERT_TRUE(result.indexesAffected);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{a: {$date: 123123123}}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(fromjson("{$set: {a: {$date: 123123123}}}"), getLogDoc());
+
+    assertOplogEntry(fromjson("{$v:2, diff: {u: {a: {$date: 123123123}}}}"));
 }
 
 TEST_F(CompareNodeTest, ApplyExistingEmbeddedDocMaxDoc) {
@@ -266,14 +282,15 @@ TEST_F(CompareNodeTest, ApplyExistingEmbeddedDocMaxDoc) {
     ASSERT_OK(node.init(update["$max"]["a"], expCtx));
 
     mutablebson::Document doc(fromjson("{a: {b: 2}}"));
-    setPathTaken("a");
+    setPathTaken(makeRuntimeUpdatePathForTest("a"));
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()["a"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
-    ASSERT_TRUE(result.indexesAffected);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{a: {b: 3}}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(fromjson("{$set: {a: {b: 3}}}"), getLogDoc());
+
+    assertOplogEntry(fromjson("{$v:2, diff: {u: {a: {b: 3}}}}"));
 }
 
 TEST_F(CompareNodeTest, ApplyExistingEmbeddedDocMaxNumber) {
@@ -283,33 +300,36 @@ TEST_F(CompareNodeTest, ApplyExistingEmbeddedDocMaxNumber) {
     ASSERT_OK(node.init(update["$max"]["a"], expCtx));
 
     mutablebson::Document doc(fromjson("{a: {b: 2}}"));
-    setPathTaken("a");
+    setPathTaken(makeRuntimeUpdatePathForTest("a"));
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()["a"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_TRUE(result.noop);
-    ASSERT_FALSE(result.indexesAffected);
+    ASSERT_FALSE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{a: {b: 2}}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(fromjson("{}"), getLogDoc());
+
+    assertOplogEntryIsNoop();
 }
 
 TEST_F(CompareNodeTest, ApplyMinRespectsCollation) {
     auto update = fromjson("{$min: {a: 'dba'}}");
-    CollatorInterfaceMock collator(CollatorInterfaceMock::MockType::kReverseString);
     boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    expCtx->setCollator(&collator);
+    auto collator =
+        std::make_unique<CollatorInterfaceMock>(CollatorInterfaceMock::MockType::kReverseString);
+    expCtx->setCollator(std::move(collator));
     CompareNode node(CompareNode::CompareMode::kMin);
     ASSERT_OK(node.init(update["$min"]["a"], expCtx));
 
     mutablebson::Document doc(fromjson("{a: 'cbc'}"));
-    setPathTaken("a");
+    setPathTaken(makeRuntimeUpdatePathForTest("a"));
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()["a"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
-    ASSERT_TRUE(result.indexesAffected);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{a: 'dba'}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(fromjson("{$set: {a: 'dba'}}"), getLogDoc());
+
+    assertOplogEntry(fromjson("{$v:2, diff: {u: {a: 'dba'}}}"));
 }
 
 TEST_F(CompareNodeTest, ApplyMinRespectsCollationFromSetCollator) {
@@ -323,14 +343,15 @@ TEST_F(CompareNodeTest, ApplyMinRespectsCollationFromSetCollator) {
     node.setCollator(&reverseStringCollator);
 
     mutablebson::Document doc(fromjson("{a: 'cbc'}"));
-    setPathTaken("a");
+    setPathTaken(makeRuntimeUpdatePathForTest("a"));
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()["a"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
-    ASSERT_TRUE(result.indexesAffected);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{a: 'dba'}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(fromjson("{$set: {a: 'dba'}}"), getLogDoc());
+
+    assertOplogEntry(fromjson("{$v:2, diff: {u: {a: 'dba'}}}"));
 }
 
 TEST_F(CompareNodeTest, ApplyMaxRespectsCollationFromSetCollator) {
@@ -344,27 +365,32 @@ TEST_F(CompareNodeTest, ApplyMaxRespectsCollationFromSetCollator) {
     node.setCollator(&reverseStringCollator);
 
     mutablebson::Document doc(fromjson("{a: 'cbc'}"));
-    setPathTaken("a");
+    setPathTaken(makeRuntimeUpdatePathForTest("a"));
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()["a"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
-    ASSERT_TRUE(result.indexesAffected);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{a: 'abd'}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(fromjson("{$set: {a: 'abd'}}"), getLogDoc());
+
+    assertOplogEntry(fromjson("{$v:2, diff: {u: {a: 'abd'}}}"));
 }
 
-DEATH_TEST(CompareNodeTest, CannotSetCollatorIfCollatorIsNonNull, "Invariant failure !_collator") {
+DEATH_TEST_REGEX(CompareNodeTest,
+                 CannotSetCollatorIfCollatorIsNonNull,
+                 "Invariant failure.*!_collator") {
     auto update = fromjson("{$max: {a: 1}}");
-    CollatorInterfaceMock caseInsensitiveCollator(CollatorInterfaceMock::MockType::kToLowerString);
+    auto collator =
+        std::make_unique<CollatorInterfaceMock>(CollatorInterfaceMock::MockType::kToLowerString);
+
     boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    expCtx->setCollator(&caseInsensitiveCollator);
+    expCtx->setCollator(std::move(collator));
     CompareNode node(CompareNode::CompareMode::kMax);
     ASSERT_OK(node.init(update["$max"]["a"], expCtx));
-    node.setCollator(&caseInsensitiveCollator);
+    node.setCollator(expCtx->getCollator());
 }
 
-DEATH_TEST(CompareNodeTest, CannotSetCollatorTwice, "Invariant failure !_collator") {
+DEATH_TEST_REGEX(CompareNodeTest, CannotSetCollatorTwice, "Invariant failure.*!_collator") {
     auto update = fromjson("{$max: {a: 1}}");
     boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
     CompareNode node(CompareNode::CompareMode::kMax);
@@ -383,14 +409,15 @@ TEST_F(CompareNodeTest, ApplyIndexesNotAffected) {
     ASSERT_OK(node.init(update["$max"]["a"], expCtx));
 
     mutablebson::Document doc(fromjson("{a: 0}"));
-    setPathTaken("a");
+    setPathTaken(makeRuntimeUpdatePathForTest("a"));
     addIndexedPath("b");
-    auto result = node.apply(getApplyParams(doc.root()["a"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
-    ASSERT_FALSE(result.indexesAffected);
+    ASSERT_FALSE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{a: 1}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(fromjson("{$set: {a: 1}}"), getLogDoc());
+
+    assertOplogEntry(fromjson("{$v:2, diff: {u: {a: 1}}}"));
 }
 
 TEST_F(CompareNodeTest, ApplyNoIndexDataOrLogBuilder) {
@@ -400,11 +427,11 @@ TEST_F(CompareNodeTest, ApplyNoIndexDataOrLogBuilder) {
     ASSERT_OK(node.init(update["$max"]["a"], expCtx));
 
     mutablebson::Document doc(fromjson("{a: 0}"));
-    setPathTaken("a");
+    setPathTaken(makeRuntimeUpdatePathForTest("a"));
     setLogBuilderToNull();
-    auto result = node.apply(getApplyParams(doc.root()["a"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
-    ASSERT_FALSE(result.indexesAffected);
+    ASSERT_FALSE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{a: 1}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
 }

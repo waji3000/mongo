@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,18 +27,15 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include "mongo/scripting/deadline_monitor.h"
+#include "mongo/platform/atomic_word.h"
+#include "mongo/scripting/deadline_monitor_gen.h"
 
-#include "mongo/db/server_parameters.h"
 
 namespace mongo {
 
-MONGO_EXPORT_SERVER_PARAMETER(scriptingEngineInterruptIntervalMS, int, 1000);
-
 int getScriptingEngineInterruptInterval() {
-    return scriptingEngineInterruptIntervalMS.load();
+    return gScriptingEngineInterruptIntervalMS.load();
 }
 
 }  // namespace mongo

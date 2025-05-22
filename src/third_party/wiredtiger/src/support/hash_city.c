@@ -1,5 +1,5 @@
 /*-
- * Public Domain 2014-2018 MongoDB, Inc.
+ * Public Domain 2014-present MongoDB, Inc.
  * Public Domain 2008-2014 WiredTiger, Inc.
  *
  * This is free and unencumbered software released into the public domain.
@@ -94,7 +94,7 @@ static uint32_t UNALIGNED_LOAD32(const char *p) {
 
 #elif defined(__APPLE__)
 
-// Mac OS X / Darwin features
+/* Mac OS X / Darwin features */
 #include <libkern/OSByteOrder.h>
 #define	bswap_32(x) OSSwapInt32(x)
 #define	bswap_64(x) OSSwapInt64(x)
@@ -158,7 +158,7 @@ static const uint64_t k3 = 0xc949d7c7509e6557ULL;
  * Hash 128 input bits down to 64 bits of output.
  * This is intended to be a reasonably good hash function.
  */
-static inline uint64_t Hash128to64(const uint128 x) {
+static WT_INLINE uint64_t Hash128to64(const uint128 x) {
 	/* Murmur-inspired hashing. */
 	const uint64_t kMul = 0x9ddfea08eb382d69ULL;
 	uint64_t a, b;
@@ -299,14 +299,14 @@ static uint64_t HashLen33to64(const char *s, size_t len) {
 	return ShiftMix(r * k0 + vs) * k2;
 }
 
-static inline uint64_t CityHash64(const char *s, size_t len) {
+static WT_INLINE uint64_t CityHash64(const char *s, size_t len) {
 	uint64_t temp, x, y, z;
 	uint128 v, w;
 
 	if (len <= 32) {
 		if (len <= 16) {
 			return HashLen0to16(s, len);
-		} else {
+		} else { /* NOLINT(readability-else-after-return) */
 			return HashLen17to32(s, len);
 		}
 	} else if (len <= 64) {

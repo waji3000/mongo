@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -27,12 +26,20 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
 
-#include "mongo/platform/basic.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <mutex>
+#include <utility>
+#include <vector>
+
+#include <boost/optional/optional.hpp>
 
 #include "mongo/db/repl/oplog_buffer_proxy.h"
 #include "mongo/util/assert_util.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
+
 
 namespace mongo {
 namespace repl {
@@ -60,39 +67,24 @@ void OplogBufferProxy::shutdown(OperationContext* opCtx) {
     _target->shutdown(opCtx);
 }
 
-void OplogBufferProxy::pushEvenIfFull(OperationContext* opCtx, const Value& value) {
-    stdx::lock_guard<stdx::mutex> lk(_lastPushedMutex);
-    _lastPushed = value;
-    _target->pushEvenIfFull(opCtx, value);
-}
-
-void OplogBufferProxy::push(OperationContext* opCtx, const Value& value) {
-    stdx::lock_guard<stdx::mutex> lk(_lastPushedMutex);
-    _lastPushed = value;
-    _target->push(opCtx, value);
-}
-
-void OplogBufferProxy::pushAllNonBlocking(OperationContext* opCtx,
-                                          Batch::const_iterator begin,
-                                          Batch::const_iterator end) {
+void OplogBufferProxy::push(OperationContext* opCtx,
+                            Batch::const_iterator begin,
+                            Batch::const_iterator end,
+                            boost::optional<const Cost&> cost) {
     if (begin == end) {
         return;
     }
     stdx::lock_guard<stdx::mutex> lk(_lastPushedMutex);
     _lastPushed = *(end - 1);
-    _target->pushAllNonBlocking(opCtx, begin, end);
+    _target->push(opCtx, begin, end, cost);
 }
 
-void OplogBufferProxy::waitForSpace(OperationContext* opCtx, std::size_t size) {
-    _target->waitForSpace(opCtx, size);
+void OplogBufferProxy::waitForSpace(OperationContext* opCtx, const Cost& cost) {
+    _target->waitForSpace(opCtx, cost);
 }
 
 bool OplogBufferProxy::isEmpty() const {
     return _target->isEmpty();
-}
-
-std::size_t OplogBufferProxy::getMaxSize() const {
-    return _target->getMaxSize();
 }
 
 std::size_t OplogBufferProxy::getSize() const {
@@ -125,14 +117,24 @@ bool OplogBufferProxy::tryPop(OperationContext* opCtx, Value* value) {
     return true;
 }
 
-bool OplogBufferProxy::waitForData(Seconds waitDuration) {
+bool OplogBufferProxy::waitForDataFor(Milliseconds waitDuration, Interruptible* interruptible) {
     {
         stdx::unique_lock<stdx::mutex> lk(_lastPushedMutex);
         if (_lastPushed) {
             return true;
         }
     }
-    return _target->waitForData(waitDuration);
+    return _target->waitForDataFor(waitDuration, interruptible);
+}
+
+bool OplogBufferProxy::waitForDataUntil(Date_t deadline, Interruptible* interruptible) {
+    {
+        stdx::unique_lock<stdx::mutex> lk(_lastPushedMutex);
+        if (_lastPushed) {
+            return true;
+        }
+    }
+    return _target->waitForDataUntil(deadline, interruptible);
 }
 
 bool OplogBufferProxy::peek(OperationContext* opCtx, Value* value) {

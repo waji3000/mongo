@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,9 +29,37 @@
 
 #include "mongo/db/read_concern.h"
 
+#include <string>
+
+#include "mongo/base/shim.h"
+#include "mongo/db/repl/speculative_majority_read_info.h"
+
 namespace mongo {
 
-MONGO_DEFINE_SHIM(waitForReadConcern);
-MONGO_DEFINE_SHIM(waitForLinearizableReadConcern);
+void setPrepareConflictBehaviorForReadConcern(OperationContext* opCtx,
+                                              const repl::ReadConcernArgs& readConcernArgs,
+                                              PrepareConflictBehavior prepareConflictBehavior) {
+    static auto w = MONGO_WEAK_FUNCTION_DEFINITION(setPrepareConflictBehaviorForReadConcern);
+    return w(opCtx, readConcernArgs, prepareConflictBehavior);
+}
+
+Status waitForReadConcern(OperationContext* opCtx,
+                          const repl::ReadConcernArgs& readConcernArgs,
+                          const DatabaseName& dbName,
+                          bool allowAfterClusterTime) {
+    static auto w = MONGO_WEAK_FUNCTION_DEFINITION(waitForReadConcern);
+    return w(opCtx, readConcernArgs, dbName, allowAfterClusterTime);
+}
+
+Status waitForLinearizableReadConcern(OperationContext* opCtx, Milliseconds readConcernTimeout) {
+    static auto w = MONGO_WEAK_FUNCTION_DEFINITION(waitForLinearizableReadConcern);
+    return w(opCtx, readConcernTimeout);
+}
+
+Status waitForSpeculativeMajorityReadConcern(
+    OperationContext* opCtx, repl::SpeculativeMajorityReadInfo speculativeReadInfo) {
+    static auto w = MONGO_WEAK_FUNCTION_DEFINITION(waitForSpeculativeMajorityReadConcern);
+    return w(opCtx, speculativeReadInfo);
+}
 
 }  // namespace mongo

@@ -1,7 +1,3 @@
-// socktests.cpp : sock.{h,cpp} unit tests.
-//
-
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -31,13 +27,20 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+/**
+ * sock.{h,cpp} unit tests.
+ */
 
-#include "mongo/db/repl/isself.h"
-#include "mongo/dbtests/dbtests.h"
+#include <string>
+#include <vector>
+
+#include "mongo/base/string_data.h"
+#include "mongo/dbtests/dbtests.h"  // IWYU pragma: keep
+#include "mongo/unittest/unittest.h"
 #include "mongo/util/net/hostandport.h"
 #include "mongo/util/net/socket_utils.h"
 
+namespace mongo {
 namespace SockTests {
 
 class HostByName {
@@ -52,14 +55,15 @@ public:
     }
 };
 
-class All : public Suite {
+class All : public unittest::OldStyleSuiteSpecification {
 public:
-    All() : Suite("sock") {}
-    void setupTests() {
+    All() : OldStyleSuiteSpecification("sock") {}
+    void setupTests() override {
         add<HostByName>();
     }
 };
 
-SuiteInstance<All> myall;
+unittest::OldStyleSuiteInitializer<All> myall;
 
 }  // namespace SockTests
+}  // namespace mongo

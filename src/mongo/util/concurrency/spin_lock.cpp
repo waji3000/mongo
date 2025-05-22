@@ -1,6 +1,3 @@
-// spin_lock.cpp
-
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,14 +27,12 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/config.h"
+#include "mongo/config.h"  // IWYU pragma: keep
 
 #if !(defined(_WIN32) || MONGO_CONFIG_DEBUG_BUILD)
 
+#include <ctime>
 #include <sched.h>
-#include <time.h>
 
 #include "mongo/platform/pause.h"
 #include "mongo/util/concurrency/spin_lock.h"
@@ -72,7 +67,7 @@ void SpinLock::_lockSlowPath() {
     t.tv_nsec = 5000000;
 
     while (!_tryLock()) {
-        nanosleep(&t, NULL);
+        nanosleep(&t, nullptr);
     }
 }
 

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,11 +27,14 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <string>
 
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/string_data.h"
+#include "mongo/db/exec/document_value/document_value_test_util.h"
 #include "mongo/db/pipeline/sequential_document_cache.h"
-
-#include "mongo/db/pipeline/document_value_test_util.h"
 #include "mongo/unittest/death_test.h"
 #include "mongo/unittest/unittest.h"
 
@@ -83,7 +85,7 @@ TEST(SequentialDocumentCacheTest, CanIterateCacheAfterFreezing) {
 
     ASSERT_DOCUMENT_EQ(*cache.getNext(), DOC("_id" << 0));
     ASSERT_DOCUMENT_EQ(*cache.getNext(), DOC("_id" << 1));
-    ASSERT_FALSE(cache.getNext().is_initialized());
+    ASSERT_FALSE(cache.getNext().has_value());
 }
 
 TEST(SequentialDocumentCacheTest, CanRestartCacheIterationAfterFreezing) {
@@ -99,13 +101,13 @@ TEST(SequentialDocumentCacheTest, CanRestartCacheIterationAfterFreezing) {
 
     ASSERT_DOCUMENT_EQ(*cache.getNext(), DOC("_id" << 0));
     ASSERT_DOCUMENT_EQ(*cache.getNext(), DOC("_id" << 1));
-    ASSERT_FALSE(cache.getNext().is_initialized());
+    ASSERT_FALSE(cache.getNext().has_value());
 
     cache.restartIteration();
 
     ASSERT_DOCUMENT_EQ(*cache.getNext(), DOC("_id" << 0));
     ASSERT_DOCUMENT_EQ(*cache.getNext(), DOC("_id" << 1));
-    ASSERT_FALSE(cache.getNext().is_initialized());
+    ASSERT_FALSE(cache.getNext().has_value());
 }
 
 DEATH_TEST(SequentialDocumentCacheTest, CannotAddDocumentsToCacheAfterFreezing, "invariant") {

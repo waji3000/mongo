@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,265 +27,203 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <algorithm>
+#include <bitset>
 
-#include "mongo/db/jsobj.h"
+
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/exec/document_value/document_metadata_fields.h"
 #include "mongo/db/pipeline/dependencies.h"
 #include "mongo/db/pipeline/field_path.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
+#include <compare>
 
 namespace mongo {
 
-using std::set;
-using std::string;
-using std::vector;
+OrderedPathSet DepsTracker::simplifyDependencies(const OrderedPathSet& dependencies,
+                                                 TruncateToRootLevel truncateToRootLevel) {
+    // The key operation here is folding dependencies into ancestor dependencies, wherever possible.
+    // This is assisted by a special sort in OrderedPathSet that treats '.'
+    // as the first char and thus places parent paths directly before their children.
+    OrderedPathSet returnSet;
+    std::string last;
+    for (const auto& path : dependencies) {
+        if (!last.empty() && str::startsWith(path, last)) {
+            // We are including a parent of this field, so we can skip this field.
+            continue;
+        }
 
-namespace str = mongoutils::str;
+        // Check that the field requested is a valid field name in the agg language. This
+        // constructor will throw if it isn't.
+        FieldPath fp(path);
 
-constexpr DepsTracker::MetadataAvailable DepsTracker::kAllGeoNearDataAvailable;
-
-bool DepsTracker::_appendMetaProjections(BSONObjBuilder* projectionBuilder) const {
-    if (_needTextScore) {
-        projectionBuilder->append(Document::metaFieldTextScore,
-                                  BSON("$meta"
-                                       << "textScore"));
+        if (truncateToRootLevel == TruncateToRootLevel::yes) {
+            last = fp.front().toString() + '.';
+            returnSet.insert(fp.front().toString());
+        } else {
+            last = path + '.';
+            returnSet.insert(path);
+        }
     }
-    if (_needSortKey) {
-        projectionBuilder->append(Document::metaFieldSortKey,
-                                  BSON("$meta"
-                                       << "sortKey"));
-    }
-    if (_needGeoNearDistance) {
-        projectionBuilder->append(Document::metaFieldGeoNearDistance,
-                                  BSON("$meta"
-                                       << "geoNearDistance"));
-    }
-    if (_needGeoNearPoint) {
-        projectionBuilder->append(Document::metaFieldGeoNearPoint,
-                                  BSON("$meta"
-                                       << "geoNearPoint"));
-    }
-    return (_needTextScore || _needSortKey || _needGeoNearDistance || _needGeoNearPoint);
+    return returnSet;
 }
 
-BSONObj DepsTracker::toProjection() const {
+BSONObj DepsTracker::toProjectionWithoutMetadata(
+    TruncateToRootLevel truncationBehavior /*= TruncateToRootLevel::no*/) const {
     BSONObjBuilder bb;
-
-    const bool needsMetadata = _appendMetaProjections(&bb);
 
     if (needWholeDocument) {
         return bb.obj();
     }
 
     if (fields.empty()) {
-        if (needsMetadata) {
-            // We only need metadata, but there is no easy way to express this in the query
-            // projection language. We use $noFieldsNeeded with a meta-projection since this is an
-            // inclusion projection which will exclude all existing fields but add the metadata.
-            bb.append("_id", 0);
-            bb.append("$noFieldsNeeded", 1);
-        }
-        // We either need nothing (as we would if this was logically a count), or only the metadata.
+        // We need no user-level fields (as we would if this was logically a count). Since there is
+        // no way of expressing a projection that indicates no depencies, we return an empty
+        // projection.
         return bb.obj();
     }
 
-    bool needId = false;
-    string last;
-    for (set<string>::const_iterator it(fields.begin()), end(fields.end()); it != end; ++it) {
-        if (str::startsWith(*it, "_id") && (it->size() == 3 || (*it)[3] == '.')) {
-            // _id and subfields are handled specially due in part to SERVER-7502
-            needId = true;
-            continue;
+    // Create a projection from the simplified dependencies (absorbing descendants into parents).
+    // For example, the dependencies ["a.b", "a.b.c.g", "c", "c.d", "f"] would be
+    // minimally covered by the projection {"a.b": 1, "c": 1, "f": 1}.
+    bool idSpecified = false;
+    for (auto& path : simplifyDependencies(fields, truncationBehavior)) {
+        // Remember if _id was specified.  If not, we'll later explicitly add {_id: 0}
+        if (str::startsWith(path, "_id") && (path.size() == 3 || path[3] == '.')) {
+            idSpecified = true;
         }
-
-        if (!last.empty() && str::startsWith(*it, last)) {
-            // we are including a parent of *it so we don't need to include this field
-            // explicitly. In fact, due to SERVER-6527 if we included this field, the parent
-            // wouldn't be fully included.  This logic relies on on set iterators going in
-            // lexicographic order so that a string is always directly before of all fields it
-            // prefixes.
-            continue;
-        }
-
-        last = *it + '.';
-        bb.append(*it, 1);
+        bb.append(path, 1);
     }
 
-    if (needId)  // we are explicit either way
-        bb.append("_id", 1);
-    else
+    if (!idSpecified) {
         bb.append("_id", 0);
+    }
 
     return bb.obj();
 }
 
-// ParsedDeps::_fields is a simple recursive look-up table. For each field:
-//      If the value has type==Bool, the whole field is needed
-//      If the value has type==Object, the fields in the subobject are needed
-//      All other fields should be missing which means not needed
-boost::optional<ParsedDeps> DepsTracker::toParsedDeps() const {
-    MutableDocument md;
+void DepsTracker::setNeedsMetadata(DocumentMetadataFields::MetaType type) {
+    static const std::set<DocumentMetadataFields::MetaType> kMetadataFieldsToBeValidated = {
+        DocumentMetadataFields::MetaType::kTextScore,
+        DocumentMetadataFields::MetaType::kGeoNearDist,
+        DocumentMetadataFields::MetaType::kGeoNearPoint,
+        DocumentMetadataFields::MetaType::kScore,
+        DocumentMetadataFields::MetaType::kScoreDetails,
+        DocumentMetadataFields::MetaType::kSearchScore,
+        DocumentMetadataFields::MetaType::kVectorSearchScore,
+    };
 
-    if (needWholeDocument || _needTextScore) {
-        // can't use ParsedDeps in this case
-        return boost::none;
+    // Perform validation if necessary.
+    if (!std::holds_alternative<NoMetadataValidation>(_availableMetadata) &&
+        kMetadataFieldsToBeValidated.contains(type)) {
+        auto& availableMetadataBitSet = std::get<QueryMetadataBitSet>(_availableMetadata);
+        uassert(40218,
+                str::stream() << "query requires " << type << " metadata, but it is not available",
+                availableMetadataBitSet[type]);
+    }
+    _metadataDeps[type] = true;
+}
+
+void DepsTracker::setNeedsMetadata(const QueryMetadataBitSet& metadata) {
+    for (size_t i = 1; i < DocumentMetadataFields::kNumFields; ++i) {
+        if (metadata[i]) {
+            setNeedsMetadata(static_cast<DocumentMetadataFields::MetaType>(i));
+        }
+    }
+}
+
+void DepsTracker::setMetadataAvailable(DocumentMetadataFields::MetaType type) {
+    if (std::holds_alternative<NoMetadataValidation>(_availableMetadata)) {
+        return;
     }
 
-    string last;
-    for (set<string>::const_iterator it(fields.begin()), end(fields.end()); it != end; ++it) {
-        if (!last.empty() && str::startsWith(*it, last)) {
-            // we are including a parent of *it so we don't need to include this field
-            // explicitly. In fact, if we included this field, the parent wouldn't be fully
-            // included.  This logic relies on on set iterators going in lexicographic order so
-            // that a string is always directly before of all fields it prefixes.
+    auto& availableMetadataBitSet = std::get<QueryMetadataBitSet>(_availableMetadata);
+    availableMetadataBitSet[type] = true;
+
+    // Some meta types are alias'd to others (for example, "textScore" is also available via
+    // "score"), so we must mark those alias'd types as available too.
+    switch (type) {
+        case DocumentMetadataFields::MetaType::kTextScore:
+        case DocumentMetadataFields::MetaType::kSearchScore:
+        case DocumentMetadataFields::MetaType::kVectorSearchScore:
+        // Setting "scoreDetails" will also set "score".
+        case DocumentMetadataFields::MetaType::kScoreDetails:
+            availableMetadataBitSet[DocumentMetadataFields::MetaType::kScore] = true;
+            break;
+        case DocumentMetadataFields::MetaType::kSearchScoreDetails:
+            availableMetadataBitSet[DocumentMetadataFields::MetaType::kScoreDetails] = true;
+            break;
+        default:
+            break;
+    }
+}
+
+void DepsTracker::setMetadataAvailable(const QueryMetadataBitSet& metadata) {
+    for (size_t i = 1; i < DocumentMetadataFields::kNumFields; ++i) {
+        if (metadata[i]) {
+            setMetadataAvailable(static_cast<DocumentMetadataFields::MetaType>(i));
+        }
+    }
+}
+
+void DepsTracker::clearMetadataAvailable() {
+    // TODO SERVER-100443 Right now we only clear "score" and "scoreDetails", but we should be able
+    // to reset the entire bit set.
+
+    std::visit(OverloadedVisitor{
+                   [](NoMetadataValidation) {},
+                   [](auto& availableMetadataBitSet) {
+                       availableMetadataBitSet[DocumentMetadataFields::kScore] = false;
+                       availableMetadataBitSet[DocumentMetadataFields::kScoreDetails] = false;
+                   },
+               },
+               _availableMetadata);
+}
+
+// Returns true if the lhs value should sort before the rhs, false otherwise.
+bool PathComparator::operator()(StringData lhs, StringData rhs) const {
+    // Use the three-way (<=>) comparator to avoid code duplication.
+    return std::is_lt(ThreeWayPathComparator{}(lhs, rhs));
+}
+
+std::strong_ordering ThreeWayPathComparator::operator()(StringData lhs, StringData rhs) const {
+    constexpr char dot = '.';
+
+    for (size_t pos = 0, len = std::min(lhs.size(), rhs.size()); pos < len; ++pos) {
+        // Below, we explicitly choose unsigned char because the usual const char& returned by
+        // operator[] is actually signed on x86 and will incorrectly order unicode characters.
+        unsigned char lchar = lhs[pos], rchar = rhs[pos];
+
+        const auto res = lchar <=> rchar;
+        if (std::is_eq(res)) {
             continue;
         }
-        last = *it + '.';
-        md.setNestedField(*it, Value(true));
-    }
 
-    return ParsedDeps(md.freeze());
-}
-
-bool DepsTracker::getNeedsMetadata(MetadataType type) const {
-    switch (type) {
-        case MetadataType::TEXT_SCORE:
-            return _needTextScore;
-        case MetadataType::SORT_KEY:
-            return _needSortKey;
-        case MetadataType::GEO_NEAR_DISTANCE:
-            return _needGeoNearDistance;
-        case MetadataType::GEO_NEAR_POINT:
-            return _needGeoNearPoint;
-    }
-    MONGO_UNREACHABLE;
-}
-
-bool DepsTracker::isMetadataAvailable(MetadataType type) const {
-    switch (type) {
-        case MetadataType::TEXT_SCORE:
-            return _metadataAvailable & MetadataAvailable::kTextScore;
-        case MetadataType::SORT_KEY:
-            MONGO_UNREACHABLE;
-        case MetadataType::GEO_NEAR_DISTANCE:
-            return _metadataAvailable & MetadataAvailable::kGeoNearDistance;
-        case MetadataType::GEO_NEAR_POINT:
-            return _metadataAvailable & MetadataAvailable::kGeoNearPoint;
-    }
-    MONGO_UNREACHABLE;
-}
-
-void DepsTracker::setNeedsMetadata(MetadataType type, bool required) {
-    switch (type) {
-        case MetadataType::TEXT_SCORE:
-            uassert(40218,
-                    "pipeline requires text score metadata, but there is no text score available",
-                    !required || isMetadataAvailable(type));
-            _needTextScore = required;
-            return;
-        case MetadataType::SORT_KEY:
-            invariant(required || !_needSortKey);
-            _needSortKey = required;
-            return;
-        case MetadataType::GEO_NEAR_DISTANCE:
-            uassert(50860,
-                    "pipeline requires $geoNear distance metadata, but it is not available",
-                    !required || isMetadataAvailable(type));
-            invariant(required || !_needGeoNearDistance);
-            _needGeoNearDistance = required;
-            return;
-        case MetadataType::GEO_NEAR_POINT:
-            uassert(50859,
-                    "pipeline requires $geoNear point metadata, but it is not available",
-                    !required || isMetadataAvailable(type));
-            invariant(required || !_needGeoNearPoint);
-            _needGeoNearPoint = required;
-            return;
-    }
-    MONGO_UNREACHABLE;
-}
-
-std::vector<DepsTracker::MetadataType> DepsTracker::getAllRequiredMetadataTypes() const {
-    std::vector<MetadataType> reqs;
-    if (_needTextScore) {
-        reqs.push_back(MetadataType::TEXT_SCORE);
-    }
-    if (_needSortKey) {
-        reqs.push_back(MetadataType::SORT_KEY);
-    }
-    if (_needGeoNearDistance) {
-        reqs.push_back(MetadataType::GEO_NEAR_DISTANCE);
-    }
-    if (_needGeoNearPoint) {
-        reqs.push_back(MetadataType::GEO_NEAR_POINT);
-    }
-    return reqs;
-}
-
-namespace {
-// Mutually recursive with arrayHelper
-Document documentHelper(const BSONObj& bson, const Document& neededFields, int nFieldsNeeded = -1);
-
-// Handles array-typed values for ParsedDeps::extractFields
-Value arrayHelper(const BSONObj& bson, const Document& neededFields) {
-    BSONObjIterator it(bson);
-
-    vector<Value> values;
-    while (it.more()) {
-        BSONElement bsonElement(it.next());
-        if (bsonElement.type() == Object) {
-            Document sub = documentHelper(bsonElement.embeddedObject(), neededFields);
-            values.push_back(Value(sub));
+        // Consider the path delimiter '.' as being less than all other characters, so that
+        // paths sort directly before any paths they prefix and directly after any paths
+        // which prefix them.
+        if (lchar == dot) {
+            return std::strong_ordering::less;
+        } else if (rchar == dot) {
+            return std::strong_ordering::greater;
         }
 
-        if (bsonElement.type() == Array) {
-            values.push_back(arrayHelper(bsonElement.embeddedObject(), neededFields));
-        }
+        // Otherwise, default to normal character comparison.
+        return res;
     }
 
-    return Value(std::move(values));
+    // If we get here, then we have reached the end of lhs and/or rhs and all of their path
+    // segments up to this point match. If lhs is shorter than rhs, then lhs prefixes rhs
+    // and should sort before it.
+    return lhs.size() <=> rhs.size();
 }
 
-// Handles object-typed values including the top-level for ParsedDeps::extractFields
-Document documentHelper(const BSONObj& bson, const Document& neededFields, int nFieldsNeeded) {
-    // We cache the number of top level fields, so don't need to re-compute it every time. For
-    // sub-documents, just scan for the number of fields.
-    if (nFieldsNeeded == -1) {
-        nFieldsNeeded = neededFields.size();
-    }
-    MutableDocument md(nFieldsNeeded);
-
-    BSONObjIterator it(bson);
-    while (it.more() && nFieldsNeeded > 0) {
-        auto bsonElement = it.next();
-        StringData fieldName = bsonElement.fieldNameStringData();
-        Value isNeeded = neededFields[fieldName];
-
-        if (isNeeded.missing())
-            continue;
-
-        --nFieldsNeeded;  // Found a needed field.
-        if (isNeeded.getType() == Bool) {
-            md.addField(fieldName, Value(bsonElement));
-        } else {
-            dassert(isNeeded.getType() == Object);
-
-            if (bsonElement.type() == BSONType::Object) {
-                md.addField(
-                    fieldName,
-                    Value(documentHelper(bsonElement.embeddedObject(), isNeeded.getDocument())));
-            } else if (bsonElement.type() == BSONType::Array) {
-                md.addField(fieldName,
-                            arrayHelper(bsonElement.embeddedObject(), isNeeded.getDocument()));
-            }
-        }
-    }
-
-    return md.freeze();
+bool DepsTracker::needsTextScoreMetadata(const QueryMetadataBitSet& metadataDeps) {
+    // Users may request the score with either $textScore or $score.
+    return metadataDeps[DocumentMetadataFields::kTextScore] ||
+        metadataDeps[DocumentMetadataFields::kScore];
 }
-}  // namespace
 
-Document ParsedDeps::extractFields(const BSONObj& input) const {
-    return documentHelper(input, _fields, _nFields);
-}
-}
+}  // namespace mongo

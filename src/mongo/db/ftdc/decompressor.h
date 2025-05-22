@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -33,10 +32,9 @@
 #include <vector>
 
 #include "mongo/base/data_range.h"
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/status_with.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/db/ftdc/block_compressor.h"
-#include "mongo/db/jsobj.h"
 
 namespace mongo {
 
@@ -44,7 +42,8 @@ namespace mongo {
  * Inflates a compressed chunk of metrics into a list of BSON documents
  */
 class FTDCDecompressor {
-    MONGO_DISALLOW_COPYING(FTDCDecompressor);
+    FTDCDecompressor(const FTDCDecompressor&) = delete;
+    FTDCDecompressor& operator=(const FTDCDecompressor&) = delete;
 
 public:
     FTDCDecompressor() = default;

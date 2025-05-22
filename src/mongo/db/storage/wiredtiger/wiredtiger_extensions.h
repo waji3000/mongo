@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,7 +29,7 @@
 
 #pragma once
 
-#include <memory>
+#include <string>
 #include <vector>
 
 namespace mongo {

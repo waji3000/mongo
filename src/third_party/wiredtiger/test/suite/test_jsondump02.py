@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Public Domain 2014-2018 MongoDB, Inc.
+# Public Domain 2014-present MongoDB, Inc.
 # Public Domain 2008-2014 WiredTiger, Inc.
 #
 # This is free and unencumbered software released into the public domain.
@@ -26,12 +26,12 @@
 # ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
 # OTHER DEALINGS IN THE SOFTWARE.
 
-import os
 import wiredtiger, wttest
 from suite_subprocess import suite_subprocess
 
 # test_jsondump.py
 # Test dump output from json cursors.
+@wttest.skip_for_hook("tiered", "Fails with tiered storage")
 class test_jsondump02(wttest.WiredTigerTestCase, suite_subprocess):
 
     table_uri1 = 'table:jsondump02a.wt'
@@ -88,6 +88,10 @@ class test_jsondump02(wttest.WiredTigerTestCase, suite_subprocess):
             cursor.close()
 
     def test_json_cursor(self):
+        # FIXME-WT-9986: Re-enable this test after fixing the JSON cursor bug
+        # triggered by allocator changes.
+        self.skipTest('Known failure in JSON cursor')
+
         """
         Create JSON cursors and test them directly, also test
         dump/load commands.
@@ -117,13 +121,12 @@ class test_jsondump02(wttest.WiredTigerTestCase, suite_subprocess):
         self.set_kv(self.table_uri1, 'KEY001', '\'\"({[]})\"\'\\, etc. allowed')
         # \u03c0 is pi in Unicode, converted by Python to UTF-8: 0xcf 0x80.
         # Here's how UTF-8 might be used.
-        self.set_kv(self.table_uri1, 'KEY002', u'\u03c0'.encode('utf-8'))
-        # 0xf5-0xff are illegal in Unicode, but may occur legally in C strings.
-        self.set_kv(self.table_uri1, 'KEY003', '\xff\xfe')
+        self.set_kv(self.table_uri1, 'KEY002', u'\u03c0')
+        self.set_kv(self.table_uri1, 'KEY003', u'\u0abc')
         self.set_kv2(self.table_uri2, 'KEY000', 123, 'str0')
         self.set_kv2(self.table_uri2, 'KEY001', 234, 'str1')
-        self.set_kv(self.table_uri3, 1, '\x01\x02\x03')
-        self.set_kv(self.table_uri3, 2, '\x77\x88\x99\x00\xff\xfe')
+        self.set_kv(self.table_uri3, 1, b'\x01\x02\x03')
+        self.set_kv(self.table_uri3, 2, b'\x77\x88\x99\x00\x66\x55')
         self.populate_squarecube(self.table_uri4)
 
         table1_json =  (
@@ -131,7 +134,7 @@ class test_jsondump02(wttest.WiredTigerTestCase, suite_subprocess):
             ('"key0" : "KEY001"', '"value0" : ' +
              '"\'\\\"({[]})\\\"\'\\\\, etc. allowed"'),
             ('"key0" : "KEY002"', '"value0" : "\\u00cf\\u0080"'),
-            ('"key0" : "KEY003"', '"value0" : "\\u00ff\\u00fe"'))
+            ('"key0" : "KEY003"', '"value0" : "\\u00e0\\u00aa\\u00bc"'))
         self.check_json(self.table_uri1, table1_json)
 
         self.session.truncate(self.table_uri1, None, None, None)
@@ -156,7 +159,7 @@ class test_jsondump02(wttest.WiredTigerTestCase, suite_subprocess):
         # bad tokens
         self.assertRaisesWithMessage(wiredtiger.WiredTigerError,
             lambda: self.load_json(self.table_uri2,
-              (('"abc\u"', ''),)),
+              (('"abc\\u"', ''),)),
             '/invalid Unicode/')
 
         # bad tokens
@@ -222,7 +225,7 @@ class test_jsondump02(wttest.WiredTigerTestCase, suite_subprocess):
         table3_json =  (
             ('"key0" : 1', '"value0" : "\\u0001\\u0002\\u0003"'),
             ('"key0" : 2',
-             '"value0" : "\\u0077\\u0088\\u0099\\u0000\\u00ff\\u00fe"'))
+             '"value0" : "\\u0077\\u0088\\u0099\\u0000\\u0066\\u0055"'))
         self.check_json(self.table_uri3, table3_json)
         table4_json = (
                 ('"ikey" : 1,\n"Skey" : "key1"',
@@ -234,24 +237,7 @@ class test_jsondump02(wttest.WiredTigerTestCase, suite_subprocess):
                 ('"ikey" : 4,\n"Skey" : "key4"',
                  '"S1" : "val16",\n"i2" : 16,\n"S3" : "val64",\n"i4" : 64'))
         self.check_json(self.table_uri4, table4_json)
-        # This projection has 3 value fields reversed with a key at the end.
-        table4_json_projection = (
-                ('"ikey" : 1,\n"Skey" : "key1"',
-                 '"i4" : 1,\n"S3" : "val1",\n"i2" : 1,\n"ikey" : 1'),
-                ('"ikey" : 2,\n"Skey" : "key2"',
-                 '"i4" : 8,\n"S3" : "val8",\n"i2" : 4,\n"ikey" : 2'),
-                ('"ikey" : 3,\n"Skey" : "key3"',
-                 '"i4" : 27,\n"S3" : "val27",\n"i2" : 9,\n"ikey" : 3'),
-                ('"ikey" : 4,\n"Skey" : "key4"',
-                 '"i4" : 64,\n"S3" : "val64",\n"i2" : 16,\n"ikey" : 4'))
-        # bad projection URI
-        self.assertRaisesWithMessage(wiredtiger.WiredTigerError,
-                 lambda: self.check_json(self.table_uri4 + '(i4,S3,i2,ikey',
-                        table4_json_projection),
-            '/Unbalanced brackets/')
-        # This projection should work.
-        self.check_json(self.table_uri4 + '(i4,S3,i2,ikey)',
-                        table4_json_projection)
+
         # The dump config currently is not supported for the index type.
         self.check_json(uri4index1, (
                 ('"Skey" : "key1"',
@@ -323,15 +309,30 @@ class test_jsondump02(wttest.WiredTigerTestCase, suite_subprocess):
     #    i==0  :  v:[0x00, 0x01, 0x02]
     #    i==1  :  v:[0x01, 0x02, 0x03]
     # etc.
-    # A null byte is disallowed in a string value, it is replaced by 'X'
+    # A null byte or any byte >= 0x7f is disallowed in a string value,
+    # it is replaced by 'X'
     def generate_value(self, i, v, isstring):
         for j in range(0, 3):
-            val = (i + j) % 256
-            if isstring and val == 0:
-                val = 88  # 'X'
+            val = i + j
+            if val >= 256 or (isstring and (val == 0 or val >= 128)):
+                val = ord('X')
             v[j] = val
 
+    # As of Python3, we cannot simply shove random bytes with values >= 0x80
+    # into a string, as strings are unicode aware, so we test only up to 0x80.
+    # Real Unicode strings are tested elsewhere.
+    def bytes_to_str(self, barray):
+        mask = 0x7f
+        result = ''
+        for b in barray:
+            result += chr(b & mask)
+        return result
+
     def test_json_all_bytes(self):
+        # FIXME-WT-9986: Re-enable this test after fixing the JSON cursor bug
+        # triggered by allocator changes.
+        self.skipTest('Known failure in JSON cursor')
+
         """
         Test the generated JSON for all byte values in byte array and
         string formats.
@@ -343,12 +344,15 @@ class test_jsondump02(wttest.WiredTigerTestCase, suite_subprocess):
         c6 = self.session.open_cursor(self.table_uri6, None, None)
         k = bytearray(b'\x00\x00')
         v = bytearray(b'\x00\x00\x00')
-        for i in range(0, 512):
+        for i in range(0, 256):
             self.generate_key(i, k)
             self.generate_value(i, v, False)
-            c5[str(k)] = str(v)
+            # A 'u' format requires a bytes type with Python3
+            c5[bytes(k)] = bytes(v)
             self.generate_value(i, v, True)   # no embedded nuls
-            c6[str(k)] = str(v)
+            kstr = self.bytes_to_str(k)
+            vstr = self.bytes_to_str(v)
+            c6[kstr] = vstr
         c5.close()
         c6.close()
 
@@ -381,10 +385,10 @@ class test_jsondump02(wttest.WiredTigerTestCase, suite_subprocess):
 
         table5_json = []
         table6_json = []
-        for i in range(0, 512):
+        for i in range(0, 256):
             self.generate_key(i, k)
             self.generate_value(i, v, False)
-            j = i if (i > 0 and i < 254) or (i > 256 and i < 510) else 88
+            j = i if (i > 0 and i < 126) else 88
             table5_json.append(('"key0" : "' + bin_unicode[k[0]] +
                                 bin_unicode[k[1]] + '"',
                                 '"value0" : "' + bin_unicode[v[0]] +
@@ -415,6 +419,3 @@ class test_jsondump02(wttest.WiredTigerTestCase, suite_subprocess):
         self.runWt(['load', '-jf', 'jsondump6.out'])
         self.session.drop(self.table_uri5)
         self.session.drop(self.table_uri6)
-
-if __name__ == '__main__':
-    wttest.run()

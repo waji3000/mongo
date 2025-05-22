@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,49 +27,165 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kIndex
-
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/index/btree_access_method.h"
-
+#include <algorithm>
+#include <boost/container/container_fwd.hpp>
+#include <boost/cstdint.hpp>
+#include <boost/optional/optional.hpp>
+#include <fmt/format.h>
+#include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
 #include "mongo/base/error_codes.h"
 #include "mongo/base/status.h"
-#include "mongo/db/catalog/collection_impl.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/catalog/index_catalog.h"
-#include "mongo/db/catalog/index_consistency.h"
-#include "mongo/db/client.h"
-#include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/commands/server_status.h"
+#include "mongo/db/concurrency/exception_util.h"
 #include "mongo/db/curop.h"
+#include "mongo/db/exec/matcher/matcher.h"
+#include "mongo/db/index/2d_access_method.h"
+#include "mongo/db/index/btree_access_method.h"
+#include "mongo/db/index/fts_access_method.h"
+#include "mongo/db/index/hash_access_method.h"
+#include "mongo/db/index/index_access_method.h"
 #include "mongo/db/index/index_descriptor.h"
-#include "mongo/db/jsobj.h"
-#include "mongo/db/keypattern.h"
+#include "mongo/db/index/preallocated_container_pool.h"
+#include "mongo/db/index/s2_access_method.h"
+#include "mongo/db/index/s2_bucket_access_method.h"
+#include "mongo/db/index/wildcard_access_method.h"
+#include "mongo/db/index_builds/index_build_interceptor.h"
+#include "mongo/db/index_names.h"
+#include "mongo/db/matcher/expression.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/repl/replication_coordinator.h"
-#include "mongo/db/repl/timestamp_block.h"
-#include "mongo/db/server_parameters.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/sorter/sorter.h"
+#include "mongo/db/sorter/sorter_template_defs.h"
+#include "mongo/db/storage/index_entry_comparison.h"
+#include "mongo/db/storage/kv/kv_engine.h"
+#include "mongo/db/storage/recovery_unit.h"
+#include "mongo/db/storage/storage_engine.h"
 #include "mongo/db/storage/storage_options.h"
-#include "mongo/util/log.h"
-#include "mongo/util/progress_meter.h"
-#include "mongo/util/scopeguard.h"
+#include "mongo/db/transaction_resources.h"
+#include "mongo/db/validate/validate_results.h"
+#include "mongo/logv2/log.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/bufreader.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/namespace_string_util.h"
+#include "mongo/util/stacktrace.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 namespace mongo {
 
-using std::endl;
 using std::pair;
-using std::set;
-using std::vector;
 
 using IndexVersion = IndexDescriptor::IndexVersion;
 
+MONGO_FAIL_POINT_DEFINE(hangIndexBuildDuringBulkLoadPhase);
+MONGO_FAIL_POINT_DEFINE(hangIndexBuildDuringBulkLoadPhaseSecond);
+MONGO_FAIL_POINT_DEFINE(hangDuringIndexBuildBulkLoadYield);
+MONGO_FAIL_POINT_DEFINE(hangDuringIndexBuildBulkLoadYieldSecond);
+
+/**
+ * Static factory method that constructs and returns an appropriate IndexAccessMethod depending on
+ * the type of the index.
+ */
+std::unique_ptr<IndexAccessMethod> IndexAccessMethod::make(
+    OperationContext* opCtx,
+    const NamespaceString& nss,
+    const CollectionOptions& collectionOptions,
+    IndexCatalogEntry* entry,
+    StringData ident) {
+
+    auto engine = opCtx->getServiceContext()->getStorageEngine()->getEngine();
+    auto desc = entry->descriptor();
+    auto keyFormat =
+        collectionOptions.clusteredIndex.has_value() ? KeyFormat::String : KeyFormat::Long;
+    auto makeSDI = [&] {
+        return engine->getSortedDataInterface(
+            opCtx, nss, *collectionOptions.uuid, ident, desc->toIndexConfig(), keyFormat);
+    };
+    const std::string& type = desc->getAccessMethodName();
+
+    if ("" == type)
+        return std::make_unique<BtreeAccessMethod>(entry, makeSDI());
+    else if (IndexNames::HASHED == type)
+        return std::make_unique<HashAccessMethod>(entry, makeSDI());
+    else if (IndexNames::GEO_2DSPHERE == type)
+        return std::make_unique<S2AccessMethod>(entry, makeSDI());
+    else if (IndexNames::GEO_2DSPHERE_BUCKET == type)
+        return std::make_unique<S2BucketAccessMethod>(entry, makeSDI());
+    else if (IndexNames::TEXT == type)
+        return std::make_unique<FTSAccessMethod>(entry, makeSDI());
+    else if (IndexNames::GEO_2D == type)
+        return std::make_unique<TwoDAccessMethod>(entry, makeSDI());
+    else if (IndexNames::WILDCARD == type)
+        return std::make_unique<WildcardAccessMethod>(entry, makeSDI());
+    LOGV2(20688, "Can't find index for keyPattern", "keyPattern"_attr = desc->keyPattern());
+    fassertFailed(31021);
+}
+
 namespace {
 
-// Reserved RecordId against which multikey metadata keys are indexed.
-static const RecordId kMultikeyMetadataKeyId =
-    RecordId{RecordId::ReservedId::kWildcardMultikeyMetadataId};
+/**
+ * Metrics for index bulk builder operations. Intended to support index build diagnostics
+ * during the following scenarios:
+ * - createIndex commands;
+ * - collection cloning during initial sync; and
+ * - resuming index builds at startup.
+ *
+ * Also includes statistics for disk usage (by the external sorter) for index builds that
+ * do not fit in memory.
+ */
+class IndexBulkBuilderSSS : public ServerStatusSection {
+public:
+    using ServerStatusSection::ServerStatusSection;
+
+    bool includeByDefault() const final {
+        return true;
+    }
+
+    BSONObj generateSection(OperationContext* opCtx, const BSONElement& configElement) const final {
+        BSONObjBuilder builder;
+        builder.append("count", count.loadRelaxed());
+        builder.append("resumed", resumed.loadRelaxed());
+        builder.append("filesOpenedForExternalSort", sorterFileStats.opened.loadRelaxed());
+        builder.append("filesClosedForExternalSort", sorterFileStats.closed.loadRelaxed());
+        builder.append("spilledRanges", sorterTracker.spilledRanges.loadRelaxed());
+        builder.append("bytesSpilledUncompressed",
+                       sorterTracker.bytesSpilledUncompressed.loadRelaxed());
+        builder.append("bytesSpilled", sorterTracker.bytesSpilled.loadRelaxed());
+        builder.append("numSorted", sorterTracker.numSorted.loadRelaxed());
+        builder.append("bytesSorted", sorterTracker.bytesSorted.loadRelaxed());
+        builder.append("memUsage", sorterTracker.memUsage.loadRelaxed());
+        return builder.obj();
+    }
+
+    // Number of instances of the bulk builder created.
+    AtomicWord<long long> count;
+
+    // Number of times the bulk builder was created for a resumable index build.
+    // This value should not exceed 'count'.
+    AtomicWord<long long> resumed;
+
+    // Sorter statistics that are aggregate of all sorters.
+    SorterTracker sorterTracker;
+
+    // Number of times the external sorter opened/closed a file handle to spill data to disk.
+    // This pair of counters in aggregate indicate the number of open file handles used by
+    // the external sorter and may be useful in diagnosing situations where the process is
+    // close to exhausting this finite resource.
+    SorterFileStats sorterFileStats = {&sorterTracker};
+};
+
+auto& indexBulkBuilderSSS =
+    *ServerStatusSectionBuilder<IndexBulkBuilderSSS>("indexBulkBuilder").forShard();
 
 /**
  * Returns true if at least one prefix of any of the indexed fields causes the index to be
@@ -80,318 +195,408 @@ static const RecordId kMultikeyMetadataKeyId =
 bool isMultikeyFromPaths(const MultikeyPaths& multikeyPaths) {
     return std::any_of(multikeyPaths.cbegin(),
                        multikeyPaths.cend(),
-                       [](const std::set<std::size_t>& components) { return !components.empty(); });
+                       [](const MultikeyComponents& components) { return !components.empty(); });
 }
 
-std::vector<BSONObj> asVector(const BSONObjSet& objSet) {
-    return {objSet.begin(), objSet.end()};
+SortOptions makeSortOptions(size_t maxMemoryUsageBytes,
+                            const DatabaseName& dbName,
+                            SorterFileStats* stats) {
+    return SortOptions()
+        .TempDir(storageGlobalParams.dbpath + "/_tmp")
+        .ExtSortAllowed()
+        .MaxMemoryUsageBytes(maxMemoryUsageBytes)
+        .UseMemoryPool(true)
+        .FileStats(stats)
+        .Tracker(&indexBulkBuilderSSS.sorterTracker)
+        .DBName(dbName);
 }
 
-// TODO SERVER-36385: Remove this
-const int TempKeyMaxSize = 1024;
-
-// TODO SERVER-36385: Completely remove the key size check in 4.4
-Status checkKeySize(const BSONObj& key) {
-    if (key.objsize() >= TempKeyMaxSize) {
-        std::string msg = mongoutils::str::stream() << "Index key too large to index, failing "
-                                                    << key.objsize() << ' ' << redact(key);
-        return Status(ErrorCodes::KeyTooLong, msg);
+MultikeyPaths createMultikeyPaths(const std::vector<MultikeyPath>& multikeyPathsVec) {
+    MultikeyPaths multikeyPaths;
+    for (const auto& multikeyPath : multikeyPathsVec) {
+        multikeyPaths.emplace_back(boost::container::ordered_unique_range_t(),
+                                   multikeyPath.getMultikeyComponents().begin(),
+                                   multikeyPath.getMultikeyComponents().end());
     }
-    return Status::OK();
+
+    return multikeyPaths;
 }
 
 }  // namespace
 
-// TODO SERVER-36386: Remove the server parameter
-MONGO_EXPORT_SERVER_PARAMETER(failIndexKeyTooLong, bool, true);
-
-// TODO SERVER-36386: Remove the server parameter
-bool failIndexKeyTooLongParam() {
-    // Always return true in FCV 4.2 although FCV 4.2 actually never needs to
-    // check this value because there shouldn't be any KeyTooLong errors in FCV 4.2.
-    if (serverGlobalParams.featureCompatibility.getVersion() ==
-        ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42)
-        return true;
-    return failIndexKeyTooLong.load();
-}
-
-class BtreeExternalSortComparison {
-public:
-    BtreeExternalSortComparison(const BSONObj& ordering, IndexVersion version)
-        : _ordering(Ordering::make(ordering)), _version(version) {
-        invariant(IndexDescriptor::isIndexVersionSupported(version));
+struct BtreeExternalSortComparison {
+    int operator()(const key_string::Value& l, const key_string::Value& r) const {
+        return l.compare(r);
     }
-
-    typedef std::pair<BSONObj, RecordId> Data;
-
-    int operator()(const Data& l, const Data& r) const {
-        if (int x = l.first.woCompare(r.first, _ordering, /*considerfieldname*/ false))
-            return x;
-        return l.second.compare(r.second);
-    }
-
-private:
-    const Ordering _ordering;
-    const IndexVersion _version;
 };
 
-AbstractIndexAccessMethod::AbstractIndexAccessMethod(IndexCatalogEntry* btreeState,
-                                                     SortedDataInterface* btree)
-    : _btreeState(btreeState), _descriptor(btreeState->descriptor()), _newInterface(btree) {
-    verify(IndexDescriptor::isIndexVersionSupported(_descriptor->version()));
+SortedDataIndexAccessMethod::SortedDataIndexAccessMethod(const IndexCatalogEntry* btreeState,
+                                                         std::unique_ptr<SortedDataInterface> btree)
+    : _newInterface(std::move(btree)) {
+    MONGO_verify(IndexDescriptor::isIndexVersionSupported(btreeState->descriptor()->version()));
 }
 
-// TODO SERVER-36385: Remove this when there is no KeyTooLong error.
-bool AbstractIndexAccessMethod::ignoreKeyTooLong() {
-    return !failIndexKeyTooLongParam();
-}
+Status SortedDataIndexAccessMethod::insert(OperationContext* opCtx,
+                                           SharedBufferFragmentBuilder& pooledBuilder,
+                                           const CollectionPtr& coll,
+                                           const IndexCatalogEntry* entry,
+                                           const std::vector<BsonRecord>& bsonRecords,
+                                           const InsertDeleteOptions& options,
+                                           int64_t* numInserted) {
+    for (const auto& bsonRecord : bsonRecords) {
+        invariant(bsonRecord.id != RecordId());
 
-// TODO SERVER-36385: Remove this when there is no KeyTooLong error.
-bool AbstractIndexAccessMethod::shouldCheckIndexKeySize(OperationContext* opCtx) {
-    // Don't check index key size if we cannot write to the collection. That indicates we are a
-    // secondary node and we should accept any index key.
-    const NamespaceString collName(_btreeState->ns());
-    const auto shouldRelaxConstraints =
-        repl::ReplicationCoordinator::get(opCtx)->shouldRelaxIndexConstraints(opCtx, collName);
-
-    // Don't check index key size if FCV hasn't been initialized.
-    return !shouldRelaxConstraints &&
-        serverGlobalParams.featureCompatibility.isVersionInitialized() &&
-        serverGlobalParams.featureCompatibility.getVersion() ==
-        ServerGlobalParams::FeatureCompatibility::Version::kFullyDowngradedTo40;
-}
-
-bool AbstractIndexAccessMethod::isFatalError(OperationContext* opCtx, Status status, BSONObj key) {
-    // If the status is Status::OK(), or if it is ErrorCodes::KeyTooLong and the user has chosen to
-    // ignore this error, return false immediately.
-    // TODO SERVER-36385: Remove this when there is no KeyTooLong error.
-    if (status.isOK() || (status == ErrorCodes::KeyTooLong && ignoreKeyTooLong())) {
-        return false;
-    }
-
-    // A document might be indexed multiple times during a background index build if it moves ahead
-    // of the cursor (e.g. via an update). We test this scenario and swallow the error accordingly.
-    if (status == ErrorCodes::DuplicateKeyValue && !_btreeState->isReady(opCtx)) {
-        LOG(3) << "key " << key << " already in index during background indexing (ok)";
-        return false;
-    }
-    return true;
-}
-
-// Find the keys for obj, put them in the tree pointing to loc.
-Status AbstractIndexAccessMethod::insert(OperationContext* opCtx,
-                                         const BSONObj& obj,
-                                         const RecordId& loc,
-                                         const InsertDeleteOptions& options,
-                                         InsertResult* result) {
-    bool checkIndexKeySize = shouldCheckIndexKeySize(opCtx);
-    BSONObjSet multikeyMetadataKeys = SimpleBSONObjComparator::kInstance.makeBSONObjSet();
-    BSONObjSet keys = SimpleBSONObjComparator::kInstance.makeBSONObjSet();
-    MultikeyPaths multikeyPaths;
-    // Delegate to the subclass.
-    getKeys(obj, options.getKeysMode, &keys, &multikeyMetadataKeys, &multikeyPaths);
-
-    // Add all new data keys, and all new multikey metadata keys, into the index. When iterating
-    // over the data keys, each of them should point to the doc's RecordId. When iterating over
-    // the multikey metadata keys, they should point to the reserved 'kMultikeyMetadataKeyId'.
-    for (const auto keySet : {&keys, &multikeyMetadataKeys}) {
-        const auto& recordId = (keySet == &keys ? loc : kMultikeyMetadataKeyId);
-        for (const auto& key : *keySet) {
-            Status status = checkIndexKeySize ? checkKeySize(key) : Status::OK();
-            if (status.isOK()) {
-                bool unique = _descriptor->unique();
-                StatusWith<SpecialFormatInserted> ret =
-                    _newInterface->insert(opCtx, key, recordId, !unique /* dupsAllowed */);
-                status = ret.getStatus();
-
-                // When duplicates are encountered and allowed, retry with dupsAllowed. Add the
-                // key to the output vector so callers know which duplicate keys were inserted.
-                if (ErrorCodes::DuplicateKey == status.code() && options.dupsAllowed) {
-                    invariant(unique);
-                    ret = _newInterface->insert(opCtx, key, recordId, true /* dupsAllowed */);
-                    status = ret.getStatus();
-
-                    // This is speculative in that the 'dupsInserted' vector is not used by any code
-                    // today. It is currently in place to test detecting duplicate key errors during
-                    // hybrid index builds. Duplicate detection in the future will likely not take
-                    // place in this insert() method.
-                    if (status.isOK() && result) {
-                        result->dupsInserted.push_back(key);
-                    }
-                }
-
-                if (status.isOK() && ret.getValue() == SpecialFormatInserted::LongTypeBitsInserted)
-                    _btreeState->setIndexKeyStringWithLongTypeBitsExistsOnDisk(opCtx);
-            }
-            if (isFatalError(opCtx, status, key)) {
+        if (!bsonRecord.ts.isNull()) {
+            Status status = shard_role_details::getRecoveryUnit(opCtx)->setTimestamp(bsonRecord.ts);
+            if (!status.isOK())
                 return status;
-            }
         }
-    }
 
-    if (result) {
-        result->numInserted += keys.size() + multikeyMetadataKeys.size();
-    }
+        auto& containerPool = PreallocatedContainerPool::get(opCtx);
+        auto keys = containerPool.keys();
+        auto multikeyMetadataKeys = containerPool.multikeyMetadataKeys();
+        auto multikeyPaths = containerPool.multikeyPaths();
 
-    if (shouldMarkIndexAsMultikey(keys, multikeyMetadataKeys, multikeyPaths)) {
-        _btreeState->setMultikey(opCtx, multikeyPaths);
+        getKeys(opCtx,
+                coll,
+                entry,
+                pooledBuilder,
+                *bsonRecord.docPtr,
+                options.getKeysMode,
+                GetKeysContext::kAddingKeys,
+                keys.get(),
+                multikeyMetadataKeys.get(),
+                multikeyPaths.get(),
+                bsonRecord.id);
+
+        Status status = _indexKeysOrWriteToSideTable(opCtx,
+                                                     coll,
+                                                     entry,
+                                                     *keys,
+                                                     *multikeyMetadataKeys,
+                                                     *multikeyPaths,
+                                                     *bsonRecord.docPtr,
+                                                     options,
+                                                     numInserted);
+        if (!status.isOK()) {
+            return status;
+        }
     }
 
     return Status::OK();
 }
 
-void AbstractIndexAccessMethod::removeOneKey(OperationContext* opCtx,
-                                             const BSONObj& key,
-                                             const RecordId& loc,
-                                             bool dupsAllowed) {
+void SortedDataIndexAccessMethod::remove(OperationContext* opCtx,
+                                         SharedBufferFragmentBuilder& pooledBuilder,
+                                         const CollectionPtr& coll,
+                                         const IndexCatalogEntry* entry,
+                                         const BSONObj& obj,
+                                         const RecordId& loc,
+                                         bool logIfError,
+                                         const InsertDeleteOptions& options,
+                                         int64_t* numDeleted,
+                                         CheckRecordId checkRecordId) {
+    auto& containerPool = PreallocatedContainerPool::get(opCtx);
 
-    try {
-        _newInterface->unindex(opCtx, key, loc, dupsAllowed);
-    } catch (AssertionException& e) {
-        log() << "Assertion failure: _unindex failed " << _descriptor->indexNamespace();
-        log() << "Assertion failure: _unindex failed: " << redact(e) << "  key:" << key.toString()
-              << "  dl:" << loc;
-        logContext();
+    // There's no need to compute the prefixes of the indexed fields that cause the index to be
+    // multikey when removing a document since the index metadata isn't updated when keys are
+    // deleted.
+    auto keys = containerPool.keys();
+    getKeys(opCtx,
+            coll,
+            entry,
+            pooledBuilder,
+            obj,
+            InsertDeleteOptions::ConstraintEnforcementMode::kRelaxConstraintsUnfiltered,
+            GetKeysContext::kRemovingKeys,
+            keys.get(),
+            nullptr,
+            nullptr,
+            loc);
+
+    _unindexKeysOrWriteToSideTable(
+        opCtx, coll->ns(), entry, *keys, obj, logIfError, numDeleted, options, checkRecordId);
+}
+
+Status SortedDataIndexAccessMethod::update(OperationContext* opCtx,
+                                           SharedBufferFragmentBuilder& pooledBufferBuilder,
+                                           const BSONObj& oldDoc,
+                                           const BSONObj& newDoc,
+                                           const RecordId& loc,
+                                           const CollectionPtr& coll,
+                                           const IndexCatalogEntry* entry,
+                                           const InsertDeleteOptions& options,
+                                           int64_t* numInserted,
+                                           int64_t* numDeleted) {
+    UpdateTicket updateTicket;
+    prepareUpdate(opCtx, coll, entry, oldDoc, newDoc, loc, options, &updateTicket);
+
+    auto status = Status::OK();
+    if (entry->isHybridBuilding() || !entry->isReady()) {
+        bool logIfError = false;
+        _unindexKeysOrWriteToSideTable(opCtx,
+                                       coll->ns(),
+                                       entry,
+                                       updateTicket.removed,
+                                       oldDoc,
+                                       logIfError,
+                                       numDeleted,
+                                       options,
+                                       CheckRecordId::Off);
+        return _indexKeysOrWriteToSideTable(opCtx,
+                                            coll,
+                                            entry,
+                                            updateTicket.added,
+                                            updateTicket.newMultikeyMetadataKeys,
+                                            updateTicket.newMultikeyPaths,
+                                            newDoc,
+                                            options,
+                                            numInserted);
+    } else {
+        return doUpdate(opCtx, coll, entry, updateTicket, numInserted, numDeleted);
     }
 }
 
-std::unique_ptr<SortedDataInterface::Cursor> AbstractIndexAccessMethod::newCursor(
+Status SortedDataIndexAccessMethod::insertKeysAndUpdateMultikeyPaths(
+    OperationContext* opCtx,
+    const CollectionPtr& coll,
+    const IndexCatalogEntry* entry,
+    const KeyStringSet& keys,
+    const KeyStringSet& multikeyMetadataKeys,
+    const MultikeyPaths& multikeyPaths,
+    const InsertDeleteOptions& options,
+    KeyHandlerFn&& onDuplicateKey,
+    int64_t* numInserted,
+    IncludeDuplicateRecordId includeDuplicateRecordId) {
+    // Insert the specified data keys into the index.
+    auto status = insertKeys(opCtx,
+                             coll,
+                             entry,
+                             keys,
+                             options,
+                             std::move(onDuplicateKey),
+                             numInserted,
+                             includeDuplicateRecordId);
+    if (!status.isOK()) {
+        return status;
+    }
+    // If these keys should cause the index to become multikey, pass them into the catalog.
+    if (shouldMarkIndexAsMultikey(keys.size(), multikeyMetadataKeys, multikeyPaths)) {
+        entry->setMultikey(opCtx, coll, multikeyMetadataKeys, multikeyPaths);
+    }
+    // If we have some multikey metadata keys, they should have been added while marking the index
+    // as multikey in the catalog. Add them to the count of keys inserted for completeness.
+    if (numInserted && !multikeyMetadataKeys.empty()) {
+        *numInserted += multikeyMetadataKeys.size();
+    }
+    return Status::OK();
+}
+
+Status SortedDataIndexAccessMethod::insertKeys(OperationContext* opCtx,
+                                               const CollectionPtr& coll,
+                                               const IndexCatalogEntry* entry,
+                                               const KeyStringSet& keys,
+                                               const InsertDeleteOptions& options,
+                                               KeyHandlerFn&& onDuplicateKey,
+                                               int64_t* numInserted,
+                                               IncludeDuplicateRecordId includeDuplicateRecordId) {
+    // Initialize the 'numInserted' out-parameter to zero in case the caller did not already do so.
+    if (numInserted) {
+        *numInserted = 0;
+    }
+    bool unique = entry->descriptor()->unique();
+    bool prepareUnique = entry->descriptor()->prepareUnique();
+    bool dupsAllowed;
+    if (!entry->descriptor()->isIdIndex() && !opCtx->isEnforcingConstraints() &&
+        coll->isIndexReady(entry->descriptor()->indexName())) {
+        // Oplog application should avoid checking for duplicates on unique indexes except when:
+        // 1. Building an index. We have to use the duplicate key error to record possible
+        // conflicts.
+        // 2. Inserting into the '_id' index. We never allow duplicates in the '_id' index.
+        //
+        // Additionally, unique indexes conflict checking can cause out-of-order updates in
+        // wiredtiger. See SERVER-59831.
+        dupsAllowed = true;
+    } else if (prepareUnique) {
+        // Before the index build commits, duplicate keys are allowed to exist with the
+        // 'prepareUnique' option. After that, duplicates are not allowed.
+        dupsAllowed = !coll->isIndexReady(entry->descriptor()->indexName());
+    } else {
+        dupsAllowed = !unique;
+    }
+    // Add all new keys into the index. The RecordId for each is already encoded in the KeyString.
+    for (const auto& keyString : keys) {
+        auto result =
+            _newInterface->insert(opCtx, keyString, dupsAllowed, includeDuplicateRecordId);
+
+        // When duplicates are encountered and allowed, retry with dupsAllowed. Call
+        // onDuplicateKey() with the inserted duplicate key.
+        if (std::holds_alternative<SortedDataInterface::DuplicateKey>(result) &&
+            options.dupsAllowed && !prepareUnique) {
+            invariant(unique);
+
+            result = _newInterface->insert(
+                opCtx, keyString, true /* dupsAllowed */, includeDuplicateRecordId);
+            if (auto status = std::get_if<Status>(&result)) {
+                if (status->isOK() && onDuplicateKey) {
+                    result = onDuplicateKey(keyString);
+                }
+            }
+        }
+        if (auto duplicate = std::get_if<SortedDataInterface::DuplicateKey>(&result)) {
+            return buildDupKeyErrorStatus(duplicate->key,
+                                          coll->ns(),
+                                          entry->descriptor()->indexName(),
+                                          entry->descriptor()->keyPattern(),
+                                          entry->descriptor()->collation(),
+                                          std::move(duplicate->foundValue),
+                                          std::move(duplicate->id));
+        } else if (auto& status = std::get<Status>(result); !status.isOK()) {
+            return status;
+        }
+    }
+    if (numInserted) {
+        *numInserted = keys.size();
+    }
+    return Status::OK();
+}
+
+void SortedDataIndexAccessMethod::removeOneKey(OperationContext* opCtx,
+                                               const IndexCatalogEntry* entry,
+                                               const key_string::Value& keyString,
+                                               bool dupsAllowed) const {
+
+    try {
+        _newInterface->unindex(opCtx, keyString, dupsAllowed);
+    } catch (AssertionException& e) {
+        if (e.code() == ErrorCodes::DataCorruptionDetected) {
+            // DataCorruptionDetected errors are expected to have logged an error and added an entry
+            // to the health log with the stack trace at the location where the error was initially
+            // thrown. No need to do so again.
+            throw;
+        }
+
+        NamespaceString ns = entry->getNSSFromCatalog(opCtx);
+        LOGV2(20683,
+              "Assertion failure: _unindex failed",
+              "error"_attr = redact(e),
+              "keyString"_attr = keyString,
+              logAttrs(ns),
+              "indexName"_attr = entry->descriptor()->indexName());
+        printStackTrace();
+    }
+}
+
+std::unique_ptr<SortedDataInterface::Cursor> SortedDataIndexAccessMethod::newCursor(
     OperationContext* opCtx, bool isForward) const {
     return _newInterface->newCursor(opCtx, isForward);
 }
 
-std::unique_ptr<SortedDataInterface::Cursor> AbstractIndexAccessMethod::newCursor(
-    OperationContext* opCtx) const {
-    return newCursor(opCtx, true);
-}
-
-// Remove the provided doc from the index.
-Status AbstractIndexAccessMethod::remove(OperationContext* opCtx,
-                                         const BSONObj& obj,
-                                         const RecordId& loc,
-                                         const InsertDeleteOptions& options,
-                                         int64_t* numDeleted) {
-    invariant(numDeleted);
-    *numDeleted = 0;
-    BSONObjSet keys = SimpleBSONObjComparator::kInstance.makeBSONObjSet();
-    // There's no need to compute the prefixes of the indexed fields that cause the index to be
-    // multikey when removing a document since the index metadata isn't updated when keys are
-    // deleted.
-    BSONObjSet* multikeyMetadataKeys = nullptr;
-    MultikeyPaths* multikeyPaths = nullptr;
-
-    // Relax key constraints on removal when deleting documents with invalid formats, but only
-    // those that don't apply to the partialIndex filter.
-    getKeys(
-        obj, GetKeysMode::kRelaxConstraintsUnfiltered, &keys, multikeyMetadataKeys, multikeyPaths);
+Status SortedDataIndexAccessMethod::removeKeys(OperationContext* opCtx,
+                                               const IndexCatalogEntry* entry,
+                                               const KeyStringSet& keys,
+                                               const InsertDeleteOptions& options,
+                                               int64_t* numDeleted) const {
 
     for (const auto& key : keys) {
-        removeOneKey(opCtx, key, loc, options.dupsAllowed);
+        removeOneKey(opCtx, entry, key, options.dupsAllowed);
     }
 
     *numDeleted = keys.size();
-
     return Status::OK();
 }
 
-Status AbstractIndexAccessMethod::initializeAsEmpty(OperationContext* opCtx) {
-    return _newInterface->initAsEmpty(opCtx);
+Status SortedDataIndexAccessMethod::initializeAsEmpty() {
+    return _newInterface->initAsEmpty();
 }
 
-Status AbstractIndexAccessMethod::touch(OperationContext* opCtx, const BSONObj& obj) {
-    BSONObjSet keys = SimpleBSONObjComparator::kInstance.makeBSONObjSet();
-    // There's no need to compute the prefixes of the indexed fields that cause the index to be
-    // multikey when paging a document's index entries into memory.
-    BSONObjSet* multikeyMetadataKeys = nullptr;
-    MultikeyPaths* multikeyPaths = nullptr;
-    getKeys(obj, GetKeysMode::kEnforceConstraints, &keys, multikeyMetadataKeys, multikeyPaths);
+RecordId SortedDataIndexAccessMethod::findSingle(OperationContext* opCtx,
+                                                 const CollectionPtr& collection,
+                                                 const IndexCatalogEntry* entry,
+                                                 const BSONObj& requestedKey) const {
+    boost::optional<RecordId> loc = [&]() {
+        // Generate the key for this index.
+        if (entry->getCollator()) {
+            // For performance, call get keys only if there is a non-simple collation.
+            SharedBufferFragmentBuilder pooledBuilder(
+                key_string::HeapBuilder::kHeapAllocatorDefaultBytes);
+            auto& containerPool = PreallocatedContainerPool::get(opCtx);
+            auto keys = containerPool.keys();
+            KeyStringSet* multikeyMetadataKeys = nullptr;
+            MultikeyPaths* multikeyPaths = nullptr;
 
-    std::unique_ptr<SortedDataInterface::Cursor> cursor(_newInterface->newCursor(opCtx));
-    for (const auto& key : keys) {
-        cursor->seekExact(key);
-    }
+            getKeys(opCtx,
+                    collection,
+                    entry,
+                    pooledBuilder,
+                    requestedKey,
+                    InsertDeleteOptions::ConstraintEnforcementMode::kEnforceConstraints,
+                    GetKeysContext::kAddingKeys,
+                    keys.get(),
+                    multikeyMetadataKeys,
+                    multikeyPaths,
+                    boost::none /* loc */);
+            invariant(keys->size() == 1);
+            const key_string::Value& actualKey = *keys->begin();
+            dassert(key_string::decodeDiscriminator(actualKey.getView(),
+                                                    getSortedDataInterface()->getOrdering(),
+                                                    actualKey.getTypeBits()) ==
+                    key_string::Discriminator::kInclusive);
+            return _newInterface->findLoc(opCtx, actualKey.getView());
+        } else {
+            key_string::Builder requestedKeyString(getSortedDataInterface()->getKeyStringVersion(),
+                                                   requestedKey,
+                                                   getSortedDataInterface()->getOrdering());
+            return _newInterface->findLoc(opCtx, requestedKeyString.finishAndGetBuffer());
+        }
+    }();
 
-    return Status::OK();
-}
-
-
-Status AbstractIndexAccessMethod::touch(OperationContext* opCtx) const {
-    return _newInterface->touch(opCtx);
-}
-
-RecordId AbstractIndexAccessMethod::findSingle(OperationContext* opCtx,
-                                               const BSONObj& requestedKey) const {
-    // Generate the key for this index.
-    BSONObj actualKey;
-    if (_btreeState->getCollator()) {
-        // For performance, call get keys only if there is a non-simple collation.
-        BSONObjSet keys = SimpleBSONObjComparator::kInstance.makeBSONObjSet();
-        BSONObjSet* multikeyMetadataKeys = nullptr;
-        MultikeyPaths* multikeyPaths = nullptr;
-        getKeys(requestedKey,
-                GetKeysMode::kEnforceConstraints,
-                &keys,
-                multikeyMetadataKeys,
-                multikeyPaths);
-        invariant(keys.size() == 1);
-        actualKey = *keys.begin();
-    } else {
-        actualKey = requestedKey;
-    }
-
-    std::unique_ptr<SortedDataInterface::Cursor> cursor(_newInterface->newCursor(opCtx));
-    const auto requestedInfo = kDebugBuild ? SortedDataInterface::Cursor::kKeyAndLoc
-                                           : SortedDataInterface::Cursor::kWantLoc;
-    if (auto kv = cursor->seekExact(actualKey, requestedInfo)) {
-        // StorageEngine should guarantee these.
-        dassert(!kv->loc.isNull());
-        dassert(kv->key.woCompare(actualKey, /*order*/ BSONObj(), /*considerFieldNames*/ false) ==
-                0);
-
-        return kv->loc;
+    if (loc) {
+        dassert(!loc->isNull());
+        return std::move(*loc);
     }
 
     return RecordId();
 }
 
-void AbstractIndexAccessMethod::validate(OperationContext* opCtx,
-                                         int64_t* numKeys,
-                                         ValidateResults* fullResults) {
-    long long keys = 0;
-    _newInterface->fullValidate(opCtx, &keys, fullResults);
-    *numKeys = keys;
+IndexValidateResults SortedDataIndexAccessMethod::validate(
+    OperationContext* opCtx, const CollectionValidation::ValidationOptions& options) const {
+    return _newInterface->validate(opCtx, options);
 }
 
-bool AbstractIndexAccessMethod::appendCustomStats(OperationContext* opCtx,
-                                                  BSONObjBuilder* output,
-                                                  double scale) const {
+int64_t SortedDataIndexAccessMethod::numKeys(OperationContext* opCtx) const {
+    return _newInterface->numEntries(opCtx);
+}
+
+bool SortedDataIndexAccessMethod::appendCustomStats(OperationContext* opCtx,
+                                                    BSONObjBuilder* output,
+                                                    double scale) const {
     return _newInterface->appendCustomStats(opCtx, output, scale);
 }
 
-long long AbstractIndexAccessMethod::getSpaceUsedBytes(OperationContext* opCtx) const {
+long long SortedDataIndexAccessMethod::getSpaceUsedBytes(OperationContext* opCtx) const {
     return _newInterface->getSpaceUsedBytes(opCtx);
 }
 
-pair<vector<BSONObj>, vector<BSONObj>> AbstractIndexAccessMethod::setDifference(
-    const BSONObjSet& left, const BSONObjSet& right) {
+long long SortedDataIndexAccessMethod::getFreeStorageBytes(OperationContext* opCtx) const {
+    return _newInterface->getFreeStorageBytes(opCtx);
+}
+
+pair<KeyStringSet, KeyStringSet> SortedDataIndexAccessMethod::setDifference(
+    const KeyStringSet& left, const KeyStringSet& right) {
     // Two iterators to traverse the two sets in sorted order.
     auto leftIt = left.begin();
     auto rightIt = right.begin();
-    vector<BSONObj> onlyLeft;
-    vector<BSONObj> onlyRight;
+    KeyStringSet::sequence_type onlyLeft;
+    KeyStringSet::sequence_type onlyRight;
 
     while (leftIt != left.end() && rightIt != right.end()) {
-        const int cmp = leftIt->woCompare(*rightIt);
+        // Use compareWithTypeBits instead of the regular compare as we want just a difference in
+        // typeinfo to also result in an index change.
+        const int cmp = leftIt->compareWithTypeBits(*rightIt);
         if (cmp == 0) {
-            // 'leftIt' and 'rightIt' compare equal using woCompare(), but may not be identical,
-            // which should result in an index change.
-            if (!leftIt->binaryEqual(*rightIt)) {
-                onlyLeft.push_back(*leftIt);
-                onlyRight.push_back(*rightIt);
-            }
             ++leftIt;
             ++rightIt;
-            continue;
         } else if (cmp > 0) {
             onlyRight.push_back(*rightIt);
             ++rightIt;
@@ -405,31 +610,62 @@ pair<vector<BSONObj>, vector<BSONObj>> AbstractIndexAccessMethod::setDifference(
     onlyLeft.insert(onlyLeft.end(), leftIt, left.end());
     onlyRight.insert(onlyRight.end(), rightIt, right.end());
 
-    return {std::move(onlyLeft), std::move(onlyRight)};
+    KeyStringSet outLeft;
+    KeyStringSet outRight;
+
+    // The above algorithm guarantees that the elements are sorted and unique, so we can let the
+    // container know so we get O(1) complexity adopting it.
+    outLeft.adopt_sequence(boost::container::ordered_unique_range_t(), std::move(onlyLeft));
+    outRight.adopt_sequence(boost::container::ordered_unique_range_t(), std::move(onlyRight));
+
+    return {{std::move(outLeft)}, {std::move(outRight)}};
 }
 
-Status AbstractIndexAccessMethod::validateUpdate(OperationContext* opCtx,
-                                                 const BSONObj& from,
-                                                 const BSONObj& to,
-                                                 const RecordId& record,
-                                                 const InsertDeleteOptions& options,
-                                                 UpdateTicket* ticket,
-                                                 const MatchExpression* indexFilter) {
-    if (!indexFilter || indexFilter->matchesBSON(from)) {
+void SortedDataIndexAccessMethod::prepareUpdate(OperationContext* opCtx,
+                                                const CollectionPtr& collection,
+                                                const IndexCatalogEntry* entry,
+                                                const BSONObj& from,
+                                                const BSONObj& to,
+                                                const RecordId& record,
+                                                const InsertDeleteOptions& options,
+                                                UpdateTicket* ticket) const {
+    SharedBufferFragmentBuilder pooledBuilder(key_string::HeapBuilder::kHeapAllocatorDefaultBytes);
+    const MatchExpression* indexFilter = entry->getFilterExpression();
+    if (!indexFilter || exec::matcher::matchesBSON(indexFilter, from)) {
+        // Override key constraints when generating keys for removal. This only applies to keys
+        // that do not apply to a partial filter expression.
+        const auto getKeysMode = entry->isHybridBuilding()
+            ? InsertDeleteOptions::ConstraintEnforcementMode::kRelaxConstraintsUnfiltered
+            : options.getKeysMode;
+
         // There's no need to compute the prefixes of the indexed fields that possibly caused the
         // index to be multikey when the old version of the document was written since the index
         // metadata isn't updated when keys are deleted.
-        BSONObjSet* multikeyMetadataKeys = nullptr;
-        MultikeyPaths* multikeyPaths = nullptr;
-        getKeys(from, options.getKeysMode, &ticket->oldKeys, multikeyMetadataKeys, multikeyPaths);
+        getKeys(opCtx,
+                collection,
+                entry,
+                pooledBuilder,
+                from,
+                getKeysMode,
+                GetKeysContext::kRemovingKeys,
+                &ticket->oldKeys,
+                nullptr,
+                nullptr,
+                record);
     }
 
-    if (!indexFilter || indexFilter->matchesBSON(to)) {
-        getKeys(to,
+    if (!indexFilter || exec::matcher::matchesBSON(indexFilter, to)) {
+        getKeys(opCtx,
+                collection,
+                entry,
+                pooledBuilder,
+                to,
                 options.getKeysMode,
+                GetKeysContext::kAddingKeys,
                 &ticket->newKeys,
                 &ticket->newMultikeyMetadataKeys,
-                &ticket->newMultikeyPaths);
+                &ticket->newMultikeyPaths,
+                record);
     }
 
     ticket->loc = record;
@@ -438,14 +674,15 @@ Status AbstractIndexAccessMethod::validateUpdate(OperationContext* opCtx,
     std::tie(ticket->removed, ticket->added) = setDifference(ticket->oldKeys, ticket->newKeys);
 
     ticket->_isValid = true;
-
-    return Status::OK();
 }
 
-Status AbstractIndexAccessMethod::update(OperationContext* opCtx,
-                                         const UpdateTicket& ticket,
-                                         int64_t* numInserted,
-                                         int64_t* numDeleted) {
+Status SortedDataIndexAccessMethod::doUpdate(OperationContext* opCtx,
+                                             const CollectionPtr& coll,
+                                             const IndexCatalogEntry* entry,
+                                             const UpdateTicket& ticket,
+                                             int64_t* numInserted,
+                                             int64_t* numDeleted) {
+    invariant(!entry->isHybridBuilding());
     invariant(ticket.newKeys.size() ==
               ticket.oldKeys.size() + ticket.added.size() - ticket.removed.size());
     invariant(numInserted);
@@ -459,74 +696,251 @@ Status AbstractIndexAccessMethod::update(OperationContext* opCtx,
     }
 
     for (const auto& remKey : ticket.removed) {
-        _newInterface->unindex(opCtx, remKey, ticket.loc, ticket.dupsAllowed);
+        _newInterface->unindex(opCtx, remKey, ticket.dupsAllowed);
     }
 
-    bool checkIndexKeySize = shouldCheckIndexKeySize(opCtx);
-
-    // Add all new data keys, and all new multikey metadata keys, into the index. When iterating
-    // over the data keys, each of them should point to the doc's RecordId. When iterating over
-    // the multikey metadata keys, they should point to the reserved 'kMultikeyMetadataKeyId'.
-    const auto newMultikeyMetadataKeys = asVector(ticket.newMultikeyMetadataKeys);
-    for (const auto keySet : {&ticket.added, &newMultikeyMetadataKeys}) {
-        const auto& recordId = (keySet == &ticket.added ? ticket.loc : kMultikeyMetadataKeyId);
-        for (const auto& key : *keySet) {
-            Status status = checkIndexKeySize ? checkKeySize(key) : Status::OK();
-            if (status.isOK()) {
-                StatusWith<SpecialFormatInserted> ret =
-                    _newInterface->insert(opCtx, key, recordId, ticket.dupsAllowed);
-                status = ret.getStatus();
-                if (status.isOK() && ret.getValue() == SpecialFormatInserted::LongTypeBitsInserted)
-                    _btreeState->setIndexKeyStringWithLongTypeBitsExistsOnDisk(opCtx);
-            }
-            if (isFatalError(opCtx, status, key)) {
-                return status;
-            }
+    // Add all new data keys into the index.
+    for (const auto& keyString : ticket.added) {
+        bool dupsAllowed =
+            (!entry->descriptor()->prepareUnique() || !opCtx->isEnforcingConstraints()) &&
+            ticket.dupsAllowed;
+        auto result = _newInterface->insert(opCtx, keyString, dupsAllowed);
+        if (auto duplicate = std::get_if<SortedDataInterface::DuplicateKey>(&result)) {
+            return buildDupKeyErrorStatus(duplicate->key,
+                                          coll->ns(),
+                                          entry->descriptor()->indexName(),
+                                          entry->descriptor()->keyPattern(),
+                                          entry->descriptor()->collation(),
+                                          std::move(duplicate->foundValue),
+                                          std::move(duplicate->id));
+        } else if (auto& status = std::get<Status>(result); !status.isOK()) {
+            return status;
         }
     }
 
+    // If these keys should cause the index to become multikey, pass them into the catalog.
     if (shouldMarkIndexAsMultikey(
-            ticket.newKeys, ticket.newMultikeyMetadataKeys, ticket.newMultikeyPaths)) {
-        _btreeState->setMultikey(opCtx, ticket.newMultikeyPaths);
+            ticket.newKeys.size(), ticket.newMultikeyMetadataKeys, ticket.newMultikeyPaths)) {
+        entry->setMultikey(opCtx, coll, ticket.newMultikeyMetadataKeys, ticket.newMultikeyPaths);
     }
 
+    // If we have some multikey metadata keys, they should have been added while marking the index
+    // as multikey in the catalog. Add them to the count of keys inserted for completeness.
+    *numInserted = ticket.added.size() + ticket.newMultikeyMetadataKeys.size();
     *numDeleted = ticket.removed.size();
-    *numInserted = ticket.added.size();
 
     return Status::OK();
 }
 
-Status AbstractIndexAccessMethod::compact(OperationContext* opCtx) {
-    return this->_newInterface->compact(opCtx);
+StatusWith<int64_t> SortedDataIndexAccessMethod::compact(OperationContext* opCtx,
+                                                         const CompactOptions& options) {
+    return this->_newInterface->compact(opCtx, options);
 }
 
-class AbstractIndexAccessMethod::BulkBuilderImpl : public IndexAccessMethod::BulkBuilder {
+std::shared_ptr<Ident> SortedDataIndexAccessMethod::getSharedIdent() const {
+    return this->_newInterface->getSharedIdent();
+}
+
+void SortedDataIndexAccessMethod::setIdent(std::shared_ptr<Ident> newIdent) {
+    this->_newInterface->setIdent(std::move(newIdent));
+}
+
+Status SortedDataIndexAccessMethod::applyIndexBuildSideWrite(OperationContext* opCtx,
+                                                             const CollectionPtr& coll,
+                                                             const IndexCatalogEntry* entry,
+                                                             const BSONObj& operation,
+                                                             const InsertDeleteOptions& options,
+                                                             KeyHandlerFn&& onDuplicateKey,
+                                                             int64_t* const keysInserted,
+                                                             int64_t* const keysDeleted) {
+    auto opType = [&operation] {
+        switch (operation.getStringField("op")[0]) {
+            case 'i':
+                return IndexBuildInterceptor::Op::kInsert;
+            case 'd':
+                return IndexBuildInterceptor::Op::kDelete;
+            case 'u':
+                return IndexBuildInterceptor::Op::kUpdate;
+            default:
+                MONGO_UNREACHABLE;
+        }
+    }();
+
+    // Deserialize the encoded key_string::Value.
+    int keyLen;
+    const char* binKey = operation["key"].binData(keyLen);
+    BufReader reader(binKey, keyLen);
+    const key_string::Value keyString =
+        key_string::Value::deserialize(reader,
+                                       getSortedDataInterface()->getKeyStringVersion(),
+                                       getSortedDataInterface()->rsKeyFormat());
+
+    const KeyStringSet keySet{keyString};
+    if (opType == IndexBuildInterceptor::Op::kInsert) {
+        int64_t numInserted;
+        auto status = insertKeysAndUpdateMultikeyPaths(opCtx,
+                                                       coll,
+                                                       entry,
+                                                       {keySet.begin(), keySet.end()},
+                                                       {},
+                                                       MultikeyPaths{},
+                                                       options,
+                                                       std::move(onDuplicateKey),
+                                                       &numInserted);
+        if (!status.isOK()) {
+            return status;
+        }
+
+        *keysInserted += numInserted;
+        shard_role_details::getRecoveryUnit(opCtx)->onRollback(
+            [keysInserted, numInserted](OperationContext*) { *keysInserted -= numInserted; });
+    } else {
+        invariant(opType == IndexBuildInterceptor::Op::kDelete);
+        int64_t numDeleted;
+        Status s = removeKeys(opCtx, entry, {keySet.begin(), keySet.end()}, options, &numDeleted);
+        if (!s.isOK()) {
+            return s;
+        }
+
+        *keysDeleted += numDeleted;
+        shard_role_details::getRecoveryUnit(opCtx)->onRollback(
+            [keysDeleted, numDeleted](OperationContext*) { *keysDeleted -= numDeleted; });
+    }
+    return Status::OK();
+}
+
+void IndexAccessMethod::BulkBuilder::countNewBuildInStats() {
+    indexBulkBuilderSSS.count.addAndFetch(1);
+}
+
+void IndexAccessMethod::BulkBuilder::countResumedBuildInStats() {
+    indexBulkBuilderSSS.count.addAndFetch(1);
+    indexBulkBuilderSSS.resumed.addAndFetch(1);
+}
+
+SorterFileStats* IndexAccessMethod::BulkBuilder::bulkBuilderFileStats() {
+    return &indexBulkBuilderSSS.sorterFileStats;
+}
+
+SorterTracker* IndexAccessMethod::BulkBuilder::bulkBuilderTracker() {
+    return &indexBulkBuilderSSS.sorterTracker;
+}
+
+const IndexCatalogEntry* IndexAccessMethod::BulkBuilder::yield(OperationContext* opCtx,
+                                                               const CollectionPtr& collection,
+                                                               const NamespaceString& ns,
+                                                               const IndexCatalogEntry* entry) {
+    const std::string indexIdent = entry->getIdent();
+
+    // Releasing locks means a new snapshot should be acquired when restored.
+    shard_role_details::getRecoveryUnit(opCtx)->abandonSnapshot();
+    collection.yield();
+
+    auto locker = shard_role_details::getLocker(opCtx);
+    Locker::LockSnapshot snapshot;
+    locker->saveLockStateAndUnlock(&snapshot);
+
+    // Track the number of yields in CurOp.
+    CurOp::get(opCtx)->yielded();
+
+    auto failPointHang = [opCtx, &ns](FailPoint* fp) {
+        fp->executeIf(
+            [fp](auto&&) {
+                LOGV2(5180600, "Hanging index build during bulk load yield");
+                fp->pauseWhileSet();
+            },
+            [opCtx, &ns](auto&& config) {
+                return NamespaceStringUtil::parseFailPointData(config, "namespace") == ns;
+            });
+    };
+    failPointHang(&hangDuringIndexBuildBulkLoadYield);
+    failPointHang(&hangDuringIndexBuildBulkLoadYieldSecond);
+
+    locker->restoreLockState(opCtx, snapshot);
+    collection.restore();
+
+    // After yielding, the latest instance of the collection is fetched and can be
+    // different from the collection instance prior to yielding. For this reason we need
+    // to refresh the index entry pointer.
+    if (!collection) {
+        return nullptr;
+    }
+
+    return collection->getIndexCatalog()
+        ->findIndexByIdent(opCtx, indexIdent, IndexCatalog::InclusionPolicy::kUnfinished)
+        ->getEntry();
+}
+
+class SortedDataIndexAccessMethod::BulkBuilderImpl final : public IndexAccessMethod::BulkBuilder {
 public:
-    BulkBuilderImpl(const IndexAccessMethod* index,
-                    const IndexDescriptor* descriptor,
-                    size_t maxMemoryUsageBytes);
+    using Sorter = mongo::Sorter<key_string::Value, mongo::NullValue>;
+    using KeyHandlerFn = IndexAccessMethod::KeyHandlerFn;
+    using RecordIdHandlerFn = IndexAccessMethod::RecordIdHandlerFn;
+
+    BulkBuilderImpl(const IndexCatalogEntry* entry,
+                    SortedDataIndexAccessMethod* iam,
+                    size_t maxMemoryUsageBytes,
+                    const DatabaseName& dbName);
+
+    BulkBuilderImpl(const IndexCatalogEntry* entry,
+                    SortedDataIndexAccessMethod* iam,
+                    size_t maxMemoryUsageBytes,
+                    const IndexStateInfo& stateInfo,
+                    const DatabaseName& dbName);
 
     Status insert(OperationContext* opCtx,
+                  const CollectionPtr& collection,
+                  const IndexCatalogEntry* entry,
                   const BSONObj& obj,
                   const RecordId& loc,
-                  const InsertDeleteOptions& options) final;
+                  const InsertDeleteOptions& options,
+                  const OnSuppressedErrorFn& onSuppressedError = nullptr,
+                  const ShouldRelaxConstraintsFn& shouldRelaxConstraints = nullptr) final;
 
     const MultikeyPaths& getMultikeyPaths() const final;
 
     bool isMultikey() const final;
 
-    /**
-     * Inserts all multikey metadata keys cached during the BulkBuilder's lifetime into the
-     * underlying Sorter, finalizes it, and returns an iterator over the sorted dataset.
-     */
-    Sorter::Iterator* done() final;
+    IndexStateInfo persistDataForShutdown() final;
 
-    int64_t getKeysInserted() const final;
+    std::unique_ptr<Sorter::Iterator> finalizeSort();
+
+    void debugEnsureSorted(const Sorter::Data& data);
+
+    bool duplicateCheck(OperationContext* opCtx,
+                        const IndexCatalogEntry* entry,
+                        const Sorter::Data& data,
+                        bool dupsAllowed,
+                        const RecordIdHandlerFn& onDuplicateRecord);
+
+    Status commit(OperationContext* opCtx,
+                  const CollectionPtr& collection,
+                  const IndexCatalogEntry* entry,
+                  bool dupsAllowed,
+                  int32_t yieldIterations,
+                  const KeyHandlerFn& onDuplicateKeyInserted,
+                  const RecordIdHandlerFn& onDuplicateRecord) final;
 
 private:
-    std::unique_ptr<Sorter> _sorter;
-    const IndexAccessMethod* _real;
+    void _insertMultikeyMetadataKeysIntoSorter();
+
+    std::unique_ptr<Sorter> _makeSorter(
+        size_t maxMemoryUsageBytes,
+        const DatabaseName& dbName,
+        boost::optional<StringData> fileName = boost::none,
+        const boost::optional<std::vector<SorterRange>>& ranges = boost::none) const;
+
+    Sorter::Settings _makeSorterSettings() const;
+
     int64_t _keysInserted = 0;
+    const StringData _progressMessage;
+    const std::string _indexName;
+    NamespaceString _ns;
+
+    SortedDataIndexAccessMethod* _iam;
+    std::unique_ptr<Sorter> _sorter;
+
+    key_string::Value _previousKey;
 
     // Set to true if any document added to the BulkBuilder causes the index to become multikey.
     bool _isMultiKey = false;
@@ -538,225 +952,375 @@ private:
     // Caches the set of all multikey metadata keys generated during the bulk build process.
     // These are inserted into the sorter after all normal data keys have been added, just
     // before the bulk build is committed.
-    BSONObjSet _multikeyMetadataKeys{SimpleBSONObjComparator::kInstance.makeBSONObjSet()};
+    KeyStringSet _multikeyMetadataKeys;
 };
 
-std::unique_ptr<IndexAccessMethod::BulkBuilder> AbstractIndexAccessMethod::initiateBulk(
-    size_t maxMemoryUsageBytes) {
-    return std::make_unique<BulkBuilderImpl>(this, _descriptor, maxMemoryUsageBytes);
+std::unique_ptr<IndexAccessMethod::BulkBuilder> SortedDataIndexAccessMethod::initiateBulk(
+    const IndexCatalogEntry* entry,
+    size_t maxMemoryUsageBytes,
+    const boost::optional<IndexStateInfo>& stateInfo,
+    const DatabaseName& dbName) {
+    return stateInfo
+        ? std::make_unique<BulkBuilderImpl>(entry, this, maxMemoryUsageBytes, *stateInfo, dbName)
+        : std::make_unique<BulkBuilderImpl>(entry, this, maxMemoryUsageBytes, dbName);
 }
 
-AbstractIndexAccessMethod::BulkBuilderImpl::BulkBuilderImpl(const IndexAccessMethod* index,
-                                                            const IndexDescriptor* descriptor,
-                                                            size_t maxMemoryUsageBytes)
-    : _sorter(Sorter::make(
-          SortOptions()
-              .TempDir(storageGlobalParams.dbpath + "/_tmp")
-              .ExtSortAllowed()
-              .MaxMemoryUsageBytes(maxMemoryUsageBytes),
-          BtreeExternalSortComparison(descriptor->keyPattern(), descriptor->version()))),
-      _real(index) {}
+SortedDataIndexAccessMethod::BulkBuilderImpl::BulkBuilderImpl(const IndexCatalogEntry* entry,
+                                                              SortedDataIndexAccessMethod* iam,
+                                                              size_t maxMemoryUsageBytes,
+                                                              const DatabaseName& dbName)
+    : _progressMessage("Index Build: inserting keys from external sorter into index"),
+      _indexName(entry->descriptor()->indexName()),
+      _iam(iam),
+      _sorter(_makeSorter(maxMemoryUsageBytes, dbName)) {
+    countNewBuildInStats();
+}
 
-Status AbstractIndexAccessMethod::BulkBuilderImpl::insert(OperationContext* opCtx,
-                                                          const BSONObj& obj,
-                                                          const RecordId& loc,
-                                                          const InsertDeleteOptions& options) {
-    BSONObjSet keys = SimpleBSONObjComparator::kInstance.makeBSONObjSet();
-    MultikeyPaths multikeyPaths;
+SortedDataIndexAccessMethod::BulkBuilderImpl::BulkBuilderImpl(const IndexCatalogEntry* entry,
+                                                              SortedDataIndexAccessMethod* iam,
+                                                              size_t maxMemoryUsageBytes,
+                                                              const IndexStateInfo& stateInfo,
+                                                              const DatabaseName& dbName)
+    : _keysInserted(stateInfo.getNumKeys().value_or(0)),
+      _progressMessage("Index Build: inserting keys from external sorter into index"),
+      _indexName(entry->descriptor()->indexName()),
+      _iam(iam),
+      _sorter(
+          _makeSorter(maxMemoryUsageBytes, dbName, stateInfo.getFileName(), stateInfo.getRanges())),
+      _isMultiKey(stateInfo.getIsMultikey()),
+      _indexMultikeyPaths(createMultikeyPaths(stateInfo.getMultikeyPaths())) {
+    countResumedBuildInStats();
+}
 
-    _real->getKeys(obj, options.getKeysMode, &keys, &_multikeyMetadataKeys, &multikeyPaths);
+Status SortedDataIndexAccessMethod::BulkBuilderImpl::insert(
+    OperationContext* opCtx,
+    const CollectionPtr& collection,
+    const IndexCatalogEntry* entry,
+    const BSONObj& obj,
+    const RecordId& loc,
+    const InsertDeleteOptions& options,
+    const OnSuppressedErrorFn& onSuppressedError,
+    const ShouldRelaxConstraintsFn& shouldRelaxConstraints) {
+    auto& containerPool = PreallocatedContainerPool::get(opCtx);
 
-    if (!multikeyPaths.empty()) {
+    auto keys = containerPool.keys();
+    auto multikeyPaths = containerPool.multikeyPaths();
+
+    try {
+        _iam->getKeys(opCtx,
+                      collection,
+                      entry,
+                      _sorter->memPool(),
+                      obj,
+                      options.getKeysMode,
+                      GetKeysContext::kAddingKeys,
+                      keys.get(),
+                      &_multikeyMetadataKeys,
+                      multikeyPaths.get(),
+                      loc,
+                      onSuppressedError,
+                      shouldRelaxConstraints);
+    } catch (...) {
+        return exceptionToStatus();
+    }
+
+    if (!multikeyPaths->empty()) {
         if (_indexMultikeyPaths.empty()) {
-            _indexMultikeyPaths = multikeyPaths;
+            _indexMultikeyPaths = *multikeyPaths;
         } else {
-            invariant(_indexMultikeyPaths.size() == multikeyPaths.size());
-            for (size_t i = 0; i < multikeyPaths.size(); ++i) {
-                _indexMultikeyPaths[i].insert(multikeyPaths[i].begin(), multikeyPaths[i].end());
+            invariant(_indexMultikeyPaths.size() == multikeyPaths->size());
+            for (size_t i = 0; i < multikeyPaths->size(); ++i) {
+                _indexMultikeyPaths[i].insert(boost::container::ordered_unique_range_t(),
+                                              (*multikeyPaths)[i].begin(),
+                                              (*multikeyPaths)[i].end());
             }
         }
     }
 
-    for (const auto& key : keys) {
-        _sorter->add(key, loc);
+    for (const auto& keyString : *keys) {
+        _sorter->add(keyString, mongo::NullValue());
         ++_keysInserted;
     }
 
-    _isMultiKey =
-        _isMultiKey || _real->shouldMarkIndexAsMultikey(keys, _multikeyMetadataKeys, multikeyPaths);
+    _isMultiKey = _isMultiKey ||
+        _iam->shouldMarkIndexAsMultikey(keys->size(), _multikeyMetadataKeys, *multikeyPaths);
 
     return Status::OK();
 }
 
-const MultikeyPaths& AbstractIndexAccessMethod::BulkBuilderImpl::getMultikeyPaths() const {
+const MultikeyPaths& SortedDataIndexAccessMethod::BulkBuilderImpl::getMultikeyPaths() const {
     return _indexMultikeyPaths;
 }
 
-bool AbstractIndexAccessMethod::BulkBuilderImpl::isMultikey() const {
+bool SortedDataIndexAccessMethod::BulkBuilderImpl::isMultikey() const {
     return _isMultiKey;
 }
 
-IndexAccessMethod::BulkBuilder::Sorter::Iterator*
-AbstractIndexAccessMethod::BulkBuilderImpl::done() {
-    for (const auto& key : _multikeyMetadataKeys) {
-        _sorter->add(key, kMultikeyMetadataKeyId);
+IndexStateInfo SortedDataIndexAccessMethod::BulkBuilderImpl::persistDataForShutdown() {
+    _insertMultikeyMetadataKeysIntoSorter();
+    auto state = _sorter->persistDataForShutdown();
+
+    IndexStateInfo stateInfo;
+    stateInfo.setFileName(state.fileName);
+    stateInfo.setNumKeys(_keysInserted);
+    stateInfo.setRanges(std::move(state.ranges));
+
+    return stateInfo;
+}
+
+void SortedDataIndexAccessMethod::BulkBuilderImpl::_insertMultikeyMetadataKeysIntoSorter() {
+    for (const auto& keyString : _multikeyMetadataKeys) {
+        _sorter->add(keyString, mongo::NullValue());
         ++_keysInserted;
     }
+
+    // We clear the multikey metadata keys to prevent them from being inserted into the Sorter
+    // twice in the case that done() is called and then persistDataForShutdown() is later called.
+    _multikeyMetadataKeys.clear();
+}
+
+SortedDataIndexAccessMethod::BulkBuilderImpl::Sorter::Settings
+SortedDataIndexAccessMethod::BulkBuilderImpl::_makeSorterSettings() const {
+    return std::pair<key_string::Value::SorterDeserializeSettings,
+                     mongo::NullValue::SorterDeserializeSettings>(
+        {_iam->getSortedDataInterface()->getKeyStringVersion(),
+         _iam->getSortedDataInterface()->rsKeyFormat()},
+        {});
+}
+
+std::unique_ptr<SortedDataIndexAccessMethod::BulkBuilderImpl::Sorter>
+SortedDataIndexAccessMethod::BulkBuilderImpl::_makeSorter(
+    size_t maxMemoryUsageBytes,
+    const DatabaseName& dbName,
+    boost::optional<StringData> fileName,
+    const boost::optional<std::vector<SorterRange>>& ranges) const {
+    return fileName
+        ? Sorter::makeFromExistingRanges(
+              fileName->toString(),
+              *ranges,
+              makeSortOptions(maxMemoryUsageBytes, dbName, bulkBuilderFileStats()),
+              BtreeExternalSortComparison(),
+              _makeSorterSettings())
+        : Sorter::make(makeSortOptions(maxMemoryUsageBytes, dbName, bulkBuilderFileStats()),
+                       BtreeExternalSortComparison(),
+                       _makeSorterSettings());
+}
+
+std::unique_ptr<mongo::Sorter<key_string::Value, mongo::NullValue>::Iterator>
+SortedDataIndexAccessMethod::BulkBuilderImpl::finalizeSort() {
+    _insertMultikeyMetadataKeysIntoSorter();
     return _sorter->done();
 }
 
-int64_t AbstractIndexAccessMethod::BulkBuilderImpl::getKeysInserted() const {
-    return _keysInserted;
+void SortedDataIndexAccessMethod::BulkBuilderImpl::debugEnsureSorted(const Sorter::Data& data) {
+    if (data.first.compare(_previousKey) < 0) {
+        LOGV2_FATAL_NOTRACE(31171,
+                            "Expected the next key to be greater than or equal to the previous key",
+                            "nextKey"_attr = data.first.toString(),
+                            "previousKey"_attr = _previousKey.toString(),
+                            "index"_attr = _indexName);
+    }
 }
 
-Status AbstractIndexAccessMethod::commitBulk(OperationContext* opCtx,
-                                             BulkBuilder* bulk,
-                                             bool mayInterrupt,
-                                             bool dupsAllowed,
-                                             set<RecordId>* dupRecords,
-                                             std::vector<BSONObj>* dupKeysInserted) {
-    // Cannot simultaneously report uninserted duplicates 'dupRecords' and inserted duplicates
-    // 'dupKeysInserted'.
-    invariant(!(dupRecords && dupKeysInserted));
+bool SortedDataIndexAccessMethod::BulkBuilderImpl::duplicateCheck(
+    OperationContext* opCtx,
+    const IndexCatalogEntry* entry,
+    const Sorter::Data& data,
+    bool dupsAllowed,
+    const RecordIdHandlerFn& onDuplicateRecord) {
 
+    // Duplicate checking is only applicable to unique (including id) indexes
+    if (!entry->descriptor()->unique()) {
+        return false;
+    }
+
+    auto keyFormat = _iam->getSortedDataInterface()->rsKeyFormat();
+    auto& key = data.first;
+    int cmpData = key.compareWithoutRecordId(_previousKey, keyFormat);
+    if (cmpData != 0) {
+        invariant(cmpData > 0);
+        return false;
+    }
+
+    if (dupsAllowed) {
+        return true;
+    }
+
+    RecordId recordId = key_string::decodeRecordIdAtEnd(key.getView(), keyFormat);
+
+    // If supplied, onDuplicateRecord may be able to clean up the state, such as by moving the
+    // duplicate to a different collection
+    if (onDuplicateRecord) {
+        uassertStatusOK(onDuplicateRecord(recordId));
+        return true;
+    }
+
+    // Otherwise we just report the duplicate error
+    BSONObj dupKey = key_string::toBson(key, _iam->getSortedDataInterface()->getOrdering());
+    uassertStatusOK(buildDupKeyErrorStatus(dupKey.getOwned(),
+                                           entry->getNSSFromCatalog(opCtx),
+                                           entry->descriptor()->indexName(),
+                                           entry->descriptor()->keyPattern(),
+                                           entry->descriptor()->collation()));
+    MONGO_COMPILER_UNREACHABLE;  // The status will never be OK
+}
+
+Status SortedDataIndexAccessMethod::BulkBuilderImpl::commit(
+    OperationContext* opCtx,
+    const CollectionPtr& collection,
+    const IndexCatalogEntry* entry,
+    bool dupsAllowed,
+    int32_t yieldIterations,
+    const KeyHandlerFn& onDuplicateKeyInserted,
+    const RecordIdHandlerFn& onDuplicateRecord) {
     Timer timer;
 
-    std::unique_ptr<BulkBuilder::Sorter::Iterator> it(bulk->done());
+    _ns = entry->getNSSFromCatalog(opCtx);
+    auto builder = _iam->getSortedDataInterface()->makeBulkBuilder(opCtx);
+    auto it = finalizeSort();
 
-    stdx::unique_lock<Client> lk(*opCtx->getClient());
-    ProgressMeterHolder pm(
-        CurOp::get(opCtx)->setMessage_inlock("Index Bulk Build: (2/3) btree bottom up",
-                                             "Index: (2/3) BTree Bottom Up Progress",
-                                             bulk->getKeysInserted(),
-                                             10));
-    lk.unlock();
+    ProgressMeterHolder pm;
+    {
+        stdx::unique_lock<Client> lk(*opCtx->getClient());
+        pm.set(lk,
+               CurOp::get(opCtx)->setProgress(
+                   lk, _progressMessage, _keysInserted, 3 /* secondsBetween */),
+               opCtx);
+    }
 
-    auto builder = std::unique_ptr<SortedDataBuilderInterface>(
-        _newInterface->getBulkBuilder(opCtx, dupsAllowed));
-
-    bool checkIndexKeySize = shouldCheckIndexKeySize(opCtx);
-
-    BSONObj previousKey;
-    const Ordering ordering = Ordering::make(_descriptor->keyPattern());
-
+    int64_t iterations = 0;
     while (it->more()) {
-        if (mayInterrupt) {
-            opCtx->checkForInterrupt();
+        opCtx->checkForInterrupt();
+
+        auto failPointHang = [opCtx, iterations, &indexName = _indexName](FailPoint& fp) {
+            fp.executeIf(
+                [&fp, opCtx, iterations, &indexName](const BSONObj& data) {
+                    LOGV2(4924400,
+                          "Hanging index build during bulk load phase",
+                          "iteration"_attr = iterations,
+                          "index"_attr = indexName);
+
+                    fp.pauseWhileSet(opCtx);
+                },
+                [iterations, &indexName](const BSONObj& data) {
+                    auto indexNames = data.getObjectField("indexNames");
+                    return iterations == data["iteration"].numberLong() &&
+                        std::any_of(indexNames.begin(),
+                                    indexNames.end(),
+                                    [&indexName](const auto& elem) {
+                                        return indexName == elem.String();
+                                    });
+                });
+        };
+        failPointHang(hangIndexBuildDuringBulkLoadPhase);
+        failPointHang(hangIndexBuildDuringBulkLoadPhaseSecond);
+
+        auto data = it->next();
+        if (kDebugBuild) {
+            debugEnsureSorted(data);
         }
 
-        WriteUnitOfWork wunit(opCtx);
-
-        // Get the next datum and add it to the builder.
-        BulkBuilder::Sorter::Data data = it->next();
-
-        // Before attempting to insert, perform a duplicate key check.
-        bool isDup = false;
-        if (_descriptor->unique()) {
-            isDup = data.first.woCompare(previousKey, ordering) == 0;
-            if (isDup && !dupsAllowed) {
-                if (dupRecords) {
-                    dupRecords->insert(data.second);
-                    continue;
-                }
-                return buildDupKeyErrorStatus(data.first,
-                                              _descriptor->parentNS(),
-                                              _descriptor->indexName(),
-                                              _descriptor->keyPattern());
-            }
+        // Before attempting to insert, check if this key is a duplicate of the previous one
+        // inserted. onDuplicateRecord may attempt to perform a write to repair the state, which can
+        // potentially fail.
+        bool isDup;
+        try {
+            isDup = duplicateCheck(opCtx, entry, data, dupsAllowed, onDuplicateRecord);
+        } catch (DBException& e) {
+            return e.toStatus();
         }
 
-        Status status = checkIndexKeySize ? checkKeySize(data.first) : Status::OK();
-        if (status.isOK()) {
-            StatusWith<SpecialFormatInserted> ret = builder->addKey(data.first, data.second);
-            status = ret.getStatus();
-            if (status.isOK() && ret.getValue() == SpecialFormatInserted::LongTypeBitsInserted)
-                _btreeState->setIndexKeyStringWithLongTypeBitsExistsOnDisk(opCtx);
+        if (isDup && !dupsAllowed) {
+            // onDuplicateRecord took care of processing this duplicate key, so we don't need to do
+            // anything.
+            continue;
         }
 
-        if (!status.isOK()) {
+        _previousKey = data.first;
+
+        try {
+            writeConflictRetry(opCtx, "addingKey", _ns, [&] {
+                WriteUnitOfWork wunit(opCtx);
+                builder->addKey(data.first);
+                wunit.commit();
+            });
+        } catch (DBException& e) {
+            Status status = e.toStatus();
             // Duplicates are checked before inserting.
             invariant(status.code() != ErrorCodes::DuplicateKey);
-
-            // Overlong key that's OK to skip?
-            // TODO SERVER-36385: Remove this when there is no KeyTooLong error.
-            if (status.code() == ErrorCodes::KeyTooLong && ignoreKeyTooLong()) {
-                continue;
-            }
-
             return status;
         }
 
-        previousKey = data.first.getOwned();
-
-        if (isDup && dupsAllowed && dupKeysInserted) {
-            dupKeysInserted->push_back(data.first.getOwned());
+        if (isDup) {
+            if (auto status = onDuplicateKeyInserted(data.first); !status.isOK())
+                return status;
         }
 
-        // If we're here either it's a dup and we're cool with it or the addKey went just fine.
-        pm.hit();
-        wunit.commit();
-    }
+        // Yield locks every 'yieldIterations' key insertions.
+        if (yieldIterations > 0 && (++iterations % yieldIterations == 0)) {
+            entry = yield(opCtx, collection, _ns, entry);
+        }
 
-    pm.finished();
+        {
+            stdx::unique_lock<Client> lk(*opCtx->getClient());
+            // If we're here either it's a dup and we're cool with it or the addKey went
+            // just fine.
+            pm.get(lk)->hit();
+        }
+    }
 
     {
-        stdx::lock_guard<Client> lk(*opCtx->getClient());
-        CurOp::get(opCtx)->setMessage_inlock("Index Bulk Build: (3/3) btree-middle",
-                                             "Index: (3/3) BTree Middle Progress");
+        stdx::unique_lock<Client> lk(*opCtx->getClient());
+        pm.get(lk)->finished();
     }
 
-    LOG(timer.seconds() > 10 ? 0 : 1) << "\t done building bottom layer, going to commit";
-
-    WriteUnitOfWork wunit(opCtx);
-    SpecialFormatInserted specialFormatInserted = builder->commit(mayInterrupt);
-    // It's ok to insert KeyStrings with long TypeBits but we need to mark the feature
-    // tracker bit so that downgrade binary which cannot read the long TypeBits fails to
-    // start up.
-    if (specialFormatInserted == SpecialFormatInserted::LongTypeBitsInserted)
-        _btreeState->setIndexKeyStringWithLongTypeBitsExistsOnDisk(opCtx);
-    wunit.commit();
+    LOGV2(20685,
+          "Index build: inserted keys from external sorter into index",
+          logAttrs(_ns),
+          "index"_attr = _indexName,
+          "keysInserted"_attr = _keysInserted,
+          "duration"_attr = duration_cast<Milliseconds>(timer.elapsed()));
     return Status::OK();
 }
 
-void AbstractIndexAccessMethod::setIndexIsMultikey(OperationContext* opCtx, MultikeyPaths paths) {
-    _btreeState->setMultikey(opCtx, paths);
-}
+void SortedDataIndexAccessMethod::getKeys(
+    OperationContext* opCtx,
+    const CollectionPtr& collection,
+    const IndexCatalogEntry* entry,
+    SharedBufferFragmentBuilder& pooledBufferBuilder,
+    const BSONObj& obj,
+    InsertDeleteOptions::ConstraintEnforcementMode mode,
+    GetKeysContext context,
+    KeyStringSet* keys,
+    KeyStringSet* multikeyMetadataKeys,
+    MultikeyPaths* multikeyPaths,
+    const boost::optional<RecordId>& id,
+    const OnSuppressedErrorFn& onSuppressedErrorFn,
+    const ShouldRelaxConstraintsFn& shouldRelaxConstraints) const {
+    invariant(!id || _newInterface->rsKeyFormat() != KeyFormat::String || id->isStr(),
+              fmt::format("RecordId is not in the same string format as its RecordStore; id: {}",
+                          id->toString()));
+    invariant(!id || _newInterface->rsKeyFormat() != KeyFormat::Long || id->isLong(),
+              fmt::format("RecordId is not in the same long format as its RecordStore; id: {}",
+                          id->toString()));
 
-void AbstractIndexAccessMethod::getKeys(const BSONObj& obj,
-                                        GetKeysMode mode,
-                                        BSONObjSet* keys,
-                                        BSONObjSet* multikeyMetadataKeys,
-                                        MultikeyPaths* multikeyPaths) const {
-    // TODO SERVER-36385: Remove ErrorCodes::KeyTooLong.
-    static stdx::unordered_set<int> whiteList{ErrorCodes::CannotBuildIndexKeys,
-                                              // Btree
-                                              ErrorCodes::KeyTooLong,
-                                              ErrorCodes::CannotIndexParallelArrays,
-                                              // FTS
-                                              16732,
-                                              16733,
-                                              16675,
-                                              17261,
-                                              17262,
-                                              // Hash
-                                              16766,
-                                              // Haystack
-                                              16775,
-                                              16776,
-                                              // 2dsphere geo
-                                              16755,
-                                              16756,
-                                              // 2d geo
-                                              16804,
-                                              13067,
-                                              13068,
-                                              13026,
-                                              13027};
     try {
-        doGetKeys(obj, keys, multikeyMetadataKeys, multikeyPaths);
+        if (entry->shouldValidateDocument()) {
+            validateDocument(collection, obj, entry->descriptor()->keyPattern());
+        }
+        doGetKeys(opCtx,
+                  collection,
+                  entry,
+                  pooledBufferBuilder,
+                  obj,
+                  context,
+                  keys,
+                  multikeyMetadataKeys,
+                  multikeyPaths,
+                  id);
     } catch (const AssertionException& ex) {
         // Suppress all indexing errors when mode is kRelaxConstraints.
-        if (mode == GetKeysMode::kEnforceConstraints) {
+        if (mode == InsertDeleteOptions::ConstraintEnforcementMode::kEnforceConstraints) {
             throw;
         }
 
@@ -764,50 +1328,155 @@ void AbstractIndexAccessMethod::getKeys(const BSONObj& obj,
         if (multikeyPaths) {
             multikeyPaths->clear();
         }
-        // Only suppress the errors in the whitelist.
-        if (whiteList.find(ex.code()) == whiteList.end()) {
+
+        if (!opCtx->checkForInterruptNoAssert().isOK()) {
             throw;
         }
 
         // If the document applies to the filter (which means that it should have never been
-        // indexed), do not supress the error.
-        const MatchExpression* filter = _btreeState->getFilterExpression();
-        if (mode == GetKeysMode::kRelaxConstraintsUnfiltered && filter &&
-            filter->matchesBSON(obj)) {
+        // indexed), do not suppress the error.
+        const MatchExpression* filter = entry->getFilterExpression();
+        if (mode == InsertDeleteOptions::ConstraintEnforcementMode::kRelaxConstraintsUnfiltered &&
+            filter && exec::matcher::matchesBSON(filter, obj)) {
             throw;
         }
 
-        LOG(1) << "Ignoring indexing error for idempotency reasons: " << redact(ex)
-               << " when getting index keys of " << redact(obj);
+        if (mode == InsertDeleteOptions::ConstraintEnforcementMode::kRelaxConstraintsCallback) {
+            invariant(shouldRelaxConstraints);
+            if (!shouldRelaxConstraints(opCtx, collection)) {
+                throw;
+            }
+        }
+
+        if (onSuppressedErrorFn) {
+            onSuppressedErrorFn(opCtx, entry, ex.toStatus(), obj, id);
+        } else {
+            LOGV2_DEBUG(20686,
+                        1,
+                        "Suppressed key generation error",
+                        "error"_attr = redact(ex.toStatus()),
+                        "loc"_attr = id,
+                        "obj"_attr = redact(obj));
+        }
     }
 }
 
-bool AbstractIndexAccessMethod::shouldMarkIndexAsMultikey(
-    const BSONObjSet& keys,
-    const BSONObjSet& multikeyMetadataKeys,
+bool SortedDataIndexAccessMethod::shouldMarkIndexAsMultikey(
+    size_t numberOfKeys,
+    const KeyStringSet& multikeyMetadataKeys,
     const MultikeyPaths& multikeyPaths) const {
-    return (keys.size() > 1 || isMultikeyFromPaths(multikeyPaths));
+    return numberOfKeys > 1 || isMultikeyFromPaths(multikeyPaths);
 }
 
-SortedDataInterface* AbstractIndexAccessMethod::getSortedDataInterface() const {
-    return _newInterface.get();
+void SortedDataIndexAccessMethod::validateDocument(const CollectionPtr& collection,
+                                                   const BSONObj& obj,
+                                                   const BSONObj& keyPattern) const {}
+
+Status SortedDataIndexAccessMethod::_indexKeysOrWriteToSideTable(
+    OperationContext* opCtx,
+    const CollectionPtr& coll,
+    const IndexCatalogEntry* entry,
+    const KeyStringSet& keys,
+    const KeyStringSet& multikeyMetadataKeys,
+    const MultikeyPaths& multikeyPaths,
+    const BSONObj& obj,
+    const InsertDeleteOptions& options,
+    int64_t* keysInsertedOut) {
+    Status status = Status::OK();
+    if (entry->isHybridBuilding()) {
+        // The side table interface accepts only records that meet the criteria for this partial
+        // index.
+        // See SERVER-28975 and SERVER-39705 for details.
+        if (auto filter = entry->getFilterExpression()) {
+            if (!exec::matcher::matchesBSON(filter, obj)) {
+                return Status::OK();
+            }
+        }
+
+        int64_t inserted = 0;
+        status = entry->indexBuildInterceptor()->sideWrite(opCtx,
+                                                           entry,
+                                                           keys,
+                                                           multikeyMetadataKeys,
+                                                           multikeyPaths,
+                                                           IndexBuildInterceptor::Op::kInsert,
+                                                           &inserted);
+        if (keysInsertedOut) {
+            *keysInsertedOut += inserted;
+        }
+    } else {
+        int64_t numInserted = 0;
+        status = insertKeysAndUpdateMultikeyPaths(
+            opCtx,
+            coll,
+            entry,
+            keys,
+            {multikeyMetadataKeys.begin(), multikeyMetadataKeys.end()},
+            multikeyPaths,
+            options,
+            nullptr,
+            &numInserted);
+        if (keysInsertedOut) {
+            *keysInsertedOut += numInserted;
+        }
+    }
+
+    return status;
 }
 
-/**
- * Generates a new file name on each call using a static, atomic and monotonically increasing
- * number.
- *
- * Each user of the Sorter must implement this function to ensure that all temporary files that the
- * Sorter instances produce are uniquely identified using a unique file name extension with separate
- * atomic variable. This is necessary because the sorter.cpp code is separately included in multiple
- * places, rather than compiled in one place and linked, and so cannot provide a globally unique ID.
- */
-std::string nextFileName() {
-    static AtomicUInt32 indexAccessMethodFileCounter;
-    return "extsort-index." + std::to_string(indexAccessMethodFileCounter.fetchAndAdd(1));
+void SortedDataIndexAccessMethod::_unindexKeysOrWriteToSideTable(
+    OperationContext* opCtx,
+    const NamespaceString& ns,
+    const IndexCatalogEntry* entry,
+    const KeyStringSet& keys,
+    const BSONObj& obj,
+    bool logIfError,
+    int64_t* const keysDeletedOut,
+    InsertDeleteOptions options,  // copy!
+    CheckRecordId checkRecordId) {
+
+    if (entry->isHybridBuilding()) {
+        // The side table interface accepts only records that meet the criteria for this partial
+        // index.
+        // See SERVER-28975 and SERVER-39705 for details.
+        if (auto filter = entry->getFilterExpression()) {
+            if (!exec::matcher::matchesBSON(filter, obj)) {
+                return;
+            }
+        }
+
+        int64_t removed = 0;
+        fassert(31155,
+                entry->indexBuildInterceptor()->sideWrite(
+                    opCtx, entry, keys, {}, {}, IndexBuildInterceptor::Op::kDelete, &removed));
+        if (keysDeletedOut) {
+            *keysDeletedOut += removed;
+        }
+
+        return;
+    }
+
+    // On WiredTiger, we do blind unindexing of records for efficiency.  However, when duplicates
+    // are allowed in unique indexes, WiredTiger does not do blind unindexing, and instead confirms
+    // that the recordid matches the element we are removing.
+    //
+    // We need to disable blind-deletes if 'checkRecordId' is explicitly set 'On'.
+    options.dupsAllowed = options.dupsAllowed || checkRecordId == CheckRecordId::On;
+
+    int64_t removed = 0;
+    Status status = removeKeys(opCtx, entry, keys, options, &removed);
+
+    if (!status.isOK()) {
+        LOGV2(20362,
+              "Couldn't unindex record",
+              "record"_attr = redact(obj),
+              logAttrs(ns),
+              "error"_attr = redact(status));
+    }
+
+    if (keysDeletedOut) {
+        *keysDeletedOut += removed;
+    }
 }
 
 }  // namespace mongo
-
-#include "mongo/db/sorter/sorter.cpp"
-MONGO_CREATE_SORTER(mongo::BSONObj, mongo::RecordId, mongo::BtreeExternalSortComparison);

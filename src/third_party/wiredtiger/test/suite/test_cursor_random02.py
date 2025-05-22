@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Public Domain 2014-2018 MongoDB, Inc.
+# Public Domain 2014-present MongoDB, Inc.
 # Public Domain 2008-2014 WiredTiger, Inc.
 #
 # This is free and unencumbered software released into the public domain.
@@ -26,7 +26,7 @@
 # ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
 # OTHER DEALINGS IN THE SOFTWARE.
 
-import wiredtiger, wttest
+import wttest
 from wtdataset import SimpleDataSet
 from wtscenario import make_scenarios
 
@@ -34,7 +34,6 @@ from wtscenario import make_scenarios
 #    Cursor next_random operations
 class test_cursor_random02(wttest.WiredTigerTestCase):
     types = [
-        ('lsm', dict(type='lsm:random')),
         ('table', dict(type='table:random'))
     ]
     config = [
@@ -87,14 +86,11 @@ class test_cursor_random02(wttest.WiredTigerTestCase):
         '''
         self.tty('differentKeys: ' + str(differentKeys) + ' of ' + \
             str(num_entries) + ', ' + \
-            str((int)((differentKeys * 100) / num_entries)) + '%')
+            str((int)((differentKeys * 100) // num_entries)) + '%')
         '''
         # Can't test for non-sequential data when there is 1 item in the table
         if num_entries > 1:
             self.assertGreater(num_entries - 1, sequentialKeys,
                 'cursor is returning sequential data')
-        self.assertGreater(differentKeys, num_entries / 4,
+        self.assertGreater(differentKeys, num_entries // 4,
             'next_random random distribution not adequate')
-
-if __name__ == '__main__':
-    wttest.run()

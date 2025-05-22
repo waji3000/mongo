@@ -1,21 +1,36 @@
-// Runner for checkOplogs() that compares the oplog on all replica set nodes
-// to ensure all nodes have the same data.
-'use strict';
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import newMongoWithRetry from "jstests/libs/retryable_mongo.js";
 
-(function() {
-    var startTime = Date.now();
-    assert.neq(typeof db, 'undefined', 'No `db` object, is the shell connected to a mongod?');
+var startTime = Date.now();
+assert.neq(typeof db, 'undefined', 'No `db` object, is the shell connected to a mongod?');
 
-    var primaryInfo = db.isMaster();
+let runCheckOnReplSet = function(db) {
+    let primaryInfo = db.adminCommand("isMaster");
 
     assert(primaryInfo.ismaster,
            'shell is not connected to the primary or master node: ' + tojson(primaryInfo));
 
-    var cmdLineOpts = db.adminCommand('getCmdLineOpts');
-    assert.commandWorked(cmdLineOpts);
-    var testFixture = new ReplSetTest(db.getMongo().host);
+    let testFixture = new ReplSetTest(db.getMongo().host);
     testFixture.checkOplogs();
+};
 
-    var totalTime = Date.now() - startTime;
-    print('Finished consistency oplog checks of cluster in ' + totalTime + ' ms.');
-})();
+if (db.getMongo().isMongos()) {
+    let configDB = db.getSiblingDB('config');
+
+    // Run check on every shard.
+    configDB.shards.find().forEach(shardEntry => {
+        let newConn = newMongoWithRetry(shardEntry.host, undefined, {gRPC: false});
+        runCheckOnReplSet(newConn.getDB('admin'));
+    });
+
+    // Run check on config server.
+    let cmdLineOpts = db.adminCommand({getCmdLineOpts: 1});
+    let configConn =
+        newMongoWithRetry(cmdLineOpts.parsed.sharding.configDB, undefined, {gRPC: false});
+    runCheckOnReplSet(configConn.getDB('admin'));
+} else {
+    runCheckOnReplSet(db);
+}
+
+var totalTime = Date.now() - startTime;
+print('Finished consistency oplog checks of cluster in ' + totalTime + ' ms.');

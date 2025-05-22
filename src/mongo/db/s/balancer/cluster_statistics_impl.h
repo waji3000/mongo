@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,7 +29,12 @@
 
 #pragma once
 
-#include "mongo/db/s/balancer/balancer_random.h"
+#include <vector>
+
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/status_with.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/s/balancer/cluster_statistics.h"
 
 namespace mongo {
@@ -42,14 +46,9 @@ namespace mongo {
  */
 class ClusterStatisticsImpl final : public ClusterStatistics {
 public:
-    ClusterStatisticsImpl(BalancerRandomSource& random);
-    ~ClusterStatisticsImpl();
+    ~ClusterStatisticsImpl() override;
 
     StatusWith<std::vector<ShardStatistics>> getStats(OperationContext* opCtx) override;
-
-private:
-    // Source of randomness when metadata needs to be randomized.
-    BalancerRandomSource& _random;
 };
 
 }  // namespace mongo

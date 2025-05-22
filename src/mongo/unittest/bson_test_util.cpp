@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,9 +27,18 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <cstddef>
+#include <ostream>
 
-#include "mongo/unittest/bson_test_util.h"
+#include "mongo/bson/bsonobj_comparator_interface.h"
+#include "mongo/bson/json.h"
+#include "mongo/bson/oid.h"
+#include "mongo/bson/simple_bsonelement_comparator.h"
+#include "mongo/bson/simple_bsonobj_comparator.h"
+#include "mongo/bson/unordered_fields_bsonobj_comparator.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 namespace unittest {
@@ -57,12 +65,54 @@ GENERATE_BSON_CMP_FUNC(BSONObj, GT, SimpleBSONObjComparator::kInstance, >);
 GENERATE_BSON_CMP_FUNC(BSONObj, GTE, SimpleBSONObjComparator::kInstance, >=);
 GENERATE_BSON_CMP_FUNC(BSONObj, NE, SimpleBSONObjComparator::kInstance, !=);
 
+GENERATE_BSON_CMP_FUNC(BSONObj, EQ_UNORDERED, UnorderedFieldsBSONObjComparator{}, ==);
+GENERATE_BSON_CMP_FUNC(BSONObj, LT_UNORDERED, UnorderedFieldsBSONObjComparator{}, <);
+GENERATE_BSON_CMP_FUNC(BSONObj, LTE_UNORDERED, UnorderedFieldsBSONObjComparator{}, <=);
+GENERATE_BSON_CMP_FUNC(BSONObj, GT_UNORDERED, UnorderedFieldsBSONObjComparator{}, >);
+GENERATE_BSON_CMP_FUNC(BSONObj, GTE_UNORDERED, UnorderedFieldsBSONObjComparator{}, >=);
+GENERATE_BSON_CMP_FUNC(BSONObj, NE_UNORDERED, UnorderedFieldsBSONObjComparator{}, !=);
+
+// This comparator checks for binary equality. Useful when logical equality (through woCompare()) is
+// not strong enough.
+class BSONObjBinaryComparator final : public BSONObj::ComparatorInterface {
+public:
+    static const BSONObjBinaryComparator kInstance;
+
+    /**
+     * The function only supports equals to operation.
+     */
+    int compare(const BSONObj& lhs, const BSONObj& rhs) const final {
+        return !lhs.binaryEqual(rhs);
+    }
+    void hash_combine(size_t& seed, const BSONObj& toHash) const final {
+        MONGO_UNREACHABLE;
+    }
+};
+const BSONObjBinaryComparator BSONObjBinaryComparator::kInstance{};
+
+GENERATE_BSON_CMP_FUNC(BSONObj, BINARY_EQ, BSONObjBinaryComparator::kInstance, ==);
+
 GENERATE_BSON_CMP_FUNC(BSONElement, EQ, SimpleBSONElementComparator::kInstance, ==);
 GENERATE_BSON_CMP_FUNC(BSONElement, LT, SimpleBSONElementComparator::kInstance, <);
 GENERATE_BSON_CMP_FUNC(BSONElement, LTE, SimpleBSONElementComparator::kInstance, <=);
 GENERATE_BSON_CMP_FUNC(BSONElement, GT, SimpleBSONElementComparator::kInstance, >);
 GENERATE_BSON_CMP_FUNC(BSONElement, GTE, SimpleBSONElementComparator::kInstance, >=);
 GENERATE_BSON_CMP_FUNC(BSONElement, NE, SimpleBSONElementComparator::kInstance, !=);
+
+std::string formatJsonStr(const std::string& input) {
+    BSONObj obj = fromjson(input);
+    const static JsonStringFormat format = JsonStringFormat::ExtendedRelaxedV2_0_0;
+    std::string str = obj.jsonString(format);
+
+    // Raw JSON strings additionally have `fromjson(R())`, so subtract that from the auto-update max
+    // line length.
+    static constexpr size_t kRawJsonMaxLineLength =
+        kAutoUpdateMaxLineLength - "fromjson(R())"_sd.size();
+    if (str.size() > kRawJsonMaxLineLength) {
+        str = obj.jsonString(format, 1);
+    }
+    return str::stream() << "R\"(" << str << ")\"";
+}
 
 }  // namespace unittest
 }  // namespace mongo

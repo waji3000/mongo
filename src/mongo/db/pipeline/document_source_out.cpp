@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,436 +27,540 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
 
-#include "mongo/platform/basic.h"
+#include <fmt/format.h>
+#include <iterator>
+#include <mutex>
+#include <vector>
 
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/db/catalog/collection_catalog.h"
+#include "mongo/db/catalog/collection_uuid_mismatch_info.h"
+#include "mongo/db/client.h"
 #include "mongo/db/curop_failpoint_helpers.h"
-#include "mongo/db/ops/write_ops.h"
-#include "mongo/db/pipeline/document_path_support.h"
+#include "mongo/db/feature_flag.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/pipeline/document_source_out.h"
-#include "mongo/db/pipeline/document_source_out_gen.h"
-#include "mongo/db/pipeline/document_source_out_in_place.h"
-#include "mongo/db/pipeline/document_source_out_replace_coll.h"
-#include "mongo/util/fail_point_service.h"
-#include "mongo/util/log.h"
+#include "mongo/db/pipeline/writer_util.h"
+#include "mongo/db/query/allowed_contexts.h"
+#include "mongo/db/query/query_feature_flags_gen.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/timeseries/catalog_helper.h"
+#include "mongo/db/timeseries/timeseries_options.h"
+#include "mongo/idl/idl_parser.h"
+#include "mongo/logv2/log.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/namespace_string_util.h"
+#include "mongo/util/str.h"
+#include "mongo/util/string_map.h"
+#include "mongo/util/uuid.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 namespace mongo {
 
 MONGO_FAIL_POINT_DEFINE(hangWhileBuildingDocumentSourceOutBatch);
-
-using boost::intrusive_ptr;
-using std::vector;
-
-std::unique_ptr<DocumentSourceOut::LiteParsed> DocumentSourceOut::LiteParsed::parse(
-    const AggregationRequest& request, const BSONElement& spec) {
-
-    uassert(ErrorCodes::TypeMismatch,
-            str::stream() << "$out stage requires a string or object argument, but found "
-                          << typeName(spec.type()),
-            spec.type() == BSONType::String || spec.type() == BSONType::Object);
-
-    NamespaceString targetNss;
-    bool allowSharded;
-    WriteModeEnum mode;
-    if (spec.type() == BSONType::String) {
-        targetNss = NamespaceString(request.getNamespaceString().db(), spec.valueStringData());
-        allowSharded = false;
-        mode = WriteModeEnum::kModeReplaceCollection;
-    } else if (spec.type() == BSONType::Object) {
-        auto outSpec =
-            DocumentSourceOutSpec::parse(IDLParserErrorContext("$out"), spec.embeddedObject());
-
-        if (auto targetDb = outSpec.getTargetDb()) {
-            targetNss = NamespaceString(*targetDb, outSpec.getTargetCollection());
-        } else {
-            targetNss =
-                NamespaceString(request.getNamespaceString().db(), outSpec.getTargetCollection());
-        }
-
-        mode = outSpec.getMode();
-
-        // Sharded output collections are not allowed with mode "replaceCollection".
-        allowSharded = mode != WriteModeEnum::kModeReplaceCollection;
-    }
-
-    uassert(ErrorCodes::InvalidNamespace,
-            str::stream() << "Invalid $out target namespace, " << targetNss.ns(),
-            targetNss.isValid());
-
-    // All modes require the "insert" action.
-    ActionSet actions{ActionType::insert};
-    switch (mode) {
-        case WriteModeEnum::kModeReplaceCollection:
-            actions.addAction(ActionType::remove);
-            break;
-        case WriteModeEnum::kModeReplaceDocuments:
-            actions.addAction(ActionType::update);
-            break;
-        case WriteModeEnum::kModeInsertDocuments:
-            // "insertDocuments" mode only requires the "insert" action.
-            break;
-    }
-
-    if (request.shouldBypassDocumentValidation()) {
-        actions.addAction(ActionType::bypassDocumentValidation);
-    }
-
-    PrivilegeVector privileges{Privilege(ResourcePattern::forExactNamespace(targetNss), actions)};
-
-    return stdx::make_unique<DocumentSourceOut::LiteParsed>(
-        std::move(targetNss), std::move(privileges), allowSharded);
-}
+MONGO_FAIL_POINT_DEFINE(outWaitAfterTempCollectionCreation);
+MONGO_FAIL_POINT_DEFINE(outWaitBeforeTempCollectionRename);
+MONGO_FAIL_POINT_DEFINE(outWaitAfterTempCollectionRenameBeforeView);
+MONGO_FAIL_POINT_DEFINE(outImplictlyCreateDBOnSpecificShard);
+MONGO_FAIL_POINT_DEFINE(hangDollarOutAfterInsert);
 
 REGISTER_DOCUMENT_SOURCE(out,
                          DocumentSourceOut::LiteParsed::parse,
-                         DocumentSourceOut::createFromBson);
+                         DocumentSourceOut::createFromBson,
+                         AllowedWithApiStrict::kAlways);
+ALLOCATE_DOCUMENT_SOURCE_ID(out, DocumentSourceOut::id)
 
-const char* DocumentSourceOut::getSourceName() const {
-    return "$out";
-}
-
-namespace {
-/**
- * Parses the fields of the 'uniqueKey' from the user-specified 'obj' from the $out spec, returning
- * a set of field paths. Throws if 'obj' is invalid.
- */
-std::set<FieldPath> parseUniqueKeyFromSpec(const BSONObj& obj) {
-    std::set<FieldPath> uniqueKey;
-    for (const auto& elem : obj) {
-        uassert(ErrorCodes::TypeMismatch,
-                str::stream() << "All fields of $out uniqueKey must be the number 1, but '"
-                              << elem.fieldNameStringData()
-                              << "' is of type "
-                              << elem.type(),
-                elem.isNumber());
-
-        uassert(ErrorCodes::BadValue,
-                str::stream() << "All fields of $out uniqueKey must be the number 1, but '"
-                              << elem.fieldNameStringData()
-                              << "' has the invalid value "
-                              << elem.numberDouble(),
-                elem.numberDouble() == 1.0);
-
-        const auto res = uniqueKey.insert(FieldPath(elem.fieldNameStringData()));
-        uassert(ErrorCodes::BadValue,
-                str::stream() << "Found a duplicate field '" << elem.fieldNameStringData()
-                              << "' in $out uniqueKey",
-                res.second);
+DocumentSourceOut::~DocumentSourceOut() {
+    if (_tmpCleanUpState == OutCleanUpProgress::kComplete) {
+        return;
     }
 
-    uassert(ErrorCodes::InvalidOptions,
-            "If explicitly specifying $out uniqueKey, must include at least one field",
-            uniqueKey.size() > 0);
-    return uniqueKey;
-}
+    try {
+        // Make sure we drop the temp collection(s) if anything goes wrong.
+        // Errors are ignored here because nothing can be done about them. Additionally, if
+        // this fails and the collection is left behind, it will be cleaned up next time the
+        // server is started.
+        auto cleanupClient =
+            pExpCtx->getOperationContext()->getService()->makeClient("$out_replace_coll_cleanup");
+        AlternativeClientRegion acr(cleanupClient);
 
-/**
- * Extracts the fields of 'uniqueKey' from 'doc' and returns the key as a BSONObj. Throws if any
- * field of the 'uniqueKey' extracted from 'doc' is nullish or an array.
- */
-BSONObj extractUniqueKeyFromDoc(const Document& doc, const std::set<FieldPath>& uniqueKey) {
-    MutableDocument result;
-    for (const auto& field : uniqueKey) {
-        auto value = doc.getNestedField(field);
-        uassert(50943,
-                str::stream() << "$out write error: uniqueKey field '" << field.fullPath()
-                              << "' is an array in the document '"
-                              << doc.toString()
-                              << "'",
-                !value.isArray());
-        uassert(
-            50905,
-            str::stream() << "$out write error: uniqueKey field '" << field.fullPath()
-                          << "' cannot be missing, null, undefined or an array. Full document: '"
-                          << doc.toString()
-                          << "'",
-            !value.nullish());
-        result.addField(field.fullPath(), std::move(value));
-    }
-    return result.freeze().toBson();
-}
+        // Create a new operation context so that any interrupts on the current operation
+        // will not affect the dropCollection operation below.
+        auto cleanupOpCtx = cc().makeOperationContext();
+        DocumentSourceWriteBlock writeBlock(cleanupOpCtx.get());
+        auto dropCollectionCmd = [&](NamespaceString dropNs) {
+            try {
+                pExpCtx->getMongoProcessInterface()->dropTempCollection(cleanupOpCtx.get(), dropNs);
+            } catch (const DBException& e) {
+                LOGV2_WARNING(7466203,
+                              "Unexpected error dropping temporary collection; drop will complete "
+                              "on next server restart",
+                              "error"_attr = redact(e.toString()),
+                              "coll"_attr = dropNs);
+            };
+        };
 
-void ensureUniqueKeyHasSupportingIndex(const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                                       const NamespaceString& outputNs,
-                                       const std::set<FieldPath>& uniqueKey,
-                                       const BSONObj& userSpecifiedUniqueKey) {
-    uassert(
-        50938,
-        str::stream() << "Cannot find index to verify that $out's unique key will be unique: "
-                      << userSpecifiedUniqueKey,
-        expCtx->mongoProcessInterface->uniqueKeyIsSupportedByIndex(expCtx, outputNs, uniqueKey));
-}
-}  // namespace
-
-DocumentSource::GetNextResult DocumentSourceOut::getNext() {
-    pExpCtx->checkForInterrupt();
-
-    if (_done) {
-        return GetNextResult::makeEOF();
-    }
-
-    if (!_initialized) {
-        initializeWriteNs();
-        _initialized = true;
-    }
-
-    BatchedObjects batch;
-    int bufferedBytes = 0;
-
-    auto nextInput = pSource->getNext();
-    for (; nextInput.isAdvanced(); nextInput = pSource->getNext()) {
-        // clang-format off
-        CurOpFailpointHelpers::waitWhileFailPointEnabled(
-            &hangWhileBuildingDocumentSourceOutBatch,
-            pExpCtx->opCtx,
-            "hangWhileBuildingDocumentSourceOutBatch",
-            []() {
-                log() << "Hanging aggregation due to 'hangWhileBuildingDocumentSourceOutBatch' "
-                      << "failpoint";
-            });
-        // clang-format on
-
-        auto doc = nextInput.releaseDocument();
-
-        // Generate an _id if the uniqueKey includes _id but the document doesn't have one.
-        if (_uniqueKeyIncludesId && doc.getField("_id"_sd).missing()) {
-            MutableDocument mutableDoc(std::move(doc));
-            mutableDoc["_id"_sd] = Value(OID::gen());
-            doc = mutableDoc.freeze();
+        switch (_tmpCleanUpState) {
+            case OutCleanUpProgress::kTmpCollExists:
+                dropCollectionCmd(_tempNs);
+                break;
+            case OutCleanUpProgress::kRenameComplete:
+                // For time-series collections, since we haven't created a view in this state, we
+                // must drop the buckets collection.
+                // TODO SERVER-92272 Update this to only drop the collection iff a time-series view
+                // doesn't exist.
+                if (_timeseries) {
+                    auto collType = pExpCtx->getMongoProcessInterface()->getCollectionType(
+                        cleanupOpCtx.get(), getOutputNs());
+                    if (collType != query_shape::CollectionType::kTimeseries) {
+                        dropCollectionCmd(getOutputNs().makeTimeseriesBucketsNamespace());
+                    }
+                }
+                [[fallthrough]];
+            case OutCleanUpProgress::kViewCreatedIfNeeded:
+                // This state indicates that the rename succeeded, but 'dropTempCollection' hasn't
+                // finished. For sharding we must also explicitly call 'dropTempCollection' on the
+                // temporary namespace to remove the namespace from the list of in-use temporary
+                // collections.
+                dropCollectionCmd(_tempNs);
+                break;
+            default:
+                MONGO_UNREACHABLE;
+                break;
         }
-
-        // Extract the unique key before converting the document to BSON.
-        auto uniqueKey = extractUniqueKeyFromDoc(doc, _uniqueKeyFields);
-        auto insertObj = doc.toBson();
-
-        bufferedBytes += insertObj.objsize();
-        if (!batch.empty() &&
-            (bufferedBytes > BSONObjMaxUserSize || batch.size() >= write_ops::kMaxWriteBatchSize)) {
-            spill(std::move(batch));
-            batch.clear();
-            bufferedBytes = insertObj.objsize();
-        }
-        batch.emplace(std::move(insertObj), std::move(uniqueKey));
-    }
-    if (!batch.empty()) {
-        spill(std::move(batch));
-        batch.clear();
-    }
-
-    switch (nextInput.getStatus()) {
-        case GetNextResult::ReturnStatus::kAdvanced: {
-            MONGO_UNREACHABLE;  // We consumed all advances above.
-        }
-        case GetNextResult::ReturnStatus::kPauseExecution: {
-            return nextInput;  // Propagate the pause.
-        }
-        case GetNextResult::ReturnStatus::kEOF: {
-
-            finalize();
-            _done = true;
-
-            // $out doesn't currently produce any outputs.
-            return nextInput;
-        }
-    }
-    MONGO_UNREACHABLE;
-}
-
-intrusive_ptr<DocumentSourceOut> DocumentSourceOut::create(
-    NamespaceString outputNs,
-    const intrusive_ptr<ExpressionContext>& expCtx,
-    WriteModeEnum mode,
-    std::set<FieldPath> uniqueKey,
-    boost::optional<ChunkVersion> targetCollectionVersion) {
-
-    // TODO (SERVER-36832): Allow this combination.
-    uassert(
-        50939,
-        str::stream() << "$out with mode " << WriteMode_serializer(mode)
-                      << " is not supported when the output collection is in a different database",
-        !(mode == WriteModeEnum::kModeReplaceCollection && outputNs.db() != expCtx->ns.db()));
-
-    uassert(50992,
-            str::stream() << "$out with mode  " << WriteMode_serializer(mode)
-                          << " is not supported when the output collection is the same as the"
-                          << " aggregation collection",
-            mode == WriteModeEnum::kModeReplaceCollection || expCtx->ns != outputNs);
-
-    uassert(ErrorCodes::OperationNotSupportedInTransaction,
-            "$out cannot be used in a transaction",
-            !expCtx->inMultiDocumentTransaction);
-
-    auto readConcernLevel = repl::ReadConcernArgs::get(expCtx->opCtx).getLevel();
-    uassert(ErrorCodes::InvalidOptions,
-            "$out cannot be used with a 'linearizable' read concern level",
-            readConcernLevel != repl::ReadConcernLevel::kLinearizableReadConcern);
-
-    // Although we perform a check for "replaceCollection" mode with a sharded output collection
-    // during lite parsing, we need to do it here as well in case mongos is stale or the command is
-    // sent directly to the shard.
-    if (mode == WriteModeEnum::kModeReplaceCollection) {
-        LocalReadConcernBlock readLocal(expCtx->opCtx);
-        uassert(17017,
-                str::stream() << "$out with mode " << WriteMode_serializer(mode)
-                              << " is not supported to an existing *sharded* output collection.",
-                !expCtx->mongoProcessInterface->isSharded(expCtx->opCtx, outputNs));
-    }
-    uassert(17385, "Can't $out to special collection: " + outputNs.coll(), !outputNs.isSpecial());
-
-    switch (mode) {
-        case WriteModeEnum::kModeReplaceCollection:
-            return new DocumentSourceOutReplaceColl(
-                std::move(outputNs), expCtx, mode, std::move(uniqueKey), targetCollectionVersion);
-        case WriteModeEnum::kModeInsertDocuments:
-            return new DocumentSourceOutInPlace(
-                std::move(outputNs), expCtx, mode, std::move(uniqueKey), targetCollectionVersion);
-        case WriteModeEnum::kModeReplaceDocuments:
-            return new DocumentSourceOutInPlaceReplace(
-                std::move(outputNs), expCtx, mode, std::move(uniqueKey), targetCollectionVersion);
-        default:
-            MONGO_UNREACHABLE;
+    } catch (...) {
+        reportFailedDestructor(MONGO_SOURCE_LOCATION());
     }
 }
 
-DocumentSourceOut::DocumentSourceOut(NamespaceString outputNs,
-                                     const intrusive_ptr<ExpressionContext>& expCtx,
-                                     WriteModeEnum mode,
-                                     std::set<FieldPath> uniqueKey,
-                                     boost::optional<ChunkVersion> targetCollectionVersion)
-    : DocumentSource(expCtx),
-      _writeConcern(expCtx->opCtx->getWriteConcern()),
-      _outputNs(std::move(outputNs)),
-      _targetCollectionVersion(targetCollectionVersion),
-      _done(false),
-      _mode(mode),
-      _uniqueKeyFields(std::move(uniqueKey)),
-      _uniqueKeyIncludesId(_uniqueKeyFields.count("_id") == 1) {}
+StageConstraints DocumentSourceOut::constraints(Pipeline::SplitState pipeState) const {
+    StageConstraints result{StreamType::kStreaming,
+                            PositionRequirement::kLast,
+                            HostTypeRequirement::kNone,
+                            DiskUseRequirement::kWritesPersistentData,
+                            FacetRequirement::kNotAllowed,
+                            TransactionRequirement::kNotAllowed,
+                            LookupRequirement::kNotAllowed,
+                            UnionRequirement::kNotAllowed};
+    if (pipeState == Pipeline::SplitState::kSplitForMerge) {
+        // If output collection resides on a single shard, we should route $out to it to perform
+        // local writes. Note that this decision is inherently racy and subject to become stale.
+        // This is okay because either choice will work correctly, we are simply applying a
+        // heuristic optimization.
+        result.mergeShardId = getMergeShardId();
+    }
+    return result;
+}
 
-intrusive_ptr<DocumentSource> DocumentSourceOut::createFromBson(
-    BSONElement elem, const intrusive_ptr<ExpressionContext>& expCtx) {
-
-    auto mode = WriteModeEnum::kModeReplaceCollection;
-    std::set<FieldPath> uniqueKey;
-    NamespaceString outputNs;
-    boost::optional<ChunkVersion> targetCollectionVersion;
-    if (elem.type() == BSONType::String) {
-        outputNs = NamespaceString(expCtx->ns.db().toString() + '.' + elem.str());
-        uniqueKey.emplace("_id");
-    } else if (elem.type() == BSONType::Object) {
-        auto spec =
-            DocumentSourceOutSpec::parse(IDLParserErrorContext("$out"), elem.embeddedObject());
-        mode = spec.getMode();
-
-        // Retrieve the target database from the user command, otherwise use the namespace from the
-        // expression context.
-        auto dbName = spec.getTargetDb() ? *spec.getTargetDb() : expCtx->ns.db();
-        outputNs = NamespaceString(dbName, spec.getTargetCollection());
-
-        std::tie(uniqueKey, targetCollectionVersion) = expCtx->inMongos
-            ? resolveUniqueKeyOnMongoS(expCtx, spec, outputNs)
-            : resolveUniqueKeyOnMongoD(expCtx, spec, outputNs);
+DocumentSourceOutSpec DocumentSourceOut::parseOutSpecAndResolveTargetNamespace(
+    const BSONElement& spec, const DatabaseName& defaultDB) {
+    DocumentSourceOutSpec outSpec;
+    if (spec.type() == BSONType::String) {
+        outSpec.setColl(spec.valueStringData());
+        // TODO SERVER-77000: access a SerializationContext object to serialize properly
+        outSpec.setDb(defaultDB.serializeWithoutTenantPrefix_UNSAFE());
+    } else if (spec.type() == BSONType::Object) {
+        // TODO SERVER-77000: access a SerializationContext object to pass into the IDLParserContext
+        outSpec = mongo::DocumentSourceOutSpec::parse(IDLParserContext(kStageName),
+                                                      spec.embeddedObject());
     } else {
-        uasserted(16990,
-                  str::stream() << "$out only supports a string or object argument, not "
-                                << typeName(elem.type()));
+        uassert(16990,
+                fmt::format("{} only supports a string or object argument, but found {}",
+                            kStageName,
+                            typeName(spec.type())),
+                spec.type() == BSONType::String);
     }
 
-    return create(std::move(outputNs), expCtx, mode, std::move(uniqueKey), targetCollectionVersion);
+    return outSpec;
 }
 
-std::pair<std::set<FieldPath>, boost::optional<ChunkVersion>>
-DocumentSourceOut::resolveUniqueKeyOnMongoD(const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                                            const DocumentSourceOutSpec& spec,
-                                            const NamespaceString& outputNs) {
-    invariant(!expCtx->inMongos);
-    auto targetCollectionVersion = spec.getTargetCollectionVersion();
-    if (targetCollectionVersion) {
-        uassert(51018, "Unexpected target chunk version specified", expCtx->fromMongos);
-        // If mongos has sent us a target shard version, we need to be sure we are prepared to
-        // act as a router which is at least as recent as that mongos.
-        expCtx->mongoProcessInterface->checkRoutingInfoEpochOrThrow(
-            expCtx, outputNs, *targetCollectionVersion);
-    }
-
-    auto userSpecifiedUniqueKey = spec.getUniqueKey();
-    if (!userSpecifiedUniqueKey) {
-        uassert(51017, "Expected uniqueKey to be provided from mongos", !expCtx->fromMongos);
-        return {std::set<FieldPath>{"_id"}, targetCollectionVersion};
-    }
-
-    // Make sure the uniqueKey has a supporting index. Skip this check if the command is sent
-    // from mongos since the uniqueKey check would've happened already.
-    auto uniqueKey = parseUniqueKeyFromSpec(userSpecifiedUniqueKey.get());
-    if (!expCtx->fromMongos) {
-        ensureUniqueKeyHasSupportingIndex(expCtx, outputNs, uniqueKey, *userSpecifiedUniqueKey);
-    }
-    return {uniqueKey, targetCollectionVersion};
+NamespaceString DocumentSourceOut::makeBucketNsIfTimeseries(const NamespaceString& ns) {
+    return _timeseries ? ns.makeTimeseriesBucketsNamespace() : ns;
 }
 
-std::pair<std::set<FieldPath>, boost::optional<ChunkVersion>>
-DocumentSourceOut::resolveUniqueKeyOnMongoS(const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                                            const DocumentSourceOutSpec& spec,
-                                            const NamespaceString& outputNs) {
-    invariant(expCtx->inMongos);
-    uassert(50984,
-            "$out received unexpected 'targetCollectionVersion' on mongos",
-            !spec.getTargetCollectionVersion());
+std::unique_ptr<DocumentSourceOut::LiteParsed> DocumentSourceOut::LiteParsed::parse(
+    const NamespaceString& nss, const BSONElement& spec, const LiteParserOptions& options) {
+    auto outSpec = parseOutSpecAndResolveTargetNamespace(spec, nss.dbName());
+    NamespaceString targetNss = NamespaceStringUtil::deserialize(nss.dbName().tenantId(),
+                                                                 outSpec.getDb(),
+                                                                 outSpec.getColl(),
+                                                                 outSpec.getSerializationContext());
 
-    if (auto userSpecifiedUniqueKey = spec.getUniqueKey()) {
-        // Convert unique key object to a vector of FieldPaths.
-        auto uniqueKey = parseUniqueKeyFromSpec(userSpecifiedUniqueKey.get());
-        ensureUniqueKeyHasSupportingIndex(expCtx, outputNs, uniqueKey, *userSpecifiedUniqueKey);
-
-        // If the user supplies the uniqueKey we don't need to attach a ChunkVersion for the shards
-        // since we are not at risk of 'guessing' the wrong shard key.
-        return {uniqueKey, boost::none};
-    }
-
-    // In case there are multiple shards which will perform this $out in parallel, we need to figure
-    // out and attach the collection's shard version to ensure each shard is talking about the same
-    // version of the collection. This mongos will coordinate that. We force a catalog refresh to do
-    // so because there is no shard versioning protocol on this namespace and so we otherwise could
-    // not be sure this node is (or will be come) at all recent. We will also figure out and attach
-    // the uniqueKey to send to the shards. We don't need to do this for 'replaceCollection' mode
-    // since that mode cannot currently target a sharded collection.
-
-    // There are cases where the aggregation could fail if the collection is dropped or re-created
-    // during or near the time of the aggregation. This is okay - we are mostly paranoid that this
-    // mongos is very stale and want to prevent returning an error if the collection was dropped a
-    // long time ago. Because of this, we are okay with piggy-backing off another thread's request
-    // to refresh the cache, simply waiting for that request to return instead of forcing another
-    // refresh.
-    boost::optional<ChunkVersion> targetCollectionVersion =
-        spec.getMode() == WriteModeEnum::kModeReplaceCollection
-        ? boost::none
-        : expCtx->mongoProcessInterface->refreshAndGetCollectionVersion(expCtx, outputNs);
-
-    auto docKeyPaths = expCtx->mongoProcessInterface->collectDocumentKeyFieldsActingAsRouter(
-        expCtx->opCtx, outputNs);
-    return {std::set<FieldPath>(std::make_move_iterator(docKeyPaths.begin()),
-                                std::make_move_iterator(docKeyPaths.end())),
-            targetCollectionVersion};
+    uassert(
+        ErrorCodes::InvalidNamespace,
+        fmt::format("Invalid {} target namespace, {}", kStageName, targetNss.toStringForErrorMsg()),
+        targetNss.isValid());
+    return std::make_unique<DocumentSourceOut::LiteParsed>(spec.fieldName(), std::move(targetNss));
 }
 
-Value DocumentSourceOut::serialize(boost::optional<ExplainOptions::Verbosity> explain) const {
-    DocumentSourceOutSpec spec;
-    spec.setTargetDb(_outputNs.db());
-    spec.setTargetCollection(_outputNs.coll());
-    spec.setMode(_mode);
-    spec.setUniqueKey([&]() {
-        BSONObjBuilder uniqueKeyBob;
-        for (auto path : _uniqueKeyFields) {
-            uniqueKeyBob.append(path.fullPath(), 1);
+boost::optional<TimeseriesOptions> DocumentSourceOut::validateTimeseries() {
+    const BSONElement targetTimeseriesElement = _originalOutOptions["timeseries"];
+    boost::optional<TimeseriesOptions> targetTSOpts;
+    if (targetTimeseriesElement) {
+        tassert(
+            9072001, "Invalid time-series options received", targetTimeseriesElement.isABSONObj());
+        targetTSOpts = TimeseriesOptions::parseOwned(IDLParserContext("TimeseriesOptions"),
+                                                     targetTimeseriesElement.Obj());
+    }
+
+    // If the user did not specify the 'timeseries' option in the input, but the target
+    // namespace is a time-series collection, then we will use the target collection time-series
+    // options, and treat this operation as a write to time-series collection.
+    if (!_timeseries) {
+        // Must update '_originalOutOptions' to be on the buckets namespace, since previously we
+        // didn't know we will be writing a time-series collection.
+        if (targetTSOpts) {
+            _originalOutOptions =
+                pExpCtx->getMongoProcessInterface()
+                    ->getCollectionOptions(pExpCtx->getOperationContext(),
+                                           getOutputNs().makeTimeseriesBucketsNamespace())
+                    .removeField("uuid");
         }
-        return uniqueKeyBob.obj();
-    }());
-    spec.setTargetCollectionVersion(_targetCollectionVersion);
-    return Value(Document{{getSourceName(), spec.toBSON()}});
+        return targetTSOpts;
+    }
+
+    // If the user specified 'timeseries' options, the target namespace must be a time-series
+    // collection. Note that the result of 'getCollectionType' can become stale at
+    // anytime and shouldn't be referenced at any other point. $out should account for
+    // concurrent view or collection creation during each step of its execution.
+    uassert(7268700,
+            "Cannot create a time-series collection from a non time-series collection or view.",
+            targetTSOpts ||
+                pExpCtx->getMongoProcessInterface()->getCollectionType(
+                    pExpCtx->getOperationContext(), getOutputNs()) ==
+                    query_shape::CollectionType::kNonExistent);
+
+    // If the user did specify 'timeseries' options and the target namespace is a time-series
+    // collection, then the time-series options should match.
+    uassert(7406103,
+            str::stream() << "Time-series options inputted must match the existing time-series "
+                             "collection. Received: "
+                          << _timeseries->toBSON().toString()
+                          << "Found: " << targetTimeseriesElement.toString(),
+            !targetTSOpts ||
+                timeseries::optionsAreEqual(_timeseries.value(), targetTSOpts.value()));
+
+    return _timeseries;
 }
 
-DepsTracker::State DocumentSourceOut::getDependencies(DepsTracker* deps) const {
-    deps->needWholeDocument = true;
-    return DepsTracker::State::EXHAUSTIVE_ALL;
+void DocumentSourceOut::createTemporaryCollection() {
+    BSONObjBuilder createCommandOptions;
+    if (_timeseries) {
+        // Append the original collection options without the 'validator' and 'clusteredIndex'
+        // fields since these fields are invalid with the 'timeseries' field and will be
+        // recreated when the buckets collection is created.
+        _originalOutOptions.isEmpty()
+            ? createCommandOptions << DocumentSourceOutSpec::kTimeseriesFieldName
+                                   << _timeseries->toBSON()
+            : createCommandOptions.appendElementsUnique(
+                  _originalOutOptions.removeFields(StringDataSet{"clusteredIndex", "validator"}));
+    } else {
+        createCommandOptions.appendElementsUnique(_originalOutOptions);
+    }
+
+    auto targetShard = [&]() -> boost::optional<ShardId> {
+        if (auto fpTarget = outImplictlyCreateDBOnSpecificShard.scoped();
+            // Used for consistently picking a shard in testing.
+            MONGO_unlikely(fpTarget.isActive())) {
+            return ShardId(fpTarget.getData()["shardId"].String());
+        } else {
+            // If the output collection exists, we should create the temp collection on the shard
+            // that owns the output collection.
+            return getMergeShardId();
+        }
+    }();
+
+    // Set the enum state to 'kTmpCollExists' first, because 'createTempCollection' can throw
+    // after constructing the collection.
+    _tmpCleanUpState = OutCleanUpProgress::kTmpCollExists;
+    pExpCtx->getMongoProcessInterface()->createTempCollection(
+        pExpCtx->getOperationContext(), _tempNs, createCommandOptions.done(), targetShard);
+    CurOpFailpointHelpers::waitWhileFailPointEnabled(
+        &outWaitAfterTempCollectionCreation,
+        pExpCtx->getOperationContext(),
+        "outWaitAfterTempCollectionCreation",
+        []() {
+            LOGV2(20901,
+                  "Hanging aggregation due to 'outWaitAfterTempCollectionCreation' failpoint");
+        });
 }
+
+void DocumentSourceOut::initialize() {
+    DocumentSourceWriteBlock writeBlock(pExpCtx->getOperationContext());
+    // We will create a temporary collection with the same indexes and collection options as the
+    // target collection if it exists. We will write all results into a temporary collection, then
+    // rename the temporary collection to be the target collection once we are done.
+
+    try {
+        // Save the original collection options and index specs so we can check they didn't change
+        // during computation. For time-series collections, these should be run on the buckets
+        // namespace.
+        _originalOutOptions =
+            // The uuid field is considered an option, but cannot be passed to createCollection.
+            pExpCtx->getMongoProcessInterface()
+                ->getCollectionOptions(pExpCtx->getOperationContext(),
+                                       makeBucketNsIfTimeseries(getOutputNs()))
+                .removeField("uuid");
+
+        // Use '_originalOutOptions' to correctly determine if we are writing to a time-series
+        // collection.
+        _timeseries = validateTimeseries();
+        _originalIndexes = pExpCtx->getMongoProcessInterface()->getIndexSpecs(
+            pExpCtx->getOperationContext(),
+            makeBucketNsIfTimeseries(getOutputNs()),
+            false /* includeBuildUUIDs */);
+
+        // Check if it's capped to make sure we have a chance of succeeding before we do all the
+        // work. If the collection becomes capped during processing, the collection options will
+        // have changed, and the $out will fail.
+        uassert(17152,
+                fmt::format("namespace '{}' is capped so it can't be used for {}",
+                            getOutputNs().toStringForErrorMsg(),
+                            kStageName),
+                _originalOutOptions["capped"].eoo());
+    } catch (ExceptionFor<ErrorCodes::NamespaceNotFound>&) {
+        LOGV2_DEBUG(7585601,
+                    5,
+                    "Database for $out target collection doesn't exist. Assuming default indexes "
+                    "and options");
+    }
+
+    //  Note that this temporary collection name is used by MongoMirror and thus should not be
+    //  changed without consultation.
+    _tempNs = makeBucketNsIfTimeseries(NamespaceStringUtil::deserialize(
+        getOutputNs().dbName(),
+        str::stream() << NamespaceString::kOutTmpCollectionPrefix << UUID::gen()));
+
+    uassert(7406100,
+            "$out to time-series collections is only supported on FCV greater than or equal to 7.1",
+            feature_flags::gFeatureFlagAggOutTimeseries.isEnabled() || !_timeseries);
+
+    createTemporaryCollection();
+
+    // Save the collection UUID to detect if it was dropped during execution. Timeseries will detect
+    // this when inserting as it doesn't implicity create collections on insert.
+    if (!_timeseries) {
+        _tempNsUUID = pExpCtx->getMongoProcessInterface()->fetchCollectionUUIDFromPrimary(
+            pExpCtx->getOperationContext(), _tempNs);
+    }
+
+    if (_originalIndexes.empty()) {
+        return;
+    }
+
+    // Copy the indexes of the output collection to the temp collection.
+    // Note that on timeseries collections, indexes are to be created on the buckets collection.
+    try {
+        std::vector<BSONObj> tempNsIndexes = {std::begin(_originalIndexes),
+                                              std::end(_originalIndexes)};
+        pExpCtx->getMongoProcessInterface()->createIndexesOnEmptyCollection(
+            pExpCtx->getOperationContext(), _tempNs, tempNsIndexes);
+    } catch (DBException& ex) {
+        ex.addContext("Copying indexes for $out failed");
+        throw;
+    }
+}
+
+void DocumentSourceOut::renameTemporaryCollection() {
+    // If the collection is time-series, we must rename to the "real" buckets collection.
+    const NamespaceString& outputNs = makeBucketNsIfTimeseries(getOutputNs());
+
+    // Use the UUID to catch a mismatch if the temp collection was dropped and recreated in case of
+    // stepdown. Timeseries has it's own handling for this case as the dropped temp collection isn't
+    // implicitly recreated.
+    if (!_timeseries) {
+        tassert(8085301, "No uuid found for $out temporary namespace", _tempNsUUID);
+        const UUID currentTempNsUUID =
+            pExpCtx->getMongoProcessInterface()->fetchCollectionUUIDFromPrimary(
+                pExpCtx->getOperationContext(), _tempNs);
+        uassert((CollectionUUIDMismatchInfo{
+                    _tempNs.dbName(), currentTempNsUUID, _tempNs.coll().toString(), boost::none}),
+                "$out cannot complete as the temp collection was dropped while executing",
+                currentTempNsUUID == _tempNsUUID);
+    }
+
+    CurOpFailpointHelpers::waitWhileFailPointEnabled(
+        &outWaitBeforeTempCollectionRename,
+        pExpCtx->getOperationContext(),
+        "outWaitBeforeTempCollectionRename",
+        []() {
+            LOGV2(7585602,
+                  "Hanging aggregation due to 'outWaitBeforeTempCollectionRename' failpoint");
+        });
+    pExpCtx->getMongoProcessInterface()->renameIfOptionsAndIndexesHaveNotChanged(
+        pExpCtx->getOperationContext(),
+        _tempNs,
+        outputNs,
+        true /* dropTarget */,
+        false /* stayTemp */,
+        _originalOutOptions,
+        _originalIndexes);
+}
+
+void DocumentSourceOut::createTimeseriesView() {
+    _tmpCleanUpState = OutCleanUpProgress::kRenameComplete;
+    CurOpFailpointHelpers::waitWhileFailPointEnabled(
+        &outWaitAfterTempCollectionRenameBeforeView,
+        pExpCtx->getOperationContext(),
+        "outWaitAfterTempCollectionRenameBeforeView",
+        []() {
+            LOGV2(8961400,
+                  "Hanging aggregation due to 'outWaitAfterTempCollectionRenameBeforeView' "
+                  "failpoint");
+        });
+
+    BSONObjBuilder cmd;
+    cmd << "create" << getOutputNs().coll();
+    cmd << DocumentSourceOutSpec::kTimeseriesFieldName << _timeseries->toBSON();
+    pExpCtx->getMongoProcessInterface()->createTimeseriesView(
+        pExpCtx->getOperationContext(), getOutputNs(), cmd.done(), _timeseries.value());
+}
+
+void DocumentSourceOut::finalize() {
+    DocumentSourceWriteBlock writeBlock(pExpCtx->getOperationContext());
+    uassert(7406101,
+            "$out to time-series collections is only supported on FCV greater than or equal to 7.1",
+            feature_flags::gFeatureFlagAggOutTimeseries.isEnabled() || !_timeseries);
+
+    // Rename the temporary collection to the namespace the user requested, and drop the target
+    // collection if $out is writing to a collection that exists.
+    renameTemporaryCollection();
+
+    // The rename has succeeded, if the collection is time-series, try to create the view. Creating
+    // the view must happen immediately after the rename. We cannot guarantee that both the rename
+    // and view creation for time-series will succeed if there is an unclean shutdown. This could
+    // lead us to an unsupported state (a buckets collection with no view). To minimize the chance
+    // this happens, we should ensure that view creation is tried immediately after the rename
+    // succeeds.
+    if (_timeseries) {
+        createTimeseriesView();
+    }
+
+    // The rename succeeded, so the temp collection no longer exists. Call 'dropTempCollection'
+    // anyway to ensure that we remove it from the list of in-use temporary collections that will be
+    // dropped on stepup (relevant on sharded clusters).
+    _tmpCleanUpState = OutCleanUpProgress::kViewCreatedIfNeeded;
+    pExpCtx->getMongoProcessInterface()->dropTempCollection(pExpCtx->getOperationContext(),
+                                                            _tempNs);
+
+    _tmpCleanUpState = OutCleanUpProgress::kComplete;
+}
+
+void DocumentSourceOut::flush(BatchedCommandRequest bcr, BatchedObjects batch) {
+    DocumentSourceWriteBlock writeBlock(pExpCtx->getOperationContext());
+
+    auto insertCommand = bcr.extractInsertRequest();
+    insertCommand->setDocuments(std::move(batch));
+    auto targetEpoch = boost::none;
+
+    if (_timeseries) {
+        uassertStatusOK(pExpCtx->getMongoProcessInterface()->insertTimeseries(
+            pExpCtx, _tempNs, std::move(insertCommand), _writeConcern, targetEpoch));
+    } else {
+        // Use the UUID to catch a mismatch if the temp collection was dropped and recreated.
+        // Timeseries will detect this as inserts into the buckets collection don't implicitly
+        // create the collection. Inserts with uuid are not supported with apiStrict, so there is a
+        // secondary check at the rename when apiStrict is true.
+        if (!APIParameters::get(pExpCtx->getOperationContext()).getAPIStrict().value_or(false)) {
+            tassert(8085300, "No uuid found for $out temporary namespace", _tempNsUUID);
+            insertCommand->getWriteCommandRequestBase().setCollectionUUID(_tempNsUUID);
+        }
+        try {
+            uassertStatusOK(pExpCtx->getMongoProcessInterface()->insert(
+                pExpCtx, _tempNs, std::move(insertCommand), _writeConcern, targetEpoch));
+
+        } catch (ExceptionFor<ErrorCodes::CollectionUUIDMismatch>& ex) {
+            ex.addContext(
+                str::stream()
+                << "$out cannot complete as the temp collection was dropped while executing");
+            throw;
+        }
+    }
+
+    CurOpFailpointHelpers::waitWhileFailPointEnabled(
+        &hangDollarOutAfterInsert,
+        pExpCtx->getOperationContext(),
+        "hangDollarOutAfterInsert",
+        []() {
+            LOGV2(8085302, "Hanging aggregation due to 'hangDollarOutAfterInsert' failpoint");
+        });
+}
+
+BatchedCommandRequest DocumentSourceOut::makeBatchedWriteRequest() const {
+    const auto& nss =
+        _tempNs.isTimeseriesBucketsCollection() ? _tempNs.getTimeseriesViewNamespace() : _tempNs;
+    return makeInsertCommand(nss, pExpCtx->getBypassDocumentValidation());
+}
+
+boost::intrusive_ptr<DocumentSource> DocumentSourceOut::create(
+    NamespaceString outputNs,
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    boost::optional<TimeseriesOptions> timeseries) {
+    uassert(ErrorCodes::OperationNotSupportedInTransaction,
+            fmt::format("{} cannot be used in a transaction", kStageName),
+            !expCtx->getOperationContext()->inMultiDocumentTransaction());
+
+    uassert(
+        ErrorCodes::InvalidNamespace,
+        fmt::format("Invalid {} target namespace, {}", kStageName, outputNs.toStringForErrorMsg()),
+        outputNs.isValid());
+
+    uassert(17385,
+            fmt::format("Can't {} to special collection: {}", kStageName, outputNs.coll()),
+            !outputNs.isSystem());
+
+    uassert(31321,
+            fmt::format("Can't {} to internal database: {}",
+                        kStageName,
+                        outputNs.dbName().toStringForErrorMsg()),
+            !outputNs.isOnInternalDb());
+    return new DocumentSourceOut(std::move(outputNs), std::move(timeseries), expCtx);
+}
+
+boost::intrusive_ptr<DocumentSource> DocumentSourceOut::createFromBson(
+    BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& expCtx) {
+    auto outSpec =
+        parseOutSpecAndResolveTargetNamespace(elem, expCtx->getNamespaceString().dbName());
+    NamespaceString targetNss =
+        NamespaceStringUtil::deserialize(expCtx->getNamespaceString().dbName().tenantId(),
+                                         outSpec.getDb(),
+                                         outSpec.getColl(),
+                                         outSpec.getSerializationContext());
+    return create(std::move(targetNss), expCtx, std::move(outSpec.getTimeseries()));
+}
+
+Value DocumentSourceOut::serialize(const SerializationOptions& opts) const {
+    BSONObjBuilder bob;
+    DocumentSourceOutSpec spec;
+    // TODO SERVER-77000: use SerializatonContext from expCtx and DatabaseNameUtil to serialize
+    // spec.setDb(DatabaseNameUtil::serialize(
+    //     getOutputNs().dbName(),
+    //     SerializationContext::stateCommandReply(pExpCtx->getSerializationContext())));
+    spec.setDb(getOutputNs().dbName().serializeWithoutTenantPrefix_UNSAFE());
+    spec.setColl(getOutputNs().coll());
+    spec.setTimeseries(_timeseries);
+    spec.serialize(&bob, opts);
+    return Value(Document{{kStageName, bob.done()}});
+}
+
+void DocumentSourceOut::waitWhileFailPointEnabled() {
+    CurOpFailpointHelpers::waitWhileFailPointEnabled(
+        &hangWhileBuildingDocumentSourceOutBatch,
+        pExpCtx->getOperationContext(),
+        "hangWhileBuildingDocumentSourceOutBatch",
+        []() {
+            LOGV2(20902,
+                  "Hanging aggregation due to 'hangWhileBuildingDocumentSourceOutBatch' failpoint");
+        });
+}
+
 }  // namespace mongo

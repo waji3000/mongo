@@ -1,6 +1,3 @@
-// fts_query_impl.cpp
-
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,22 +27,21 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <iosfwd>
+#include <memory>
+#include <utility>
 
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/fts/fts_language.h"
 #include "mongo/db/fts/fts_query_impl.h"
-
 #include "mongo/db/fts/fts_query_parser.h"
-#include "mongo/db/fts/fts_spec.h"
 #include "mongo/db/fts/fts_tokenizer.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/util/mongoutils/str.h"
-#include "mongo/util/stringutils.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 
 namespace fts {
-
-using namespace mongoutils;
 
 using std::set;
 using std::string;
@@ -53,9 +49,11 @@ using std::stringstream;
 using std::vector;
 
 Status FTSQueryImpl::parse(TextIndexVersion textIndexVersion) {
-    StatusWithFTSLanguage ftsLanguage = FTSLanguage::make(getLanguage(), textIndexVersion);
-    if (!ftsLanguage.getStatus().isOK()) {
-        return ftsLanguage.getStatus();
+    const FTSLanguage* ftsLanguage;
+    try {
+        ftsLanguage = &FTSLanguage::make(getLanguage(), textIndexVersion);
+    } catch (const DBException& e) {
+        return e.toStatus();
     }
 
     // Build a space delimited list of words to have the FtsTokenizer tokenize
@@ -133,7 +131,7 @@ Status FTSQueryImpl::parse(TextIndexVersion textIndexVersion) {
         }
     }
 
-    std::unique_ptr<FTSTokenizer> tokenizer(ftsLanguage.getValue()->createTokenizer());
+    std::unique_ptr<FTSTokenizer> tokenizer = ftsLanguage->createTokenizer();
 
     _addTerms(tokenizer.get(), positiveTermSentence, false);
     _addTerms(tokenizer.get(), negativeTermSentence, true);
@@ -142,7 +140,7 @@ Status FTSQueryImpl::parse(TextIndexVersion textIndexVersion) {
 }
 
 std::unique_ptr<FTSQuery> FTSQueryImpl::clone() const {
-    auto clonedQuery = stdx::make_unique<FTSQueryImpl>();
+    auto clonedQuery = std::make_unique<FTSQueryImpl>();
     clonedQuery->setQuery(getQuery());
     clonedQuery->setLanguage(getLanguage());
     clonedQuery->setCaseSensitive(getCaseSensitive());
@@ -209,5 +207,32 @@ BSONObj FTSQueryImpl::toBSON() const {
     bob.append("negatedPhrases", getNegatedPhr());
     return bob.obj();
 }
+
+size_t FTSQueryImpl::getApproximateSize() const {
+    auto computeVectorSize = [](const std::vector<std::string>& v) {
+        size_t size = 0;
+        for (const auto& str : v) {
+            size += sizeof(std::string) + str.size() + 1;
+        }
+        return size;
+    };
+
+    auto computeSetSize = [](const std::set<std::string>& s) {
+        size_t size = 0;
+        for (const auto& str : s) {
+            size += sizeof(std::string) + str.size() + 1;
+        }
+        return size;
+    };
+
+    auto size = sizeof(FTSQueryImpl);
+    size += FTSQuery::getApproximateSize() - sizeof(FTSQuery);
+    size += computeSetSize(_positiveTerms);
+    size += computeSetSize(_negatedTerms);
+    size += computeVectorSize(_positivePhrases);
+    size += computeVectorSize(_negatedPhrases);
+    size += computeSetSize(_termsForBounds);
+    return size;
 }
-}
+}  // namespace fts
+}  // namespace mongo

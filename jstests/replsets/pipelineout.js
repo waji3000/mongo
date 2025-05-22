@@ -1,4 +1,6 @@
 // test $out in a replicated environment
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+
 var name = "pipelineout";
 var replTest = new ReplSetTest({name: name, nodes: 2});
 var nodes = replTest.nodeList();
@@ -8,23 +10,13 @@ replTest.initiate(
     {"_id": name, "members": [{"_id": 0, "host": nodes[0]}, {"_id": 1, "host": nodes[1]}]});
 
 var primary = replTest.getPrimary().getDB(name);
-var secondary = replTest._slaves[0].getDB(name);
+var secondary = replTest.getSecondary().getDB(name);
 
 // populate the collection
-for (i = 0; i < 5; i++) {
+for (let i = 0; i < 5; i++) {
     primary.coll.insert({x: i});
 }
 replTest.awaitReplication();
-
-// make sure $out cannot be run on a secondary
-assert.throws(function() {
-    secondary.coll.aggregate({$out: "out"}).itcount();
-});
-// even if slaveOk
-secondary.setSlaveOk();
-assert.throws(function() {
-    secondary.coll.aggregate({$out: "out"}).itcount();
-});
 
 // run one and check for proper replication
 primary.coll.aggregate({$out: "out"}).itcount();

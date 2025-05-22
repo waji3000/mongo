@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,43 +27,44 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <memory>
+#include <utility>
+#include <vector>
 
-#include "mongo/db/exec/fetch.h"
-
+#include "mongo/bson/bsonobj.h"
 #include "mongo/db/catalog/collection.h"
-#include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/exec/fetch.h"
 #include "mongo/db/exec/filter.h"
-#include "mongo/db/exec/scoped_timer.h"
 #include "mongo/db/exec/working_set_common.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/util/fail_point_service.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/db/query/plan_executor_impl.h"
+#include "mongo/util/assert_util.h"
+
+namespace {
+MONGO_FAIL_POINT_DEFINE(hangFetchDoWork);
+}  // namespace
 
 namespace mongo {
 
 using std::unique_ptr;
-using std::vector;
-using stdx::make_unique;
 
 // static
 const char* FetchStage::kStageType = "FETCH";
 
-FetchStage::FetchStage(OperationContext* opCtx,
+FetchStage::FetchStage(ExpressionContext* expCtx,
                        WorkingSet* ws,
-                       PlanStage* child,
+                       std::unique_ptr<PlanStage> child,
                        const MatchExpression* filter,
-                       const Collection* collection)
-    : RequiresCollectionStage(kStageType, opCtx, collection),
+                       VariantCollectionPtrOrAcquisition collection)
+    : RequiresCollectionStage(kStageType, expCtx, collection),
       _ws(ws),
-      _filter(filter),
+      _filter((filter && !filter->isTriviallyTrue()) ? filter : nullptr),
       _idRetrying(WorkingSet::INVALID_ID) {
-    _children.emplace_back(child);
+    _children.emplace_back(std::move(child));
 }
 
 FetchStage::~FetchStage() {}
 
-bool FetchStage::isEOF() {
+bool FetchStage::isEOF() const {
     if (WorkingSet::INVALID_ID != _idRetrying) {
         // We have a working set member that we need to retry.
         return false;
@@ -74,6 +74,10 @@ bool FetchStage::isEOF() {
 }
 
 PlanStage::StageState FetchStage::doWork(WorkingSetID* out) {
+    if (MONGO_unlikely(hangFetchDoWork.shouldFail())) {
+        hangFetchDoWork.pauseWhileSet();
+    }
+
     if (isEOF()) {
         return PlanStage::IS_EOF;
     }
@@ -97,34 +101,37 @@ PlanStage::StageState FetchStage::doWork(WorkingSetID* out) {
             ++_specificStats.alreadyHasObj;
         } else {
             // We need a valid RecordId to fetch from and this is the only state that has one.
-            verify(WorkingSetMember::RID_AND_IDX == member->getState());
-            verify(member->hasRecordId());
+            MONGO_verify(WorkingSetMember::RID_AND_IDX == member->getState());
+            MONGO_verify(member->hasRecordId());
 
-            try {
-                if (!_cursor)
-                    _cursor = collection()->getCursor(getOpCtx());
+            const auto ret = handlePlanStageYield(
+                expCtx(),
+                "FetchStage",
+                [&] {
+                    const auto& coll = collectionPtr();
+                    if (!_cursor)
+                        _cursor = coll->getCursor(opCtx());
 
-                if (!WorkingSetCommon::fetch(getOpCtx(), _ws, id, _cursor)) {
-                    _ws->free(id);
-                    return NEED_TIME;
-                }
-            } catch (const WriteConflictException&) {
-                // Ensure that the BSONObj underlying the WorkingSetMember is owned because it may
-                // be freed when we yield.
-                member->makeObjOwnedIfNeeded();
-                _idRetrying = id;
-                *out = WorkingSet::INVALID_ID;
-                return NEED_YIELD;
+                    if (!WorkingSetCommon::fetch(
+                            opCtx(), _ws, id, _cursor.get(), coll, coll->ns())) {
+                        _ws->free(id);
+                        return NEED_TIME;
+                    }
+                    return PlanStage::ADVANCED;
+                },
+                [&] {
+                    // yieldHandler
+                    // Ensure that the BSONObj underlying the WorkingSetMember is owned because it
+                    // may be freed when we yield.
+                    member->makeObjOwnedIfNeeded();
+                    _idRetrying = id;
+                    *out = WorkingSet::INVALID_ID;
+                });
+            if (ret != PlanStage::ADVANCED) {
+                return ret;
             }
         }
-
         return returnIfMatches(member, id, out);
-    } else if (PlanStage::FAILURE == status || PlanStage::DEAD == status) {
-        // The stage which produces a failure is responsible for allocating a working set member
-        // with error details.
-        invariant(WorkingSet::INVALID_ID != id);
-        *out = id;
-        return status;
     } else if (PlanStage::NEED_YIELD == status) {
         *out = id;
     }
@@ -132,13 +139,13 @@ PlanStage::StageState FetchStage::doWork(WorkingSetID* out) {
     return status;
 }
 
-void FetchStage::saveState(RequiresCollTag) {
+void FetchStage::doSaveStateRequiresCollection() {
     if (_cursor) {
         _cursor->saveUnpositioned();
     }
 }
 
-void FetchStage::restoreState(RequiresCollTag) {
+void FetchStage::doRestoreStateRequiresCollection() {
     if (_cursor) {
         const bool couldRestore = _cursor->restore();
         uassert(50982, "could not restore cursor for FETCH stage", couldRestore);
@@ -152,7 +159,7 @@ void FetchStage::doDetachFromOperationContext() {
 
 void FetchStage::doReattachToOperationContext() {
     if (_cursor)
-        _cursor->reattachToOperationContext(getOpCtx());
+        _cursor->reattachToOperationContext(opCtx());
 }
 
 PlanStage::StageState FetchStage::returnIfMatches(WorkingSetMember* member,
@@ -187,14 +194,12 @@ unique_ptr<PlanStageStats> FetchStage::getStats() {
     _commonStats.isEOF = isEOF();
 
     // Add a BSON representation of the filter to the stats tree, if there is one.
-    if (NULL != _filter) {
-        BSONObjBuilder bob;
-        _filter->serialize(&bob);
-        _commonStats.filter = bob.obj();
+    if (_filter) {
+        _commonStats.filter = _filter->serialize();
     }
 
-    unique_ptr<PlanStageStats> ret = make_unique<PlanStageStats>(_commonStats, STAGE_FETCH);
-    ret->specific = make_unique<FetchStats>(_specificStats);
+    unique_ptr<PlanStageStats> ret = std::make_unique<PlanStageStats>(_commonStats, STAGE_FETCH);
+    ret->specific = std::make_unique<FetchStats>(_specificStats);
     ret->children.emplace_back(child()->getStats());
     return ret;
 }

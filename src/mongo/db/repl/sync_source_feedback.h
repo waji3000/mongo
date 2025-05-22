@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -31,9 +30,9 @@
 
 #pragma once
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/status.h"
 #include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/executor/task_executor.h"
 #include "mongo/stdx/condition_variable.h"
 #include "mongo/stdx/mutex.h"
 
@@ -50,14 +49,15 @@ class BackgroundSync;
 class Reporter;
 
 class SyncSourceFeedback {
-    MONGO_DISALLOW_COPYING(SyncSourceFeedback);
+    SyncSourceFeedback(const SyncSourceFeedback&) = delete;
+    SyncSourceFeedback& operator=(const SyncSourceFeedback&) = delete;
 
 public:
     SyncSourceFeedback() = default;
 
-    /// Notifies the SyncSourceFeedbackThread to wake up and send an update upstream of slave
+    /// Notifies the SyncSourceFeedbackThread to wake up and send an update upstream of secondary
     /// replication progress.
-    void forwardSlaveProgress();
+    void forwardSecondaryProgress(bool prioritized = false);
 
     /**
      * Loops continuously until shutdown() is called, passing updates when they are present. If no

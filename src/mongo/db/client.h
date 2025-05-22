@@ -37,23 +37,34 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
 #include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+#include <memory>
+#include <string>
+#include <utility>
 
-#include "mongo/base/disallow_copying.h"
-#include "mongo/db/client.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/service_context.h"
+#include "mongo/logv2/log.h"
+#include "mongo/platform/atomic_word.h"
 #include "mongo/platform/random.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/transport/session.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/concurrency/spin_lock.h"
+#include "mongo/util/concurrency/thread_name.h"
+#include "mongo/util/concurrency/with_lock.h"
 #include "mongo/util/decorable.h"
-#include "mongo/util/invariant.h"
 #include "mongo/util/net/hostandport.h"
+#include "mongo/util/net/ssl_peer_info.h"
+#include "mongo/util/uuid.h"
 
 namespace mongo {
 
-class Collection;
 class OperationContext;
 class ThreadClient;
 
@@ -61,21 +72,51 @@ typedef long long ConnectionId;
 
 /**
  * The database's concept of an outside "client".
- * */
+ */
 class Client final : public Decorable<Client> {
 public:
     /**
+     * These tags classify the connections associated with Clients and reasons to keep them open.
+     * When closing connections, these tags can be used to filter out the type of connections that
+     * should be kept open.
+     *
+     * Clients that are not yet classified yet are marked as kPending. The classification occurs
+     * during the processing of "hello" commands.
+     */
+    using TagMask = uint32_t;
+
+    // Client's connections should be closed.
+    static constexpr TagMask kEmptyTagMask = 0;
+
+    // Client's connection should be kept open on replication member rollback or removal.
+    static constexpr TagMask kKeepOpen = 1;
+
+    // Client is internal and their max wire version is not less than the max wire version of
+    // this server. Connection should be kept open.
+    static constexpr TagMask kLatestVersionInternalClientKeepOpen = 2;
+
+    // Client is external and connection should be kept open.
+    static constexpr TagMask kExternalClientKeepOpen = 4;
+
+    // Client has not been classified yet and should be kept open.
+    static constexpr TagMask kPending = 1 << 31;
+
+    /** Used as a placeholder argument to avoid specifying a session. */
+    static std::shared_ptr<transport::Session> noSession() {
+        return {};
+    }
+
+    /**
      * Creates a Client object and stores it in TLS for the current thread.
      *
-     * An unowned pointer to a transport::Session may optionally be provided. If 'session'
-     * is non-null, then it will be used to augment the thread name, and for reporting purposes.
-     *
-     * If provided, session's ref count will be bumped by this Client.
+     * If `session` is non-null, then it will be used to augment the thread name
+     * and for reporting purposes. Its ref count will be bumped by this Client.
      */
-    static void initThread(StringData desc, transport::SessionHandle session = nullptr);
-    static void initThread(StringData desc,
-                           ServiceContext* serviceContext,
-                           transport::SessionHandle session);
+    static void initThread(
+        StringData desc,
+        Service* service,
+        std::shared_ptr<transport::Session> session = noSession(),
+        ClientOperationKillableByStepdown killable = ClientOperationKillableByStepdown{true});
 
     /**
      * Moves client into the thread_local for this thread. After this call, Client::getCurrent
@@ -95,6 +136,8 @@ public:
 
     static Client* getCurrent();
 
+    ~Client() override;
+
     bool getIsLocalHostConnection() {
         if (!hasRemote()) {
             return false;
@@ -107,42 +150,72 @@ public:
     }
 
     HostAndPort getRemote() const {
-        verify(_session);
+        MONGO_verify(_session);
         return _session->remote();
+    }
+
+    /**
+     * Overwrites the Service for this client. To be used by the replica set endpoint only.
+     */
+    Service* setService(Service* service) {
+        return _service = service;
+    }
+
+    /**
+     * Returns the Service that owns this client.
+     */
+    Service* getService() const {
+        return _service;
+    }
+
+    /**
+     * Returns true if this client is connected to the router port of a mongod with router role.
+     */
+    bool isRouterClient() const {
+        return _isRouterClient;
     }
 
     /**
      * Returns the ServiceContext that owns this client session context.
      */
     ServiceContext* getServiceContext() const {
-        return _serviceContext;
+        return getService()->getServiceContext();
     }
 
     /**
      * Returns the Session to which this client is bound, if any.
      */
-    const transport::SessionHandle& session() const& {
+    const std::shared_ptr<transport::Session>& session() const& {
         return _session;
     }
 
-    transport::SessionHandle session() && {
+    boost::optional<std::string> getSniNameForSession() const {
+        auto sslPeerInfo = _session ? SSLPeerInfo::forSession(_session) : nullptr;
+        return sslPeerInfo ? sslPeerInfo->sniName() : boost::none;
+    }
+
+    std::shared_ptr<transport::Session> session() && {
         return std::move(_session);
     }
 
     std::string clientAddress(bool includePort = false) const;
+
     const std::string& desc() const {
         return _desc;
     }
 
     void reportState(BSONObjBuilder& builder);
 
-    // Ensures stability of the client's OperationContext. When the client is locked,
-    // the OperationContext will not disappear.
+    // Ensures stability of everything under the client object, most notably the associated
+    // OperationContext.
     void lock() {
         _lock.lock();
     }
     void unlock() {
         _lock.unlock();
+    }
+    bool try_lock() {
+        return _lock.try_lock();
     }
 
     /**
@@ -152,22 +225,6 @@ public:
      * If provided, the LogicalSessionId links this operation to a logical session.
      */
     ServiceContext::UniqueOperationContext makeOperationContext();
-
-    /**
-     * Sets the active operation context on this client to "opCtx", which must be non-NULL.
-     *
-     * It is an error to call this method if there is already an operation context on Client.
-     * It is an error to call this on an unlocked client.
-     */
-    void setOperationContext(OperationContext* opCtx);
-
-    /**
-     * Clears the active operation context on this client.
-     *
-     * There must already be such a context set on this client.
-     * It is an error to call this on an unlocked client.
-     */
-    void resetOperationContext();
 
     /**
      * Gets the operation context active on this client, or nullptr if there is no such context.
@@ -193,20 +250,157 @@ public:
     bool isFromUserConnection() const {
         return _connectionId > 0;
     }
+    bool isFromSystemConnection() const {
+        return _connectionId == 0;
+    }
+
+    const auto& getUUID() const {
+        return _uuid;
+    }
+
+    void setOperationUnkillable_ForTest() {
+        _operationKillable = ClientOperationKillableByStepdown{false};
+    }
+
+    /**
+     * Used to determine whether an operation is allowed to be killed by the stepdown thread.
+     */
+    bool canKillOperationInStepdown() const {
+        return static_cast<bool>(_operationKillable);
+    }
 
     PseudoRandom& getPrng() {
         return _prng;
     }
 
+    /**
+     * Checks if there is an active currentOp associated with this client.
+     * The definition of active varies between User and System connections.
+     * Note that the caller must hold the client lock.
+     */
+    bool hasAnyActiveCurrentOp() const;
+
+    /**
+     * Signal the client's OperationContext that it has been killed.
+     * Any future OperationContext on this client will also receive a kill signal.
+     */
+    void setKilled();
+
+    /**
+     * Get the state for killing the client's OperationContext.
+     */
+    bool getKilled() const noexcept {
+        return _killed.loadRelaxed();
+    }
+
+    /**
+     * Whether this client supports the hello command, which indicates that the server
+     * can return "not primary" error messages.
+     */
+    bool supportsHello() const {
+        return _supportsHello;
+    }
+
+    /**
+     * Will be set to true if the client sent { helloOk: true } when opening a
+     * connection to the server. Defaults to false.
+     */
+    void setSupportsHello(bool newVal) {
+        _supportsHello = newVal;
+    }
+
+    /**
+     * Returns TRUE if the client has claimed to be an "internal client" via {hello: 1} command.
+     * This API is not suitable as an authorization check and must be used with caution.
+     */
+    bool isPossiblyUnauthenticatedInternalClient() const {
+        return _isInternalClient;
+    }
+
+    /**
+     * Returns TRUE if the client has claimed to be an "internal client" AND has authenticated
+     * as a user posessing ActionType::internal on the non-tenanted Cluster resource.
+     *
+     * Callers MUST NOT rely on this for authorization checks.
+     * Callers MUST use AuthorizationSession::isAuthorizedForClusterAction(ActionType::internal).
+     */
+    bool isInternalClient();
+
+    /**
+     * Assign a callback from the authorization subsystem to validate that the current
+     * client has authorizations necessary to act as an internal client.
+     */
+    static void setCheckAuthForInternalClient(std::function<bool(Client*)>);
+
+    void setIsInternalClient(bool isInternalClient) {
+        _isInternalClient = isInternalClient;
+    }
+
+    /**
+     * Sets the error code that operations associated with this client will be killed with if the
+     * underlying ingress session disconnects.
+     */
+    void setDisconnectErrorCode(ErrorCodes::Error code) {
+        _disconnectErrorCode = code;
+    }
+
+    ErrorCodes::Error getDisconnectErrorCode() {
+        return _disconnectErrorCode;
+    }
+
+    /**
+     * Atomically set all of the connection tags specified in the 'tagsToSet' bit field. If the
+     * 'kPending' tag is set, indicating that no tags have yet been specified for the connection,
+     * this function also clears that tag as part of the same atomic operation.
+     *
+     * The 'kPending' tag is only for new connections; callers should not set it directly.
+     */
+    void setTags(TagMask tagsToSet);
+
+    /**
+     * Atomically clears all of the connection tags specified in the 'tagsToUnset' bit field. If
+     * the 'kPending' tag is set, indicating that no tags have yet been specified for the session,
+     * this function also clears that tag as part of the same atomic operation.
+     */
+    void unsetTags(TagMask tagsToUnset);
+
+    /**
+     * Loads the connection tags, passes them to 'mutateFunc' and then stores the result of that
+     * call as the new connection tags, all in one atomic operation.
+     *
+     * In order to ensure atomicity, 'mutateFunc' may get called multiple times, so it should not
+     * perform expensive computations or operations with side effects.
+     *
+     * If the 'kPending' tag is set originally, mutateTags() will unset it regardless of the result
+     * of the 'mutateFunc' call. The 'kPending' tag is only for new connections; callers should
+     * never try to set it.
+     */
+    void mutateTags(const std::function<TagMask(TagMask)>& mutateFunc);
+
+    TagMask getTags() const;
+
+    /**
+     * Returns the associated port for this client.
+     */
+    int getLocalPort() const;
+
 private:
     friend class ServiceContext;
     friend class ThreadClient;
-    explicit Client(std::string desc,
-                    ServiceContext* serviceContext,
-                    transport::SessionHandle session);
 
-    ServiceContext* const _serviceContext;
-    const transport::SessionHandle _session;
+    Client(std::string desc,
+           Service* service,
+           std::shared_ptr<transport::Session> session,
+           ClientOperationKillableByStepdown killable);
+
+    /**
+     * Sets the active operation context on this client to "opCtx".
+     */
+    void _setOperationContext(OperationContext* opCtx);
+
+    Service* _service;
+
+    const std::shared_ptr<transport::Session> _session;
 
     // Description for the client (e.g. conn8)
     const std::string _desc;
@@ -223,7 +417,28 @@ private:
     // If != NULL, then contains the currently active OperationContext
     OperationContext* _opCtx = nullptr;
 
+    // If the active system client operation is allowed to be killed.
+    ClientOperationKillableByStepdown _operationKillable{true};
+
     PseudoRandom _prng;
+
+    AtomicWord<bool> _killed{false};
+
+    // Whether this client used { helloOk: true } when opening its connection, indicating that
+    // it supports the hello command.
+    bool _supportsHello = false;
+
+    // Whether this client is connected to the router port of a mongod with router role.
+    const bool _isRouterClient = false;
+
+    UUID _uuid;
+
+    // Indicates that this client claims to be internal to the cluster.
+    bool _isInternalClient{false};
+
+    ErrorCodes::Error _disconnectErrorCode = ErrorCodes::ClientDisconnect;
+
+    AtomicWord<TagMask> _tags;
 };
 
 /**
@@ -239,14 +454,59 @@ private:
  */
 class ThreadClient {
 public:
-    explicit ThreadClient(ServiceContext* serviceContext);
-    explicit ThreadClient(StringData desc,
-                          ServiceContext* serviceContext,
-                          transport::SessionHandle session = nullptr);
+    using Killable = ClientOperationKillableByStepdown;
+
+    /**
+     * Only the Service pointer is a required parameter. All other parameters are optional and will
+     * take defaults specified below.
+     */
+    ThreadClient(StringData desc,
+                 Service* service,
+                 std::shared_ptr<transport::Session> session,
+                 Killable killable);
+
+    /**
+     * If the thread's description is not specified, default it to the thread's existing name.
+     */
+    explicit ThreadClient(Service* service) : ThreadClient{getThreadName(), service} {}
+    ThreadClient(Service* service, Killable killable)
+        : ThreadClient{getThreadName(), service, killable} {}
+    ThreadClient(Service* service, std::shared_ptr<transport::Session> session)
+        : ThreadClient{getThreadName(), service, std::move(session)} {}
+    ThreadClient(Service* service, std::shared_ptr<transport::Session> session, Killable killable)
+        : ThreadClient{getThreadName(), service, std::move(session), killable} {}
+
+    /**
+     * Then, if the session pointer is not specified, default it to the sentinel value for no
+     * session.
+     */
+    ThreadClient(StringData desc, Service* service)
+        : ThreadClient{desc, service, Client::noSession()} {}
+    ThreadClient(StringData desc, Service* service, Killable killable)
+        : ThreadClient{desc, service, Client::noSession(), killable} {}
+
+    /**
+     * Then, if it's not specified whether the client's operation should be killable, default it to
+     * true.
+     */
+    ThreadClient(StringData desc, Service* service, std::shared_ptr<transport::Session> session)
+        : ThreadClient{desc, service, std::move(session), Killable{true}} {}
+
     ~ThreadClient();
     ThreadClient(const ThreadClient&) = delete;
     ThreadClient(ThreadClient&&) = delete;
     void operator=(const ThreadClient&) = delete;
+
+    Client* get() const;
+    Client* operator->() const {
+        return get();
+    }
+    Client& operator*() const {
+        return *get();
+    }
+
+private:
+    ThreadNameRef _originalThreadName;
 };
 
 /**
@@ -258,20 +518,19 @@ public:
  */
 class AlternativeClientRegion {
 public:
-    explicit AlternativeClientRegion(ServiceContext::UniqueClient& clientToUse)
-        : _alternateClient(&clientToUse) {
-        invariant(clientToUse);
-        if (Client::getCurrent()) {
-            _originalClient = Client::releaseCurrent();
-        }
-        Client::setCurrent(std::move(*_alternateClient));
-    }
+    explicit AlternativeClientRegion(ServiceContext::UniqueClient& clientToUse);
 
-    ~AlternativeClientRegion() {
-        *_alternateClient = Client::releaseCurrent();
-        if (_originalClient) {
-            Client::setCurrent(std::move(_originalClient));
-        }
+    ~AlternativeClientRegion();
+    AlternativeClientRegion(const AlternativeClientRegion&) = delete;
+    AlternativeClientRegion(AlternativeClientRegion&&) = delete;
+    void operator=(const AlternativeClientRegion&) = delete;
+
+    Client* get() const;
+    Client* operator->() const {
+        return get();
+    }
+    Client& operator*() const {
+        return *get();
     }
 
 private:
@@ -279,9 +538,21 @@ private:
     ServiceContext::UniqueClient* const _alternateClient;
 };
 
-
 /** get the Client object for this thread. */
 Client& cc();
 
 bool haveClient();
+
+/**
+ * Checks if the client is process internal.
+ *
+ * Process internal means that the client is created for the purpose of directly invoking a command
+ * from the inside of the process. A command that creates a DBDirectClient to call another command
+ * is an example of that.
+ *
+ * TODO: Remove this function when SERVER-74444 is merged, as this PR will add
+ *       'isProcessInternalClient' directly on the client
+ */
+bool isProcessInternalClient(const Client& client);
+
 }  // namespace mongo

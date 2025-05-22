@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -33,47 +32,64 @@
  */
 
 
-#include "mongo/platform/basic.h"
+#include <algorithm>
+#include <memory>
+#include <string>
+#include <vector>
 
-#include "mongo/client/dbclient_cursor.h"
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/client.h"
+#include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/exec/limit.h"
+#include "mongo/db/exec/mock_stage.h"
 #include "mongo/db/exec/plan_stage.h"
-#include "mongo/db/exec/queued_data_stage.h"
 #include "mongo/db/exec/skip.h"
-#include "mongo/db/json.h"
-#include "mongo/dbtests/dbtests.h"
-#include "mongo/stdx/memory.h"
+#include "mongo/db/exec/working_set.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/query/collation/collator_interface.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/storage/snapshot.h"
+#include "mongo/dbtests/dbtests.h"  // IWYU pragma: keep
+#include "mongo/stdx/type_traits.h"
+#include "mongo/unittest/unittest.h"
+#include "mongo/util/intrusive_counter.h"
 
-using namespace mongo;
-
+namespace mongo {
 namespace {
 
 using std::max;
 using std::min;
 using std::unique_ptr;
-using stdx::make_unique;
 
 static const int N = 50;
 
-/* Populate a QueuedDataStage and return it.  Caller owns it. */
-QueuedDataStage* getMS(OperationContext* opCtx, WorkingSet* ws) {
-    auto ms = make_unique<QueuedDataStage>(opCtx, ws);
+/**
+ * Populates a 'MockStage' and returns it.
+ */
+std::unique_ptr<MockStage> getMS(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                 WorkingSet* ws) {
+    auto ms = std::make_unique<MockStage>(expCtx.get(), ws);
 
     // Put N ADVANCED results into the mock stage, and some other stalling results (YIELD/TIME).
     for (int i = 0; i < N; ++i) {
-        ms->pushBack(PlanStage::NEED_TIME);
+        ms->enqueueStateCode(PlanStage::NEED_TIME);
 
         WorkingSetID id = ws->allocate();
         WorkingSetMember* wsm = ws->get(id);
-        wsm->obj = Snapshotted<BSONObj>(SnapshotId(), BSON("x" << i));
+        wsm->doc = {SnapshotId(), Document{BSON("x" << i)}};
         wsm->transitionToOwnedObj();
-        ms->pushBack(id);
+        ms->enqueueAdvanced(id);
 
-        ms->pushBack(PlanStage::NEED_TIME);
+        ms->enqueueStateCode(PlanStage::NEED_TIME);
     }
 
-    return ms.release();
+    return ms;
 }
 
 int countResults(PlanStage* stage) {
@@ -95,14 +111,19 @@ int countResults(PlanStage* stage) {
 class QueryStageLimitSkipBasicTest {
 public:
     void run() {
+        const auto expCtx = ExpressionContextBuilder{}
+                                .opCtx(_opCtx)
+                                .ns(NamespaceString::createNamespaceString_forTest("test.dummyNS"))
+                                .build();
         for (int i = 0; i < 2 * N; ++i) {
             WorkingSet ws;
 
-            unique_ptr<PlanStage> skip = make_unique<SkipStage>(_opCtx, i, &ws, getMS(_opCtx, &ws));
+            unique_ptr<PlanStage> skip =
+                std::make_unique<SkipStage>(expCtx.get(), i, &ws, getMS(expCtx.get(), &ws));
             ASSERT_EQUALS(max(0, N - i), countResults(skip.get()));
 
             unique_ptr<PlanStage> limit =
-                make_unique<LimitStage>(_opCtx, i, &ws, getMS(_opCtx, &ws));
+                std::make_unique<LimitStage>(expCtx.get(), i, &ws, getMS(expCtx.get(), &ws));
             ASSERT_EQUALS(min(N, i), countResults(limit.get()));
         }
     }
@@ -112,15 +133,16 @@ protected:
     OperationContext* const _opCtx = _uniqOpCtx.get();
 };
 
-class All : public Suite {
+class All : public unittest::OldStyleSuiteSpecification {
 public:
-    All() : Suite("query_stage_limit_skip") {}
+    All() : OldStyleSuiteSpecification("query_stage_limit_skip") {}
 
-    void setupTests() {
+    void setupTests() override {
         add<QueryStageLimitSkipBasicTest>();
     }
 };
 
-SuiteInstance<All> queryStageLimitSkipAll;
+unittest::OldStyleSuiteInitializer<All> queryStageLimitSkipAll;
 
 }  // namespace
+}  // namespace mongo

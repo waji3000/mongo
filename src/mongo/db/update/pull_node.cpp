@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,12 +27,25 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <boost/optional/optional.hpp>
 
-#include "mongo/db/update/pull_node.h"
+#include <boost/smart_ptr/intrusive_ptr.hpp>
 
+#include "mongo/base/clonable_ptr.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/db/exec/matcher/matcher.h"
+#include "mongo/db/exec/mutable_bson/const_element.h"
 #include "mongo/db/matcher/copyable_match_expression.h"
+#include "mongo/db/matcher/expression.h"
+#include "mongo/db/matcher/expression_parser.h"
+#include "mongo/db/matcher/extensions_callback.h"
+#include "mongo/db/matcher/extensions_callback_noop.h"
 #include "mongo/db/query/collation/collator_interface.h"
+#include "mongo/db/update/pull_node.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 
@@ -41,21 +53,21 @@ namespace mongo {
  * The ObjectMatcher is used when the $pull condition is specified as an object and the first field
  * of that object is not an operator (like $gt).
  */
-class PullNode::ObjectMatcher final : public PullNode::ElementMatcher {
+class PullNode::ObjectMatcher final : public ArrayCullingNode::ElementMatcher {
 public:
     ObjectMatcher(BSONObj matchCondition, const boost::intrusive_ptr<ExpressionContext>& expCtx)
         : _matchExpr(matchCondition,
                      expCtx,
-                     stdx::make_unique<ExtensionsCallbackNoop>(),
+                     std::make_unique<ExtensionsCallbackNoop>(),
                      MatchExpressionParser::kBanAllSpecialFeatures) {}
 
     std::unique_ptr<ElementMatcher> clone() const final {
-        return stdx::make_unique<ObjectMatcher>(*this);
+        return std::make_unique<ObjectMatcher>(*this);
     }
 
     bool match(const mutablebson::ConstElement& element) final {
         if (element.getType() == mongo::Object) {
-            return _matchExpr->matchesBSON(element.getValueObject());
+            return exec::matcher::matchesBSON(&*_matchExpr, element.getValueObject());
         } else {
             return false;
         }
@@ -66,6 +78,10 @@ public:
     }
 
 private:
+    BSONObj value() const final {
+        return BSON("" << _matchExpr.inputBSON());
+    }
+
     CopyableMatchExpression _matchExpr;
 };
 
@@ -76,22 +92,22 @@ private:
  * empty object so that we are comparing the MatchCondition and the array element at the same level.
  * This hack allows us to use a MatchExpression to check a BSONElement.
  */
-class PullNode::WrappedObjectMatcher final : public PullNode::ElementMatcher {
+class PullNode::WrappedObjectMatcher final : public ArrayCullingNode::ElementMatcher {
 public:
     WrappedObjectMatcher(BSONElement matchCondition,
                          const boost::intrusive_ptr<ExpressionContext>& expCtx)
         : _matchExpr(matchCondition.wrap(""),
                      expCtx,
-                     stdx::make_unique<ExtensionsCallbackNoop>(),
+                     std::make_unique<ExtensionsCallbackNoop>(),
                      MatchExpressionParser::kBanAllSpecialFeatures) {}
 
     std::unique_ptr<ElementMatcher> clone() const final {
-        return stdx::make_unique<WrappedObjectMatcher>(*this);
+        return std::make_unique<WrappedObjectMatcher>(*this);
     }
 
     bool match(const mutablebson::ConstElement& element) final {
         BSONObj candidate = element.getValue().wrap("");
-        return _matchExpr->matchesBSON(candidate);
+        return exec::matcher::matchesBSON(&*_matchExpr, candidate);
     }
 
     void setCollator(const CollatorInterface* collator) final {
@@ -99,6 +115,10 @@ public:
     }
 
 private:
+    BSONObj value() const final {
+        return _matchExpr.inputBSON();
+    }
+
     CopyableMatchExpression _matchExpr;
 };
 
@@ -106,13 +126,13 @@ private:
  * The EqualityMatcher is used when the condition is a primitive value or an array value. We require
  * an exact match.
  */
-class PullNode::EqualityMatcher final : public PullNode::ElementMatcher {
+class PullNode::EqualityMatcher final : public ArrayCullingNode::ElementMatcher {
 public:
     EqualityMatcher(BSONElement modExpr, const CollatorInterface* collator)
         : _modExpr(modExpr), _collator(collator) {}
 
     std::unique_ptr<ElementMatcher> clone() const final {
-        return stdx::make_unique<EqualityMatcher>(*this);
+        return std::make_unique<EqualityMatcher>(*this);
     }
 
     bool match(const mutablebson::ConstElement& element) final {
@@ -124,6 +144,10 @@ public:
     }
 
 private:
+    BSONObj value() const final {
+        return BSON("" << _modExpr);
+    }
+
     BSONElement _modExpr;
     const CollatorInterface* _collator;
 };
@@ -135,11 +159,11 @@ Status PullNode::init(BSONElement modExpr, const boost::intrusive_ptr<Expression
         if (modExpr.type() == mongo::Object &&
             !MatchExpressionParser::parsePathAcceptingKeyword(
                 modExpr.embeddedObject().firstElement())) {
-            _matcher = stdx::make_unique<ObjectMatcher>(modExpr.embeddedObject(), expCtx);
+            _matcher = std::make_unique<ObjectMatcher>(modExpr.embeddedObject(), expCtx);
         } else if (modExpr.type() == mongo::Object || modExpr.type() == mongo::RegEx) {
-            _matcher = stdx::make_unique<WrappedObjectMatcher>(modExpr, expCtx);
+            _matcher = std::make_unique<WrappedObjectMatcher>(modExpr, expCtx);
         } else {
-            _matcher = stdx::make_unique<EqualityMatcher>(modExpr, expCtx->getCollator());
+            _matcher = std::make_unique<EqualityMatcher>(modExpr, expCtx->getCollator());
         }
     } catch (AssertionException& exception) {
         return exception.toStatus();

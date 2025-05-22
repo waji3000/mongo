@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,144 +29,165 @@
 
 #pragma once
 
-#include <set>
-#include <vector>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+#include <cstdint>
+#include <memory>
 
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/db/exec/plan_stage.h"
-#include "mongo/db/exec/sort_key_generator.h"
+#include "mongo/db/exec/plan_stats.h"
+#include "mongo/db/exec/sort_executor.h"
 #include "mongo/db/exec/working_set.h"
-#include "mongo/db/jsobj.h"
-#include "mongo/db/query/index_bounds.h"
-#include "mongo/db/record_id.h"
-#include "mongo/stdx/unordered_map.h"
+#include "mongo/db/index/sort_key_generator.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/query/sort_pattern.h"
+#include "mongo/db/query/stage_types.h"
 
 namespace mongo {
 
-class BtreeKeyGenerator;
-
-// Parameters that must be provided to a SortStage
-class SortStageParams {
-public:
-    SortStageParams() = default;
-
-    // How we're sorting.
-    BSONObj pattern;
-
-    // Equal to 0 for no limit.
-    size_t limit = 0;
-};
-
 /**
- * Sorts the input received from the child according to the sort pattern provided.
+ * Sorts the input received from the child according to the sort pattern provided. If
+ * 'addSortKeyMetadata' is true, then also attaches the sort key as metadata. This could be consumed
+ * downstream for a sort-merge on a merging node, or by a $meta:"sortKey" expression.
  *
- * Preconditions:
- *   -- For each field in 'pattern', all inputs in the child must handle a getFieldDotted for that
- *   field.
- *   -- All WSMs produced by the child stage must have the sort key available as WSM computed data.
+ * Concrete implementations derive from this abstract base class by implementing methods for
+ * spooling and unspooling.
  */
-class SortStage final : public PlanStage {
+class SortStage : public PlanStage {
 public:
-    SortStage(OperationContext* opCtx,
-              const SortStageParams& params,
-              WorkingSet* ws,
-              PlanStage* child);
-    ~SortStage();
+    static constexpr StringData kStageType = "SORT"_sd;
 
-    bool isEOF() final;
+    SortStage(boost::intrusive_ptr<ExpressionContext> expCtx,
+              WorkingSet* ws,
+              SortPattern sortPattern,
+              bool addSortKeyMetadata,
+              std::unique_ptr<PlanStage> child);
+
+    /**
+     * Loads the WorkingSetMember pointed to by 'wsid' into the set of objects being sorted. This
+     * should be called repeatedly until all documents are loaded, followed by a single call to
+     * 'loadingDone()'. Illegal to call after 'loadingDone()' has been called.
+     */
+    virtual void spool(WorkingSetID wsid) = 0;
+
+    /**
+     * Indicates that all documents to be sorted have been loaded via 'spool()'. This method must
+     * not be called more than once.
+     */
+    virtual void loadingDone() = 0;
+
+    /**
+     * Returns an id referring to the next WorkingSetMember in the sorted stream of results.
+     *
+     * If there is another WSM, the id is returned via the out-parameter and the return value is
+     * PlanStage::ADVANCED. If there are no more documents remaining in the sorted stream, returns
+     * PlanStage::IS_EOF, and 'out' is left unmodified.
+     *
+     * Illegal to call before 'loadingDone()' has been called.
+     */
+    virtual StageState unspool(WorkingSetID* out) = 0;
+
     StageState doWork(WorkingSetID* out) final;
 
-    StageType stageType() const final {
-        return STAGE_SORT;
-    }
+    std::unique_ptr<PlanStageStats> getStats() final;
 
-    std::unique_ptr<PlanStageStats> getStats();
-
-    const SpecificStats* getSpecificStats() const final;
-
-    static const char* kStageType;
-
-private:
-    //
-    // Query Stage
-    //
-
+protected:
     // Not owned by us.
     WorkingSet* _ws;
 
-    // The raw sort _pattern as expressed by the user
-    BSONObj _pattern;
+    const SortKeyGenerator _sortKeyGen;
 
-    // Equal to 0 for no limit.
-    size_t _limit;
+    const bool _addSortKeyMetadata;
 
-    //
-    // Data storage
-    //
+private:
+    // Whether or not we have finished loading data into '_sortExecutor'.
+    bool _populated = false;
+};
 
-    // Have we sorted our data? If so, we can access _resultIterator. If not,
-    // we're still populating _data.
-    bool _sorted;
+/**
+ * Generic sorting implementation which can handle sorting any WorkingSetMember, including those
+ * that have RecordIds, metadata, or which represent index keys.
+ */
+class SortStageDefault final : public SortStage {
+public:
+    SortStageDefault(boost::intrusive_ptr<ExpressionContext> expCtx,
+                     WorkingSet* ws,
+                     SortPattern sortPattern,
+                     uint64_t limit,
+                     uint64_t maxMemoryUsageBytes,
+                     bool addSortKeyMetadata,
+                     std::unique_ptr<PlanStage> child);
 
-    // Collection of working set members to sort with their respective sort key.
-    struct SortableDataItem {
-        WorkingSetID wsid;
-        BSONObj sortKey;
-        // Since we must replicate the behavior of a covered sort as much as possible we use the
-        // RecordId to break sortKey ties.
-        // See sorta.js.
-        RecordId recordId;
-    };
+    void spool(WorkingSetID wsid) final;
 
-    // Comparison object for data buffers (vector and set). Items are compared on (sortKey, loc).
-    // This is also how the items are ordered in the indices. Keys are compared using
-    // BSONObj::woCompare() with RecordId as a tie-breaker.
-    //
-    // We are comparing keys generated by the SortKeyGenerator, which are already ordered with
-    // respect the collation. Therefore, we explicitly avoid comparing using a collator here.
-    struct WorkingSetComparator {
-        explicit WorkingSetComparator(BSONObj p);
+    void loadingDone() final;
 
-        bool operator()(const SortableDataItem& lhs, const SortableDataItem& rhs) const;
+    StageState unspool(WorkingSetID* out) final;
 
-        BSONObj pattern;
-    };
+    StageType stageType() const final {
+        return STAGE_SORT_DEFAULT;
+    }
 
-    /**
-     * Inserts one item into data buffer (vector or set).
-     * If limit is exceeded, remove item with lowest key.
-     */
-    void addToBuffer(const SortableDataItem& item);
+    bool isEOF() const final {
+        return _sortExecutor.isEOF();
+    }
 
-    /**
-     * Sorts data buffer.
-     * Assumes no more items will be added to buffer.
-     * If data is stored in set, copy set
-     * contents to vector and clear set.
-     */
-    void sortBuffer();
+    const SpecificStats* getSpecificStats() const final {
+        return &_sortExecutor.stats();
+    }
 
-    // Comparator for data buffer
-    // Initialization follows sort key generator
-    std::unique_ptr<WorkingSetComparator> _sortKeyComparator;
+    void doForceSpill() final {
+        _sortExecutor.forceSpill();
+    }
 
-    // The data we buffer and sort.
-    // _data will contain sorted data when all data is gathered
-    // and sorted.
-    // When _limit is greater than 1 and not all data has been gathered from child stage,
-    // _dataSet is used instead to maintain an ordered set of the incomplete data set.
-    // When the data set is complete, we copy the items from _dataSet to _data which will
-    // be used to provide the results of this stage through _resultIterator.
-    std::vector<SortableDataItem> _data;
-    typedef std::set<SortableDataItem, WorkingSetComparator> SortableDataItemSet;
-    std::unique_ptr<SortableDataItemSet> _dataSet;
+private:
+    SortExecutor<SortableWorkingSetMember> _sortExecutor;
+};
 
-    // Iterates through _data post-sort returning it.
-    std::vector<SortableDataItem>::iterator _resultIterator;
+/**
+ * Optimized sorting implementation which can be used for WorkingSetMembers in a fetched state that
+ * have no metadata. This implementation is faster but less general than WorkingSetMemberSortStage.
+ *
+ * For performance, this implementation discards record ids and returns WorkingSetMembers in the
+ * OWNED_OBJ state. Therefore, this sort implementation cannot be used if the plan requires the
+ * record id to be preserved (e.g. for update or delete plans, where an ancestor stage needs to
+ * refer to the record in order to perform a write).
+ */
+class SortStageSimple final : public SortStage {
+public:
+    SortStageSimple(boost::intrusive_ptr<ExpressionContext> expCtx,
+                    WorkingSet* ws,
+                    SortPattern sortPattern,
+                    uint64_t limit,
+                    uint64_t maxMemoryUsageBytes,
+                    bool addSortKeyMetadata,
+                    std::unique_ptr<PlanStage> child);
 
-    SortStats _specificStats;
+    void spool(WorkingSetID wsid) final;
 
-    // The usage in bytes of all buffered data that we're sorting.
-    size_t _memUsage;
+    void loadingDone() final;
+
+    StageState unspool(WorkingSetID* out) final;
+
+    StageType stageType() const final {
+        return STAGE_SORT_SIMPLE;
+    }
+
+    bool isEOF() const final {
+        return _sortExecutor.isEOF();
+    }
+
+    const SpecificStats* getSpecificStats() const final {
+        return &_sortExecutor.stats();
+    }
+
+    void doForceSpill() final {
+        _sortExecutor.forceSpill();
+    }
+
+private:
+    SortExecutor<BSONObj> _sortExecutor;
 };
 
 }  // namespace mongo

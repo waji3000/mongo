@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,23 +29,43 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
 #include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+#include <functional>
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
 
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/client/connection_string.h"
 #include "mongo/client/read_preference.h"
 #include "mongo/db/logical_time.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/aggregate_command_gen.h"
+#include "mongo/db/pipeline/aggregation_request_helper.h"
 #include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/read_concern_args.h"
+#include "mongo/db/repl/read_concern_level.h"
+#include "mongo/db/shard_id.h"
 #include "mongo/executor/remote_command_response.h"
-#include "mongo/s/shard_id.h"
+#include "mongo/s/client/shard_gen.h"
+#include "mongo/s/write_ops/batched_command_request.h"
+#include "mongo/s/write_ops/batched_command_response.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/net/hostandport.h"
 
 namespace mongo {
 
-class BatchedCommandRequest;
-class BatchedCommandResponse;
 class OperationContext;
+
 class RemoteCommandTargeter;
 
 /**
@@ -90,6 +109,7 @@ public:
 
     enum class RetryPolicy {
         kIdempotent,
+        kIdempotentOrCursorInvalidated,
         kNotIdempotent,
         kNoRetry,
     };
@@ -108,15 +128,7 @@ public:
     /**
      * Returns the current connection string for the shard.
      */
-    virtual const ConnectionString getConnString() const = 0;
-
-    /**
-     * Returns the connection string that was used to create the Shard from the ShardFactory.  The
-     * current connection string may be different.
-     * NOTE: Chances are this isn't the method you want.  When in doubt, prefer to use
-     * getConnString() instead.
-     */
-    virtual const ConnectionString originalConnString() const = 0;
+    virtual const ConnectionString& getConnString() const = 0;
 
     /**
      * Returns the RemoteCommandTargeter for the hosts in this shard.
@@ -144,7 +156,11 @@ public:
      * (i.e. is safe to retry and has the potential to succeed next time).  The 'options' argument
      * describes whether the operation that generated the given code was idempotent, which affects
      * which codes are safe to retry on.
+     *
+     * isRetriableError() routes to either of the static functions depending on object type.
      */
+    static bool localIsRetriableError(ErrorCodes::Error code, RetryPolicy options);
+    static bool remoteIsRetriableError(ErrorCodes::Error code, RetryPolicy options);
     virtual bool isRetriableError(ErrorCodes::Error code, RetryPolicy options) = 0;
 
     /**
@@ -155,7 +171,7 @@ public:
      */
     StatusWith<CommandResponse> runCommand(OperationContext* opCtx,
                                            const ReadPreferenceSetting& readPref,
-                                           const std::string& dbName,
+                                           const DatabaseName& dbName,
                                            const BSONObj& cmdObj,
                                            RetryPolicy retryPolicy);
 
@@ -166,7 +182,7 @@ public:
      */
     StatusWith<CommandResponse> runCommand(OperationContext* opCtx,
                                            const ReadPreferenceSetting& readPref,
-                                           const std::string& dbName,
+                                           const DatabaseName& dbName,
                                            const BSONObj& cmdObj,
                                            Milliseconds maxTimeMSOverride,
                                            RetryPolicy retryPolicy);
@@ -179,7 +195,7 @@ public:
     StatusWith<CommandResponse> runCommandWithFixedRetryAttempts(
         OperationContext* opCtx,
         const ReadPreferenceSetting& readPref,
-        const std::string& dbName,
+        const DatabaseName& dbName,
         const BSONObj& cmdObj,
         RetryPolicy retryPolicy);
 
@@ -191,7 +207,7 @@ public:
     StatusWith<CommandResponse> runCommandWithFixedRetryAttempts(
         OperationContext* opCtx,
         const ReadPreferenceSetting& readPref,
-        const std::string& dbName,
+        const DatabaseName& dbName,
         const BSONObj& cmdObj,
         Milliseconds maxTimeMSOverride,
         RetryPolicy retryPolicy);
@@ -202,59 +218,60 @@ public:
      */
     virtual void runFireAndForgetCommand(OperationContext* opCtx,
                                          const ReadPreferenceSetting& readPref,
-                                         const std::string& dbName,
+                                         const DatabaseName& dbName,
                                          const BSONObj& cmdObj) = 0;
 
     /**
-    * Runs a cursor command, exhausts the cursor, and pulls all data into memory. Performs retries
-    * if the command fails in accordance with the kIdempotent RetryPolicy.
-    */
+     * Runs a cursor command, exhausts the cursor, and pulls all data into memory. Performs retries
+     * if the command fails in accordance with the kIdempotent RetryPolicy.
+     */
     StatusWith<QueryResponse> runExhaustiveCursorCommand(OperationContext* opCtx,
                                                          const ReadPreferenceSetting& readPref,
-                                                         const std::string& dbName,
+                                                         const DatabaseName& dbName,
                                                          const BSONObj& cmdObj,
                                                          Milliseconds maxTimeMSOverride);
+
+    /**
+     * Synchronously run the aggregation request, with a best effort honoring of request
+     * options. `callback` will be called with the batch and resume token contained in each
+     * response. `callback` should return `true` to execute another getmore. Returning `false` will
+     * send a `killCursors`. If the aggregation results are exhausted, there will be no additional
+     * calls to `callback`.
+     */
+    virtual Status runAggregation(
+        OperationContext* opCtx,
+        const AggregateCommandRequest& aggRequest,
+        std::function<bool(const std::vector<BSONObj>& batch,
+                           const boost::optional<BSONObj>& postBatchResumeToken)> callback) = 0;
 
     /**
      * Runs a write command against a shard. This is separate from runCommand, because write
      * commands return errors in a different format than regular commands do, so checking for
      * retriable errors must be done differently.
      */
-    BatchedCommandResponse runBatchWriteCommand(OperationContext* opCtx,
-                                                const Milliseconds maxTimeMS,
-                                                const BatchedCommandRequest& batchRequest,
-                                                RetryPolicy retryPolicy);
+    virtual BatchedCommandResponse runBatchWriteCommand(OperationContext* opCtx,
+                                                        Milliseconds maxTimeMS,
+                                                        const BatchedCommandRequest& batchRequest,
+                                                        const WriteConcernOptions& writeConcern,
+                                                        RetryPolicy retryPolicy) = 0;
 
     /**
-    * Warning: This method exhausts the cursor and pulls all data into memory.
-    * Do not use other than for very small (i.e., admin or metadata) collections.
-    * Performs retries if the query fails in accordance with the kIdempotent RetryPolicy.
-    *
-    * ShardRemote instances expect "readConcernLevel" to always be kMajorityReadConcern, whereas
-    * ShardLocal instances expect either kLocalReadConcern or kMajorityReadConcern.
-    */
-    StatusWith<QueryResponse> exhaustiveFindOnConfig(OperationContext* opCtx,
-                                                     const ReadPreferenceSetting& readPref,
-                                                     const repl::ReadConcernLevel& readConcernLevel,
-                                                     const NamespaceString& nss,
-                                                     const BSONObj& query,
-                                                     const BSONObj& sort,
-                                                     const boost::optional<long long> limit);
-
-    /**
-     * Builds an index on a config server collection.
-     * Creates the collection if it doesn't yet exist.  Does not error if the index already exists,
-     * so long as the options are the same.
-     * NOTE: Currently only supported for LocalShard.
+     * Warning: This method exhausts the cursor and pulls all data into memory.
+     * Do not use other than for very small (i.e., admin or metadata) collections.
+     * Performs retries if the query fails in accordance with the kIdempotent RetryPolicy.
+     *
+     * ShardRemote instances expect "readConcernLevel" to always be kMajorityReadConcern, whereas
+     * ShardLocal instances expect either kLocalReadConcern or kMajorityReadConcern.
      */
-    virtual Status createIndexOnConfig(OperationContext* opCtx,
-                                       const NamespaceString& ns,
-                                       const BSONObj& keys,
-                                       bool unique) = 0;
-
-    // This timeout will be used by default in operations against the config server, unless
-    // explicitly overridden
-    static const Milliseconds kDefaultConfigCommandTimeout;
+    StatusWith<QueryResponse> exhaustiveFindOnConfig(
+        OperationContext* opCtx,
+        const ReadPreferenceSetting& readPref,
+        const repl::ReadConcernLevel& readConcernLevel,
+        const NamespaceString& nss,
+        const BSONObj& query,
+        const BSONObj& sort,
+        boost::optional<long long> limit,
+        const boost::optional<BSONObj>& hint = boost::none);
 
     /**
      * Returns false if the error is a retriable error and/or causes a replset monitor update. These
@@ -264,30 +281,25 @@ public:
      */
     static bool shouldErrorBePropagated(ErrorCodes::Error code);
 
-    /**
-     * Updates this shard's lastCommittedOpTime timestamp, if the given value is greater than the
-     * currently stored value.
-     *
-     * This is only valid to call on ShardRemote instances.
-     */
-    virtual void updateLastCommittedOpTime(LogicalTime lastCommittedOpTime) = 0;
-
-    /**
-     * Returns the latest lastCommittedOpTime timestamp returned by the underlying shard. This
-     * represents the latest opTime timestamp known to be in this shard's majority committed
-     * snapshot.
-     *
-     * This is only valid to call on ShardRemote instances.
-     */
-    virtual LogicalTime getLastCommittedOpTime() const = 0;
-
 protected:
     Shard(const ShardId& id);
 
+    /**
+     * Submits the batch request applying the specified retry policy and timeout and using the
+     * machinery provided by each implementation.
+     * Callers of this function must ensure to have configured the write concern settings
+     * accordingly to their specific semantics.
+     */
+    BatchedCommandResponse _submitBatchWriteCommand(OperationContext* opCtx,
+                                                    const BSONObj& serialisedBatchRequest,
+                                                    const DatabaseName& dbName,
+                                                    Milliseconds maxTimeMS,
+                                                    RetryPolicy retryPolicy);
+
 private:
     /**
-     * Runs the specified command against the shard backed by this object with a timeout set to the
-     * minimum of maxTimeMSOverride or the timeout of the OperationContext.
+     * Runs the specified command against the shard backed by this object with a timeout set to
+     * the minimum of maxTimeMSOverride or the timeout of the OperationContext.
      *
      * The return value exposes RemoteShard's host for calls to updateReplSetMonitor.
      *
@@ -295,14 +307,14 @@ private:
      */
     virtual StatusWith<CommandResponse> _runCommand(OperationContext* opCtx,
                                                     const ReadPreferenceSetting& readPref,
-                                                    const std::string& dbname,
+                                                    const DatabaseName& dbname,
                                                     Milliseconds maxTimeMSOverride,
                                                     const BSONObj& cmdObj) = 0;
 
     virtual StatusWith<QueryResponse> _runExhaustiveCursorCommand(
         OperationContext* opCtx,
         const ReadPreferenceSetting& readPref,
-        const std::string& dbName,
+        const DatabaseName& dbName,
         Milliseconds maxTimeMSOverride,
         const BSONObj& cmdObj) = 0;
 
@@ -313,12 +325,15 @@ private:
         const NamespaceString& nss,
         const BSONObj& query,
         const BSONObj& sort,
-        boost::optional<long long> limit) = 0;
+        boost::optional<long long> limit,
+        const boost::optional<BSONObj>& hint = boost::none) = 0;
 
     /**
      * Identifier of the shard as obtained from the configuration data (i.e. shard0000).
      */
     const ShardId _id;
+
+    friend class ConfigShardWrapper;
 };
 
 }  // namespace mongo

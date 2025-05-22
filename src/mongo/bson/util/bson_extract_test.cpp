@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,14 +27,19 @@
  *    it in the license file.
  */
 
-#include <functional>
+#include <cmath>
+// IWYU pragma: no_include "ext/type_traits.h"
 #include <limits>
 #include <string>
 
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/oid.h"
 #include "mongo/bson/util/bson_extract.h"
-#include "mongo/db/jsobj.h"
-#include "mongo/db/repl/optime.h"
-#include "mongo/stdx/functional.h"
+#include "mongo/stdx/type_traits.h"
 #include "mongo/unittest/unittest.h"
 
 using namespace mongo;
@@ -92,12 +96,10 @@ TEST(ExtractBSON, ExtractStringFieldWithDefault) {
 TEST(ExtractBSON, ExtractBooleanFieldWithDefault) {
     BSONObj obj1 = BSON("a" << 1 << "b"
                             << "hello"
-                            << "c"
-                            << true);
+                            << "c" << true);
     BSONObj obj2 = BSON("a" << 0 << "b"
                             << "hello"
-                            << "c"
-                            << false);
+                            << "c" << false);
     bool b;
     b = false;
     ASSERT_OK(bsonExtractBooleanFieldWithDefault(obj1, "a", false, &b));
@@ -143,7 +145,9 @@ TEST(ExtractBSON, ExtractIntegerField) {
     ASSERT_EQUALS(-(1LL << 55), v);
     ASSERT_OK(bsonExtractIntegerField(BSON("a" << 5178), "a", &v));
     ASSERT_EQUALS(5178, v);
-    auto pred = [](long long x) { return x > 0; };
+    auto pred = [](long long x) {
+        return x > 0;
+    };
     ASSERT_OK(bsonExtractIntegerFieldWithDefaultIf(BSON("a" << 1), "a", -1LL, pred, &v));
     ASSERT_OK(bsonExtractIntegerFieldWithDefaultIf(BSON("a" << 1), "b", 1LL, pred, &v));
     auto msg = "'a' has to be greater than zero";

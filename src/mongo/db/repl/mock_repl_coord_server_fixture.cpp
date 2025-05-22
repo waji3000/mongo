@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,25 +27,37 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/client.h"
-#include "mongo/db/curop.h"
-#include "mongo/db/db_raii.h"
-#include "mongo/db/dbdirectclient.h"
-#include "mongo/db/operation_context.h"
-#include "mongo/db/repl/drop_pending_collection_reaper.h"
 #include "mongo/db/repl/mock_repl_coord_server_fixture.h"
+
+#include <memory>
+
+#include "mongo/client/connection_string.h"
+#include "mongo/db/catalog_raii.h"
+#include "mongo/db/client.h"
+#include "mongo/db/collection_crud/collection_write_path.h"
+#include "mongo/db/concurrency/lock_manager_defs.h"
+#include "mongo/db/curop.h"
+#include "mongo/db/dbdirectclient.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/repl/member_state.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/oplog_entry.h"
+#include "mongo/db/repl/repl_settings.h"
 #include "mongo/db/repl/replication_consistency_markers_mock.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/replication_coordinator_mock.h"
 #include "mongo/db/repl/replication_process.h"
 #include "mongo/db/repl/replication_recovery_mock.h"
+#include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/repl/storage_interface_mock.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/service_context_d_test_fixture.h"
-#include "mongo/stdx/memory.h"
+#include "mongo/db/storage/snapshot_manager.h"
+#include "mongo/db/storage/storage_engine.h"
+#include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/unittest/unittest.h"
+#include "mongo/util/net/hostandport.h"
 
 namespace mongo {
 
@@ -63,10 +74,10 @@ void MockReplCoordServerFixture::setUp() {
     ASSERT_TRUE(_storageInterface == repl::StorageInterface::get(service));
 
     repl::ReplicationProcess::set(service,
-                                  stdx::make_unique<repl::ReplicationProcess>(
+                                  std::make_unique<repl::ReplicationProcess>(
                                       _storageInterface,
-                                      stdx::make_unique<repl::ReplicationConsistencyMarkersMock>(),
-                                      stdx::make_unique<repl::ReplicationRecoveryMock>()));
+                                      std::make_unique<repl::ReplicationConsistencyMarkersMock>(),
+                                      std::make_unique<repl::ReplicationRecoveryMock>()));
 
     ASSERT_OK(repl::ReplicationProcess::get(service)->initializeRollbackID(opCtx()));
 
@@ -76,41 +87,37 @@ void MockReplCoordServerFixture::setUp() {
         ConnectionString::forReplicaSet("sessionTxnStateTest", {HostAndPort("a:1")}).toString());
 
     repl::ReplicationCoordinator::set(
-        service, stdx::make_unique<repl::ReplicationCoordinatorMock>(service, replSettings));
+        service, std::make_unique<repl::ReplicationCoordinatorMock>(service, replSettings));
     ASSERT_OK(
         repl::ReplicationCoordinator::get(service)->setFollowerMode(repl::MemberState::RS_PRIMARY));
 
     // Note: internal code does not allow implicit creation of non-capped oplog collection.
     DBDirectClient client(opCtx());
-    ASSERT_TRUE(
-        client.createCollection(NamespaceString::kRsOplogNamespace.ns(), 1024 * 1024, true));
+    ASSERT_TRUE(client.createCollection(NamespaceString::kRsOplogNamespace, 1024 * 1024, true));
 
-    repl::setOplogCollectionName(service);
     repl::acquireOplogCollectionForLogging(opCtx());
 
-    repl::DropPendingCollectionReaper::set(
-        service,
-        stdx::make_unique<repl::DropPendingCollectionReaper>(repl::StorageInterface::get(service)));
-}
-
-void MockReplCoordServerFixture::tearDown() {
-    // ServiceContextMongoDTest::tearDown() will try to create it's own opCtx, and it's not
-    // allowed to have 2 present per client, so destroy this one.
-    _opCtx.reset();
-
-    ServiceContextMongoDTest::tearDown();
+    // Set a committed snapshot so that we can perform majority reads.
+    WriteUnitOfWork wuow{_opCtx.get()};
+    if (auto snapshotManager =
+            _opCtx->getServiceContext()->getStorageEngine()->getSnapshotManager()) {
+        snapshotManager->setCommittedSnapshot(repl::getNextOpTime(_opCtx.get()).getTimestamp());
+    }
+    wuow.commit();
 }
 
 void MockReplCoordServerFixture::insertOplogEntry(const repl::OplogEntry& entry) {
-    AutoGetCollection autoColl(opCtx(), NamespaceString::kRsOplogNamespace, MODE_IX);
-    auto coll = autoColl.getCollection();
-    ASSERT_TRUE(coll != nullptr);
+    AutoGetCollection coll(opCtx(), NamespaceString::kRsOplogNamespace, MODE_IX);
+    ASSERT_TRUE(coll);
 
-    auto status = coll->insertDocument(opCtx(),
-                                       InsertStatement(entry.toBSON()),
-                                       &CurOp::get(opCtx())->debug(),
-                                       /* fromMigrate */ false);
+    WriteUnitOfWork wuow(opCtx());
+    auto status = collection_internal::insertDocument(opCtx(),
+                                                      *coll,
+                                                      InsertStatement(entry.getEntry().toBSON()),
+                                                      &CurOp::get(opCtx())->debug(),
+                                                      /* fromMigrate */ false);
     ASSERT_OK(status);
+    wuow.commit();
 }
 
 OperationContext* MockReplCoordServerFixture::opCtx() {

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,8 +29,24 @@
 
 #pragma once
 
+#include <boost/optional/optional.hpp>
+#include <cstdint>
+#include <map>
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/exec/mutable_bson/const_element.h"
+#include "mongo/db/exec/mutable_bson/element.h"
+#include "mongo/db/field_ref.h"
+#include "mongo/db/update/log_builder_interface.h"
+#include "mongo/db/update/runtime_update_path.h"
 #include "mongo/db/update/update_leaf_node.h"
-#include "mongo/stdx/memory.h"
+#include "mongo/db/update/update_node.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 
@@ -52,24 +67,42 @@ class ModifierNode : public UpdateLeafNode {
 public:
     explicit ModifierNode(Context context = Context::kAll) : UpdateLeafNode(context) {}
 
-    ApplyResult apply(ApplyParams applyParams) const final;
+    ApplyResult apply(ApplyParams applyParams,
+                      UpdateNodeApplyParams updateNodeApplyParams) const final;
 
 protected:
-    enum class ModifyResult {
-        // No log entry is necessary for no-op updates.
-        kNoOp,
+    struct ModifyResult {
+        enum class Type {
+            // No log entry is necessary for no-op updates.
+            kNoOp,
 
-        // The update can be logged as normal (usually with a $set on the entire element).
-        kNormalUpdate,
+            // The update can be logged as normal.
+            kNormalUpdate,
 
-        // The element is an array, and the update only appends new array items to the end. The
-        // update can be logged as a $set on each appended element, rather than including the entire
-        // array in the log entry.
-        kArrayAppendUpdate,
+            // The element is an array, and the update only appends new array items to the end.
+            kArrayAppendUpdate,
 
-        // The element did not exist, so it was created then populated with setValueForNewElement().
-        // The updateExistingElement() method should never return this value.
-        kCreated
+            // The element did not exist, so it was created then populated with
+            // setValueForNewElement().
+            // The updateExistingElement() method should never return this value.
+            kCreated
+        };
+        static const Type kNoOp = Type::kNoOp;
+        static const Type kNormalUpdate = Type::kNormalUpdate;
+        static const Type kArrayAppendUpdate = Type::kArrayAppendUpdate;
+        static const Type kCreated = Type::kCreated;
+
+        struct EmptyDescription {};
+        struct ArrayAppendUpdateDescription {
+            size_t inserted;
+        };
+
+        ModifyResult() {};
+        ModifyResult(ModifyResult::Type type) : type(type) {}
+
+        Type type;
+        std::variant<EmptyDescription, ArrayAppendUpdateDescription> description =
+            EmptyDescription{};
     };
 
     /**
@@ -78,7 +111,7 @@ protected:
      * what kind of update was performed in its return value.
      */
     virtual ModifyResult updateExistingElement(mutablebson::Element* element,
-                                               std::shared_ptr<FieldRef> elementPath) const = 0;
+                                               const FieldRef& elementPath) const = 0;
 
     /**
      * ModifierNode::apply() calls this method when applying an update to a path that does not yet
@@ -97,7 +130,7 @@ protected:
     /**
      * ModifierNode::apply() calls this method after it finishes applying its update to validate
      * that no changes resulted in an invalid document. See the implementation of
-     * storage_validation::storageValid() for more detail about document validation requirements.
+     * storage_validation::scanDocument() for more detail about document validation requirements.
      * Most ModifierNode child classes can use the default implementation of this method.
      *
      * - 'updatedElement' is the element that was set by either updateExistingElement() or
@@ -110,12 +143,17 @@ protected:
      * - 'recursionLevel' is the document nesting depth of the 'updatedElement' field.
      * - 'modifyResult' is either the value returned by updateExistingElement() or the value
      *    ModifyResult::kCreated.
+     * - If 'validateForStorage' is true, we should verify that the updated element is valid for
+     *   storage.
+     * - 'containsDotsAndDollarsField' is true if 'updatedElement' contains any dots/dollars field.
      */
     virtual void validateUpdate(mutablebson::ConstElement updatedElement,
                                 mutablebson::ConstElement leftSibling,
                                 mutablebson::ConstElement rightSibling,
                                 std::uint32_t recursionLevel,
-                                ModifyResult modifyResult) const;
+                                ModifyResult modifyResult,
+                                bool validateForStorage,
+                                bool* containsDotsAndDollarsField) const;
 
     /**
      * ModifierNode::apply() calls this method after validation to create an oplog entry for the
@@ -129,11 +167,15 @@ protected:
      *   setValueForNewElement().
      * - 'modifyResult' is either the value returned by updateExistingElement() or the value
      *    ModifyResult::kCreated.
+     * - 'createdFieldIdx' indicates what the first component in 'pathTaken' is that was created as
+     *   part of this update. If the update did not add any new fields, boost::none should be
+     *   provided.
      */
-    virtual void logUpdate(LogBuilder* logBuilder,
-                           StringData pathTaken,
+    virtual void logUpdate(LogBuilderInterface* logBuilder,
+                           const RuntimeUpdatePath& pathTaken,
                            mutablebson::Element element,
-                           ModifyResult modifyResult) const;
+                           ModifyResult modifyResult,
+                           boost::optional<int> createdFieldIdx) const;
 
     /**
      * ModifierNode::apply() calls this method to determine what to do when applying an update to a
@@ -144,7 +186,6 @@ protected:
     virtual bool allowCreation() const {
         return false;
     }
-
 
     /**
      * When allowCreation() returns false, ModiferNode::apply() calls this method when determining
@@ -169,9 +210,32 @@ protected:
         return false;
     }
 
+    void produceSerializationMap(
+        FieldRef* currentPath,
+        std::map<std::string, std::vector<std::pair<std::string, BSONObj>>>*
+            operatorOrientedUpdates) const override {
+        (*operatorOrientedUpdates)[operatorName().toString()].emplace_back(
+            currentPath->dottedField(), operatorValue());
+    }
+
 private:
-    ApplyResult applyToNonexistentElement(ApplyParams applyParams) const;
-    ApplyResult applyToExistingElement(ApplyParams applyParams) const;
+    /**
+     * Retrieve the name of the operator this node represents in input syntax. For example, for the
+     * input syntax: {$set: {a: 3}}, this function would return "$set".
+     */
+    virtual StringData operatorName() const = 0;
+
+    /**
+     * Retrieve the value this operator applies as a single-element BSONObj with an empty string as
+     * the keyname. For example, for the input syntax: {$set: {a: 3}}, this function would return:
+     * {"": 3} in BSON.
+     */
+    virtual BSONObj operatorValue() const = 0;
+
+    ApplyResult applyToNonexistentElement(ApplyParams applyParams,
+                                          UpdateNodeApplyParams updateNodeApplyParams) const;
+    ApplyResult applyToExistingElement(ApplyParams applyParams,
+                                       UpdateNodeApplyParams updateNodeApplyParams) const;
 };
 
 }  // namespace mongo

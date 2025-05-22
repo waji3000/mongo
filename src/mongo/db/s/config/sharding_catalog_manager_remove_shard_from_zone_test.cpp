@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,15 +27,22 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <string>
+#include <vector>
 
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/client/read_preference.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/s/config/config_server_test_fixture.h"
 #include "mongo/db/s/config/sharding_catalog_manager.h"
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/catalog/type_tags.h"
-#include "mongo/s/client/shard.h"
-#include "mongo/s/config_server_test_fixture.h"
+#include "mongo/unittest/unittest.h"
 
 namespace mongo {
 namespace {
@@ -51,7 +57,7 @@ TEST_F(RemoveShardFromZoneTest, RemoveZoneThatNoLongerExistsShouldNotError) {
     shard.setName("a");
     shard.setHost("a:1234");
 
-    setupShards({shard}).transitional_ignore();
+    setupShards({shard});
 
     ASSERT_OK(ShardingCatalogManager::get(operationContext())
                   ->removeShardFromZone(operationContext(), shard.getName(), "z"));
@@ -73,7 +79,7 @@ TEST_F(RemoveShardFromZoneTest, RemovingZoneThatIsOnlyReferencedByAnotherShardSh
     shardB.setName("b");
     shardB.setHost("b:1234");
 
-    setupShards({shardA, shardB}).transitional_ignore();
+    setupShards({shardA, shardB});
 
     ASSERT_OK(ShardingCatalogManager::get(operationContext())
                   ->removeShardFromZone(operationContext(), shardB.getName(), "z"));
@@ -106,13 +112,12 @@ TEST_F(RemoveShardFromZoneTest, RemoveLastZoneFromShardShouldSucceedWhenNoChunks
     shardB.setName("b");
     shardB.setHost("b:1234");
 
-    setupShards({shardA, shardB}).transitional_ignore();
+    setupShards({shardA, shardB});
 
     // Insert a chunk range document referring to a different zone
     TagsType tagDoc;
-    tagDoc.setNS(NamespaceString("test.foo"));
-    tagDoc.setMinKey(BSON("x" << 0));
-    tagDoc.setMaxKey(BSON("x" << 10));
+    tagDoc.setNS(NamespaceString::createNamespaceString_forTest("test.foo"));
+    tagDoc.setRange({BSON("x" << 0), BSON("x" << 10)});
     tagDoc.setTag("y");
     insertToConfigCollection(operationContext(), TagsType::ConfigNS, tagDoc.toBSON())
         .transitional_ignore();
@@ -147,12 +152,11 @@ TEST_F(RemoveShardFromZoneTest, RemoveLastZoneFromShardShouldFailWhenAChunkRefer
     shardB.setName("b");
     shardB.setHost("b:1234");
 
-    setupShards({shardA, shardB}).transitional_ignore();
+    setupShards({shardA, shardB});
 
     TagsType tagDoc;
-    tagDoc.setNS(NamespaceString("test.foo"));
-    tagDoc.setMinKey(BSON("x" << 0));
-    tagDoc.setMaxKey(BSON("x" << 10));
+    tagDoc.setNS(NamespaceString::createNamespaceString_forTest("test.foo"));
+    tagDoc.setRange({BSON("x" << 0), BSON("x" << 10)});
     tagDoc.setTag("z");
     insertToConfigCollection(operationContext(), TagsType::ConfigNS, tagDoc.toBSON())
         .transitional_ignore();
@@ -186,7 +190,7 @@ TEST_F(RemoveShardFromZoneTest, RemoveZoneShouldFailIfShardDoesntExist) {
     shardA.setHost("a:1234");
     shardA.setTags({"z"});
 
-    setupShards({shardA}).transitional_ignore();
+    setupShards({shardA});
 
     auto status = ShardingCatalogManager::get(operationContext())
                       ->removeShardFromZone(operationContext(), "b", "z");
@@ -213,7 +217,7 @@ TEST_F(RemoveShardFromZoneTest, RemoveZoneFromShardShouldOnlyRemoveZoneOnSpecifi
     shardB.setHost("b:1234");
     shardB.setTags({"y", "z"});
 
-    setupShards({shardA, shardB}).transitional_ignore();
+    setupShards({shardA, shardB});
 
     ASSERT_OK(ShardingCatalogManager::get(operationContext())
                   ->removeShardFromZone(operationContext(), shardB.getName(), "z"));
@@ -250,7 +254,7 @@ TEST_F(RemoveShardFromZoneTest, RemoveZoneFromShardShouldErrorIfShardDocIsMalfor
                                  << "z"));
 
     insertToConfigCollection(
-        operationContext(), ShardType::ConfigNS, invalidShardDoc);
+        operationContext(), NamespaceString::kConfigsvrShardsNamespace, invalidShardDoc);
 
 
     auto status =

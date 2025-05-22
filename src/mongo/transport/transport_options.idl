@@ -1,0 +1,139 @@
+# Copyright (C) 2019-present MongoDB, Inc.
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the Server Side Public License, version 1,
+# as published by MongoDB, Inc.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# Server Side Public License for more details.
+#
+# You should have received a copy of the Server Side Public License
+# along with this program. If not, see
+# <http://www.mongodb.com/licensing/server-side-public-license>.
+#
+# As a special exception, the copyright holders give permission to link the
+# code of portions of this program with the OpenSSL library under certain
+# conditions as described in each individual source file and distribute
+# linked combinations including the program with the OpenSSL library. You
+# must comply with the Server Side Public License in all respects for
+# all of the code used other than as permitted herein. If you modify file(s)
+# with this exception, you may extend this exception to your version of the
+# file(s), but you are not obligated to do so. If you do not wish to do so,
+# delete this exception statement from your version. If you delete this
+# exception statement from all source files in the program, then also delete
+# it in the license file.
+#
+
+global:
+    cpp_namespace: "mongo::transport"
+    cpp_includes:
+        - "mongo/transport/transport_options.h"
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+structs:
+    ConnectionListParameters:
+        description: "Represents CIDR ranges for parameters that operate on a set of connections"
+        strict: true
+        fields:
+            ranges:
+                description: "An array of CIDR ranges"
+                type: array<string>
+
+server_parameters:
+    # Options to configure inbound TFO connections.
+    tcpFastOpenServer:
+        description: Enable TCP Fast Open for inbound connections
+        set_at: startup
+        cpp_varname: gTCPFastOpenServer
+        cpp_vartype: bool
+        default: true
+        redact: false
+
+    tcpFastOpenQueueSize:
+        description: TCP Fast Open queue length
+        set_at: startup
+        cpp_varname: gTCPFastOpenQueueSize
+        cpp_vartype: int
+        default: 1024
+        validator:
+            gt: 0
+        redact: false
+
+    # Options to configure outbound TFO connections.
+    tcpFastOpenClient:
+        description: Enable TCP Fast Open when connecting to remote servers
+        set_at: startup
+        cpp_varname: gTCPFastOpenClient
+        cpp_vartype: bool
+        default: true
+        redact: false
+
+    maxIncomingConnectionsOverride:
+        description: "CIDR ranges that are exempt from the maxIncomingConnections limit"
+        set_at: runtime # Use the configuration option for setting this at startup.
+        cpp_class:
+            name: "MaxIncomingConnectionsOverrideServerParameter"
+            # Expects the payload to be an instance of `ConnectionListParameters`.
+            override_set: true
+        redact: false
+
+    maxEstablishingConnectionsOverride:
+        description: "A list of CIDRs to be exempted from the max establishing limits"
+        set_at: [startup, runtime]
+        cpp_class:
+            name: "MaxEstablishingConnectionsOverrideServerParameter"
+            # Expects the payload to be an instance of `ConnectionListParameters`.
+            override_set: true
+        redact: false
+
+    ingressConnectionEstablishmentRatePerSec:
+        description: "The number of new connections that will be allowed to establish per second"
+        set_at: [startup, runtime]
+        cpp_varname: gIngressConnectionEstablishmentRatePerSec
+        cpp_vartype: Atomic<int32_t>
+        on_update: transport::onUpdateEstablishmentRefreshRate
+        default:
+            expr: std::numeric_limits<int>::max()
+        validator: {gte: 1}
+        redact: false
+
+    ingressConnectionEstablishmentBurstSize:
+        description: >-
+            The maximum number of connection establishments that will be admitted before rate-limiting 
+            kicks in (ie, the burst size of the bucket)
+        set_at: [startup, runtime]
+        cpp_varname: gIngressConnectionEstablishmentBurstSize
+        cpp_vartype: Atomic<int32_t>
+        on_update: transport::onUpdateEstablishmentBurstSize
+        default:
+            expr: std::numeric_limits<int>::max()
+        validator: {gte: 1}
+        redact: false
+
+    ingressConnectionEstablishmentMaxQueueDepth:
+        description: >-
+            The maximum size of the connection establishment queue, after which the server will begin 
+            rejecting new connections. A queue size of 0 indicates that connections will be rejected if 
+            they cannot immediately be admitted.
+        set_at: [startup, runtime]
+        cpp_varname: gIngressConnectionEstablishmentMaxQueueDepth
+        cpp_vartype: Atomic<int32_t>
+        on_update: transport::onUpdateEstablishmentMaxQueueDepth
+        default: 0
+        validator: {gte: 0}
+        redact: false
+
+    pessimisticConnectivityCheckForAcceptedConnections:
+        description: >-
+            Instructs the server to check connectivity of accepted connections before further 
+            processing and discard those that are terminated by the client. This parameter has no 
+            effect on non-Linux platforms.
+        set_at: [startup, runtime]
+        cpp_varname: gPessimisticConnectivityCheckForAcceptedConnections
+        cpp_vartype: Atomic<bool>
+        default: false
+        redact: false

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,7 +29,11 @@
 
 #pragma once
 
-#include "mongo/base/disallow_copying.h"
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/status.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/timestamp.h"
 #include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/replication_consistency_markers.h"
 #include "mongo/stdx/mutex.h"
@@ -47,7 +50,8 @@ namespace repl {
  * A mock ReplicationConsistencyMarkers implementation that stores everything in memory.
  */
 class ReplicationConsistencyMarkersMock : public ReplicationConsistencyMarkers {
-    MONGO_DISALLOW_COPYING(ReplicationConsistencyMarkersMock);
+    ReplicationConsistencyMarkersMock(const ReplicationConsistencyMarkersMock&) = delete;
+    ReplicationConsistencyMarkersMock& operator=(const ReplicationConsistencyMarkersMock&) = delete;
 
 public:
     ReplicationConsistencyMarkersMock() = default;
@@ -58,18 +62,29 @@ public:
     void setInitialSyncFlag(OperationContext* opCtx) override;
     void clearInitialSyncFlag(OperationContext* opCtx) override;
 
-    OpTime getMinValid(OperationContext* opCtx) const override;
-    void setMinValid(OperationContext* opCtx, const OpTime& minValid) override;
-    void setMinValidToAtLeast(OperationContext* opCtx, const OpTime& minValid) override;
+    void ensureFastCountOnOplogTruncateAfterPoint(OperationContext* opCtx) override;
 
     void setOplogTruncateAfterPoint(OperationContext* opCtx, const Timestamp& timestamp) override;
     Timestamp getOplogTruncateAfterPoint(OperationContext* opCtx) const override;
 
+    void startUsingOplogTruncateAfterPointForPrimary() override;
+    void stopUsingOplogTruncateAfterPointForPrimary() override;
+    bool isOplogTruncateAfterPointBeingUsedForPrimary() const override;
+
+    void setOplogTruncateAfterPointToTopOfOplog(OperationContext* opCtx) override;
+
+    boost::optional<OpTimeAndWallTime> refreshOplogTruncateAfterPointIfPrimary(
+        OperationContext* opCtx) override;
+
     void setAppliedThrough(OperationContext* opCtx, const OpTime& optime) override;
-    void clearAppliedThrough(OperationContext* opCtx, const Timestamp& writeTimestamp) override;
+    void clearAppliedThrough(OperationContext* opCtx) override;
     OpTime getAppliedThrough(OperationContext* opCtx) const override;
 
     Status createInternalCollections(OperationContext* opCtx) override;
+
+    void setInitialSyncIdIfNotSet(OperationContext* opCtx) override;
+    void clearInitialSyncId(OperationContext* opCtx) override;
+    BSONObj getInitialSyncId(OperationContext* opCtx) override;
 
 private:
     mutable stdx::mutex _initialSyncFlagMutex;
@@ -79,6 +94,7 @@ private:
     OpTime _appliedThrough;
     OpTime _minValid;
     Timestamp _oplogTruncateAfterPoint;
+    BSONObj _initialSyncId;
 };
 
 }  // namespace repl

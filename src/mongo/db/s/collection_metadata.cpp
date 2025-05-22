@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,84 +27,103 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
 
-#include "mongo/platform/basic.h"
+#include <boost/none.hpp>
+#include <fmt/format.h>
+#include <map>
+#include <set>
+#include <utility>
 
-#include "mongo/db/s/collection_metadata.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
 
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/dotted_path/dotted_path_support.h"
 #include "mongo/bson/simple_bsonobj_comparator.h"
-#include "mongo/bson/util/builder.h"
-#include "mongo/db/bson/dotted_path_support.h"
+#include "mongo/db/s/collection_metadata.h"
+#include "mongo/logv2/log.h"
 #include "mongo/s/catalog/type_chunk.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/s/chunk.h"
+#include "mongo/s/resharding/common_types_gen.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
+
 
 namespace mongo {
 
-CollectionMetadata::CollectionMetadata(std::shared_ptr<ChunkManager> cm, const ShardId& thisShardId)
+CollectionMetadata::CollectionMetadata(ChunkManager cm, const ShardId& thisShardId)
     : _cm(std::move(cm)), _thisShardId(thisShardId) {}
 
-RangeMap CollectionMetadata::getChunks() const {
-    invariant(isSharded());
-
-    RangeMap chunksMap(SimpleBSONObjComparator::kInstance.makeBSONObjIndexedMap<BSONObj>());
-
-    for (const auto& chunk : _cm->chunks()) {
-        if (chunk.getShardId() != _thisShardId)
-            continue;
-
-        chunksMap.emplace_hint(chunksMap.end(), chunk.getMin(), chunk.getMax());
-    }
-
-    return chunksMap;
+bool CollectionMetadata::allowMigrations() const {
+    return _cm ? _cm->allowMigrations() : true;
 }
 
-bool CollectionMetadata::getNextChunk(const BSONObj& lookupKey, ChunkType* chunk) const {
-    invariant(isSharded());
+boost::optional<ShardKeyPattern> CollectionMetadata::getReshardingKeyIfShouldForwardOps() const {
+    if (!hasRoutingTable())
+        return boost::none;
 
-    auto foundIt = _cm->getNextChunkOnShard(lookupKey, _thisShardId);
-    if (foundIt.begin() == foundIt.end())
-        return false;
+    const auto& reshardingFields = getReshardingFields();
 
-    const auto& nextChunk = *foundIt.begin();
-    chunk->setMin(nextChunk.getMin());
-    chunk->setMax(nextChunk.getMax());
-    return true;
-}
+    // A resharding operation should be taking place, and additionally, the coordinator must
+    // be in the states during which the recipient tails the donor's oplog. In these states, the
+    // donor annotates each of its oplog entries with the appropriate recipients; thus, checking if
+    // the coordinator is within these states is equivalent to checking if the donor should
+    // append the resharding recipients.
+    if (!reshardingFields)
+        return boost::none;
 
-Status CollectionMetadata::checkChunkIsValid(const ChunkType& chunk) const {
-    invariant(isSharded());
-
-    ChunkType existingChunk;
-
-    if (!getNextChunk(chunk.getMin(), &existingChunk)) {
-        return {ErrorCodes::StaleShardVersion,
-                str::stream() << "Chunk with bounds "
-                              << ChunkRange(chunk.getMin(), chunk.getMax()).toString()
-                              << " is not owned by this shard."};
+    // Used a switch statement so that the compiler warns anyone who modifies the coordinator
+    // states enum.
+    switch (reshardingFields.value().getState()) {
+        case CoordinatorStateEnum::kUnused:
+        case CoordinatorStateEnum::kInitializing:
+        case CoordinatorStateEnum::kBlockingWrites:
+        case CoordinatorStateEnum::kAborting:
+        case CoordinatorStateEnum::kCommitting:
+        case CoordinatorStateEnum::kQuiesced:
+        case CoordinatorStateEnum::kDone:
+            return boost::none;
+        case CoordinatorStateEnum::kPreparingToDonate:
+        case CoordinatorStateEnum::kCloning:
+        case CoordinatorStateEnum::kApplying:
+            // We will actually return a resharding key for these cases.
+            break;
     }
 
-    if (existingChunk.getMin().woCompare(chunk.getMin()) ||
-        existingChunk.getMax().woCompare(chunk.getMax())) {
-        return {ErrorCodes::StaleShardVersion,
-                str::stream() << "Unable to find chunk with the exact bounds "
-                              << ChunkRange(chunk.getMin(), chunk.getMax()).toString()
-                              << " at collection version "
-                              << getCollVersion().toString()};
-    }
+    const auto& donorFields = reshardingFields->getDonorFields();
 
-    return Status::OK();
+    // If 'reshardingFields' doesn't contain 'donorFields', then it must contain 'recipientFields',
+    // implying that collection represents the target collection in a resharding operation.
+    if (!donorFields)
+        return boost::none;
+
+    return ShardKeyPattern(donorFields->getReshardingKey());
 }
 
-BSONObj CollectionMetadata::extractDocumentKey(BSONObj const& doc) const {
+void CollectionMetadata::throwIfReshardingInProgress(NamespaceString const& nss) const {
+    if (hasRoutingTable()) {
+        const auto& reshardingFields = getReshardingFields();
+        // Throw if the coordinator is not in states "aborting", "committing", or "done".
+        if (reshardingFields && reshardingFields->getState() < CoordinatorStateEnum::kAborting) {
+            LOGV2(5277122, "reshardCollection in progress", logAttrs(nss));
+
+            uasserted(ErrorCodes::ReshardCollectionInProgress,
+                      "reshardCollection is in progress for namespace " +
+                          nss.toStringForErrorMsg());
+        }
+    }
+}
+
+BSONObj CollectionMetadata::extractDocumentKey(const ShardKeyPattern* shardKeyPattern,
+                                               const BSONObj& doc) {
     BSONObj key;
 
-    if (isSharded()) {
-        auto const& pattern = getChunkManager()->getShardKeyPattern();
-        key = dotted_path_support::extractElementsBasedOnTemplate(doc, pattern.toBSON());
-        if (pattern.hasId()) {
+    if (shardKeyPattern) {
+        key = bson::extractElementsBasedOnTemplate(doc, shardKeyPattern->toBSON());
+        if (shardKeyPattern->hasId()) {
             return key;
         }
         // else, try to append an _id field from the document.
@@ -119,42 +137,56 @@ BSONObj CollectionMetadata::extractDocumentKey(BSONObj const& doc) const {
     return doc;
 }
 
-void CollectionMetadata::toBSONBasic(BSONObjBuilder& bb) const {
-    if (isSharded()) {
-        _cm->getVersion().appendLegacyWithField(&bb, "collVersion");
-        getShardVersion().appendLegacyWithField(&bb, "shardVersion");
-        bb.append("keyPattern", _cm->getShardKeyPattern().toBSON());
-    } else {
-        ChunkVersion::UNSHARDED().appendLegacyWithField(&bb, "collVersion");
-        ChunkVersion::UNSHARDED().appendLegacyWithField(&bb, "shardVersion");
-    }
-}
-
-void CollectionMetadata::toBSONChunks(BSONArrayBuilder& bb) const {
-    if (!isSharded())
-        return;
-
-    for (const auto& chunk : _cm->chunks()) {
-        if (chunk.getShardId() == _thisShardId) {
-            BSONArrayBuilder chunkBB(bb.subarrayStart());
-            chunkBB.append(chunk.getMin());
-            chunkBB.append(chunk.getMax());
-            chunkBB.done();
-        }
-    }
+BSONObj CollectionMetadata::extractDocumentKey(const BSONObj& doc) const {
+    return extractDocumentKey(isSharded() ? &_cm->getShardKeyPattern() : nullptr, doc);
 }
 
 std::string CollectionMetadata::toStringBasic() const {
-    if (isSharded()) {
-        return str::stream() << "collection version: " << _cm->getVersion().toString()
-                             << ", shard version: " << getShardVersion().toString();
+    if (hasRoutingTable()) {
+        return str::stream() << "collection placement version: " << _cm->getVersion().toString()
+                             << ", shard placement version: "
+                             << getShardPlacementVersionForLogging().toString();
     } else {
-        return "collection version: <unsharded>";
+        return "collection placement version: <unsharded>";
     }
 }
 
+RangeMap CollectionMetadata::getChunks() const {
+    tassert(10016202, "Expected a routing table to be initialized", hasRoutingTable());
+
+    RangeMap chunksMap(SimpleBSONObjComparator::kInstance.makeBSONObjIndexedMap<BSONObj>());
+
+    _cm->forEachChunk([this, &chunksMap](const auto& chunk) {
+        if (chunk.getShardId() == _thisShardId)
+            chunksMap.emplace_hint(chunksMap.end(), chunk.getMin(), chunk.getMax());
+
+        return true;
+    });
+
+    return chunksMap;
+}
+
+bool CollectionMetadata::getNextChunk(const BSONObj& lookupKey, ChunkType* chunk) const {
+    tassert(10016203, "Expected a routing table to be initialized", hasRoutingTable());
+
+    auto nextChunk = _cm->getNextChunkOnShard(lookupKey, _thisShardId);
+    if (!nextChunk)
+        return false;
+
+    chunk->setRange(nextChunk->getRange());
+
+    return true;
+}
+
+bool CollectionMetadata::currentShardHasAnyChunks() const {
+    tassert(10016204, "Expected a routing table to be initialized", hasRoutingTable());
+    std::set<ShardId> shards;
+    _cm->getAllShardIds(&shards);
+    return shards.find(_thisShardId) != shards.end();
+}
+
 boost::optional<ChunkRange> CollectionMetadata::getNextOrphanRange(
-    RangeMap const& receivingChunks, BSONObj const& origLookupKey) const {
+    const RangeMap& receivingChunks, const BSONObj& origLookupKey) const {
     invariant(isSharded());
 
     const BSONObj maxKey = getMaxKey();
@@ -220,6 +252,22 @@ boost::optional<ChunkRange> CollectionMetadata::getNextOrphanRange(
     }
 
     return boost::none;
+}
+
+void CollectionMetadata::toBSONChunks(BSONArrayBuilder* builder) const {
+    if (!hasRoutingTable())
+        return;
+
+    _cm->forEachChunk([this, &builder](const auto& chunk) {
+        if (chunk.getShardId() == _thisShardId) {
+            BSONArrayBuilder chunkBB(builder->subarrayStart());
+            chunkBB.append(chunk.getMin());
+            chunkBB.append(chunk.getMax());
+            chunkBB.done();
+        }
+
+        return true;
+    });
 }
 
 }  // namespace mongo

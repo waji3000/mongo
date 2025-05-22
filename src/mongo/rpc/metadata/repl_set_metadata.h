@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,6 +29,11 @@
 
 #pragma once
 
+#include <string>
+
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/bson/oid.h"
 #include "mongo/db/repl/optime.h"
 
@@ -47,20 +51,19 @@ extern const char kReplSetMetadataFieldName[];
  */
 class ReplSetMetadata {
 public:
-    /**
-     * Default primary index. Also used to indicate in metadata that there is no
-     * primary.
-     */
-    static const int kNoPrimary = -1;
-
     ReplSetMetadata() = default;
     ReplSetMetadata(long long term,
-                    repl::OpTime committedOpTime,
+                    repl::OpTimeAndWallTime committedOpTime,
                     repl::OpTime visibleOpTime,
                     long long configVersion,
-                    OID replicaSetId,
-                    int currentPrimaryIndex,
-                    int currentSyncSourceIndex);
+                    long long configTerm,
+                    OID id,
+                    int currentSyncSourceIndex,
+                    bool isPrimary);
+    explicit ReplSetMetadata(const ReplSetMetadata&) = default;
+    ReplSetMetadata(ReplSetMetadata&&) = default;
+    ReplSetMetadata& operator=(const ReplSetMetadata&) = delete;
+    ReplSetMetadata& operator=(ReplSetMetadata&&) = default;
 
     /**
      * format:
@@ -71,14 +74,15 @@ public:
      *     configVersion: 0,
      *     replicaSetId: ObjectId("..."), // Only present in certain versions and above.
      *     primaryIndex: 0,
-     *     syncSourceIndex: 0
+     *     syncSourceIndex: 0,
+     *     isPrimary: false // 4.4 and later
      * }
      */
     static StatusWith<ReplSetMetadata> readFromMetadata(const BSONObj& doc);
     Status writeToMetadata(BSONObjBuilder* builder) const;
 
     /**
-     * Returns the OpTime of the most recent operation with which the client intereacted.
+     * Returns the OpTime of the most recent operation with which the client interacted.
      */
     repl::OpTime getLastOpVisible() const {
         return _lastOpVisible;
@@ -87,7 +91,7 @@ public:
     /**
      * Returns the OpTime of the most recently committed op of which the sender was aware.
      */
-    repl::OpTime getLastOpCommitted() const {
+    repl::OpTimeAndWallTime getLastOpCommitted() const {
         return _lastOpCommitted;
     }
 
@@ -96,6 +100,13 @@ public:
      */
     long long getConfigVersion() const {
         return _configVersion;
+    }
+
+    /**
+     * Returns the ReplSetConfig term number of the sender.
+     */
+    long long getConfigTerm() const {
+        return _configTerm;
     }
 
     /**
@@ -113,19 +124,18 @@ public:
     }
 
     /**
-     * Returns the index of the current primary from the perspective of the sender.
-     * Returns kNoPrimary if there is no primary.
-     */
-    int getPrimaryIndex() const {
-        return _currentPrimaryIndex;
-    }
-
-    /**
      * Returns the index of the sync source of the sender.
      * Returns -1 if it has no sync source.
      */
     int getSyncSourceIndex() const {
         return _currentSyncSourceIndex;
+    }
+
+    /**
+     * Returns true if the sender is primary.
+     */
+    bool getIsPrimary() const {
+        return _isPrimary;
     }
 
     /**
@@ -141,13 +151,14 @@ public:
     std::string toString() const;
 
 private:
-    repl::OpTime _lastOpCommitted;
+    repl::OpTimeAndWallTime _lastOpCommitted;
     repl::OpTime _lastOpVisible;
     long long _currentTerm = -1;
     long long _configVersion = -1;
+    long long _configTerm = repl::OpTime::kUninitializedTerm;
     OID _replicaSetId;
-    int _currentPrimaryIndex = kNoPrimary;
     int _currentSyncSourceIndex = -1;
+    bool _isPrimary = false;
 };
 
 }  // namespace rpc

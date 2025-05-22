@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,16 +27,107 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
 
+#include <boost/move/utility_core.hpp>
+#include <cstddef>
+#include <fmt/format.h>
+
+
+#include "mongo/base/status.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/oid.h"
+#include "mongo/db/client.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/query/write_ops/write_ops_gen.h"
+#include "mongo/db/storage/storage_options.h"
+#include "mongo/executor/network_interface.h"
+#include "mongo/executor/remote_command_request.h"
+#include "mongo/rpc/op_msg.h"
+#include "mongo/s/grid.h"
+#include "mongo/s/resource_yielders.h"
 #include "mongo/s/sharding_test_fixture_common.h"
+#include "mongo/s/write_ops/batched_command_response.h"
+#include "mongo/unittest/unittest.h"
+#include "mongo/util/str.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 namespace mongo {
 
-constexpr Seconds ShardingTestFixtureCommon::kFutureTimeout;
+using executor::NetworkTestEnv;
 
-ShardingTestFixtureCommon::ShardingTestFixtureCommon() = default;
+ShardingTestFixtureCommon::ShardingTestFixtureCommon(
+    std::unique_ptr<ScopedGlobalServiceContextForTest> scopedGlobalContext)
+    : ServiceContextTest(std::move(scopedGlobalContext)) {}
 
-ShardingTestFixtureCommon::~ShardingTestFixtureCommon() = default;
+ShardingTestFixtureCommon::~ShardingTestFixtureCommon() {
+    invariant(!_opCtxHolder,
+              "ShardingTestFixtureCommon::tearDown() must have been called before destruction");
+}
+
+void ShardingTestFixtureCommon::setUp() {
+    _opCtxHolder = makeOperationContext();
+
+    ResourceYielderFactory::initialize(getServiceContext());
+}
+
+void ShardingTestFixtureCommon::tearDown() {
+    _opCtxHolder.reset();
+}
+
+void ShardingTestFixtureCommon::shutdownExecutorPool() {
+    auto grid = Grid::get(getServiceContext());
+
+    if (!grid || !grid->isInitialized() || !grid->getExecutorPool() || _executorPoolShutDown) {
+        return;
+    }
+    _executorPoolShutDown = true;
+
+    grid->getExecutorPool()->shutdown_forTest();
+    executor::NetworkInterfaceMock::InNetworkGuard(_mockNetwork)->runReadyNetworkOperations();
+    executor::NetworkInterfaceMock::InNetworkGuard(_mockNetworkForPool)
+        ->runReadyNetworkOperations();
+    grid->getExecutorPool()->join_forTest();
+}
+
+OperationContext* ShardingTestFixtureCommon::operationContext() const {
+    invariant(_opCtxHolder,
+              "ShardingTestFixtureCommon::setUp() must have been called before this method");
+    return _opCtxHolder.get();
+}
+
+RoutingTableHistoryValueHandle ShardingTestFixtureCommon::makeStandaloneRoutingTableHistory(
+    RoutingTableHistory rt) {
+    const auto version = rt.getVersion();
+    return RoutingTableHistoryValueHandle(
+        std::make_shared<RoutingTableHistory>(std::move(rt)),
+        ComparableChunkVersion::makeComparableChunkVersion(version));
+}
+
+void ShardingTestFixtureCommon::onCommand(NetworkTestEnv::OnCommandFunction func) {
+    _networkTestEnv->onCommand(func);
+}
+
+void ShardingTestFixtureCommon::onCommands(
+    std::vector<executor::NetworkTestEnv::OnCommandFunction> funcs) {
+    _networkTestEnv->onCommands(std::move(funcs));
+}
+
+void ShardingTestFixtureCommon::onCommandWithMetadata(
+    NetworkTestEnv::OnCommandWithMetadataFunction func) {
+    _networkTestEnv->onCommandWithMetadata(func);
+}
+
+void ShardingTestFixtureCommon::onFindCommand(NetworkTestEnv::OnFindCommandFunction func) {
+    _networkTestEnv->onFindCommand(func);
+}
+
+void ShardingTestFixtureCommon::onFindWithMetadataCommand(
+    NetworkTestEnv::OnFindCommandWithMetadataFunction func) {
+    _networkTestEnv->onFindWithMetadataCommand(func);
+}
 
 }  // namespace mongo

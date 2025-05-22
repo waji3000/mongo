@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,28 +27,59 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
 
 #include "mongo/config.h"
 
 #include "mongo/util/net/ssl_options.h"
 
+#include <boost/range/size.hpp>
 #include <ostream>
 
+#include "mongo/base/init.h"
+#include "mongo/base/initializer.h"
+#include "mongo/db/server_options_base.h"
 #include "mongo/db/server_options_server_helpers.h"
 #include "mongo/unittest/unittest.h"
+#include "mongo/util/cmdline_utils/censor_cmdline_test.h"
 #include "mongo/util/net/ssl_options.h"
 #include "mongo/util/options_parser/environment.h"
 #include "mongo/util/options_parser/option_section.h"
 #include "mongo/util/options_parser/options_parser.h"
+#include "mongo/util/options_parser/startup_options.h"
 
 namespace moe = mongo::optionenvironment;
 
 namespace mongo {
-Status addSSLServerOptions(moe::OptionSection* options);
-Status storeSSLServerOptions(const moe::Environment& params);
-
 namespace {
+
+// ssl_options_server.cpp has an initializer which depends on logging.
+// We can stub that dependency out for unit testing purposes.
+MONGO_INITIALIZER(ServerLogRedirection)(InitializerContext*) {}
+
+Status executeInitializer(const std::string& name) try {
+    InitializerFunction fn = getGlobalInitializer().getInitializerFunctionForTesting(name);
+    uassert(ErrorCodes::InternalError,
+            str::stream() << "Initializer node '" << name << "' has no associated function.",
+            fn);
+    InitializerContext initContext({});
+    fn(&initContext);
+    return Status::OK();
+} catch (const DBException& ex) {
+    return ex.toStatus();
+}
+
+Status addSSLServerOptions() {
+    return executeInitializer("SSLServerOptionsIDL_Register");
+}
+
+Status storeSSLServerOptions() {
+    auto status = executeInitializer("SSLServerOptionsIDL_Store");
+    if (!status.isOK()) {
+        return status;
+    }
+
+    return executeInitializer("SSLServerOptions_Post");
+}
 
 namespace test {
 struct Vector : public std::vector<uint8_t> {
@@ -97,7 +127,9 @@ TEST(SSLOptions, invalidCases) {
 
 class OptionsParserTester : public moe::OptionsParser {
 public:
-    Status readConfigFile(const std::string& filename, std::string* config) {
+    Status readConfigFile(const std::string& filename,
+                          std::string* config,
+                          moe::ConfigExpand) override {
         if (filename != _filename) {
             ::mongo::StringBuilder sb;
             sb << "Parser using filename: " << filename
@@ -118,51 +150,47 @@ private:
 };
 
 TEST(SetupOptions, tlsModeDisabled) {
-    OptionsParserTester parser;
-    moe::Environment environment;
-    moe::OptionSection options;
+    moe::startupOptions = moe::OptionSection();
+    moe::startupOptionsParsed = moe::Environment();
 
-    ASSERT_OK(::mongo::addGeneralServerOptions(&options));
+    ASSERT_OK(::mongo::addGeneralServerOptions(&moe::startupOptions));
+    ASSERT_OK(addSSLServerOptions());
 
     std::vector<std::string> argv;
     argv.push_back("binaryname");
     argv.push_back("--tlsMode");
     argv.push_back("disabled");
-    std::map<std::string, std::string> env_map;
 
-    ASSERT_OK(::mongo::addSSLServerOptions(&options));
-
-    ASSERT_OK(parser.run(options, argv, env_map, &environment));
-    ASSERT_OK(::mongo::storeSSLServerOptions(environment));
+    OptionsParserTester parser;
+    ASSERT_OK(parser.run(moe::startupOptions, argv, &moe::startupOptionsParsed));
+    ASSERT_OK(storeSSLServerOptions());
     ASSERT_EQ(::mongo::sslGlobalParams.sslMode.load(), ::mongo::sslGlobalParams.SSLMode_disabled);
 }
 
 TEST(SetupOptions, sslModeDisabled) {
-    OptionsParserTester parser;
-    moe::Environment environment;
-    moe::OptionSection options;
+    moe::startupOptions = moe::OptionSection();
+    moe::startupOptionsParsed = moe::Environment();
 
-    ASSERT_OK(::mongo::addGeneralServerOptions(&options));
+    ASSERT_OK(::mongo::addGeneralServerOptions(&moe::startupOptions));
+    ASSERT_OK(addSSLServerOptions());
 
     std::vector<std::string> argv;
     argv.push_back("binaryname");
     argv.push_back("--sslMode");
     argv.push_back("disabled");
-    std::map<std::string, std::string> env_map;
 
-    ASSERT_OK(::mongo::addSSLServerOptions(&options));
-
-    ASSERT_OK(parser.run(options, argv, env_map, &environment));
-    ASSERT_OK(::mongo::storeSSLServerOptions(environment));
+    OptionsParserTester parser;
+    ASSERT_OK(parser.run(moe::startupOptions, argv, &moe::startupOptionsParsed));
+    ASSERT_OK(storeSSLServerOptions());
     ASSERT_EQ(::mongo::sslGlobalParams.sslMode.load(), ::mongo::sslGlobalParams.SSLMode_disabled);
 }
 
 TEST(SetupOptions, tlsModeRequired) {
-    OptionsParserTester parser;
-    moe::Environment environment;
-    moe::OptionSection options;
+    moe::startupOptions = moe::OptionSection();
+    moe::startupOptionsParsed = moe::Environment();
 
-    ASSERT_OK(::mongo::addGeneralServerOptions(&options));
+    ASSERT_OK(::mongo::addGeneralServerOptions(&moe::startupOptions));
+    ASSERT_OK(addSSLServerOptions());
 
     std::string sslPEMKeyFile = "jstests/libs/server.pem";
     std::string sslCAFFile = "jstests/libs/ca.pem";
@@ -173,7 +201,7 @@ TEST(SetupOptions, tlsModeRequired) {
     argv.push_back("binaryname");
     argv.push_back("--tlsMode");
     argv.push_back("requireTLS");
-    argv.push_back("--tlsPEMKeyFile");
+    argv.push_back("--tlsCertificateKeyFile");
     argv.push_back(sslPEMKeyFile);
     argv.push_back("--tlsCAFile");
     argv.push_back(sslCAFFile);
@@ -184,8 +212,7 @@ TEST(SetupOptions, tlsModeRequired) {
     argv.push_back("--tlsAllowInvalidHostnames");
     argv.push_back("--tlsAllowInvalidCertificates");
     argv.push_back("--tlsWeakCertificateValidation");
-    argv.push_back("--tlsFIPSMode");
-    argv.push_back("--tlsPEMKeyPassword");
+    argv.push_back("--tlsCertificateKeyFilePassword");
     argv.push_back("pw1");
     argv.push_back("--tlsClusterPassword");
     argv.push_back("pw2");
@@ -193,12 +220,10 @@ TEST(SetupOptions, tlsModeRequired) {
     argv.push_back("TLS1_1");
     argv.push_back("--tlsLogVersions");
     argv.push_back("TLS1_2");
-    std::map<std::string, std::string> env_map;
 
-    ASSERT_OK(mongo::addSSLServerOptions(&options));
-
-    ASSERT_OK(parser.run(options, argv, env_map, &environment));
-    ASSERT_OK(mongo::storeSSLServerOptions(environment));
+    OptionsParserTester parser;
+    ASSERT_OK(parser.run(moe::startupOptions, argv, &moe::startupOptionsParsed));
+    ASSERT_OK(storeSSLServerOptions());
 
     ASSERT_EQ(::mongo::sslGlobalParams.sslMode.load(), ::mongo::sslGlobalParams.SSLMode_requireSSL);
     ASSERT_EQ(::mongo::sslGlobalParams.sslPEMKeyFile.substr(
@@ -216,7 +241,6 @@ TEST(SetupOptions, tlsModeRequired) {
     ASSERT_EQ(::mongo::sslGlobalParams.sslAllowInvalidHostnames, true);
     ASSERT_EQ(::mongo::sslGlobalParams.sslAllowInvalidCertificates, true);
     ASSERT_EQ(::mongo::sslGlobalParams.sslWeakCertificateValidation, true);
-    ASSERT_EQ(::mongo::sslGlobalParams.sslFIPSMode, true);
     ASSERT_EQ(::mongo::sslGlobalParams.sslPEMKeyPassword, "pw1");
     ASSERT_EQ(::mongo::sslGlobalParams.sslClusterPassword, "pw2");
     ASSERT_EQ(static_cast<int>(::mongo::sslGlobalParams.sslDisabledProtocols.back()),
@@ -226,11 +250,11 @@ TEST(SetupOptions, tlsModeRequired) {
 }
 
 TEST(SetupOptions, sslModeRequired) {
-    OptionsParserTester parser;
-    moe::Environment environment;
-    moe::OptionSection options;
+    moe::startupOptions = moe::OptionSection();
+    moe::startupOptionsParsed = moe::Environment();
 
-    ASSERT_OK(::mongo::addGeneralServerOptions(&options));
+    ASSERT_OK(::mongo::addGeneralServerOptions(&moe::startupOptions));
+    ASSERT_OK(addSSLServerOptions());
 
     std::string sslPEMKeyFile = "jstests/libs/server.pem";
     std::string sslCAFFile = "jstests/libs/ca.pem";
@@ -252,7 +276,6 @@ TEST(SetupOptions, sslModeRequired) {
     argv.push_back("--sslAllowInvalidHostnames");
     argv.push_back("--sslAllowInvalidCertificates");
     argv.push_back("--sslWeakCertificateValidation");
-    argv.push_back("--sslFIPSMode");
     argv.push_back("--sslPEMKeyPassword");
     argv.push_back("pw1");
     argv.push_back("--sslClusterPassword");
@@ -261,12 +284,10 @@ TEST(SetupOptions, sslModeRequired) {
     argv.push_back("TLS1_1");
     argv.push_back("--tlsLogVersions");
     argv.push_back("TLS1_0");
-    std::map<std::string, std::string> env_map;
 
-    ASSERT_OK(mongo::addSSLServerOptions(&options));
-
-    ASSERT_OK(parser.run(options, argv, env_map, &environment));
-    ASSERT_OK(mongo::storeSSLServerOptions(environment));
+    OptionsParserTester parser;
+    ASSERT_OK(parser.run(moe::startupOptions, argv, &moe::startupOptionsParsed));
+    ASSERT_OK(storeSSLServerOptions());
 
     ASSERT_EQ(::mongo::sslGlobalParams.sslMode.load(), ::mongo::sslGlobalParams.SSLMode_requireSSL);
     ASSERT_EQ(::mongo::sslGlobalParams.sslPEMKeyFile.substr(
@@ -284,7 +305,6 @@ TEST(SetupOptions, sslModeRequired) {
     ASSERT_EQ(::mongo::sslGlobalParams.sslAllowInvalidHostnames, true);
     ASSERT_EQ(::mongo::sslGlobalParams.sslAllowInvalidCertificates, true);
     ASSERT_EQ(::mongo::sslGlobalParams.sslWeakCertificateValidation, true);
-    ASSERT_EQ(::mongo::sslGlobalParams.sslFIPSMode, true);
     ASSERT_EQ(::mongo::sslGlobalParams.sslPEMKeyPassword, "pw1");
     ASSERT_EQ(::mongo::sslGlobalParams.sslClusterPassword, "pw2");
     ASSERT_EQ(static_cast<int>(::mongo::sslGlobalParams.sslDisabledProtocols.back()),
@@ -295,11 +315,11 @@ TEST(SetupOptions, sslModeRequired) {
 
 #ifdef MONGO_CONFIG_SSL_CERTIFICATE_SELECTORS
 TEST(SetupOptions, tlsModeRequiredCertificateSelector) {
-    OptionsParserTester parser;
-    moe::Environment environment;
-    moe::OptionSection options;
+    moe::startupOptions = moe::OptionSection();
+    moe::startupOptionsParsed = moe::Environment();
 
-    ASSERT_OK(::mongo::addGeneralServerOptions(&options));
+    ASSERT_OK(::mongo::addGeneralServerOptions(&moe::startupOptions));
+    ASSERT_OK(addSSLServerOptions());
 
     std::vector<std::string> argv;
     argv.push_back("binaryname");
@@ -309,12 +329,10 @@ TEST(SetupOptions, tlsModeRequiredCertificateSelector) {
     argv.push_back("subject=Subject 1");
     argv.push_back("--tlsClusterCertificateSelector");
     argv.push_back("subject=Subject 2");
-    std::map<std::string, std::string> env_map;
 
-    ASSERT_OK(mongo::addSSLServerOptions(&options));
-
-    ASSERT_OK(parser.run(options, argv, env_map, &environment));
-    ASSERT_OK(mongo::storeSSLServerOptions(environment));
+    OptionsParserTester parser;
+    ASSERT_OK(parser.run(moe::startupOptions, argv, &moe::startupOptionsParsed));
+    ASSERT_OK(storeSSLServerOptions());
 
     ASSERT_EQ(::mongo::sslGlobalParams.sslMode.load(), ::mongo::sslGlobalParams.SSLMode_requireSSL);
     ASSERT_EQ(::mongo::sslGlobalParams.sslCertificateSelector.subject, "Subject 1");
@@ -322,11 +340,11 @@ TEST(SetupOptions, tlsModeRequiredCertificateSelector) {
 }
 
 TEST(SetupOptions, sslModeRequiredCertificateSelector) {
-    OptionsParserTester parser;
-    moe::Environment environment;
-    moe::OptionSection options;
+    moe::startupOptions = moe::OptionSection();
+    moe::startupOptionsParsed = moe::Environment();
 
-    ASSERT_OK(::mongo::addGeneralServerOptions(&options));
+    ASSERT_OK(::mongo::addGeneralServerOptions(&moe::startupOptions));
+    ASSERT_OK(addSSLServerOptions());
 
     std::vector<std::string> argv;
     argv.push_back("binaryname");
@@ -336,12 +354,10 @@ TEST(SetupOptions, sslModeRequiredCertificateSelector) {
     argv.push_back("subject=Subject 1");
     argv.push_back("--sslClusterCertificateSelector");
     argv.push_back("subject=Subject 2");
-    std::map<std::string, std::string> env_map;
 
-    ASSERT_OK(mongo::addSSLServerOptions(&options));
-
-    ASSERT_OK(parser.run(options, argv, env_map, &environment));
-    ASSERT_OK(mongo::storeSSLServerOptions(environment));
+    OptionsParserTester parser;
+    ASSERT_OK(parser.run(moe::startupOptions, argv, &moe::startupOptionsParsed));
+    ASSERT_OK(storeSSLServerOptions());
 
     ASSERT_EQ(::mongo::sslGlobalParams.sslMode.load(), ::mongo::sslGlobalParams.SSLMode_requireSSL);
     ASSERT_EQ(::mongo::sslGlobalParams.sslCertificateSelector.subject, "Subject 1");
@@ -360,10 +376,9 @@ TEST(SetupOptions, disableNonSSLConnectionLoggingFalse) {
     argv.push_back("binaryname");
     argv.push_back("--setParameter");
     argv.push_back("disableNonSSLConnectionLogging=false");
-    std::map<std::string, std::string> env_map;
 
-    ASSERT_OK(parser.run(options, argv, env_map, &environment));
-    Status storeRet = mongo::storeServerOptions(environment);
+    ASSERT_OK(parser.run(options, argv, &environment));
+    ASSERT_OK(mongo::storeServerOptions(environment));
 
     ASSERT_EQ(::mongo::sslGlobalParams.disableNonSSLConnectionLogging, false);
 }
@@ -380,9 +395,8 @@ TEST(SetupOptions, disableNonTLSConnectionLoggingFalse) {
     argv.push_back("binaryname");
     argv.push_back("--setParameter");
     argv.push_back("disableNonTLSConnectionLogging=false");
-    std::map<std::string, std::string> env_map;
 
-    ASSERT_OK(parser.run(options, argv, env_map, &environment));
+    ASSERT_OK(parser.run(options, argv, &environment));
     Status storeRet = mongo::storeServerOptions(environment);
 
     ASSERT_EQ(::mongo::sslGlobalParams.disableNonSSLConnectionLogging, false);
@@ -400,9 +414,8 @@ TEST(SetupOptions, disableNonSSLConnectionLoggingTrue) {
     argv.push_back("binaryname");
     argv.push_back("--setParameter");
     argv.push_back("disableNonSSLConnectionLogging=true");
-    std::map<std::string, std::string> env_map;
 
-    ASSERT_OK(parser.run(options, argv, env_map, &environment));
+    ASSERT_OK(parser.run(options, argv, &environment));
     Status storeRet = mongo::storeServerOptions(environment);
 
     ASSERT_EQ(::mongo::sslGlobalParams.disableNonSSLConnectionLogging, true);
@@ -420,9 +433,8 @@ TEST(SetupOptions, disableNonTLSConnectionLoggingTrue) {
     argv.push_back("binaryname");
     argv.push_back("--setParameter");
     argv.push_back("disableNonTLSConnectionLogging=true");
-    std::map<std::string, std::string> env_map;
 
-    ASSERT_OK(parser.run(options, argv, env_map, &environment));
+    ASSERT_OK(parser.run(options, argv, &environment));
     Status storeRet = mongo::storeServerOptions(environment);
 
     ASSERT_EQ(::mongo::sslGlobalParams.disableNonSSLConnectionLogging, true);
@@ -441,10 +453,61 @@ TEST(SetupOptions, disableNonTLSConnectionLoggingInvalid) {
     argv.push_back("disableNonTLSConnectionLogging=false");
     argv.push_back("--setParameter");
     argv.push_back("disableNonSSLConnectionLogging=false");
-    std::map<std::string, std::string> env_map;
 
-    ASSERT_OK(parser.run(options, argv, env_map, &environment));
+    ASSERT_OK(parser.run(options, argv, &environment));
     ASSERT_NOT_OK(mongo::storeServerOptions(environment));
+}
+
+TEST(SetupOptions, RedactionSingleName) {
+    const std::vector<std::string> argv({"mongod",
+                                         "--tlsMode",
+                                         "requireTLS",
+                                         "--tlsCertificateKeyFilePassword=qwerty",
+                                         "--tlsClusterPassword",
+                                         "Lose Me.",
+                                         "--sslPEMKeyPassword=qwerty",
+                                         "--sslClusterPassword=qwerty"});
+
+    const std::vector<std::string> expected({"mongod",
+                                             "--tlsMode",
+                                             "requireTLS",
+                                             "--tlsCertificateKeyFilePassword=<password>",
+                                             "--tlsClusterPassword",
+                                             "<password>",
+                                             "--sslPEMKeyPassword=<password>",
+                                             "--sslClusterPassword=<password>"});
+
+    ASSERT_EQ(expected.size(), argv.size());
+    ::mongo::test::censoringVector(expected, argv);
+}
+
+TEST(SetupOptions, RedactionDottedName) {
+    auto obj = BSON("net" << BSON("tls" << BSON("mode" << "requireTLS"
+                                                       << "certificateKeyFilePassword"
+                                                       << "qwerty"
+                                                       << "ClusterPassword"
+                                                       << "qwerty")
+                                        << "ssl"
+                                        << BSON("mode" << "requireSSL"
+                                                       << "PEMKeyPassword"
+                                                       << "qwerty"
+                                                       << "ClusterPassword"
+                                                       << "qwerty")));
+
+    auto res = BSON("net" << BSON("tls" << BSON("mode" << "requireTLS"
+                                                       << "certificateKeyFilePassword"
+                                                       << "<password>"
+                                                       << "ClusterPassword"
+                                                       << "<password>")
+                                        << "ssl"
+                                        << BSON("mode" << "requireSSL"
+                                                       << "PEMKeyPassword"
+                                                       << "<password>"
+                                                       << "ClusterPassword"
+                                                       << "<password>")));
+
+    cmdline_utils::censorBSONObj(&obj);
+    ASSERT_BSONOBJ_EQ(res, obj);
 }
 
 }  // namespace

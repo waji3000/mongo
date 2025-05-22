@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,35 +27,34 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <cstdint>
+#include <utility>
 
 #include "mongo/executor/task_executor_pool.h"
-
-#include <algorithm>
-
-#include "mongo/db/server_parameters.h"
-#include "mongo/executor/connection_pool_stats.h"
-#include "mongo/executor/task_executor.h"
-#include "mongo/util/processinfo.h"
+#include "mongo/executor/task_executor_pool_parameters_gen.h"  // IWYU pragma: keep
+#include "mongo/util/assert_util.h"
+#include "mongo/util/processinfo.h"  // IWYU pragma: keep
 
 namespace mongo {
 namespace executor {
 
-// If less than or equal to 0, the suggested pool size will be determined by the number of cores. If
-// set to a particular positive value, this will be used as the pool size.
-MONGO_EXPORT_SERVER_PARAMETER(taskExecutorPoolSize, int, 1);
-
 size_t TaskExecutorPool::getSuggestedPoolSize() {
+#if (defined __linux__)
+    // Always use a pool of size 1 on Linux machines running mongo v4.2 and higher.
+    // Changing it past the default value can cause performance regressions.
+    return 1;
+#else
     auto poolSize = taskExecutorPoolSize.load();
     if (poolSize > 0) {
         return poolSize;
     }
 
     ProcessInfo p;
-    unsigned numCores = p.getNumCores();
+    auto numCores = p.getNumAvailableCores();
 
     // Never suggest a number outside the range [4, 64].
-    return std::max(4U, std::min(64U, numCores));
+    return std::max<size_t>(4U, std::min<size_t>(64U, numCores));
+#endif  //__linux__
 }
 
 void TaskExecutorPool::startup() {
@@ -78,8 +76,22 @@ void TaskExecutorPool::shutdownAndJoin() {
     }
 }
 
-void TaskExecutorPool::addExecutors(std::vector<std::unique_ptr<TaskExecutor>> executors,
-                                    std::unique_ptr<TaskExecutor> fixedExecutor) {
+void TaskExecutorPool::shutdown_forTest() {
+    _fixedExecutor->shutdown();
+    for (auto&& exec : _executors) {
+        exec->shutdown();
+    }
+}
+
+void TaskExecutorPool::join_forTest() {
+    _fixedExecutor->join();
+    for (auto&& exec : _executors) {
+        exec->join();
+    }
+}
+
+void TaskExecutorPool::addExecutors(std::vector<std::shared_ptr<TaskExecutor>> executors,
+                                    std::shared_ptr<TaskExecutor> fixedExecutor) {
     invariant(_executors.empty());
     invariant(fixedExecutor);
     invariant(!_fixedExecutor);
@@ -88,15 +100,15 @@ void TaskExecutorPool::addExecutors(std::vector<std::unique_ptr<TaskExecutor>> e
     _executors = std::move(executors);
 }
 
-TaskExecutor* TaskExecutorPool::getArbitraryExecutor() {
+const std::shared_ptr<TaskExecutor>& TaskExecutorPool::getArbitraryExecutor() {
     invariant(!_executors.empty());
     uint64_t idx = (_counter.fetchAndAdd(1) % _executors.size());
-    return _executors[idx].get();
+    return _executors[idx];
 }
 
-TaskExecutor* TaskExecutorPool::getFixedExecutor() {
+const std::shared_ptr<TaskExecutor>& TaskExecutorPool::getFixedExecutor() {
     invariant(_fixedExecutor);
-    return _fixedExecutor.get();
+    return _fixedExecutor;
 }
 
 void TaskExecutorPool::appendConnectionStats(ConnectionPoolStats* stats) const {
@@ -105,6 +117,13 @@ void TaskExecutorPool::appendConnectionStats(ConnectionPoolStats* stats) const {
     // Get stats from our pooled executors.
     for (auto&& executor : _executors) {
         executor->appendConnectionStats(stats);
+    }
+}
+
+void TaskExecutorPool::appendNetworkInterfaceStats(BSONObjBuilder& bob) const {
+    _fixedExecutor->appendNetworkInterfaceStats(bob);
+    for (auto&& executor : _executors) {
+        executor->appendNetworkInterfaceStats(bob);
     }
 }
 

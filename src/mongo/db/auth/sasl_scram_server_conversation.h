@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,9 +29,26 @@
 
 #pragma once
 
+#include <algorithm>
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <cstring>
+#include <string>
+#include <tuple>
+#include <type_traits>
+#include <utility>
+#include <vector>
+
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/crypto/mechanism_scram.h"
+#include "mongo/crypto/sha1_block.h"
 #include "mongo/db/auth/sasl_mechanism_policies.h"
 #include "mongo/db/auth/sasl_mechanism_registry.h"
+#include "mongo/db/auth/user.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/util/icu.h"
 
 namespace mongo {
@@ -41,14 +57,12 @@ namespace mongo {
  *  Server side authentication session for SASL SCRAM-SHA-1/256.
  */
 template <typename Policy>
-class SaslSCRAMServerMechanism : public MakeServerMechanism<Policy> {
+class SaslSCRAMServerMechanism final : public MakeServerMechanism<Policy> {
 public:
     using HashBlock = typename Policy::HashBlock;
 
     explicit SaslSCRAMServerMechanism(std::string authenticationDatabase)
         : MakeServerMechanism<Policy>(std::move(authenticationDatabase)) {}
-
-    ~SaslSCRAMServerMechanism() final = default;
 
     /**
      * Take one step in a SCRAM-SHA-1 conversation.
@@ -58,14 +72,24 @@ public:
      *
      **/
     StatusWith<std::tuple<bool, std::string>> stepImpl(OperationContext* opCtx,
-                                                       StringData inputData);
+                                                       StringData inputData) override;
 
     StatusWith<std::string> saslPrep(StringData str) const {
         if (std::is_same<SHA1Block, HashBlock>::value) {
             return str.toString();
         } else {
-            return mongo::saslPrep(str);
+            return icuSaslPrep(str);
         }
+    }
+
+    Status setOptions(BSONObj options) final;
+
+    boost::optional<unsigned int> currentStep() const override {
+        return _step;
+    }
+
+    boost::optional<unsigned int> totalSteps() const override {
+        return _totalSteps();
     }
 
 private:
@@ -80,15 +104,22 @@ private:
     StatusWith<std::tuple<bool, std::string>> _secondStep(OperationContext* opCtx,
                                                           StringData input);
 
-    int _step{0};
+    unsigned int _totalSteps() const {
+        return _skipEmptyExchange ? 2 : 3;
+    }
+
+    unsigned int _step{0};
     std::string _authMessage;
 
     // The secrets to check the client proof against during the second step
     // Usually only contains one element, except during key rollover.
-    std::vector<scram::Secrets<HashBlock>> _secrets;
+    std::vector<scram::Secrets<HashBlock, scram::UnlockedSecretsPolicy>> _secrets;
 
     // client and server nonce concatenated
     std::string _nonce;
+
+    // Do not send empty 3rd reply in scram conversation.
+    bool _skipEmptyExchange{false};
 };
 
 extern template class SaslSCRAMServerMechanism<SCRAMSHA1Policy>;
@@ -97,6 +128,7 @@ extern template class SaslSCRAMServerMechanism<SCRAMSHA256Policy>;
 template <typename ScramMechanism>
 class SCRAMServerFactory : public MakeServerFactory<ScramMechanism> {
 public:
+    using MakeServerFactory<ScramMechanism>::MakeServerFactory;
     static constexpr bool isInternal = true;
     bool canMakeMechanismForUser(const User* user) const final {
         auto credentials = user->getCredentials();

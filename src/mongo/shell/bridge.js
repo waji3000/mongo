@@ -31,6 +31,13 @@ function MongoBridge(options) {
     // The connection used by a test for running commands against the mongod or mongos process.
     var userConn;
 
+    // copy the enableTestCommands field from TestData since this can be
+    // changed in the middle of a test. This is the same value that
+    // will ultimately be used by MongoRunner, and determines if
+    // *From commands can be used during the lifetime of the MongoBridge
+    // instance.
+    this._testCommandsEnabledAtInit = jsTest.options().enableTestCommands;
+
     // A separate (hidden) connection for configuring the mongobridge process.
     var controlConn;
 
@@ -106,14 +113,17 @@ function MongoBridge(options) {
             },
         });
 
-        controlConn = new Mongo(hostName + ':' + this.port);
+        assert.soonNoExcept(() => {
+            controlConn = new Mongo(hostName + ':' + this.port);
+            return true;
+        }, 'failed to make control connection to the mongobridge on port ' + this.port);
     };
 
     /**
      * Terminates the mongobridge process.
      */
     this.stop = function stop() {
-        _stopMongoProgram(this.port);
+        return _stopMongoProgram(this.port);
     };
 
     // Throws an error if 'obj' is not a MongoBridge instance.
@@ -127,10 +137,7 @@ function MongoBridge(options) {
     function runBridgeCommand(conn, cmdName, cmdArgs) {
         // The wire version of this mongobridge is detected as the wire version of the corresponding
         // mongod or mongos process because the message is simply forwarded to that process.
-        // Commands to configure the mongobridge process must support being sent as an OP_QUERY
-        // message in order to handle when the mongobridge is a proxy for a mongos process or when
-        // --readMode=legacy is passed to the mongo shell. Create a new Object with 'cmdName' as the
-        // first key and $forBridge=true.
+        // Create a new Object with 'cmdName' as the first key and $forBridge=true.
         var cmdObj = {};
         cmdObj[cmdName] = 1;
         cmdObj.$forBridge = true;
@@ -178,6 +185,16 @@ function MongoBridge(options) {
         bridges.forEach(bridge => bridge.rejectConnectionsFrom(this));
     };
 
+    // All *From functions require that test commands be enabled on the mongod
+    // instance (which populates the hostInfo field).
+    function checkTestCommandsEnabled(fn_name) {
+        return function(bridge) {
+            assert(bridge._testCommandsEnabledAtInit,
+                   "testing commands have not been enabled. " + fn_name +
+                       " will not work as expected");
+        };
+    }
+
     /**
      * Configures 'this' bridge to accept new connections from the 'dest' of each of the 'bridges'.
      *
@@ -188,6 +205,7 @@ function MongoBridge(options) {
             bridges = [bridges];
         }
         bridges.forEach(throwErrorIfNotMongoBridgeInstance);
+        bridges.forEach(checkTestCommandsEnabled("acceptConnectionsFrom"));
 
         bridges.forEach(bridge => {
             var res = runBridgeCommand(controlConn, 'acceptConnectionsFrom', {host: bridge.dest});
@@ -208,6 +226,7 @@ function MongoBridge(options) {
             bridges = [bridges];
         }
         bridges.forEach(throwErrorIfNotMongoBridgeInstance);
+        bridges.forEach(checkTestCommandsEnabled("rejectConnectionsFrom"));
 
         bridges.forEach(bridge => {
             var res = runBridgeCommand(controlConn, 'rejectConnectionsFrom', {host: bridge.dest});
@@ -229,6 +248,7 @@ function MongoBridge(options) {
             bridges = [bridges];
         }
         bridges.forEach(throwErrorIfNotMongoBridgeInstance);
+        bridges.forEach(checkTestCommandsEnabled("delayMessagesFrom"));
 
         bridges.forEach(bridge => {
             var res = runBridgeCommand(controlConn, 'delayMessagesFrom', {
@@ -254,6 +274,7 @@ function MongoBridge(options) {
             bridges = [bridges];
         }
         bridges.forEach(throwErrorIfNotMongoBridgeInstance);
+        bridges.forEach(checkTestCommandsEnabled("discardMessagesFrom"));
 
         bridges.forEach(bridge => {
             var res = runBridgeCommand(controlConn, 'discardMessagesFrom', {

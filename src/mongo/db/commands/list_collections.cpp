@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,38 +27,85 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
 
+#include <cstdint>
+#include <iosfwd>
+#include <limits>
+#include <memory>
+#include <set>
+#include <string>
+#include <utility>
 #include <vector>
 
+#include <boost/cstdint.hpp>
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
 #include "mongo/base/checked_cast.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
 #include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/simple_bsonobj_comparator.h"
-#include "mongo/bson/util/bson_extract.h"
+#include "mongo/client/read_preference.h"
+#include "mongo/db/api_parameters.h"
 #include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/auth/resource_pattern.h"
+#include "mongo/db/basic_types_gen.h"
 #include "mongo/db/catalog/collection.h"
-#include "mongo/db/catalog/collection_catalog_entry.h"
-#include "mongo/db/catalog/database.h"
-#include "mongo/db/catalog/database_catalog_entry.h"
+#include "mongo/db/catalog/collection_catalog.h"
+#include "mongo/db/catalog/collection_catalog_helper.h"
+#include "mongo/db/catalog/collection_options.h"
+#include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog/index_catalog.h"
-#include "mongo/db/clientcursor.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/list_collections_filter.h"
+#include "mongo/db/commands/shuffle_list_command_results.h"
 #include "mongo/db/concurrency/d_concurrency.h"
-#include "mongo/db/cursor_manager.h"
+#include "mongo/db/concurrency/lock_manager_defs.h"
+#include "mongo/db/curop_failpoint_helpers.h"
 #include "mongo/db/db_raii.h"
+#include "mongo/db/exec/matcher/matcher.h"
+#include "mongo/db/exec/plan_stage.h"
 #include "mongo/db/exec/queued_data_stage.h"
 #include "mongo/db/exec/working_set.h"
 #include "mongo/db/index/index_descriptor.h"
-#include "mongo/db/query/cursor_request.h"
-#include "mongo/db/query/cursor_response.h"
+#include "mongo/db/list_collections_gen.h"
+#include "mongo/db/matcher/expression.h"
+#include "mongo/db/matcher/expression_leaf.h"
+#include "mongo/db/matcher/expression_parser.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/query/client_cursor/clientcursor.h"
+#include "mongo/db/query/client_cursor/cursor_id.h"
+#include "mongo/db/query/client_cursor/cursor_manager.h"
+#include "mongo/db/query/collation/collator_interface.h"
 #include "mongo/db/query/find_common.h"
+#include "mongo/db/query/plan_executor.h"
+#include "mongo/db/query/plan_executor_factory.h"
+#include "mongo/db/query/plan_yield_policy.h"
+#include "mongo/db/record_id.h"
+#include "mongo/db/repl/read_concern_args.h"
 #include "mongo/db/service_context.h"
-#include "mongo/db/storage/storage_engine.h"
-#include "mongo/db/storage/storage_options.h"
-#include "mongo/db/views/view_catalog.h"
-#include "mongo/stdx/memory.h"
+#include "mongo/db/storage/snapshot.h"
+#include "mongo/db/timeseries/timeseries_constants.h"
+#include "mongo/db/views/view.h"
+#include "mongo/idl/idl_parser.h"
+#include "mongo/logv2/log.h"
+#include "mongo/rpc/op_msg.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/decorable.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/intrusive_counter.h"
+#include "mongo/util/namespace_string_util.h"
+#include "mongo/util/serialization_context.h"
+#include "mongo/util/uuid.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
+
 
 namespace mongo {
 
@@ -67,9 +113,11 @@ using std::string;
 using std::stringstream;
 using std::unique_ptr;
 using std::vector;
-using stdx::make_unique;
 
 namespace {
+
+// Failpoint which causes to hang "listCollections" cmd after acquiring the DB lock.
+MONGO_FAIL_POINT_DEFINE(hangBeforeListCollections);
 
 /**
  * Determines if 'matcher' is an exact match on the "name" field. If so, returns a vector of all the
@@ -87,7 +135,7 @@ boost::optional<vector<StringData>> _getExactNameMatches(const MatchExpression* 
     if (matchType == MatchExpression::EQ) {
         auto eqMatch = checked_cast<const EqualityMatchExpression*>(matcher);
         if (eqMatch->path() == "name") {
-            StringData name(eqMatch->getData().valuestrsafe());
+            StringData name(eqMatch->getData().valueStringDataSafe());
             if (name.size()) {
                 return {vector<StringData>{name}};
             } else {
@@ -99,7 +147,7 @@ boost::optional<vector<StringData>> _getExactNameMatches(const MatchExpression* 
         if (matchIn->path() == "name" && matchIn->getRegexes().empty()) {
             vector<StringData> exactMatches;
             for (auto&& elem : matchIn->getEqualities()) {
-                StringData name(elem.valuestrsafe());
+                StringData name(elem.valueStringDataSafe());
                 if (name.size()) {
                     exactMatches.push_back(elem.valueStringData());
                 }
@@ -112,7 +160,7 @@ boost::optional<vector<StringData>> _getExactNameMatches(const MatchExpression* 
 
 /**
  * Uses 'matcher' to determine if the collection's information should be added to 'root'. If so,
- * allocates a WorkingSetMember containing information about 'collection', and adds it to 'root'.
+ * allocates a WorkingSetMember containing information about 'collection', and adds it to 'results'.
  *
  * Does not add any information about non-existent collections.
  */
@@ -120,8 +168,8 @@ void _addWorkingSetMember(OperationContext* opCtx,
                           const BSONObj& maybe,
                           const MatchExpression* matcher,
                           WorkingSet* ws,
-                          QueuedDataStage* root) {
-    if (matcher && !matcher->matchesBSON(maybe)) {
+                          std::vector<WorkingSetID>& results) {
+    if (matcher && !exec::matcher::matchesBSON(matcher, maybe)) {
         return;
     }
 
@@ -129,12 +177,14 @@ void _addWorkingSetMember(OperationContext* opCtx,
     WorkingSetMember* member = ws->get(id);
     member->keyData.clear();
     member->recordId = RecordId();
-    member->obj = Snapshotted<BSONObj>(SnapshotId(), maybe);
+    member->resetDocument(SnapshotId(), maybe);
     member->transitionToOwnedObj();
-    root->pushBack(id);
+    results.emplace_back(std::move(id));
 }
 
 BSONObj buildViewBson(const ViewDefinition& view, bool nameOnly) {
+    invariant(!view.timeseries());
+
     BSONObjBuilder b;
     b.append("name", view.name().coll());
     b.append("type", "view");
@@ -156,47 +206,83 @@ BSONObj buildViewBson(const ViewDefinition& view, bool nameOnly) {
     return b.obj();
 }
 
+BSONObj buildTimeseriesBson(OperationContext* opCtx, const Collection* collection, bool nameOnly) {
+    invariant(collection);
+
+    BSONObjBuilder builder;
+    builder.append("name", collection->ns().getTimeseriesViewNamespace().coll());
+    builder.append("type", "timeseries");
+
+    if (nameOnly) {
+        return builder.obj();
+    }
+
+    builder.append("options",
+                   collection->getCollectionOptions().toBSON(
+                       false /* includeUUID */, timeseries::kAllowedCollectionCreationOptions));
+    builder.append("info", BSON("readOnly" << opCtx->readOnly()));
+
+    return builder.obj();
+}
+
+BSONObj buildTimeseriesBson(OperationContext* opCtx, StringData collName, bool nameOnly) {
+    BSONObjBuilder builder;
+    builder.append("name", collName);
+    builder.append("type", "timeseries");
+
+    if (nameOnly) {
+        return builder.obj();
+    }
+
+    builder.append("options", BSONObj{});
+    builder.append("info", BSON("readOnly" << opCtx->readOnly()));
+
+    return builder.obj();
+}
+
 /**
  * Return an object describing the collection. Takes a collection lock if nameOnly is false.
  */
-BSONObj buildCollectionBson(OperationContext* opCtx,
-                            const Collection* collection,
-                            bool includePendingDrops,
-                            bool nameOnly) {
+BSONObj buildCollectionBson(OperationContext* opCtx, const Collection* collection, bool nameOnly) {
     if (!collection) {
         return {};
     }
-    auto nss = collection->ns();
-    auto collectionName = nss.coll();
-
-    // Drop-pending collections are replicated collections that have been marked for deletion.
-    // These collections are considered dropped and should not be returned in the results for this
-    // command, unless specified explicitly by the 'includePendingDrops' command argument.
-    if (nss.isDropPendingNamespace() && !includePendingDrops) {
-        return {};
-    }
+    const auto& nss = collection->ns();
 
     BSONObjBuilder b;
-    b.append("name", collectionName);
-    b.append("type", "collection");
+    b.append("name", nss.coll());
+
+    const auto collectionType = [&] {
+        if (collection->isTimeseriesCollection() && collection->isNewTimeseriesWithoutView()) {
+            return "timeseries";
+        } else {
+            return "collection";
+        }
+    }();
+
+    b.append("type", collectionType);
 
     if (nameOnly) {
         return b.obj();
     }
 
-    Lock::CollectionLock clk(opCtx->lockState(), nss.ns(), MODE_IS);
-    CollectionOptions options = collection->getCatalogEntry()->getCollectionOptions(opCtx);
+    const auto& options = collection->getCollectionOptions();
 
     // While the UUID is stored as a collection option, from the user's perspective it is an
-    // unsettable read-only property, so put it in the 'info' section.
-    auto uuid = options.uuid;
-    options.uuid.reset();
-    b.append("options", options.toBSON());
+    // unsettable read-only property, so put it in the 'info' section. Pass 'false' to toBSON so it
+    // doesn't include 'uuid' here.
+    b.append("options", options.toBSON(false));
 
     BSONObjBuilder infoBuilder;
-    infoBuilder.append("readOnly", storageGlobalParams.readOnly);
-    if (uuid)
-        infoBuilder.appendElements(uuid->toBSON());
+    infoBuilder.append("readOnly", opCtx->readOnly());
+    if (options.uuid) {
+        infoBuilder.appendElements(options.uuid->toBSON());
+    }
+    if (const auto configDebugDump =
+            catalog::getConfigDebugDump(VersionContext::getDecoration(opCtx), nss);
+        configDebugDump.has_value()) {
+        infoBuilder.append("configDebugDump", *configDebugDump);
+    }
     b.append("info", infoBuilder.obj());
 
     auto idIndex = collection->getIndexCatalog()->findIdIndex(opCtx);
@@ -207,181 +293,331 @@ BSONObj buildCollectionBson(OperationContext* opCtx,
     return b.obj();
 }
 
-class CmdListCollections : public BasicCommand {
+ListCollectionsReply createListCollectionsCursorReply(
+    CursorId cursorId,
+    const NamespaceString& cursorNss,
+    const SerializationContext& respSerializationContext,
+    std::vector<mongo::ListCollectionsReplyItem>&& firstBatch) {
+    return ListCollectionsReply(
+        ListCollectionsReplyCursor(
+            cursorId, cursorNss, std::move(firstBatch), respSerializationContext),
+        respSerializationContext);
+}
+
+class CmdListCollections : public ListCollectionsCmdVersion1Gen<CmdListCollections> {
 public:
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const final {
         return AllowedOnSecondary::kOptIn;
     }
+
+    bool allowedWithSecurityToken() const final {
+        return true;
+    }
+
+    bool maintenanceOk() const final {
+        return false;
+    }
+
     bool adminOnly() const final {
         return false;
     }
-    bool supportsWriteConcern(const BSONObj& cmd) const final {
-        return false;
+
+    bool collectsResourceConsumptionMetrics() const final {
+        return true;
     }
 
     std::string help() const final {
         return "list collections for this db";
     }
 
-    Status checkAuthForCommand(Client* client,
-                               const std::string& dbname,
-                               const BSONObj& cmdObj) const final {
-
-        AuthorizationSession* authzSession = AuthorizationSession::get(client);
-
-        if (authzSession->isAuthorizedToListCollections(dbname, cmdObj)) {
-            return Status::OK();
+    class Invocation final : public InvocationBaseGen {
+    public:
+        using InvocationBaseGen::InvocationBaseGen;
+        bool supportsWriteConcern() const final {
+            return false;
         }
 
-        return Status(ErrorCodes::Unauthorized,
-                      str::stream() << "Not authorized to list collections on db: " << dbname);
-    }
+        bool isSubjectToIngressAdmissionControl() const override {
+            return true;
+        }
 
-    CmdListCollections() : BasicCommand("listCollections") {}
+        void doCheckAuthorization(OperationContext* opCtx) const final {
+            AuthorizationSession* authzSession = AuthorizationSession::get(opCtx->getClient());
+            uassertStatusOK(authzSession->checkAuthorizedToListCollections(request()));
+        }
 
-    bool run(OperationContext* opCtx,
-             const string& dbname,
-             const BSONObj& jsobj,
-             BSONObjBuilder& result) final {
-        unique_ptr<MatchExpression> matcher;
-        const auto as = AuthorizationSession::get(opCtx->getClient());
+        NamespaceString ns() const final {
+            return NamespaceString(request().getDbName());
+        }
 
-        const bool nameOnly = jsobj["nameOnly"].trueValue();
-        const bool authorizedCollections = jsobj["authorizedCollections"].trueValue();
+        Reply typedRun(OperationContext* opCtx) final {
+            CommandHelpers::handleMarkKillOnClientDisconnect(opCtx);
+            unique_ptr<MatchExpression> matcher;
+            const auto as = AuthorizationSession::get(opCtx->getClient());
 
-        // Check for 'filter' argument.
-        BSONElement filterElt = jsobj["filter"];
-        if (!filterElt.eoo()) {
-            if (filterElt.type() != mongo::Object) {
-                uasserted(ErrorCodes::BadValue, "\"filter\" must be an object");
-            }
+            const auto listCollRequest = request();
+            const auto dbName = listCollRequest.getDbName();
+            const bool nameOnly = listCollRequest.getNameOnly();
+            const bool authorizedCollections = listCollRequest.getAuthorizedCollections();
+
+            // We need to copy the serialization context from the request to the reply object
+            const auto respSerializationContext =
+                SerializationContext::stateCommandReply(listCollRequest.getSerializationContext());
+
             // The collator is null because collection objects are compared using binary comparison.
-            const CollatorInterface* collator = nullptr;
-            boost::intrusive_ptr<ExpressionContext> expCtx(new ExpressionContext(opCtx, collator));
-            StatusWithMatchExpression statusWithMatcher =
-                MatchExpressionParser::parse(filterElt.Obj(), std::move(expCtx));
-            uassertStatusOK(statusWithMatcher.getStatus());
-            matcher = std::move(statusWithMatcher.getValue());
+            auto expCtx = ExpressionContextBuilder{}.opCtx(opCtx).ns(ns()).build();
+
+            if (listCollRequest.getFilter()) {
+                matcher = uassertStatusOK(
+                    MatchExpressionParser::parse(*listCollRequest.getFilter(), expCtx));
+            }
+
+            const NamespaceString cursorNss = NamespaceString::makeListCollectionsNSS(dbName);
+            std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> exec;
+            std::vector<mongo::ListCollectionsReplyItem> firstBatch;
+            {
+                // Acquire only the global lock and set up a consistent in-memory catalog and
+                // storage snapshot.
+                AutoGetDbForReadMaybeLockFree lockFreeReadBlock(opCtx, dbName);
+                auto catalog = CollectionCatalog::get(opCtx);
+
+                CurOpFailpointHelpers::waitWhileFailPointEnabled(
+                    &hangBeforeListCollections,
+                    opCtx,
+                    "hangBeforeListCollections",
+                    []() {},
+                    cursorNss);
+
+                auto ws = std::make_unique<WorkingSet>();
+                auto root = std::make_unique<QueuedDataStage>(expCtx.get(), ws.get());
+                std::vector<WorkingSetID> results;
+                tassert(9089302,
+                        "point in time catalog lookup for a collection list is not supported",
+                        RecoveryUnit::ReadSource::kNoTimestamp ==
+                            shard_role_details::getRecoveryUnit(opCtx)->getTimestampReadSource());
+
+                if (DatabaseHolder::get(opCtx)->dbExists(opCtx, dbName)) {
+                    if (auto collNames = _getExactNameMatches(matcher.get())) {
+                        for (auto&& collName : *collNames) {
+                            auto nss = NamespaceStringUtil::deserialize(dbName, collName);
+
+                            // Only validate on a per-collection basis if the user requested
+                            // a list of authorized collections
+                            if (authorizedCollections &&
+                                (!as->isAuthorizedForAnyActionOnResource(
+                                    ResourcePattern::forExactNamespace(nss)))) {
+                                continue;
+                            }
+
+                            auto collBson = [&] {
+                                auto collection =
+                                    catalog->establishConsistentCollection(opCtx, nss, boost::none);
+                                if (collection) {
+                                    return buildCollectionBson(opCtx, collection.get(), nameOnly);
+                                }
+
+                                std::shared_ptr<const ViewDefinition> view =
+                                    catalog->lookupView(opCtx, nss);
+                                // TODO SERVER-101594: remove this once 9.0 becomes last LTS
+                                // legacy timeseries view won't exist anymore.
+                                if (view && view->timeseries()) {
+                                    if (auto bucketsCollection =
+                                            catalog->establishConsistentCollection(
+                                                opCtx, view->viewOn(), boost::none)) {
+                                        return buildTimeseriesBson(
+                                            opCtx, bucketsCollection.get(), nameOnly);
+                                    } else {
+                                        // The buckets collection does not exist, so the time-series
+                                        // view will be appended when we iterate through the view
+                                        // catalog below.
+                                    }
+                                }
+
+                                return BSONObj{};
+                            }();
+
+                            if (!collBson.isEmpty()) {
+                                _addWorkingSetMember(
+                                    opCtx, collBson, matcher.get(), ws.get(), results);
+                            }
+                        }
+                    } else {
+                        auto perCollectionWork = [&](const Collection* collection) {
+                            // TODO SERVER-101594: remove this once 9.0 becomes last LTS
+                            // buckets collection ('system.buckets') won't exists anymore.
+                            if (collection->isTimeseriesCollection() &&
+                                !collection->isNewTimeseriesWithoutView()) {
+                                auto viewNss = collection->ns().getTimeseriesViewNamespace();
+                                auto view =
+                                    catalog->lookupViewWithoutValidatingDurable(opCtx, viewNss);
+                                if (view && view->timeseries() &&
+                                    (!authorizedCollections ||
+                                     as->isAuthorizedForAnyActionOnResource(
+                                         ResourcePattern::forExactNamespace(viewNss)))) {
+                                    // The time-series view for this buckets namespace exists, so
+                                    // add it here while we have the collection options.
+                                    _addWorkingSetMember(
+                                        opCtx,
+                                        buildTimeseriesBson(opCtx, collection, nameOnly),
+                                        matcher.get(),
+                                        ws.get(),
+                                        results);
+                                }
+                            }
+
+                            if (authorizedCollections &&
+                                (!as->isAuthorizedForAnyActionOnResource(
+                                    ResourcePattern::forExactNamespace(collection->ns())))) {
+                                return true;
+                            }
+
+                            BSONObj collBson = buildCollectionBson(opCtx, collection, nameOnly);
+                            if (!collBson.isEmpty()) {
+                                _addWorkingSetMember(
+                                    opCtx, collBson, matcher.get(), ws.get(), results);
+                            }
+
+                            return true;
+                        };
+
+                        auto collections = catalog->establishConsistentCollections(opCtx, dbName);
+                        for (const auto& collection : collections) {
+                            perCollectionWork(collection.get());
+                        }
+                    }
+
+                    // Skipping views is only necessary for internal cloning operations.
+                    bool skipViews = listCollRequest.getFilter() &&
+                        SimpleBSONObjComparator::kInstance.evaluate(
+                            *listCollRequest.getFilter() ==
+                            ListCollectionsFilter::makeTypeCollectionFilter());
+
+                    if (!skipViews) {
+                        catalog->iterateViews(opCtx, dbName, [&](const ViewDefinition& view) {
+                            if (authorizedCollections &&
+                                !as->isAuthorizedForAnyActionOnResource(
+                                    ResourcePattern::forExactNamespace(view.name()))) {
+                                return true;
+                            }
+
+                            // TODO SERVER-101594: remove once 9.0 becomes last LTS
+                            // legacy timeseries view won't exist anymore.
+                            if (view.timeseries()) {
+                                if (!catalog->lookupCollectionByNamespace(opCtx, view.viewOn())) {
+                                    // There is no buckets collection backing this time-series view,
+                                    // which means that it was not already added along with the
+                                    // buckets collection above.
+                                    _addWorkingSetMember(
+                                        opCtx,
+                                        buildTimeseriesBson(opCtx, view.name().coll(), nameOnly),
+                                        matcher.get(),
+                                        ws.get(),
+                                        results);
+                                }
+                                return true;
+                            }
+
+                            BSONObj viewBson = buildViewBson(view, nameOnly);
+                            if (!viewBson.isEmpty()) {
+                                _addWorkingSetMember(
+                                    opCtx, viewBson, matcher.get(), ws.get(), results);
+                            }
+                            return true;
+                        });
+                    }
+                }
+
+                shuffleListCommandResults.execute([&](const auto&) {
+                    std::random_device rd;
+                    std::mt19937 g(rd());
+                    std::shuffle(results.begin(), results.end(), g);
+                });
+
+                for (const auto& id : results) {
+                    root->pushBack(id);
+                }
+
+                exec = uassertStatusOK(
+                    plan_executor_factory::make(expCtx,
+                                                std::move(ws),
+                                                std::move(root),
+                                                &CollectionPtr::null,
+                                                PlanYieldPolicy::YieldPolicy::INTERRUPT_ONLY,
+                                                false, /* whether owned BSON must be returned */
+                                                cursorNss));
+
+                long long batchSize = std::numeric_limits<long long>::max();
+                if (listCollRequest.getCursor() && listCollRequest.getCursor()->getBatchSize()) {
+                    batchSize = *listCollRequest.getCursor()->getBatchSize();
+                }
+
+                FindCommon::BSONArrayResponseSizeTracker responseSizeTracker;
+                for (long long objCount = 0; objCount < batchSize; objCount++) {
+                    BSONObj nextDoc;
+                    PlanExecutor::ExecState state = exec->getNext(&nextDoc, nullptr);
+                    if (state == PlanExecutor::IS_EOF) {
+                        break;
+                    }
+                    invariant(state == PlanExecutor::ADVANCED);
+
+                    // If we can't fit this result inside the current batch, then we stash it for
+                    // later.
+                    if (!responseSizeTracker.haveSpaceForNext(nextDoc)) {
+                        exec->stashResult(nextDoc);
+                        break;
+                    }
+
+                    try {
+                        firstBatch.push_back(ListCollectionsReplyItem::parse(
+                            IDLParserContext("ListCollectionsReplyItem",
+                                             auth::ValidatedTenancyScope::get(opCtx),
+                                             cursorNss.tenantId(),
+                                             respSerializationContext),
+                            nextDoc));
+                    } catch (const DBException& exc) {
+                        LOGV2_ERROR(
+                            5254300,
+                            "Could not parse catalog entry while replying to listCollections",
+                            "entry"_attr = nextDoc,
+                            "error"_attr = exc);
+                        fassertFailed(5254301);
+                    }
+                    responseSizeTracker.add(nextDoc);
+                }
+                if (exec->isEOF()) {
+                    return createListCollectionsCursorReply(0 /* cursorId */,
+                                                            cursorNss,
+                                                            respSerializationContext,
+                                                            std::move(firstBatch));
+                }
+                exec->saveState();
+                exec->detachFromOperationContext();
+            }  // Drop db lock. Global cursor registration must be done without holding any locks.
+
+            auto cmdObj = listCollRequest.toBSON();
+            auto pinnedCursor = CursorManager::get(opCtx)->registerCursor(
+                opCtx,
+                {std::move(exec),
+                 cursorNss,
+                 AuthorizationSession::get(opCtx->getClient())->getAuthenticatedUserName(),
+                 APIParameters::get(opCtx),
+                 opCtx->getWriteConcern(),
+                 repl::ReadConcernArgs::get(opCtx),
+                 ReadPreferenceSetting::get(opCtx),
+                 cmdObj,
+                 uassertStatusOK(AuthorizationSession::get(opCtx->getClient())
+                                     ->checkAuthorizedToListCollections(listCollRequest))});
+            pinnedCursor->incNBatches();
+            pinnedCursor->incNReturnedSoFar(firstBatch.size());
+
+            return createListCollectionsCursorReply(pinnedCursor.getCursor()->cursorid(),
+                                                    cursorNss,
+                                                    respSerializationContext,
+                                                    std::move(firstBatch));
         }
-
-        const long long defaultBatchSize = std::numeric_limits<long long>::max();
-        long long batchSize;
-        Status parseCursorStatus =
-            CursorRequest::parseCommandCursorOptions(jsobj, defaultBatchSize, &batchSize);
-        uassertStatusOK(parseCursorStatus);
-
-        // Check for 'includePendingDrops' flag. The default is to not include drop-pending
-        // collections.
-        bool includePendingDrops;
-        Status status = bsonExtractBooleanFieldWithDefault(
-            jsobj, "includePendingDrops", false, &includePendingDrops);
-        uassertStatusOK(status);
-
-        const NamespaceString cursorNss = NamespaceString::makeListCollectionsNSS(dbname);
-        std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> exec;
-        BSONArrayBuilder firstBatch;
-        {
-            AutoGetDb autoDb(opCtx, dbname, MODE_IS);
-            Database* db = autoDb.getDb();
-
-            auto ws = make_unique<WorkingSet>();
-            auto root = make_unique<QueuedDataStage>(opCtx, ws.get());
-
-            if (db) {
-                if (auto collNames = _getExactNameMatches(matcher.get())) {
-                    for (auto&& collName : *collNames) {
-                        auto nss = NamespaceString(db->name(), collName);
-
-                        // Only validate on a per-collection basis if the user requested
-                        // a list of authorized collections
-                        if (authorizedCollections &&
-                            (nss.coll().startsWith("system.") ||
-                             !as->isAuthorizedForAnyActionOnResource(
-                                 ResourcePattern::forExactNamespace(nss)))) {
-                            continue;
-                        }
-
-                        Collection* collection = db->getCollection(opCtx, nss);
-                        BSONObj collBson =
-                            buildCollectionBson(opCtx, collection, includePendingDrops, nameOnly);
-                        if (!collBson.isEmpty()) {
-                            _addWorkingSetMember(
-                                opCtx, collBson, matcher.get(), ws.get(), root.get());
-                        }
-                    }
-                } else {
-                    for (auto&& collection : *db) {
-                        if (authorizedCollections &&
-                            (collection->ns().coll().startsWith("system.") ||
-                             !as->isAuthorizedForAnyActionOnResource(
-                                 ResourcePattern::forExactNamespace(collection->ns())))) {
-                            continue;
-                        }
-                        BSONObj collBson =
-                            buildCollectionBson(opCtx, collection, includePendingDrops, nameOnly);
-                        if (!collBson.isEmpty()) {
-                            _addWorkingSetMember(
-                                opCtx, collBson, matcher.get(), ws.get(), root.get());
-                        }
-                    }
-                }
-
-                // Skipping views is only necessary for internal cloning operations.
-                bool skipViews = filterElt.type() == mongo::Object &&
-                    SimpleBSONObjComparator::kInstance.evaluate(
-                        filterElt.Obj() == ListCollectionsFilter::makeTypeCollectionFilter());
-                if (!skipViews) {
-                    db->getViewCatalog()->iterate(opCtx, [&](const ViewDefinition& view) {
-                        BSONObj viewBson = buildViewBson(view, nameOnly);
-                        if (!viewBson.isEmpty()) {
-                            _addWorkingSetMember(
-                                opCtx, viewBson, matcher.get(), ws.get(), root.get());
-                        }
-                    });
-                }
-            }
-
-            exec = uassertStatusOK(PlanExecutor::make(
-                opCtx, std::move(ws), std::move(root), cursorNss, PlanExecutor::NO_YIELD));
-
-            for (long long objCount = 0; objCount < batchSize; objCount++) {
-                BSONObj next;
-                PlanExecutor::ExecState state = exec->getNext(&next, NULL);
-                if (state == PlanExecutor::IS_EOF) {
-                    break;
-                }
-                invariant(state == PlanExecutor::ADVANCED);
-
-                // If we can't fit this result inside the current batch, then we stash it for later.
-                if (!FindCommon::haveSpaceForNext(next, objCount, firstBatch.len())) {
-                    exec->enqueue(next);
-                    break;
-                }
-
-                firstBatch.append(next);
-            }
-            if (exec->isEOF()) {
-                appendCursorResponseObject(0LL, cursorNss.ns(), firstBatch.arr(), &result);
-                return true;
-            }
-            exec->saveState();
-            exec->detachFromOperationContext();
-        }  // Drop db lock. Global cursor registration must be done without holding any locks.
-
-        auto pinnedCursor = CursorManager::getGlobalCursorManager()->registerCursor(
-            opCtx,
-            {std::move(exec),
-             cursorNss,
-             AuthorizationSession::get(opCtx->getClient())->getAuthenticatedUserNames(),
-             repl::ReadConcernArgs::get(opCtx),
-             jsobj});
-
-        appendCursorResponseObject(
-            pinnedCursor.getCursor()->cursorid(), cursorNss.ns(), firstBatch.arr(), &result);
-
-        return true;
-    }
-} cmdListCollections;
+    };
+};
+MONGO_REGISTER_COMMAND(CmdListCollections).forShard();
 
 }  // namespace
 }  // namespace mongo

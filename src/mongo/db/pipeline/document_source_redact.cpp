@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,18 +27,30 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <boost/move/utility_core.hpp>
+#include <cstddef>
+#include <iterator>
+#include <list>
+#include <memory>
+#include <utility>
+#include <vector>
 
-#include "mongo/db/pipeline/document_source_redact.h"
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+#include <boost/utility/in_place_factory.hpp>
 
-#include <boost/optional.hpp>
-
-#include "mongo/db/jsobj.h"
-#include "mongo/db/pipeline/document.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/exec/document_value/value_comparator.h"
 #include "mongo/db/pipeline/document_source_match.h"
+#include "mongo/db/pipeline/document_source_redact.h"
 #include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/lite_parsed_document_source.h"
-#include "mongo/db/pipeline/value.h"
+#include "mongo/db/query/allowed_contexts.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -47,39 +58,43 @@ using boost::intrusive_ptr;
 using std::vector;
 
 DocumentSourceRedact::DocumentSourceRedact(const intrusive_ptr<ExpressionContext>& expCtx,
-                                           const intrusive_ptr<Expression>& expression)
-    : DocumentSource(expCtx), _expression(expression) {}
+                                           const intrusive_ptr<Expression>& expression,
+                                           Variables::Id currentId)
+    : DocumentSource(kStageName, expCtx),
+      _redactProcessor(boost::in_place(expCtx, expression, currentId)) {}
 
 REGISTER_DOCUMENT_SOURCE(redact,
                          LiteParsedDocumentSourceDefault::parse,
-                         DocumentSourceRedact::createFromBson);
+                         DocumentSourceRedact::createFromBson,
+                         AllowedWithApiStrict::kAlways);
+ALLOCATE_DOCUMENT_SOURCE_ID(redact, DocumentSourceRedact::id)
 
 const char* DocumentSourceRedact::getSourceName() const {
-    return "$redact";
+    return kStageName.data();
 }
 
 static const Value descendVal = Value("descend"_sd);
 static const Value pruneVal = Value("prune"_sd);
 static const Value keepVal = Value("keep"_sd);
 
-DocumentSource::GetNextResult DocumentSourceRedact::getNext() {
-    pExpCtx->checkForInterrupt();
-
+DocumentSource::GetNextResult DocumentSourceRedact::doGetNext() {
     auto nextInput = pSource->getNext();
     for (; nextInput.isAdvanced(); nextInput = pSource->getNext()) {
-        auto& variables = pExpCtx->variables;
-        variables.setValue(_currentId, Value(nextInput.getDocument()));
-        if (boost::optional<Document> result = redactObject(nextInput.releaseDocument())) {
+        if (boost::optional<Document> result =
+                _redactProcessor->process(nextInput.releaseDocument())) {
             return std::move(*result);
         }
     }
-
     return nextInput;
 }
 
 Pipeline::SourceContainer::iterator DocumentSourceRedact::doOptimizeAt(
     Pipeline::SourceContainer::iterator itr, Pipeline::SourceContainer* container) {
     invariant(*itr == this);
+
+    if (std::next(itr) == container->end()) {
+        return container->end();
+    }
 
     auto nextMatch = dynamic_cast<DocumentSourceMatch*>((*std::next(itr)).get());
 
@@ -100,76 +115,13 @@ Pipeline::SourceContainer::iterator DocumentSourceRedact::doOptimizeAt(
     return std::next(itr);
 }
 
-Value DocumentSourceRedact::redactValue(const Value& in, const Document& root) {
-    const BSONType valueType = in.getType();
-    if (valueType == Object) {
-        pExpCtx->variables.setValue(_currentId, in);
-        const boost::optional<Document> result = redactObject(root);
-        if (result) {
-            return Value(*result);
-        } else {
-            return Value();
-        }
-    } else if (valueType == Array) {
-        // TODO dont copy if possible
-        vector<Value> newArr;
-        const vector<Value>& arr = in.getArray();
-        for (size_t i = 0; i < arr.size(); i++) {
-            if (arr[i].getType() == Object || arr[i].getType() == Array) {
-                const Value toAdd = redactValue(arr[i], root);
-                if (!toAdd.missing()) {
-                    newArr.push_back(toAdd);
-                }
-            } else {
-                newArr.push_back(arr[i]);
-            }
-        }
-        return Value(std::move(newArr));
-    } else {
-        return in;
-    }
-}
-
-boost::optional<Document> DocumentSourceRedact::redactObject(const Document& root) {
-    auto& variables = pExpCtx->variables;
-    const Value expressionResult = _expression->evaluate(root);
-
-    ValueComparator simpleValueCmp;
-    if (simpleValueCmp.evaluate(expressionResult == keepVal)) {
-        return variables.getDocument(_currentId, root);
-    } else if (simpleValueCmp.evaluate(expressionResult == pruneVal)) {
-        return boost::optional<Document>();
-    } else if (simpleValueCmp.evaluate(expressionResult == descendVal)) {
-        const Document in = variables.getDocument(_currentId, root);
-        MutableDocument out;
-        out.copyMetaDataFrom(in);
-        FieldIterator fields(in);
-        while (fields.more()) {
-            const Document::FieldPair field(fields.next());
-
-            // This changes CURRENT so don't read from variables after this
-            const Value val = redactValue(field.second, root);
-            if (!val.missing()) {
-                out.addField(field.first, val);
-            }
-        }
-        return out.freeze();
-    } else {
-        uasserted(17053,
-                  str::stream() << "$redact's expression should not return anything "
-                                << "aside from the variables $$KEEP, $$DESCEND, and "
-                                << "$$PRUNE, but returned "
-                                << expressionResult.toString());
-    }
-}
-
 intrusive_ptr<DocumentSource> DocumentSourceRedact::optimize() {
-    _expression = _expression->optimize();
+    _redactProcessor->setExpression(_redactProcessor->getExpression()->optimize());
     return this;
 }
 
-Value DocumentSourceRedact::serialize(boost::optional<ExplainOptions::Verbosity> explain) const {
-    return Value(DOC(getSourceName() << _expression.get()->serialize(static_cast<bool>(explain))));
+Value DocumentSourceRedact::serialize(const SerializationOptions& opts) const {
+    return Value(DOC(getSourceName() << _redactProcessor->getExpression().get()->serialize(opts)));
 }
 
 intrusive_ptr<DocumentSource> DocumentSourceRedact::createFromBson(
@@ -179,18 +131,17 @@ intrusive_ptr<DocumentSource> DocumentSourceRedact::createFromBson(
     Variables::Id decendId = vps.defineVariable("DESCEND");
     Variables::Id pruneId = vps.defineVariable("PRUNE");
     Variables::Id keepId = vps.defineVariable("KEEP");
-    intrusive_ptr<Expression> expression = Expression::parseOperand(expCtx, elem, vps);
-    intrusive_ptr<DocumentSourceRedact> source = new DocumentSourceRedact(expCtx, expression);
+    intrusive_ptr<Expression> expression = Expression::parseOperand(expCtx.get(), elem, vps);
+    intrusive_ptr<DocumentSourceRedact> source =
+        new DocumentSourceRedact(expCtx, expression, currentId);
 
     // TODO figure out how much of this belongs in constructor and how much here.
     // Set up variables. Never need to reset DESCEND, PRUNE, or KEEP.
-    source->_currentId = currentId;
     auto& variables = expCtx->variables;
     variables.setValue(decendId, descendVal);
     variables.setValue(pruneId, pruneVal);
     variables.setValue(keepId, keepVal);
 
-
     return source;
 }
-}
+}  // namespace mongo

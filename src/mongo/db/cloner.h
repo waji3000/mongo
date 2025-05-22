@@ -1,6 +1,3 @@
-// cloner.h - copy a database (export/import basically)
-
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -32,121 +29,135 @@
 
 #pragma once
 
+/**
+ * copy a database (export/import basically)
+ */
+
+#include <list>
+#include <memory>
+#include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
-#include "mongo/base/disallow_copying.h"
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/client/connpool.h"
 #include "mongo/client/dbclient_base.h"
-#include "mongo/db/catalog/collection_options.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
 
 namespace mongo {
 
-struct CloneOptions;
 class DBClientBase;
 class NamespaceString;
 class OperationContext;
 
-
-class Cloner {
-    MONGO_DISALLOW_COPYING(Cloner);
-
+class ClonerImpl {
 public:
-    Cloner();
+    virtual ~ClonerImpl() = default;
+    virtual Status copyDb(OperationContext* opCtx,
+                          const DatabaseName& dbName,
+                          const std::string& masterHost,
+                          const std::vector<NamespaceString>& trackedColls,
+                          std::set<std::string>* clonedColls) = 0;
 
-    void setConnection(std::unique_ptr<DBClientBase> c) {
-        _conn = std::move(c);
-    }
+    virtual Status setupConn(OperationContext* opCtx, const std::string& masterHost) = 0;
 
+    virtual StatusWith<std::vector<BSONObj>> getListOfCollections(
+        OperationContext* opCtx, const DatabaseName& dbName, const std::string& masterHost) = 0;
+};
+
+class DefaultClonerImpl : public ClonerImpl {
+public:
     /**
      * Copies an entire database from the specified host.
-     * clonedColls: when not-null, the function will return with this populated with a list of
-     *              the collections that were cloned.
+     * clonedColls: the function will return with this populated with a list of the collections that
+     *              were cloned.
      * collectionsToClone: When opts.createCollections is false, this list reflects the collections
      *              that are cloned.  When opts.createCollections is true, this parameter is
      *              ignored and the collection list is fetched from the remote via _conn.
      */
     Status copyDb(OperationContext* opCtx,
-                  const std::string& toDBName,
+                  const DatabaseName& dbName,
                   const std::string& masterHost,
-                  const CloneOptions& opts,
-                  std::set<std::string>* clonedColls,
-                  std::vector<BSONObj> collectionsToClone = std::vector<BSONObj>());
+                  const std::vector<NamespaceString>& trackedColls,
+                  std::set<std::string>* clonedColls) override;
 
-    /**
-     * Copies a collection. The optionsParser indicates how to parse the collection options. If
-     * 'parseForCommand' is provided, then the UUID is ignored and a new UUID is generated. If
-     * 'parseForStorage' is provided, then the UUID will be preserved and parsed out of the
-     * options.
-     */
-    bool copyCollection(OperationContext* opCtx,
-                        const std::string& ns,
-                        const BSONObj& query,
-                        std::string& errmsg,
-                        bool copyIndexes,
-                        CollectionOptions::ParseKind optionsParser);
+    Status setupConn(OperationContext* opCtx, const std::string& masterHost) override;
+
+    StatusWith<std::vector<BSONObj>> getListOfCollections(OperationContext* opCtx,
+                                                          const DatabaseName& dbName,
+                                                          const std::string& masterHost) override;
+
+private:
+    std::unique_ptr<DBClientBase> _conn;
 
     // Filters a database's collection list and removes collections that should not be cloned.
-    // CloneOptions should be populated with a fromDB and a list of collections to ignore, which
-    // will be filtered out.
-    StatusWith<std::vector<BSONObj>> filterCollectionsForClone(
-        const CloneOptions& opts, const std::list<BSONObj>& initialCollections);
+    StatusWith<std::vector<BSONObj>> _filterCollectionsForClone(
+        const DatabaseName& fromDBName, const std::list<BSONObj>& initialCollections);
 
     struct CreateCollectionParams {
         std::string collectionName;
         BSONObj collectionInfo;
         BSONObj idIndexSpec;
-        bool shardedColl = false;
+        bool trackedColls = false;
     };
 
     // Executes 'createCollection' for each collection described in 'createCollectionParams', in
     // 'dbName'.
-    Status createCollectionsForDb(OperationContext* opCtx,
-                                  const std::vector<CreateCollectionParams>& createCollectionParams,
-                                  const std::string& dbName,
-                                  const CloneOptions& opts);
+    Status _createCollectionsForDb(
+        OperationContext* opCtx,
+        const std::vector<CreateCollectionParams>& createCollectionParams,
+        const DatabaseName& dbName);
 
     /*
      * Returns the _id index spec from 'indexSpecs', or an empty BSONObj if none is found.
      */
-    static BSONObj getIdIndexSpec(const std::list<BSONObj>& indexSpecs);
+    static BSONObj _getIdIndexSpec(const std::list<BSONObj>& indexSpecs);
 
-private:
-    void copy(OperationContext* opCtx,
-              const std::string& toDBName,
-              const NamespaceString& from_ns,
-              const BSONObj& from_opts,
-              const BSONObj& from_id_index,
-              const NamespaceString& to_ns,
-              const CloneOptions& opts,
-              Query q);
+    void _copy(OperationContext* opCtx,
+               const DatabaseName& toDBName,
+               const NamespaceString& nss,
+               const BSONObj& from_opts,
+               const BSONObj& from_id_index);
 
-    void copyIndexes(OperationContext* opCtx,
-                     const std::string& toDBName,
-                     const NamespaceString& from_ns,
-                     const BSONObj& from_opts,
-                     const std::list<BSONObj>& from_indexes,
-                     const NamespaceString& to_ns);
+    void _copyIndexes(OperationContext* opCtx,
+                      const NamespaceString& nss,
+                      const BSONObj& from_opts,
+                      const std::list<BSONObj>& from_indexes);
 
-    struct Fun;
-    std::unique_ptr<DBClientBase> _conn;
+    struct BatchHandler;
+
+    DBClientBase* getConn() {
+        return _conn.get();
+    }
 };
 
-/**
- *  slaveOk     - if true it is ok if the source of the data is !ismaster.
- *  useReplAuth - use the credentials we normally use as a replication slave for the cloning
- *  createCollections - When 'true', will fetch a list of collections from the remote and create
- *                them.  When 'false', assumes collections have already been created ahead of time.
- */
-struct CloneOptions {
-    std::string fromDB;
-    std::set<std::string> shardedColls;
+class Cloner {
 
-    bool slaveOk = false;
-    bool useReplAuth = false;
+public:
+    Cloner(std::unique_ptr<ClonerImpl> clonerImpl) : _clonerImpl(std::move(clonerImpl)) {}
 
-    bool syncData = true;
-    bool syncIndexes = true;
-    bool createCollections = true;
+    Cloner();
+
+    Cloner(const Cloner&) = delete;
+
+    Cloner& operator=(const Cloner&) = delete;
+
+    Status copyDb(OperationContext* opCtx,
+                  const DatabaseName& dbName,
+                  const std::string& masterHost,
+                  const std::vector<NamespaceString>& trackedColls,
+                  std::set<std::string>* clonedColls);
+
+    StatusWith<std::vector<BSONObj>> getListOfCollections(OperationContext* opCtx,
+                                                          const DatabaseName& dbName,
+                                                          const std::string& masterHost);
+
+private:
+    std::unique_ptr<ClonerImpl> _clonerImpl;
 };
 
 }  // namespace mongo

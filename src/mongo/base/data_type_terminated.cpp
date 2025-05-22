@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,8 +29,9 @@
 
 #include "mongo/base/data_type_terminated.h"
 
-#include "mongo/util/mongoutils/str.h"
-#include "mongo/util/stringutils.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/base/string_data.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -39,8 +39,8 @@ Status TerminatedHelper::makeLoadNoTerminalStatus(char c,
                                                   size_t length,
                                                   std::ptrdiff_t debug_offset) {
     str::stream ss;
-    ss << "couldn't locate terminal char (" << escape(StringData(&c, 1)) << ") in buffer[" << length
-       << "] at offset: " << debug_offset;
+    ss << "couldn't locate terminal char (" << str::escape(StringData(&c, 1)) << ") in buffer["
+       << length << "] at offset: " << debug_offset;
     return Status(ErrorCodes::Overflow, ss);
 }
 
@@ -50,15 +50,15 @@ Status TerminatedHelper::makeLoadShortReadStatus(char c,
                                                  std::ptrdiff_t debug_offset) {
     str::stream ss;
     ss << "only read (" << read << ") bytes. (" << length << ") bytes to terminal char ("
-       << escape(StringData(&c, 1)) << ") at offset: " << debug_offset;
+       << str::escape(StringData(&c, 1)) << ") at offset: " << debug_offset;
 
     return Status(ErrorCodes::Overflow, ss);
 }
 
 Status TerminatedHelper::makeStoreStatus(char c, size_t length, std::ptrdiff_t debug_offset) {
     str::stream ss;
-    ss << "couldn't write terminal char (" << escape(StringData(&c, 1)) << ") in buffer[" << length
-       << "] at offset: " << debug_offset;
+    ss << "couldn't write terminal char (" << str::escape(StringData(&c, 1)) << ") in buffer["
+       << length << "] at offset: " << debug_offset;
     return Status(ErrorCodes::Overflow, ss);
 }
 

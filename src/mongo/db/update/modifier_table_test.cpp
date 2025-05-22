@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -38,7 +37,6 @@ namespace {
 
 using namespace mongo::modifiertable;
 
-using std::unique_ptr;
 
 TEST(getType, Normal) {
     ASSERT_EQUALS(getType("$set"), MOD_SET);

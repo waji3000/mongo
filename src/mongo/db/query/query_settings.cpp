@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,8 +29,18 @@
 
 #include "mongo/db/query/query_settings.h"
 
+#include <boost/move/utility_core.hpp>
+#include <tuple>
+#include <utility>
+
+#include <absl/container/node_hash_map.h>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/bson/simple_bsonobj_comparator.h"
+#include "mongo/db/basic_types_gen.h"
 #include "mongo/db/query/canonical_query.h"
-#include "mongo/db/query/plan_cache.h"
+#include "mongo/db/query/collation/collator_interface.h"
+#include "mongo/db/query/find_command.h"
 
 namespace mongo {
 
@@ -78,7 +87,15 @@ AllowedIndexEntry::AllowedIndexEntry(const BSONObj& query,
 //
 
 boost::optional<AllowedIndicesFilter> QuerySettings::getAllowedIndicesFilter(
-    const CanonicalQuery::QueryShapeString& key) const {
+    const CanonicalQuery& canonicalQuery) const {
+    // Fast-check if there is at least one allowed index in query settings.
+    if (!_someAllowedIndexEntriesPresent.loadRelaxed()) {
+        return {};
+    }
+
+    // Compute the key before entering the critical section.
+    const CanonicalQuery::PlanCacheCommandKey key = canonicalQuery.encodeKeyForPlanCacheCommand();
+
     stdx::lock_guard<stdx::mutex> cacheLock(_mutex);
     AllowedIndexEntryMap::const_iterator cacheIter = _allowedIndexEntryMap.find(key);
 
@@ -102,11 +119,11 @@ std::vector<AllowedIndexEntry> QuerySettings::getAllAllowedIndices() const {
 void QuerySettings::setAllowedIndices(const CanonicalQuery& canonicalQuery,
                                       const BSONObjSet& indexKeyPatterns,
                                       const stdx::unordered_set<std::string>& indexNames) {
-    const QueryRequest& qr = canonicalQuery.getQueryRequest();
-    const BSONObj& query = qr.getFilter();
-    const BSONObj& sort = qr.getSort();
-    const BSONObj& projection = qr.getProj();
-    const auto key = canonicalQuery.encodeKey();
+    const FindCommandRequest& findCommand = canonicalQuery.getFindCommandRequest();
+    const BSONObj& query = findCommand.getFilter();
+    const BSONObj& sort = findCommand.getSort();
+    const BSONObj& projection = findCommand.getProjection();
+    const auto key = canonicalQuery.encodeKeyForPlanCacheCommand();
     const BSONObj collation =
         canonicalQuery.getCollator() ? canonicalQuery.getCollator()->getSpec().toBSON() : BSONObj();
 
@@ -116,9 +133,10 @@ void QuerySettings::setAllowedIndices(const CanonicalQuery& canonicalQuery,
         std::piecewise_construct,
         std::forward_as_tuple(key),
         std::forward_as_tuple(query, sort, projection, collation, indexKeyPatterns, indexNames));
+    _updateSomeAllowedIndexEntriesPresent();
 }
 
-void QuerySettings::removeAllowedIndices(const CanonicalQuery::QueryShapeString& key) {
+void QuerySettings::removeAllowedIndices(const CanonicalQuery::PlanCacheCommandKey& key) {
     stdx::lock_guard<stdx::mutex> cacheLock(_mutex);
     AllowedIndexEntryMap::iterator i = _allowedIndexEntryMap.find(key);
 
@@ -128,11 +146,17 @@ void QuerySettings::removeAllowedIndices(const CanonicalQuery::QueryShapeString&
     }
 
     _allowedIndexEntryMap.erase(i);
+    _updateSomeAllowedIndexEntriesPresent();
 }
 
 void QuerySettings::clearAllowedIndices() {
     stdx::lock_guard<stdx::mutex> cacheLock(_mutex);
     _allowedIndexEntryMap.clear();
+    _updateSomeAllowedIndexEntriesPresent();
+}
+
+void QuerySettings::_updateSomeAllowedIndexEntriesPresent() {
+    _someAllowedIndexEntriesPresent.store(!_allowedIndexEntryMap.empty());
 }
 
 }  // namespace mongo

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,38 +27,48 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
 
-#include "mongo/platform/basic.h"
+#include <absl/container/node_hash_set.h>
+#include <absl/meta/type_traits.h>
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+// IWYU pragma: no_include "cxxabi.h"
+#include <exception>
+#include <list>
+#include <memory>
 
-#include "mongo/db/service_context.h"
-
-#include "mongo/base/init.h"
-#include "mongo/bson/bsonobj.h"
+#include "mongo/base/init.h"  // IWYU pragma: keep
+#include "mongo/base/initializer.h"
 #include "mongo/db/client.h"
-#include "mongo/db/concurrency/locker_noop.h"
-#include "mongo/db/op_observer.h"
+#include "mongo/db/default_baton.h"
+#include "mongo/db/op_observer/op_observer.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/server_options.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/storage/recovery_unit.h"
 #include "mongo/db/storage/recovery_unit_noop.h"
-#include "mongo/stdx/list.h"
-#include "mongo/stdx/memory.h"
+#include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/logv2/log.h"
 #include "mongo/transport/service_entry_point.h"
 #include "mongo/transport/session.h"
-#include "mongo/transport/transport_layer.h"
+#include "mongo/transport/transport_layer_manager.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/processinfo.h"
+#include "mongo/util/scopeguard.h"
 #include "mongo/util/system_clock_source.h"
 #include "mongo/util/system_tick_source.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
+
 
 namespace mongo {
 namespace {
 
-using ConstructorActionList = stdx::list<ServiceContext::ConstructorDestructorActions>;
-
 ServiceContext* globalServiceContext = nullptr;
 
 }  // namespace
+
+ClientLock::ClientLock(Client* client) : service_context_detail::ObjectLock<Client>(client) {}
 
 bool hasGlobalServiceContext() {
     return globalServiceContext;
@@ -68,6 +77,15 @@ bool hasGlobalServiceContext() {
 ServiceContext* getGlobalServiceContext() {
     fassert(17508, globalServiceContext);
     return globalServiceContext;
+}
+
+ServiceContext* getCurrentServiceContext() {
+    auto client = Client::getCurrent();
+    if (client) {
+        return client->getServiceContext();
+    }
+
+    return nullptr;
 }
 
 void setGlobalServiceContext(ServiceContext::UniqueServiceContext&& serviceContext) {
@@ -81,24 +99,78 @@ void setGlobalServiceContext(ServiceContext::UniqueServiceContext&& serviceConte
     globalServiceContext = serviceContext.release();
 }
 
-bool _supportsDocLocking = false;
-
-bool supportsDocLocking() {
-    return _supportsDocLocking;
+logv2::LogService toLogService(Service* service) {
+    return toLogService(service ? service->role() : ClusterRole::None);
 }
 
-ServiceContext::ServiceContext()
-    : _tickSource(stdx::make_unique<SystemTickSource>()),
-      _fastClockSource(stdx::make_unique<SystemClockSource>()),
-      _preciseClockSource(stdx::make_unique<SystemClockSource>()) {}
+/**
+ * The global clusterRole determines which services are initialized.
+ * If no role is set, then ShardServer is assumed, so there's always
+ * at least one Service created.
+ */
+struct ServiceContext::ServiceSet {
+public:
+    explicit ServiceSet(ServiceContext* sc) {
+        auto role = serverGlobalParams.clusterRole;
+        if (!role.has(ClusterRole::RouterServer))
+            role += ClusterRole::ShardServer;
+        if (role.has(ClusterRole::RouterServer))
+            _router = Service::make(sc, ClusterRole::RouterServer);
+        if (role.has(ClusterRole::ShardServer))
+            _shard = Service::make(sc, ClusterRole::ShardServer);
+    }
+
+    /** The `role` here must be ShardServer or RouterServer exactly. */
+    Service* getService(ClusterRole role) {
+        if (role.hasExclusively(ClusterRole::ShardServer))
+            return _shard.get();
+        if (role.hasExclusively(ClusterRole::RouterServer))
+            return _router.get();
+        MONGO_UNREACHABLE;
+    }
+
+private:
+    Service::UniqueService _shard;
+    Service::UniqueService _router;
+};
+
+Service::~Service() = default;
+Service::Service(ServiceContext* sc, ClusterRole role) : _sc{sc}, _role{role} {}
+
+ServiceContext::ServiceContext(std::unique_ptr<ClockSource> fastClockSource,
+                               std::unique_ptr<ClockSource> preciseClockSource,
+                               std::unique_ptr<TickSource> tickSource)
+    : _tickSource(std::move(tickSource)),
+      _fastClockSource(std::move(fastClockSource)),
+      _preciseClockSource(std::move(preciseClockSource)),
+      _serviceSet(std::make_unique<ServiceSet>(this)) {}
+
 
 ServiceContext::~ServiceContext() {
     stdx::lock_guard<stdx::mutex> lk(_mutex);
-    for (const auto& client : _clients) {
-        severe() << "Client " << client->desc() << " still exists while destroying ServiceContext@"
-                 << static_cast<void*>(this);
+    for (const auto& [client, _] : _clients) {
+        LOGV2_ERROR(23828,
+                    "Non-empty client list when destroying service context",
+                    "client"_attr = client->desc(),
+                    "serviceContext"_attr = reinterpret_cast<uint64_t>(this));
     }
     invariant(_clients.empty());
+}
+
+Service* ServiceContext::getService(ClusterRole role) const {
+    return _serviceSet->getService(role);
+}
+
+Service* ServiceContext::getService() const {
+    for (auto role : {ClusterRole::ShardServer, ClusterRole::RouterServer})
+        if (auto p = getService(role))
+            return p;
+    MONGO_UNREACHABLE;
+}
+
+void Service::setServiceEntryPoint(std::unique_ptr<ServiceEntryPoint> sep) {
+    auto old = _serviceEntryPoint.swap(std::move(sep));
+    invariant(!old);
 }
 
 namespace {
@@ -151,39 +223,35 @@ void onCreate(T* object, const ObserversContainer& observers) {
     onCreate(object, observers.cbegin(), observers.cend());
 }
 
-
 }  // namespace
 
-ServiceContext::UniqueClient ServiceContext::makeClient(std::string desc,
-                                                        transport::SessionHandle session) {
-    std::unique_ptr<Client> client(new Client(std::move(desc), this, std::move(session)));
+ServiceContext::UniqueClient ServiceContext::makeClientForService(
+    std::string desc,
+    std::shared_ptr<transport::Session> session,
+    ClientOperationKillableByStepdown killable,
+    Service* service) {
+    std::unique_ptr<Client> client(
+        new Client(std::move(desc), service, std::move(session), killable));
     onCreate(client.get(), _clientObservers);
+    auto entry = _clientsList.add(client.get());
     {
         stdx::lock_guard<stdx::mutex> lk(_mutex);
-        invariant(_clients.insert(client.get()).second);
+        invariant(_clients.insert({client.get(), entry}).second);
     }
     return UniqueClient(client.release());
 }
 
 void ServiceContext::setPeriodicRunner(std::unique_ptr<PeriodicRunner> runner) {
-    invariant(!_runner);
-    _runner = std::move(runner);
+    auto old = _runner.swap(std::move(runner));
+    invariant(!old);
 }
 
 PeriodicRunner* ServiceContext::getPeriodicRunner() const {
     return _runner.get();
 }
 
-transport::TransportLayer* ServiceContext::getTransportLayer() const {
-    return _transportLayer.get();
-}
-
-ServiceEntryPoint* ServiceContext::getServiceEntryPoint() const {
-    return _serviceEntryPoint.get();
-}
-
-transport::ServiceExecutor* ServiceContext::getServiceExecutor() const {
-    return _serviceExecutor.get();
+transport::TransportLayerManager* ServiceContext::getTransportLayerManager() const {
+    return _transportLayerManager.get();
 }
 
 void ServiceContext::setStorageEngine(std::unique_ptr<StorageEngine> engine) {
@@ -193,139 +261,212 @@ void ServiceContext::setStorageEngine(std::unique_ptr<StorageEngine> engine) {
 }
 
 void ServiceContext::setOpObserver(std::unique_ptr<OpObserver> opObserver) {
+    auto old = _opObserver.swap(std::move(opObserver));
+    invariant(!old);
+}
+
+void ServiceContext::resetOpObserver_forTest(std::unique_ptr<OpObserver> opObserver) {
     _opObserver = std::move(opObserver);
 }
 
-void ServiceContext::setTickSource(std::unique_ptr<TickSource> newSource) {
-    _tickSource = std::move(newSource);
-}
-
-void ServiceContext::setFastClockSource(std::unique_ptr<ClockSource> newSource) {
-    _fastClockSource = std::move(newSource);
-}
-
-void ServiceContext::setPreciseClockSource(std::unique_ptr<ClockSource> newSource) {
-    _preciseClockSource = std::move(newSource);
-}
-
-void ServiceContext::setServiceEntryPoint(std::unique_ptr<ServiceEntryPoint> sep) {
-    _serviceEntryPoint = std::move(sep);
-}
-
-void ServiceContext::setTransportLayer(std::unique_ptr<transport::TransportLayer> tl) {
-    _transportLayer = std::move(tl);
-}
-
-void ServiceContext::setServiceExecutor(std::unique_ptr<transport::ServiceExecutor> exec) {
-    _serviceExecutor = std::move(exec);
+void ServiceContext::setTransportLayerManager(
+    std::unique_ptr<transport::TransportLayerManager> tl) {
+    auto old = _transportLayerManager.swap(std::move(tl));
+    invariant(!old);
 }
 
 void ServiceContext::ClientDeleter::operator()(Client* client) const {
-    ServiceContext* const service = client->getServiceContext();
-    {
-        stdx::lock_guard<stdx::mutex> lk(service->_mutex);
-        invariant(service->_clients.erase(client));
-    }
-    onDestroy(client, service->_clientObservers);
+    ServiceContext* const svcCtx = client->getServiceContext();
+    OperationIdManager::get(svcCtx).eraseClientFromMap(client);
+    auto entry = [&] {
+        stdx::lock_guard lk(svcCtx->_mutex);
+        auto it = svcCtx->_clients.find(client);
+        invariant(it != svcCtx->_clients.end(), "Cannot find client in the list of clients!");
+        auto entry = it->second;
+        svcCtx->_clients.erase(it);
+        return entry;
+    }();
+    svcCtx->_clientsList.remove(entry);
+    onDestroy(client, svcCtx->_clientObservers);
     delete client;
 }
 
 ServiceContext::UniqueOperationContext ServiceContext::makeOperationContext(Client* client) {
-    auto opCtx = std::make_unique<OperationContext>(client, _nextOpId.fetchAndAdd(1));
+    auto opCtx = std::make_unique<OperationContext>(
+        client, OperationIdManager::get(this).issueForClient(client));
+
+    // If there's an egress transport layer and it can produce a
+    // nonnull `BatonHandle`, let it do so. Otherwise, we'll use a
+    // `DefaultBaton` as a fallback.
+    opCtx->setBaton([&]() -> BatonHandle {
+        if (_transportLayerManager)
+            if (auto baton =
+                    _transportLayerManager->getDefaultEgressLayer()->makeBaton(opCtx.get()))
+                return baton;
+        return std::make_shared<DefaultBaton>(opCtx.get());
+    }());
+
+    // We must prevent changing the storage engine while setting a new opCtx on the client.
+    auto lk = _storageChangeMutex.readLock();
+
     onCreate(opCtx.get(), _clientObservers);
-    if (!opCtx->lockState()) {
-        opCtx->setLockState(std::make_unique<LockerNoop>());
-    }
-    if (!opCtx->recoveryUnit()) {
-        opCtx->setRecoveryUnit(std::make_unique<RecoveryUnitNoop>(),
-                               WriteUnitOfWork::RecoveryUnitState::kNotInUnitOfWork);
-    }
+    ScopeGuard onCreateAndBatonGuard([&] {
+        onDestroy(opCtx.get(), _clientObservers);
+        opCtx->getBaton()->detach();
+    });
+
     {
-        stdx::lock_guard<Client> lk(*client);
-        client->setOperationContext(opCtx.get());
+        ClientLock lk(client);
+
+        if (!opCtx->recoveryUnit_DO_NOT_USE()) {
+            opCtx->setRecoveryUnit_DO_NOT_USE(std::make_unique<RecoveryUnitNoop>(),
+                                              WriteUnitOfWork::RecoveryUnitState::kNotInUnitOfWork,
+                                              lk);
+        }
+
+        // If we have a previous operation context, it's not worth crashing the process in
+        // production. However, we do want to prevent it from doing more work and complain
+        // loudly.
+        auto lastOpCtx = client->getOperationContext();
+        if (lastOpCtx) {
+            killOperation(lk, lastOpCtx, ErrorCodes::Error(4946800));
+            tasserted(4946801,
+                      "Client has attempted to create a new OperationContext, but it already "
+                      "has one");
+        }
+
+        client->_setOperationContext(opCtx.get());
     }
+
+    onCreateAndBatonGuard.dismiss();
+
     return UniqueOperationContext(opCtx.release());
 };
 
 void ServiceContext::OperationContextDeleter::operator()(OperationContext* opCtx) const {
     auto client = opCtx->getClient();
+    invariant(client);
+
     auto service = client->getServiceContext();
-    {
-        stdx::lock_guard<Client> lk(*client);
-        client->resetOperationContext();
-    }
+    invariant(service);
+
     onDestroy(opCtx, service->_clientObservers);
+    service->_delistOperation(opCtx);
+    opCtx->getBaton()->detach();
+
     delete opCtx;
+}
+
+ClientLock ServiceContext::getLockedClient(OperationId id) {
+    return OperationIdManager::get(this).findAndLockClient(id);
 }
 
 void ServiceContext::registerClientObserver(std::unique_ptr<ClientObserver> observer) {
     _clientObservers.emplace_back(std::move(observer));
 }
 
-ServiceContext::LockedClientsCursor::LockedClientsCursor(ServiceContext* service)
-    : _lock(service->_mutex), _curr(service->_clients.cbegin()), _end(service->_clients.cend()) {}
-
-Client* ServiceContext::LockedClientsCursor::next() {
-    if (_curr == _end)
-        return nullptr;
-    Client* result = *_curr;
-    ++_curr;
-    return result;
+/**
+ * TODO SERVER-85991 Once the _clients field in ServiceContext is moved to Service, change the
+ * implementation here to just iterate over the _clients list directly.
+ */
+ClientLock Service::LockedClientsCursor::next() {
+    while (auto client = _cursor.next()) {
+        ClientLock lk(client);
+        if (lk->getService() == _service) {
+            return lk;
+        }
+    }
+    return {};
 }
 
-void ServiceContext::setKillAllOperations() {
-    stdx::lock_guard<stdx::mutex> clientLock(_mutex);
+void ServiceContext::setKillAllOperations(const std::set<std::string>& excludedClients) {
+    ServiceContextLock svcCtxLock(this);
 
     // Ensure that all newly created operation contexts will immediately be in the interrupted state
     _globalKill.store(true);
+    auto opsKilled = 0;
 
     // Interrupt all active operations
-    for (auto&& client : _clients) {
-        stdx::lock_guard<Client> lk(*client);
+    for (auto& [client, _] : _clients) {
+        ClientLock lk(client);
+
+        // Do not kill operations from the excluded clients.
+        if (excludedClients.find(client->desc()) != excludedClients.end()) {
+            continue;
+        }
+
         auto opCtxToKill = client->getOperationContext();
         if (opCtxToKill) {
-            killOperation(opCtxToKill, ErrorCodes::InterruptedAtShutdown);
+            killOperation(lk, opCtxToKill, ErrorCodes::InterruptedAtShutdown);
+            opsKilled++;
         }
     }
 
-    // Notify any listeners who need to reach to the server shutting down
+    // Shared by mongos and mongod shutdown code paths
+    LOGV2(4695300, "Interrupted all currently running operations", "opsKilled"_attr = opsKilled);
+
+    // Notify any listeners who need to react to the server shutting down
     for (const auto listener : _killOpListeners) {
         try {
-            listener->interruptAll();
+            listener->interruptAll(svcCtxLock);
         } catch (...) {
             std::terminate();
         }
     }
 }
 
-void ServiceContext::killOperation(OperationContext* opCtx, ErrorCodes::Error killCode) {
+void ServiceContext::killOperation(ClientLock& clientLock,
+                                   OperationContext* opCtx,
+                                   ErrorCodes::Error killCode) {
     opCtx->markKilled(killCode);
 
     for (const auto listener : _killOpListeners) {
         try {
-            listener->interrupt(opCtx->getOpID());
+            listener->interrupt(clientLock, opCtx);
         } catch (...) {
             std::terminate();
         }
     }
 }
 
-void ServiceContext::killAllUserOperations(const OperationContext* opCtx,
-                                           ErrorCodes::Error killCode) {
-    for (LockedClientsCursor cursor(this); Client* client = cursor.next();) {
-        if (!client->isFromUserConnection()) {
-            // Don't kill system operations.
-            continue;
+void ServiceContext::_delistOperation(OperationContext* opCtx) {
+    auto client = opCtx->getClient();
+    {
+        stdx::lock_guard clientLock(*client);
+        if (!client->getOperationContext()) {
+            // We've already delisted this operation.
+            return;
         }
-
-        stdx::lock_guard<Client> lk(*client);
-        OperationContext* toKill = client->getOperationContext();
-
-        // Don't kill ourself.
-        if (toKill && toKill->getOpID() != opCtx->getOpID()) {
-            killOperation(toKill, killCode);
-        }
+        // Assigning a new opCtx to the client must never precede the destruction of any existing
+        // opCtx that references the client.
+        invariant(client->getOperationContext() == opCtx);
+        client->_setOperationContext({});
     }
+    opCtx->releaseOperationKey();
+}
+
+void ServiceContext::delistOperation(OperationContext* opCtx) {
+    auto client = opCtx->getClient();
+    invariant(client);
+
+    auto service = client->getServiceContext();
+    invariant(service == this);
+
+    _delistOperation(opCtx);
+}
+
+void ServiceContext::killAndDelistOperation(OperationContext* opCtx, ErrorCodes::Error killCode) {
+
+    auto client = opCtx->getClient();
+    invariant(client);
+
+    auto service = client->getServiceContext();
+    invariant(service == this);
+
+    _delistOperation(opCtx);
+
+    ClientLock clientLock(client);
+    killOperation(clientLock, opCtx, killCode);
 }
 
 void ServiceContext::unsetKillAllOperations() {
@@ -342,61 +483,86 @@ void ServiceContext::waitForStartupComplete() {
     _startupCompleteCondVar.wait(lk, [this] { return _startupComplete; });
 }
 
-void ServiceContext::notifyStartupComplete() {
+void ServiceContext::notifyStorageStartupRecoveryComplete() {
     stdx::unique_lock<stdx::mutex> lk(_mutex);
     _startupComplete = true;
     lk.unlock();
     _startupCompleteCondVar.notify_all();
 }
 
-namespace {
-
-/**
- * Accessor function to get the global list of ServiceContext constructor and destructor
- * functions.
- */
-ConstructorActionList& registeredConstructorActions() {
-    static ConstructorActionList cal;
-    return cal;
-}
-
-}  // namespace
-
-ServiceContext::ConstructorActionRegisterer::ConstructorActionRegisterer(
-    std::string name, ConstructorAction constructor, DestructorAction destructor)
-    : ConstructorActionRegisterer(
+template <typename T>
+ConstructorActionRegistererType<T>::ConstructorActionRegistererType(std::string name,
+                                                                    ConstructorAction constructor,
+                                                                    DestructorAction destructor)
+    : ConstructorActionRegistererType(
           std::move(name), {}, std::move(constructor), std::move(destructor)) {}
 
-ServiceContext::ConstructorActionRegisterer::ConstructorActionRegisterer(
+template <typename T>
+ConstructorActionRegistererType<T>::ConstructorActionRegistererType(
     std::string name,
     std::vector<std::string> prereqs,
     ConstructorAction constructor,
+    DestructorAction destructor)
+    : ConstructorActionRegistererType(
+          std::move(name), prereqs, {}, std::move(constructor), std::move(destructor)) {}
+
+template <typename T>
+ConstructorActionRegistererType<T>::ConstructorActionRegistererType(
+    std::string name,
+    std::vector<std::string> prereqs,
+    std::vector<std::string> dependents,
+    ConstructorAction constructor,
     DestructorAction destructor) {
     if (!destructor)
-        destructor = [](ServiceContext*) {};
-    _registerer.emplace(std::move(name),
-                        std::move(prereqs),
-                        [this, constructor, destructor](InitializerContext* context) {
-                            _iter = registeredConstructorActions().emplace(
-                                registeredConstructorActions().end(),
-                                std::move(constructor),
-                                std::move(destructor));
-                            return Status::OK();
-                        },
-                        [this](DeinitializerContext* context) {
-                            registeredConstructorActions().erase(_iter);
-                            return Status::OK();
-                        });
+        destructor = [](T*) {
+        };
+    _registerer.emplace(
+        std::move(name),
+        [this, constructor, destructor](InitializerContext*) {
+            _iter = ConstructorActionRegistererType::registeredConstructorActions().emplace(
+                ConstructorActionRegistererType::registeredConstructorActions().end(),
+                std::move(constructor),
+                std::move(destructor));
+        },
+        [this](DeinitializerContext*) {
+            ConstructorActionRegistererType::registeredConstructorActions().erase(_iter);
+        },
+        std::move(prereqs),
+        std::move(dependents));
 }
 
-ServiceContext::UniqueServiceContext ServiceContext::make() {
-    auto service = std::make_unique<ServiceContext>();
-    onCreate(service.get(), registeredConstructorActions());
+template class ConstructorActionRegistererType<ServiceContext>;
+template class ConstructorActionRegistererType<Service>;
+
+ServiceContext::UniqueServiceContext ServiceContext::make(
+    std::unique_ptr<ClockSource> fastClockSource,
+    std::unique_ptr<ClockSource> preciseClockSource,
+    std::unique_ptr<TickSource> tickSource) {
+    auto service = std::make_unique<ServiceContext>(
+        fastClockSource ? std::move(fastClockSource) : std::make_unique<SystemClockSource>(),
+        preciseClockSource ? std::move(preciseClockSource) : std::make_unique<SystemClockSource>(),
+        tickSource ? std::move(tickSource) : makeSystemTickSource());
+    onCreate(service.get(), ConstructorActionRegisterer::registeredConstructorActions());
     return UniqueServiceContext{service.release()};
 }
 
-void ServiceContext::ServiceContextDeleter::operator()(ServiceContext* service) const {
-    onDestroy(service, registeredConstructorActions());
+Service::UniqueService Service::make(ServiceContext* sc, ClusterRole role) {
+    auto service = std::unique_ptr<Service>(new Service(sc, role));
+    onCreate(service.get(), ConstructorActionRegisterer::registeredConstructorActions());
+    return UniqueService{service.release()};
+}
+
+void ServiceContext::ServiceContextDeleter::operator()(ServiceContext* sc) const {
+    // TODO SERVER-86083: Make the Service DestructorActions run before the ServiceContext
+    // DestructorActions, and then destruct Services after all DestructorActions have run.
+    onDestroy(sc, ConstructorActionRegisterer::registeredConstructorActions());
+    // Delete the Services and fire their destructor actions.
+    sc->_serviceSet.reset();
+    delete sc;
+}
+
+void Service::ServiceDeleter::operator()(Service* service) const {
+    onDestroy(service, ConstructorActionRegisterer::registeredConstructorActions());
     delete service;
 }
 

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,22 +29,37 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
 #include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+#include <cstddef>
+#include <cstdint>
+#include <functional>
+#include <limits>
+#include <map>
+#include <memory>
 #include <string>
+#include <vector>
 
-#include "mongo/base/shim.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/oid.h"
 #include "mongo/client/dbclient_base.h"
-#include "mongo/db/jsobj.h"
-#include "mongo/db/logical_session_id.h"
+#include "mongo/db/query/write_ops/write_ops.h"
+#include "mongo/db/query/write_ops/write_ops_parsers.h"
+#include "mongo/db/session/logical_session_id.h"
+#include "mongo/db/session/logical_session_id_gen.h"
+#include "mongo/db/tenant_id.h"
 #include "mongo/platform/atomic_word.h"
+#include "mongo/platform/random.h"
 #include "mongo/stdx/condition_variable.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/stdx/thread.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/pcre.h"
 #include "mongo/util/timer.h"
-
-namespace pcrecpp {
-class RE;
-}  // namespace pcrecpp;
 
 namespace mongo {
 
@@ -63,6 +77,14 @@ enum class OpType {
     LET,
     CPULOAD
 };
+
+inline bool isReadOp(OpType opType) {
+    return opType == OpType::FINDONE || opType == OpType::FIND;
+}
+
+inline bool isWriteOp(OpType opType) {
+    return opType == OpType::UPDATE || opType == OpType::INSERT || opType == OpType::REMOVE;
+}
 
 class BenchRunConfig;
 struct BenchRunStats;
@@ -111,19 +133,20 @@ struct BenchRunOp {
     int options = 0;
     BSONObj projection;
     BSONObj query;
-    bool safe = false;
     int skip = 0;
+    BSONObj sort;
     bool showError = false;
-    bool showResult = false;
     std::string target;
     bool throwGLE = false;
-    BSONObj update;
+    write_ops::UpdateModification update;
     bool upsert = false;
     bool useCheck = false;
     bool useReadCmd = false;
     bool useWriteCmd = false;
     BSONObj writeConcern;
     BSONObj value;
+    BSONObj expectedDoc;
+    boost::optional<TenantId> tenantId;
 
     // Only used for find cmds when set greater than 0. A find operation will retrieve the latest
     // cluster time from the oplog and randomly chooses a time between that timestamp and
@@ -139,6 +162,8 @@ struct BenchRunOp {
     // resources that a snapshot transaction would hold for a time.
     int maxRandomMillisecondDelayBeforeGetMore{0};
 
+    boost::optional<ReadPreferenceSetting> readPref;
+
     // This is an owned copy of the raw operation. All unowned members point into this.
     BSONObj myBsonOp;
 };
@@ -147,7 +172,8 @@ struct BenchRunOp {
  * Configuration object describing a bench run activity.
  */
 class BenchRunConfig {
-    MONGO_DISALLOW_COPYING(BenchRunConfig);
+    BenchRunConfig(const BenchRunConfig&) = delete;
+    BenchRunConfig& operator=(const BenchRunConfig&) = delete;
 
 public:
     /**
@@ -158,8 +184,7 @@ public:
      */
     static BenchRunConfig* createFromBson(const BSONObj& args);
 
-    static MONGO_DECLARE_SHIM((const BenchRunConfig&)->std::unique_ptr<DBClientBase>)
-        createConnectionImpl;
+    static std::unique_ptr<DBClientBase> createConnectionImpl(const BenchRunConfig&);
 
     BenchRunConfig();
 
@@ -226,14 +251,13 @@ public:
     /// Base random seed for threads
     int64_t randomSeed;
 
-    bool hideResults;
     bool handleErrors;
     bool hideErrors;
 
-    std::shared_ptr<pcrecpp::RE> trapPattern;
-    std::shared_ptr<pcrecpp::RE> noTrapPattern;
-    std::shared_ptr<pcrecpp::RE> watchPattern;
-    std::shared_ptr<pcrecpp::RE> noWatchPattern;
+    std::shared_ptr<pcre::Regex> trapPattern;
+    std::shared_ptr<pcre::Regex> noTrapPattern;
+    std::shared_ptr<pcre::Regex> watchPattern;
+    std::shared_ptr<pcre::Regex> noWatchPattern;
 
     /**
      * Operation description. A list of BenchRunOps, each describing a single
@@ -248,6 +272,7 @@ public:
 
     bool throwGLE;
     bool breakOnTrap;
+    bool benchRunOnce;  // is this a call of benchRunOnce() instead of benchRunSync(), etc.?
 
 private:
     static std::function<std::unique_ptr<DBClientBase>(const BenchRunConfig&)> _factory;
@@ -315,7 +340,8 @@ private:
  * In all cases, the counter objects must outlive the trace object.
  */
 class BenchRunEventTrace {
-    MONGO_DISALLOW_COPYING(BenchRunEventTrace);
+    BenchRunEventTrace(const BenchRunEventTrace&) = delete;
+    BenchRunEventTrace& operator=(const BenchRunEventTrace&) = delete;
 
 public:
     explicit BenchRunEventTrace(BenchRunEventCounter* eventCounter) {
@@ -382,7 +408,8 @@ struct BenchRunStats {
  * Logically, the states are "starting up", "running" and "finished."
  */
 class BenchRunState {
-    MONGO_DISALLOW_COPYING(BenchRunState);
+    BenchRunState(const BenchRunState&) = delete;
+    BenchRunState& operator=(const BenchRunState&) = delete;
 
 public:
     enum State { BRS_STARTING_UP, BRS_RUNNING, BRS_FINISHED };
@@ -428,9 +455,9 @@ public:
     bool shouldWorkerFinish() const;
 
     /**
-    * Predicate that workers call to see if they should start collecting stats (as a result
-    * of a call to tellWorkersToCollectStats()).
-    */
+     * Predicate that workers call to see if they should start collecting stats (as a result
+     * of a call to tellWorkersToCollectStats()).
+     */
     bool shouldWorkerCollectStats() const;
 
     /**
@@ -453,8 +480,8 @@ private:
     unsigned _numUnstartedWorkers;
     unsigned _numActiveWorkers;
 
-    AtomicUInt32 _isShuttingDown;
-    AtomicUInt32 _isCollectingStats;
+    AtomicWord<unsigned> _isShuttingDown;
+    AtomicWord<unsigned> _isCollectingStats;
 };
 
 /**
@@ -463,7 +490,8 @@ private:
  * Represents the behavior of one thread working in a bench run activity.
  */
 class BenchRunWorker {
-    MONGO_DISALLOW_COPYING(BenchRunWorker);
+    BenchRunWorker(const BenchRunWorker&) = delete;
+    BenchRunWorker& operator=(const BenchRunWorker&) = delete;
 
 public:
     /**
@@ -508,7 +536,7 @@ private:
 
     stdx::thread _thread;
 
-    const size_t _id;
+    const size_t _id;  // 0-based ID of this worker instance
 
     const BenchRunConfig* _config;
 
@@ -527,7 +555,8 @@ private:
  * Object representing a "bench run" activity.
  */
 class BenchRunner {
-    MONGO_DISALLOW_COPYING(BenchRunner);
+    BenchRunner(const BenchRunner&) = delete;
+    BenchRunner& operator=(const BenchRunner&) = delete;
 
 public:
     /**
@@ -591,6 +620,7 @@ public:
     static BSONObj benchFinish(const BSONObj& argsFake, void* data);
     static BSONObj benchStart(const BSONObj& argsFake, void* data);
     static BSONObj benchRunSync(const BSONObj& argsFake, void* data);
+    static BSONObj benchRunOnce(const BSONObj& argsFake, void* data);
 
 private:
     // TODO: Same as for createWithConfig.

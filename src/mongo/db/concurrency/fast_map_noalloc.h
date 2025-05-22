@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,9 +29,10 @@
 
 #pragma once
 
+#include <cstddef>
 #include <deque>
+#include <utility>
 
-#include "mongo/base/static_assert.h"
 #include "mongo/util/assert_util.h"
 
 namespace mongo {

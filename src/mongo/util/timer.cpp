@@ -1,6 +1,3 @@
-// @file mongo/util/timer.cpp
-
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,12 +27,12 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <cstdint>
 
-#include "mongo/util/timer.h"
-
+#include "mongo/util/assert_util.h"
 #include "mongo/util/system_tick_source.h"
 #include "mongo/util/tick_source.h"
+#include "mongo/util/timer.h"
 
 namespace mongo {
 
@@ -45,7 +42,7 @@ const int64_t kMicrosPerSecond = 1000 * 1000;
 
 }  // unnamed namespace
 
-Timer::Timer() : Timer(SystemTickSource::get()) {}
+Timer::Timer() : Timer(globalSystemTickSource()) {}
 
 Timer::Timer(TickSource* tickSource)
     : _tickSource(tickSource),
@@ -53,7 +50,7 @@ Timer::Timer(TickSource* tickSource)
     reset();
 }
 
-long long Timer::now() const {
+long long Timer::_now() const {
     return _tickSource->getTicks();
 }
 

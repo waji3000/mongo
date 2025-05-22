@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Public Domain 2014-2018 MongoDB, Inc.
+# Public Domain 2014-present MongoDB, Inc.
 # Public Domain 2008-2014 WiredTiger, Inc.
 #
 # This is free and unencumbered software released into the public domain.
@@ -27,7 +27,6 @@
 # OTHER DEALINGS IN THE SOFTWARE.
 
 import wiredtiger, wttest
-from time import sleep
 from wtdataset import SimpleDataSet
 
 # test_inmem02.py
@@ -44,7 +43,8 @@ class test_inmem02(wttest.WiredTigerTestCase):
         # Create a new table that is allowed to exceed the cache size, do this
         # before filling the cache so that the create succeeds
         self.session.create(
-            self.uri + '_over', 'ignore_in_memory_cache_size=true')
+            self.uri + '_over',
+            'key_format=S,value_format=S,ignore_in_memory_cache_size=true')
 
         # Populate a table with enough data to fill the cache.
         msg = '/WT_CACHE_FULL.*/'
@@ -57,6 +57,3 @@ class test_inmem02(wttest.WiredTigerTestCase):
         for i in range(1, 1000):
             cursor[str('%015d' % i)] = str(i) + ': abcdefghijklmnopqrstuvwxyz'
         cursor.close()
-
-if __name__ == '__main__':
-    wttest.run()

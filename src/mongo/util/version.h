@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -31,12 +30,12 @@
 #ifndef UTIL_VERSION_HEADER
 #define UTIL_VERSION_HEADER
 
+#include <iosfwd>
 #include <string>
-#include <tuple>
 #include <vector>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
 
 namespace mongo {
 
@@ -48,11 +47,21 @@ class BSONObjBuilder;
  * able to access version information.
  */
 class VersionInfoInterface {
-    MONGO_DISALLOW_COPYING(VersionInfoInterface);
-
 public:
-    using BuildInfoTuple = std::tuple<StringData, StringData, bool, bool>;
+    struct BuildInfoField {
+        StringData key;
+        StringData value;
+        bool inBuildInfo;  // included in buildInfo BSON
+        bool inVersion;    // included in --version output
+    };
 
+    enum class NotEnabledAction {
+        kAbortProcess,
+        kFallback,
+    };
+
+    VersionInfoInterface(const VersionInfoInterface&) = delete;
+    VersionInfoInterface& operator=(const VersionInfoInterface&) = delete;
     virtual ~VersionInfoInterface() = default;
 
     /**
@@ -60,11 +69,6 @@ public:
      * below. Ownership of the object is not transferred.
      */
     static void enable(const VersionInfoInterface* handler);
-
-    enum class NotEnabledAction {
-        kAbortProcess,
-        kFallback,
-    };
 
     /**
      * Obtain the currently configured instance of the VersionInfoInterface. By default, if this
@@ -78,32 +82,32 @@ public:
     /**
      * Returns the major version as configured via MONGO_VERSION.
      */
-    virtual int majorVersion() const noexcept = 0;
+    virtual int majorVersion() const = 0;
 
     /**
      * Returns the minor version as configured via MONGO_VERSION.
      */
-    virtual int minorVersion() const noexcept = 0;
+    virtual int minorVersion() const = 0;
 
     /**
      * Returns the patch version as configured via MONGO_VERSION.
      */
-    virtual int patchVersion() const noexcept = 0;
+    virtual int patchVersion() const = 0;
 
     /**
      * Returns the extra version as configured via MONGO_VERSION.
      */
-    virtual int extraVersion() const noexcept = 0;
+    virtual int extraVersion() const = 0;
 
     /**
      * Returns a string representation of MONGO_VERSION.
      */
-    virtual StringData version() const noexcept = 0;
+    virtual StringData version() const = 0;
 
     /**
      * Returns a string representation of MONGO_GIT_HASH.
      */
-    virtual StringData gitVersion() const noexcept = 0;
+    virtual StringData gitVersion() const = 0;
 
     /**
      * Returns a vector describing the enabled modules.
@@ -113,23 +117,23 @@ public:
     /**
      * Returns a string describing the configured memory allocator.
      */
-    virtual StringData allocator() const noexcept = 0;
+    virtual StringData allocator() const = 0;
 
     /**
      * Returns a string describing the configured javascript engine.
      */
-    virtual StringData jsEngine() const noexcept = 0;
+    virtual StringData jsEngine() const = 0;
 
     /**
      * Returns a string describing the minimum requred OS. Note that this method is currently only
      * valid to call when running on Windows.
      */
-    virtual StringData targetMinOS() const noexcept = 0;
+    virtual StringData targetMinOS() const = 0;
 
     /**
-     * Returns a vector of tuples describing build information (e.g. LINKFLAGS, compiler, etc.).
+     * Returns build information (e.g. LINKFLAGS, compiler, etc.).
      */
-    virtual std::vector<BuildInfoTuple> buildInfo() const = 0;
+    virtual std::vector<BuildInfoField> buildInfo() const = 0;
 
     /**
      * Returns the version of OpenSSL in use, if any, adorned with the provided prefix and suffix.
@@ -137,20 +141,9 @@ public:
     std::string openSSLVersion(StringData prefix = "", StringData suffix = "") const;
 
     /**
-     * Returns true if the running version has the same major and minor version as the provided
-     * string. Note that the minor version is checked, despite the name of this function.
-     */
-    bool isSameMajorVersion(const char* otherVersion) const noexcept;
-
-    /**
      * Uses the provided text to make a pretty representation of the version.
      */
     std::string makeVersionString(StringData binaryName) const;
-
-    /**
-     * Appends the information associated with 'buildInfo', above, to the given builder.
-     */
-    void appendBuildInfo(BSONObjBuilder* result) const;
 
     /**
      * Logs the result of 'targetMinOS', above.
@@ -158,13 +151,21 @@ public:
     void logTargetMinOS() const;
 
     /**
-     * Logs the result of 'buildInfo', above.
+     * Logs similar info to `appendBuildInfo`, suitable for the --version flag or for a
+     * startup log message (trimmed for user-friendliness). The `buildInfo` data appear
+     * in a subobject mapped to the "environment" key, but with the elements for which
+     * inVersion == false removed. Puts to `os` if nonnull, else to LOGV2.
      */
-    void logBuildInfo() const;
+    void logBuildInfo(std::ostream* os) const;
 
 protected:
     constexpr VersionInfoInterface() = default;
 };
+
+/**
+ * Returns a pretty string describing the provided binary's version.
+ */
+std::string formatVersionString(StringData versioned, const VersionInfoInterface& provider);
 
 /**
  * Returns a pretty string describing the current shell version.
@@ -175,6 +176,11 @@ std::string mongoShellVersion(const VersionInfoInterface& provider);
  * Returns a pretty string describing the current mongos version.
  */
 std::string mongosVersion(const VersionInfoInterface& provider);
+
+/**
+ * Returns a pretty string describing the current mongocrypt version.
+ */
+std::string mongocryptVersion(const VersionInfoInterface& provider);
 
 /**
  * Returns a pretty string describing the current mongod version.

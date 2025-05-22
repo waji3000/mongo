@@ -1,5 +1,5 @@
 // Returns non-localhost ipaddr of host running the mongo shell process
-function get_ipaddr() {
+export function get_ipaddr() {
     // set temp path, if it exists
     var path = "";
     try {
@@ -15,7 +15,8 @@ function get_ipaddr() {
 
     var ipFile = path + "ipaddr-" + Random.srand() + ".log";
     var windowsCmd = "ipconfig > " + ipFile;
-    var unixCmd = "/sbin/ifconfig | grep inet | grep -v '127.0.0.1' > " + ipFile;
+    var unixCmd =
+        "(/sbin/ifconfig || /usr/sbin/ip addr) | grep 'inet ' | grep -v '127.0.0.1' > " + ipFile;
     var ipAddr = null;
     var hostType = null;
 
@@ -27,8 +28,9 @@ function get_ipaddr() {
             runProgram('cmd.exe', '/c', windowsCmd);
             ipAddr = cat(ipFile).match(/IPv4.*: (.*)/)[1];
         } else {
-            runProgram('bash', '-c', unixCmd);
-            ipAddr = cat(ipFile).replace(/addr:/g, "").match(/inet (.[^ ]*) /)[1];
+            runProgram('/bin/sh', '-c', unixCmd);
+            ipAddr =
+                cat(ipFile).replace(/addr:/g, "").match(/inet ([\d]+\.[\d]+\.[\d]+\.[\d]+)/)[1];
         }
     } finally {
         removeFile(ipFile);

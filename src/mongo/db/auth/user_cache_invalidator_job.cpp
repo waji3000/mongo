@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,177 +27,244 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kAccessControl
-
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/auth/user_cache_invalidator_job.h"
 
 #include <string>
+#include <utility>
+
+#include <boost/move/utility_core.hpp>
 
 #include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
-#include "mongo/client/connpool.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
 #include "mongo/db/auth/authorization_manager.h"
+#include "mongo/db/auth/user_cache_invalidator_job.h"
+#include "mongo/db/auth/user_cache_invalidator_job_parameters_gen.h"
 #include "mongo/db/client.h"
-#include "mongo/db/commands.h"
-#include "mongo/db/server_parameters.h"
-#include "mongo/platform/compiler.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/logv2/log.h"
+#include "mongo/platform/atomic_word.h"
 #include "mongo/rpc/get_status_from_command_result.h"
+#include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/grid.h"
-#include "mongo/stdx/mutex.h"
-#include "mongo/util/background.h"
-#include "mongo/util/concurrency/idle_thread_block.h"
-#include "mongo/util/exit.h"
-#include "mongo/util/log.h"
-#include "mongo/util/time_support.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/decorable.h"
+#include "mongo/util/duration.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kAccessControl
+
 
 namespace mongo {
 namespace {
 
-// How often to check with the config servers whether authorization information has changed.
-AtomicInt32 userCacheInvalidationIntervalSecs(30);  // 30 second default
-stdx::mutex invalidationIntervalMutex;
-stdx::condition_variable invalidationIntervalChangedCondition;
-Date_t lastInvalidationTime;
+using OIDorTimestamp = UserCacheInvalidator::OIDorTimestamp;
 
-class ExportedInvalidationIntervalParameter
-    : public ExportedServerParameter<int, ServerParameterType::kStartupAndRuntime> {
-    using Base = ExportedServerParameter<int, ServerParameterType::kStartupAndRuntime>;
+const auto getUserCacheInvalidator =
+    ServiceContext::declareDecoration<std::unique_ptr<UserCacheInvalidator>>();
 
-public:
-    ExportedInvalidationIntervalParameter()
-        : Base(ServerParameterSet::getGlobal(),
-               "userCacheInvalidationIntervalSecs",
-               &userCacheInvalidationIntervalSecs) {}
+Seconds loadInterval() {
+    return Seconds(userCacheInvalidationIntervalSecs.load());
+}
 
-    // Don't hide Base::set(const BSONElement&)
-    using Base::set;
-
-    Status set(const int& newValue) override {
-        stdx::unique_lock<stdx::mutex> lock(invalidationIntervalMutex);
-        Status status = Base::set(newValue);
-        invalidationIntervalChangedCondition.notify_all();
-        return status;
-    }
-};
-
-MONGO_COMPILER_VARIABLE_UNUSED auto _exportedInterval =
-    (new ExportedInvalidationIntervalParameter())
-        -> withValidator([](const int& potentialNewValue) {
-            if (potentialNewValue < 1 || potentialNewValue > 86400) {
-                return Status(ErrorCodes::BadValue,
-                              "userCacheInvalidationIntervalSecs must be between 1 "
-                              "and 86400 (24 hours)");
-            }
-            return Status::OK();
-        });
-
-StatusWith<OID> getCurrentCacheGeneration(OperationContext* opCtx) {
+StatusWith<OIDorTimestamp> getCurrentCacheGeneration(OperationContext* opCtx) {
     try {
         BSONObjBuilder result;
         const bool ok = Grid::get(opCtx)->catalogClient()->runUserManagementReadCommand(
-            opCtx, "admin", BSON("_getUserCacheGeneration" << 1), &result);
+            opCtx, DatabaseName::kAdmin, BSON("_getUserCacheGeneration" << 1), &result);
         if (!ok) {
             return getStatusFromCommandResult(result.obj());
         }
-        return result.obj()["cacheGeneration"].OID();
+
+        const auto resultObj = result.obj();
+        const auto cacheGenerationElem = resultObj["cacheGeneration"];
+        const auto authInfoOpTimeElem = resultObj["authInfoOpTime"];
+        uassert(4664500,
+                "It is illegal to include both 'cacheGeneration' and 'authInfoOpTime'",
+                !cacheGenerationElem || !authInfoOpTimeElem);
+
+        if (cacheGenerationElem)
+            return OIDorTimestamp(cacheGenerationElem.OID());
+
+        uassert(
+            4664501, "Must include 'authInfoOpTime'", authInfoOpTimeElem.type() == bsonTimestamp);
+        return authInfoOpTimeElem.timestamp();
     } catch (const DBException& e) {
-        return StatusWith<OID>(e.toStatus());
-    } catch (const std::exception& e) {
-        return StatusWith<OID>(ErrorCodes::UnknownError, e.what());
+        return e.toStatus();
     }
+}
+
+std::string oidOrTimestampToString(const OIDorTimestamp& oidOrTimestamp) {
+    if (oidOrTimestamp.index() == 0) {  // OID
+        return get<OID>(oidOrTimestamp).toString();
+    } else if (oidOrTimestamp.index() == 1) {  // Timestamp
+        return get<Timestamp>(oidOrTimestamp).toString();
+    }
+    MONGO_UNREACHABLE;
+}
+
+/**
+ * TODO: SERVER-86458 - remove.
+ *
+ * RAII type for making the OperationContext it is instantiated with use the router service util it
+ * goes out of scope.
+ */
+class ScopedSetRouterService {
+public:
+    ScopedSetRouterService(OperationContext* opCtx);
+    ~ScopedSetRouterService();
+
+private:
+    OperationContext* const _opCtx;
+    Service* const _originalService;
+};
+
+ScopedSetRouterService::ScopedSetRouterService(OperationContext* opCtx)
+    : _opCtx(opCtx), _originalService(opCtx->getService()) {
+    // Verify that the opCtx is not using the router service already.
+    ClientLock lk(_opCtx->getClient());
+
+    auto service = opCtx->getServiceContext()->getService(ClusterRole::RouterServer);
+    invariant(service);
+    _opCtx->getClient()->setService(service);
+}
+
+ScopedSetRouterService::~ScopedSetRouterService() {
+    // Verify that the opCtx is still using the router service.
+    ClientLock lk(_opCtx->getClient());
+    invariant(_opCtx->getService()->role().has(ClusterRole::RouterServer));
+    _opCtx->getClient()->setService(_originalService);
 }
 
 }  // namespace
 
+Status userCacheInvalidationIntervalSecsNotify(const int& value) {
+    LOGV2_DEBUG(20259, 5, "setInterval", "newInterval"_attr = loadInterval());
+    if (hasGlobalServiceContext()) {
+        auto service = getGlobalServiceContext();
+        if (getUserCacheInvalidator(service)) {
+            getUserCacheInvalidator(service)->setPeriod(loadInterval());
+        }
+    }
+    return Status::OK();
+}
+
+void UserCacheInvalidator::setPeriod(Milliseconds period) {
+    _job->setPeriod(period);
+}
+
 UserCacheInvalidator::UserCacheInvalidator(AuthorizationManager* authzManager)
     : _authzManager(authzManager) {}
 
-UserCacheInvalidator::~UserCacheInvalidator() {
-    invariant(globalInShutdownDeprecated());
-    // Wait to stop running.
-    wait();
-}
-
 void UserCacheInvalidator::initialize(OperationContext* opCtx) {
-    StatusWith<OID> currentGeneration = getCurrentCacheGeneration(opCtx);
-    if (currentGeneration.isOK()) {
-        _previousCacheGeneration = currentGeneration.getValue();
+    auto swCurrentGeneration = getCurrentCacheGeneration(opCtx);
+    if (swCurrentGeneration.isOK()) {
+        _previousGeneration = swCurrentGeneration.getValue();
         return;
     }
 
-    if (currentGeneration.getStatus().code() == ErrorCodes::CommandNotFound) {
-        warning() << "_getUserCacheGeneration command not found while fetching initial user "
-                     "cache generation from the config server(s).  This most likely means you are "
-                     "running an outdated version of mongod on the config servers";
+    LOGV2_WARNING(20265,
+                  "An error occurred while fetching initial user cache generation from config "
+                  "servers",
+                  "error"_attr = swCurrentGeneration.getStatus());
+    _previousGeneration = OID();
+}
+
+void UserCacheInvalidator::start(ServiceContext* serviceCtx, OperationContext* opCtx) {
+    // UserCacheInvalidator should only run on a router.
+    invariant(serverGlobalParams.clusterRole.has(ClusterRole::RouterServer));
+    ScopedSetRouterService guard(opCtx);
+    auto invalidator =
+        std::make_unique<UserCacheInvalidator>(AuthorizationManager::get(opCtx->getService()));
+    invalidator->initialize(opCtx);
+
+    auto periodicRunner = serviceCtx->getPeriodicRunner();
+    invariant(periodicRunner);
+
+    // This job is killable. When interrupted, we will warn, and retry after the configured
+    // interval.
+    PeriodicRunner::PeriodicJob job(
+        "UserCacheInvalidator",
+        [serviceCtx](Client* client) { getUserCacheInvalidator(serviceCtx)->run(); },
+        loadInterval(),
+        true /*isKillableByStepdown*/);
+
+    invalidator->_job =
+        std::make_unique<PeriodicJobAnchor>(periodicRunner->makeJob(std::move(job)));
+
+    // Make sure the invalidator is moved to the service context by the time we call start()
+    getUserCacheInvalidator(serviceCtx) = std::move(invalidator);
+    getUserCacheInvalidator(serviceCtx)->_job->start();
+}
+
+void UserCacheInvalidator::stop(ServiceContext* serviceCtx) {
+    const auto& invalidator = getUserCacheInvalidator(serviceCtx);
+    if (invalidator == nullptr) {
+        return;
+    }
+
+    invalidator->_job->stop();
+}
+
+void UserCacheInvalidator::run() try {
+    auto opCtx = cc().makeOperationContext();
+    ScopedSetRouterService guard(opCtx.get());
+
+    // Get current cache generation from the config server.
+    auto swCurrentGeneration = getCurrentCacheGeneration(opCtx.get());
+    if (!swCurrentGeneration.isOK()) {
+        LOGV2_WARNING(20266,
+                      "An error occurred while fetching current user cache generation from "
+                      "config servers",
+                      "error"_attr = swCurrentGeneration.getStatus());
+
+        // When in doubt, invalidate the cache
+        try {
+            AuthorizationManager::get(opCtx->getService())->invalidateUserCache();
+        } catch (const DBException& e) {
+            LOGV2_WARNING(20267, "Error invalidating user cache", "error"_attr = e.toStatus());
+        }
+        return;
+    }
+
+    if (swCurrentGeneration.getValue() != _previousGeneration) {
+        LOGV2(20263,
+              "User cache generation changed; invalidating user cache",
+              "previousGeneration"_attr = oidOrTimestampToString(_previousGeneration),
+              "currentGeneration"_attr = oidOrTimestampToString(swCurrentGeneration.getValue()));
+        try {
+            // Invalidate user cache from router server.
+            AuthorizationManager::get(opCtx->getService())->invalidateUserCache();
+        } catch (const DBException& e) {
+            LOGV2_WARNING(20268, "Error invalidating user cache", "error"_attr = e.toStatus());
+        }
+        _previousGeneration = swCurrentGeneration.getValue();
     } else {
-        warning() << "An error occurred while fetching initial user cache generation from "
-                     "config servers: "
-                  << currentGeneration.getStatus();
-    }
-    _previousCacheGeneration = OID();
-}
-
-void UserCacheInvalidator::run() {
-    Client::initThread("UserCacheInvalidator");
-    lastInvalidationTime = Date_t::now();
-
-    while (true) {
-        stdx::unique_lock<stdx::mutex> lock(invalidationIntervalMutex);
-        Date_t sleepUntil =
-            lastInvalidationTime + Seconds(userCacheInvalidationIntervalSecs.load());
-        Date_t now = Date_t::now();
-        while (now < sleepUntil) {
-            MONGO_IDLE_THREAD_BLOCK;
-            invalidationIntervalChangedCondition.wait_until(lock, sleepUntil.toSystemTimePoint());
-            sleepUntil = lastInvalidationTime + Seconds(userCacheInvalidationIntervalSecs.load());
-            now = Date_t::now();
-        }
-        lastInvalidationTime = now;
-        lock.unlock();
-
-        if (globalInShutdownDeprecated()) {
-            break;
-        }
-
-        auto opCtx = cc().makeOperationContext();
-        StatusWith<OID> currentGeneration = getCurrentCacheGeneration(opCtx.get());
-        if (!currentGeneration.isOK()) {
-            if (currentGeneration.getStatus().code() == ErrorCodes::CommandNotFound) {
-                warning() << "_getUserCacheGeneration command not found on config server(s), "
-                             "this most likely means you are running an outdated version of mongod "
-                             "on the config servers";
-            } else {
-                warning() << "An error occurred while fetching current user cache generation "
-                             "to check if user cache needs invalidation: "
-                          << currentGeneration.getStatus();
-            }
-            // When in doubt, invalidate the cache
+        // If LDAP authorization is enabled and the authz cache generation has not changed, the
+        // external users should be refreshed to ensure that any cached users evicted on the config
+        // server are appropriately refreshed here.
+        auto refreshStatus = _authzManager->refreshExternalUsers(opCtx.get());
+        if (!refreshStatus.isOK()) {
+            LOGV2_WARNING(5914803,
+                          "Error refreshing external users in user cache, so invalidating external "
+                          "users in cache",
+                          "error"_attr = refreshStatus);
             try {
-                _authzManager->invalidateUserCache(opCtx.get());
+                AuthorizationManager::get(opCtx->getService())
+                    ->invalidateUsersFromDB(DatabaseName::kExternal);
             } catch (const DBException& e) {
-                warning() << "Error invalidating user cache: " << e.toStatus();
+                LOGV2_WARNING(5914805,
+                              "Error invalidating $external users from user cache",
+                              "error"_attr = e.toStatus());
             }
-            continue;
-        }
-
-        if (currentGeneration.getValue() != _previousCacheGeneration) {
-            log() << "User cache generation changed from " << _previousCacheGeneration << " to "
-                  << currentGeneration.getValue() << "; invalidating user cache";
-            try {
-                _authzManager->invalidateUserCache(opCtx.get());
-            } catch (const DBException& e) {
-                warning() << "Error invalidating user cache: " << e.toStatus();
-            }
-
-            _previousCacheGeneration = currentGeneration.getValue();
         }
     }
-}
-
-std::string UserCacheInvalidator::name() const {
-    return "UserCacheInvalidatorThread";
+} catch (const DBException& e) {
+    LOGV2_WARNING(7466000, "Error invalidating user cache", "error"_attr = e.toStatus());
 }
 
 }  // namespace mongo

@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Public Domain 2014-2018 MongoDB, Inc.
+# Public Domain 2014-present MongoDB, Inc.
 # Public Domain 2008-2014 WiredTiger, Inc.
 #
 # This is free and unencumbered software released into the public domain.
@@ -32,7 +32,7 @@
 import fnmatch, os
 import wiredtiger, wttest
 from suite_subprocess import suite_subprocess
-from wtdataset import SimpleDataSet, simple_key
+from wtdataset import SimpleDataSet
 from wtscenario import make_scenarios
 
 class test_compat01(wttest.WiredTigerTestCase, suite_subprocess):
@@ -45,14 +45,22 @@ class test_compat01(wttest.WiredTigerTestCase, suite_subprocess):
     # Declare the log versions that do and do not have prevlsn.
     # Log version 1 does not have the prevlsn record.
     # Log version 2 introduced that record.
-    # Log version 3 continues to have that record.
+    # Log versions 3 and higher continue to have that record.
     min_logv = 2
-    latest_logv = 3
+    latest_logv = 5
 
     # The API uses only the major and minor numbers but accepts with
     # and without the patch number.  Test both.
     start_compat = [
-        ('def', dict(compat1='none', logv1=3)),
+        ('def', dict(compat1='none', logv1=5)),
+        ('120', dict(compat1='12.0', logv1=5)),
+        ('113', dict(compat1='11.3', logv1=5)),
+        ('112', dict(compat1='11.2', logv1=5)),
+        ('111', dict(compat1='11.1', logv1=5)),
+        ('110', dict(compat1='11.0', logv1=5)),
+        ('100', dict(compat1='10.0', logv1=5)),
+        ('33', dict(compat1='3.3', logv1=4)),
+        ('32', dict(compat1='3.2', logv1=3)),
         ('31', dict(compat1="3.1", logv1=3)),
         ('30', dict(compat1="3.0", logv1=2)),
         ('30_patch', dict(compat1="3.0.0", logv1=2)),
@@ -61,7 +69,15 @@ class test_compat01(wttest.WiredTigerTestCase, suite_subprocess):
         ('old_patch', dict(compat1="1.8.1", logv1=1)),
     ]
     restart_compat = [
-        ('def2', dict(compat2='none', logv2=3)),
+        ('def2', dict(compat2='none', logv2=5)),
+        ('120_2', dict(compat2='12.0', logv2=5)),
+        ('113_2', dict(compat2='11.3', logv2=5)),
+        ('112_2', dict(compat2='11.2', logv2=5)),
+        ('111_2', dict(compat2='11.1', logv2=5)),
+        ('110_2', dict(compat2='11.0', logv2=5)),
+        ('100_2', dict(compat2='10.0', logv2=5)),
+        ('33_2', dict(compat2='3.3', logv2=4)),
+        ('32_2', dict(compat2='3.2', logv2=3)),
         ('31_2', dict(compat2="3.1", logv2=3)),
         ('30_2', dict(compat2="3.0", logv2=2)),
         ('30_patch2', dict(compat2="3.0.0", logv2=2)),
@@ -82,8 +98,8 @@ class test_compat01(wttest.WiredTigerTestCase, suite_subprocess):
         return compat_str
 
     def conn_config(self):
-        # Set archive false on the home directory.
-        log_str = 'log=(archive=false,enabled,file_max=%s),' % self.logmax
+        # Set remove=false on the home directory.
+        log_str = 'log=(enabled,file_max=%s,remove=false),' % self.logmax
         compat_str = self.make_compat_str(True)
         self.pr("Conn config:" + log_str + compat_str)
         return log_str + compat_str
@@ -111,10 +127,10 @@ class test_compat01(wttest.WiredTigerTestCase, suite_subprocess):
 
         if not reconfig:
             #
-            # Close and open the connection to force recovery and log archiving
-            # even if archive is turned off (in some circumstances). If we are
-            # downgrading we must archive newer logs. Verify the log files
-            # have or have not been archived.
+            # Close and open the connection to force recovery and log removal
+            # even if remove is turned off (in some circumstances). If we are
+            # downgrading we must remove newer logs. Verify the log files
+            # have or have not been removed.
             #
             exist = True
             if self.logv1 < self.min_logv:
@@ -122,7 +138,7 @@ class test_compat01(wttest.WiredTigerTestCase, suite_subprocess):
             self.check_prev_lsn(exist, True)
 
             self.conn.close()
-            log_str = 'log=(enabled,file_max=%s,archive=false),' % self.logmax
+            log_str = 'log=(enabled,file_max=%s,remove=false),' % self.logmax
             restart_config = log_str + compat_str
             self.pr("Restart conn " + restart_config)
             #
@@ -137,9 +153,9 @@ class test_compat01(wttest.WiredTigerTestCase, suite_subprocess):
             check_close = True
 
             #
-            # Archiving is turned off explicitly.
+            # Removal is turned off explicitly.
             #
-            # Check logs. The original logs should have been archived only if
+            # Check logs. The original logs should have been removed only if
             # we downgraded.  In all other cases the original logs should be there.
             # Downgrade means not running the latest possible log version, not
             # the difference between original and current.
@@ -189,16 +205,21 @@ class test_reconfig_fail(wttest.WiredTigerTestCase):
         ds = SimpleDataSet(self, uri, 100, key_format='S')
         ds.populate()
 
-        self.session.begin_transaction("isolation=snapshot")
+        # Reconfigure to an older version.
+        compat_str = 'compatibility=(release="2.6")'
+        self.conn.reconfigure(compat_str)
+
+        self.session.begin_transaction()
         c = self.session.open_cursor(uri, None)
         c.set_key(ds.key(20))
         c.set_value("abcde")
-        self.assertEquals(c.update(), 0)
+        self.assertEqual(c.update(), 0)
+
+        # Make sure we can reconfigure unrelated things while downgraded
+        # and we have an active transaction.
+        self.conn.reconfigure("cache_size=100M")
 
         compat_str = 'compatibility=(release="3.0.0")'
         msg = '/system must be quiescent/'
         self.assertRaisesWithMessage(wiredtiger.WiredTigerError,
             lambda:self.conn.reconfigure(compat_str), msg)
-
-if __name__ == '__main__':
-    wttest.run()

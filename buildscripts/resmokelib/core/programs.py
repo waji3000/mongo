@@ -1,208 +1,289 @@
-"""Utility functions to create MongoDB processes.
+"""Utility functions for creating MongoDB processes.
 
 Handles all the nitty-gritty parameter conversion.
 """
 
-from __future__ import absolute_import
-
 import json
 import os
 import os.path
+import re
 import stat
+from typing import Any, Optional, Tuple
 
-from . import jasper_process
-from . import process
-from .. import config
-from .. import utils
+from packaging import version
 
-# The below parameters define the default 'logComponentVerbosity' object passed to mongod processes
-# started either directly via resmoke or those that will get started by the mongo shell. We allow
-# this default to be different for tests run locally and tests run in Evergreen. This allows us, for
-# example, to keep log verbosity high in Evergreen test runs without polluting the logs for
-# developers running local tests.
-
-# The default verbosity setting for any tests that are not started with an Evergreen task id. This
-# will apply to any tests run locally.
-DEFAULT_MONGOD_LOG_COMPONENT_VERBOSITY = {"replication": {"rollback": 2}, "transaction": 4}
-
-# The default verbosity setting for any tests running in Evergreen i.e. started with an Evergreen
-# task id.
-DEFAULT_EVERGREEN_MONGOD_LOG_COMPONENT_VERBOSITY = {
-    "replication": {"election": 4, "heartbeats": 2, "initialSync": 2, "rollback": 2},
-    "storage": {"recovery": 2}, "transaction": 4
-}
+from buildscripts.resmokelib import config, logging, utils
+from buildscripts.resmokelib.core import network, process
+from buildscripts.resmokelib.testing.fixtures import shardedcluster, standalone
+from buildscripts.resmokelib.testing.fixtures.fixturelib import FixtureLib
+from buildscripts.resmokelib.utils.history import HistoryDict, make_historic
 
 
-def make_process(*args, **kwargs):
-    """Choose whether to use python built in process or jasper."""
+def make_process(*args, **kwargs) -> process.Process:
+    """Set up the environment for subprocesses."""
     process_cls = process.Process
-    if config.SPAWN_USING == "jasper":
-        process_cls = jasper_process.Process
+
+    # Add the current working directory and /data/multiversion to the PATH.
+    env_vars = kwargs.get("env_vars", {}).copy()
+    path = get_path_env_var(env_vars)
+
+    if config.INSTALL_DIR is not None:
+        env_vars["INSTALL_DIR"] = config.INSTALL_DIR
+
+    env_vars["PATH"] = os.pathsep.join(path)
+    kwargs["env_vars"] = env_vars
     return process_cls(*args, **kwargs)
 
 
-def default_mongod_log_component_verbosity():
-    """Return the default 'logComponentVerbosity' value to use for mongod processes."""
-    if config.EVERGREEN_TASK_ID:
-        return DEFAULT_EVERGREEN_MONGOD_LOG_COMPONENT_VERBOSITY
-    return DEFAULT_MONGOD_LOG_COMPONENT_VERBOSITY
+def get_path_env_var(env_vars):
+    """Return the path base on provided environment variable."""
+    path = [os.getcwd()] + config.MULTIVERSION_DIRS
+    # If installDir is provided, add it early to the path
+    if config.INSTALL_DIR is not None:
+        path.append(config.INSTALL_DIR)
+    path.append(env_vars.get("PATH", os.environ.get("PATH", "")))
+    return path
 
 
-def mongod_program(  # pylint: disable=too-many-branches
-        logger, executable=None, process_kwargs=None, **kwargs):
-    """Return a Process instance that starts mongod arguments constructed from 'kwargs'."""
+def get_binary_version(executable):
+    """Return the string for the binary version of the given executable."""
 
-    executable = utils.default_if_none(executable, config.DEFAULT_MONGOD_EXECUTABLE)
+    from buildscripts.resmokelib.multiversionconstants import LATEST_FCV
+
+    split_executable = os.path.basename(executable).split("-")
+    version_regex = re.compile(version.VERSION_PATTERN, re.VERBOSE | re.IGNORECASE)
+    if len(split_executable) > 1 and version_regex.match(split_executable[-1]):
+        return split_executable[-1]
+    return LATEST_FCV
+
+
+def remove_set_parameter_if_before_version(
+    set_parameters, parameter_name, bin_version, required_bin_version
+):
+    """
+    Used for removing a server parameter that does not exist prior to a specified version.
+
+    Remove 'parameter_name' from the 'set_parameters' dictionary if 'bin_version' is older than
+    'required_bin_version'.
+    """
+    if version.parse(bin_version) < version.parse(required_bin_version):
+        set_parameters.pop(parameter_name, None)
+
+
+def mongod_program(
+    logger: logging.Logger,
+    job_num: int,
+    executable: str,
+    process_kwargs: dict,
+    mongod_options: HistoryDict,
+) -> tuple[process.Process, HistoryDict]:
+    """
+    Return a Process instance that starts mongod arguments constructed from 'mongod_options'.
+
+    @param logger - The logger to pass into the process.
+    @param job_num - The Resmoke job number running this process.
+    @param executable - The mongod executable to run.
+    @param process_kwargs - A dict of key-value pairs to pass to the process.
+    @param mongod_options - A HistoryDict describing the various options to pass to the mongod.
+    """
+
+    bin_version = get_binary_version(executable)
     args = [executable]
+    mongod_options = mongod_options.copy()
 
-    # Apply the --setParameter command line argument. Command line options to resmoke.py override
-    # the YAML configuration.
-    suite_set_parameters = kwargs.pop("set_parameters", {})
+    if config.NOOP_MONGO_D_S_PROCESSES:
+        args[0] = os.path.basename(args[0])
+        mongod_options["set_parameters"]["fassertOnLockTimeoutForStepUpDown"] = 0
+        mongod_options["set_parameters"].pop("backtraceLogFile", None)
+        mongod_options.update(
+            {
+                "logpath": "/var/log/mongodb/mongodb.log",
+                "dbpath": "/data/db",
+                "bind_ip": "0.0.0.0",
+                "oplogSize": "256",
+                "wiredTigerCacheSizeGB": "1",
+            }
+        )
 
-    if config.MONGOD_SET_PARAMETERS is not None:
-        suite_set_parameters.update(utils.load_yaml(config.MONGOD_SET_PARAMETERS))
+    if config.TLS_MODE:
+        mongod_options["tlsMode"] = config.TLS_MODE
+        if config.TLS_MODE != "disabled":
+            # Note: "tlsAllowInvalidCertificates" is enabled to avoid
+            # hostname conflicts with our testing certificates.
+            # The ssl and ssl_special suites handle hostname validation testing.
+            mongod_options["tlsAllowInvalidHostnames"] = ""
 
-    # Set default log verbosity levels if none were specified.
-    if "logComponentVerbosity" not in suite_set_parameters:
-        suite_set_parameters["logComponentVerbosity"] = default_mongod_log_component_verbosity()
+    if config.MONGOD_TLS_CERTIFICATE_KEY_FILE:
+        mongod_options["tlsCertificateKeyFile"] = config.MONGOD_TLS_CERTIFICATE_KEY_FILE
 
-    # orphanCleanupDelaySecs controls an artificial delay before cleaning up an orphaned chunk
-    # that has migrated off of a shard, meant to allow most dependent queries on secondaries to
-    # complete first. It defaults to 900, or 15 minutes, which is prohibitively long for tests.
-    # Setting it in the .yml file overrides this.
-    if "shardsvr" in kwargs and "orphanCleanupDelaySecs" not in suite_set_parameters:
-        suite_set_parameters["orphanCleanupDelaySecs"] = 1
+    if config.TLS_CA_FILE:
+        mongod_options["tlsCAFile"] = config.TLS_CA_FILE
 
-    # The LogicalSessionCache does automatic background refreshes in the server. This is
-    # race-y for tests, since tests trigger their own immediate refreshes instead. Turn off
-    # background refreshing for tests. Set in the .yml file to override this.
-    if "disableLogicalSessionCacheRefresh" not in suite_set_parameters:
-        suite_set_parameters["disableLogicalSessionCacheRefresh"] = True
+    if "port" not in mongod_options:
+        mongod_options["port"] = network.PortAllocator.next_fixture_port(job_num)
 
-    # There's a periodic background thread that checks for and aborts expired transactions.
-    # "transactionLifetimeLimitSeconds" specifies for how long a transaction can run before expiring
-    # and being aborted by the background thread. It defaults to 60 seconds, which is too short to
-    # be reliable for our tests. Setting it to 3 hours, so that it is longer than the 2 hours we
-    # allow JS tests to run before timing them out.
-    if "transactionLifetimeLimitSeconds" not in suite_set_parameters:
-        suite_set_parameters["transactionLifetimeLimitSeconds"] = 3 * 60 * 60
+    suite_set_parameters = mongod_options.get("set_parameters", {})
+    remove_set_parameter_if_before_version(
+        suite_set_parameters, "queryAnalysisSamplerConfigurationRefreshSecs", bin_version, "7.0.0"
+    )
+    remove_set_parameter_if_before_version(
+        suite_set_parameters, "queryAnalysisWriterIntervalSecs", bin_version, "7.0.0"
+    )
+    remove_set_parameter_if_before_version(
+        suite_set_parameters, "defaultConfigCommandTimeoutMS", bin_version, "7.3.0"
+    )
 
-    # The periodic no-op writer writes an oplog entry of type='n' once every 10 seconds. This has
-    # the potential to mask issues such as SERVER-31609 because it allows the operationTime of
-    # cluster to advance even if the client is blocked for other reasons. We should disable the
-    # periodic no-op writer. Set in the .yml file to override this.
-    if "replSet" in kwargs and "writePeriodicNoops" not in suite_set_parameters:
-        suite_set_parameters["writePeriodicNoops"] = False
+    remove_set_parameter_if_before_version(
+        suite_set_parameters, "internalQueryStatsRateLimit", bin_version, "7.3.0"
+    )
+    remove_set_parameter_if_before_version(
+        suite_set_parameters, "internalQueryStatsErrorsAreCommandFatal", bin_version, "7.3.0"
+    )
+    remove_set_parameter_if_before_version(
+        suite_set_parameters, "enableAutoCompaction", bin_version, "7.3.0"
+    )
+
+    if "grpcPort" not in mongod_options and suite_set_parameters.get("featureFlagGRPC"):
+        mongod_options["grpcPort"] = network.PortAllocator.next_fixture_port(job_num)
 
     _apply_set_parameters(args, suite_set_parameters)
-
-    shortcut_opts = {
-        "enableMajorityReadConcern": config.MAJORITY_READ_CONCERN,
-        "nojournal": config.NO_JOURNAL,
-        "serviceExecutor": config.SERVICE_EXECUTOR,
-        "storageEngine": config.STORAGE_ENGINE,
-        "transportLayer": config.TRANSPORT_LAYER,
-        "wiredTigerCollectionConfigString": config.WT_COLL_CONFIG,
-        "wiredTigerEngineConfigString": config.WT_ENGINE_CONFIG,
-        "wiredTigerIndexConfigString": config.WT_INDEX_CONFIG,
-    }
-
-    if config.STORAGE_ENGINE == "rocksdb":
-        shortcut_opts["rocksdbCacheSizeGB"] = config.STORAGE_ENGINE_CACHE_SIZE
-    elif config.STORAGE_ENGINE == "wiredTiger" or config.STORAGE_ENGINE is None:
-        shortcut_opts["wiredTigerCacheSizeGB"] = config.STORAGE_ENGINE_CACHE_SIZE
-
-    # These options are just flags, so they should not take a value.
-    opts_without_vals = ("nojournal", )
-
-    # Have the --nojournal command line argument to resmoke.py unset the journal option.
-    if shortcut_opts["nojournal"] and "journal" in kwargs:
-        del kwargs["journal"]
-
-    # Ensure that config servers run with journaling enabled.
-    if "configsvr" in kwargs:
-        shortcut_opts["nojournal"] = False
-        kwargs["journal"] = ""
-
-    # Command line options override the YAML configuration.
-    for opt_name in shortcut_opts:
-        opt_value = shortcut_opts[opt_name]
-        if opt_name in opts_without_vals:
-            # Options that are specified as --flag on the command line are represented by a boolean
-            # value where True indicates that the flag should be included in 'kwargs'.
-            if opt_value:
-                kwargs[opt_name] = ""
-        else:
-            # Options that are specified as --key=value on the command line are represented by a
-            # value where None indicates that the key-value pair shouldn't be included in 'kwargs'.
-            if opt_value is not None:
-                kwargs[opt_name] = opt_value
-
-    # Override the storage engine specified on the command line with "wiredTiger" if running a
-    # config server replica set.
-    if "replSet" in kwargs and "configsvr" in kwargs:
-        kwargs["storageEngine"] = "wiredTiger"
+    final_mongod_options = mongod_options.copy()
+    mongod_options.pop("set_parameters")
 
     # Apply the rest of the command line arguments.
-    _apply_kwargs(args, kwargs)
+    _apply_kwargs(args, mongod_options)
 
-    _set_keyfile_permissions(kwargs)
+    _set_keyfile_permissions(mongod_options)
 
-    process_kwargs = utils.default_if_none(process_kwargs, {})
-    return make_process(logger, args, **process_kwargs)
+    process_kwargs = make_historic(utils.default_if_none(process_kwargs, {}))
+    if config.EXPORT_MONGOD_CONFIG == "regular":
+        mongod_options.dump_history(f"{logger.name}_config.yml")
+    elif config.EXPORT_MONGOD_CONFIG == "detailed":
+        mongod_options.dump_history(f"{logger.name}_config.yml", include_location=True)
+
+    return make_process(logger, args, **process_kwargs), final_mongod_options
 
 
-def mongos_program(logger, executable=None, process_kwargs=None, **kwargs):
+def mongos_program(
+    logger: logging.Logger,
+    job_num: int,
+    executable: Optional[str] = None,
+    process_kwargs: Optional[dict] = None,
+    mongos_options: dict = None,
+) -> Tuple[process.Process, dict]:
     """Return a Process instance that starts a mongos with arguments constructed from 'kwargs'."""
-
-    executable = utils.default_if_none(executable, config.DEFAULT_MONGOS_EXECUTABLE)
+    bin_version = get_binary_version(executable)
     args = [executable]
 
-    # Apply the --setParameter command line argument. Command line options to resmoke.py override
-    # the YAML configuration.
-    suite_set_parameters = kwargs.pop("set_parameters", {})
+    mongos_options = mongos_options.copy()
+    mongos_options.setdefault("set_parameters", {})
 
-    if config.MONGOS_SET_PARAMETERS is not None:
-        suite_set_parameters.update(utils.load_yaml(config.MONGOS_SET_PARAMETERS))
+    if config.NOOP_MONGO_D_S_PROCESSES:
+        args[0] = os.path.basename(args[0])
+        mongos_options["set_parameters"]["fassertOnLockTimeoutForStepUpDown"] = 0
+        mongos_options.update({"logpath": "/var/log/mongodb/mongodb.log", "bind_ip": "0.0.0.0"})
+
+    if config.TLS_MODE:
+        mongos_options["tlsMode"] = config.TLS_MODE
+        if config.TLS_MODE != "disabled":
+            mongos_options["tlsAllowInvalidHostnames"] = ""
+
+    if config.MONGOS_TLS_CERTIFICATE_KEY_FILE:
+        mongos_options["tlsCertificateKeyFile"] = config.MONGOS_TLS_CERTIFICATE_KEY_FILE
+
+    if config.TLS_CA_FILE:
+        mongos_options["tlsCAFile"] = config.TLS_CA_FILE
+
+    if "port" not in mongos_options:
+        mongos_options["port"] = network.PortAllocator.next_fixture_port(job_num)
+
+    suite_set_parameters = mongos_options.get("set_parameters", {})
+    remove_set_parameter_if_before_version(
+        suite_set_parameters, "queryAnalysisSamplerConfigurationRefreshSecs", bin_version, "7.0.0"
+    )
+    remove_set_parameter_if_before_version(
+        suite_set_parameters, "defaultConfigCommandTimeoutMS", bin_version, "7.3.0"
+    )
+
+    remove_set_parameter_if_before_version(
+        suite_set_parameters, "internalQueryStatsRateLimit", bin_version, "7.3.0"
+    )
+    remove_set_parameter_if_before_version(
+        suite_set_parameters, "internalQueryStatsErrorsAreCommandFatal", bin_version, "7.3.0"
+    )
+
+    if "grpcPort" not in mongos_options and suite_set_parameters.get("featureFlagGRPC"):
+        mongos_options["grpcPort"] = network.PortAllocator.next_fixture_port(job_num)
 
     _apply_set_parameters(args, suite_set_parameters)
+    final_mongos_options = mongos_options.copy()
+    mongos_options.pop("set_parameters")
 
     # Apply the rest of the command line arguments.
-    _apply_kwargs(args, kwargs)
+    _apply_kwargs(args, mongos_options)
 
-    _set_keyfile_permissions(kwargs)
+    _set_keyfile_permissions(mongos_options)
 
-    process_kwargs = utils.default_if_none(process_kwargs, {})
-    return make_process(logger, args, **process_kwargs)
+    process_kwargs = make_historic(utils.default_if_none(process_kwargs, {}))
+
+    return make_process(logger, args, **process_kwargs), final_mongos_options
 
 
-def mongo_shell_program(  # pylint: disable=too-many-branches,too-many-locals,too-many-statements
-        logger, executable=None, connection_string=None, filename=None, process_kwargs=None,
-        **kwargs):
+def mongot_program(
+    logger, job_num, executable=None, process_kwargs=None, mongot_options=None
+) -> Tuple[process.Process, Any]:
+    """Return a Process instance that starts a mongot."""
+    args = [executable]
+    mongot_options = mongot_options.copy()
+    final_mongot_options = mongot_options.copy()
+    # Apply the rest of the command line arguments.
+    _apply_kwargs(args, mongot_options)
+    process_kwargs = make_historic(utils.default_if_none(process_kwargs, {}))
+    return make_process(logger, args, **process_kwargs), final_mongot_options
+
+
+def mongo_shell_program(
+    logger: logging.Logger,
+    test_name: str,
+    executable: Optional[str] = None,
+    connection_string: Optional[str] = None,
+    filenames: Optional[list[str]] = None,
+    process_kwargs: Optional[dict] = None,
+    **kwargs,
+) -> process.Process:
     """Return a Process instance that starts a mongo shell.
 
-    The shell is started with the given connection string and arguments constructed from 'kwargs'.
+    Args:
+        logger (logging.Logger): logger
+        test_name (str): Name of the test. Passed into the test as 'testName'.
+        executable (Optional[str], optional): Path to the mongo shell binary. Defaults to None. If not given will be inferred.
+        connection_string (Optional[str], optional): Connection string to mongodb. Defaults to None. If not given will be inferred.
+        filenames (Optional[list[str]], optional): The files to run by the mongo shell in a single invocation. Defaults to None.
+        process_kwargs (Optional[dict], optional): Extra args to pass into make_process. Defaults to None.
+
+    Returns
+        process.Process: The mongo shell invocation.
     """
 
     executable = utils.default_if_none(
-        utils.default_if_none(executable, config.MONGO_EXECUTABLE), config.DEFAULT_MONGO_EXECUTABLE)
+        utils.default_if_none(executable, config.MONGO_EXECUTABLE), config.DEFAULT_MONGO_EXECUTABLE
+    )
     args = [executable]
 
     eval_sb = []  # String builder.
     global_vars = kwargs.pop("global_vars", {}).copy()
 
-    if filename is not None:
-        test_name = os.path.splitext(os.path.basename(filename))[0]
-    else:
-        test_name = None
+    # the Shell fixtures uses hyphen-delimited versions (e.g. last-lts) while resmoke.py
+    # uses underscore (e.g. last_lts). resmoke's version is needed as it's part of the task name.
+    shell_mixed_version = (config.MULTIVERSION_BIN_VERSION or "").replace("_", "-")
+
     shortcut_opts = {
-        "enableMajorityReadConcern": (config.MAJORITY_READ_CONCERN, True),
-        "noJournal": (config.NO_JOURNAL, False),
-        "serviceExecutor": (config.SERVICE_EXECUTOR, ""),
+        "backupOnRestartDir": (config.BACKUP_ON_RESTART_DIR, None),
+        "mixedBinVersions": (config.MIXED_BIN_VERSIONS, ""),
+        "multiversionBinVersion": (shell_mixed_version, ""),
         "storageEngine": (config.STORAGE_ENGINE, ""),
         "storageEngineCacheSizeGB": (config.STORAGE_ENGINE_CACHE_SIZE, ""),
         "testName": (test_name, ""),
-        "transportLayer": (config.TRANSPORT_LAYER, ""),
         "wiredTigerCollectionConfigString": (config.WT_COLL_CONFIG, ""),
         "wiredTigerEngineConfigString": (config.WT_ENGINE_CONFIG, ""),
         "wiredTigerIndexConfigString": (config.WT_INDEX_CONFIG, ""),
@@ -217,42 +298,124 @@ def mongo_shell_program(  # pylint: disable=too-many-branches,too-many-locals,to
             # Only use 'opt_default' if the property wasn't set in the YAML configuration.
             test_data[opt_name] = opt_default
 
+    if config.CONFIG_FUZZER_ENCRYPTION_OPTS:
+        for opt_name in config.CONFIG_FUZZER_ENCRYPTION_OPTS:
+            if opt_name in test_data:
+                continue
+
+            test_data[opt_name] = config.CONFIG_FUZZER_ENCRYPTION_OPTS[opt_name]
+
+    if config.LOG_FORMAT:
+        test_data["logFormat"] = config.LOG_FORMAT
+
+    level_names_to_numbers = {"ERROR": 1, "WARNING": 2, "INFO": 3, "DEBUG": 4}
+    # Convert Log Level from string to numbered values. Defaults to using "INFO".
+    test_data["logLevel"] = level_names_to_numbers.get(config.LOG_LEVEL, 3)
+
+    if config.SHELL_TLS_ENABLED:
+        test_data["shellTlsEnabled"] = True
+
+        if config.SHELL_TLS_CERTIFICATE_KEY_FILE:
+            test_data["shellTlsCertificateKeyFile"] = config.SHELL_TLS_CERTIFICATE_KEY_FILE
+
+    if config.SHELL_GRPC:
+        test_data["shellGRPC"] = True
+
+    if config.TLS_CA_FILE:
+        test_data["tlsCAFile"] = config.TLS_CA_FILE
+
+    if config.TLS_MODE:
+        test_data["tlsMode"] = config.TLS_MODE
+
+    if config.MONGOD_TLS_CERTIFICATE_KEY_FILE:
+        test_data["mongodTlsCertificateKeyFile"] = config.MONGOD_TLS_CERTIFICATE_KEY_FILE
+
+    if config.MONGOS_TLS_CERTIFICATE_KEY_FILE:
+        test_data["mongosTlsCertificateKeyFile"] = config.MONGOS_TLS_CERTIFICATE_KEY_FILE
+
     global_vars["TestData"] = test_data
+
+    if config.EVERGREEN_TASK_ID is not None:
+        test_data["inEvergreen"] = True
+        test_data["evergreenTaskId"] = config.EVERGREEN_TASK_ID
+        test_data["evergreenVariantName"] = config.EVERGREEN_VARIANT_NAME
+
+    if config.SHELL_SEED is not None:
+        test_data["seed"] = int(config.SHELL_SEED)
 
     # Initialize setParameters for mongod and mongos, to be passed to the shell via TestData. Since
     # they are dictionaries, they will be converted to JavaScript objects when passed to the shell
     # by the _format_shell_vars() function.
-    mongod_set_parameters = {}
+    mongod_set_parameters = test_data.get("setParameters", {}).copy()
+    mongos_set_parameters = test_data.get("setParametersMongos", {}).copy()
+    mongocryptd_set_parameters = test_data.get("setParametersMongocryptd", {}).copy()
+    mongo_set_parameters = test_data.get("setParametersMongo", {}).copy()
+
+    feature_flag_dict = {}
+    if config.ENABLED_FEATURE_FLAGS is not None:
+        feature_flag_dict = {ff: "true" for ff in config.ENABLED_FEATURE_FLAGS}
+
+    # Propagate additional setParameters to mongod processes spawned by the mongo shell. Command
+    # line options to resmoke.py override the YAML configuration.
     if config.MONGOD_SET_PARAMETERS is not None:
-        if "setParameters" in test_data:
-            raise ValueError("setParameters passed via TestData can only be set from either the"
-                             " command line or the suite YAML, not both")
-        mongod_set_parameters = utils.load_yaml(config.MONGOD_SET_PARAMETERS)
+        mongod_set_parameters.update(utils.load_yaml(config.MONGOD_SET_PARAMETERS))
+        mongod_set_parameters.update(feature_flag_dict)
+
+    # Propagate additional setParameters to mongos processes spawned by the mongo shell. Command
+    # line options to resmoke.py override the YAML configuration.
+    if config.MONGOS_SET_PARAMETERS is not None:
+        mongos_set_parameters.update(utils.load_yaml(config.MONGOS_SET_PARAMETERS))
+        mongos_set_parameters.update(feature_flag_dict)
+
+    # Propagate additional setParameters to mongocryptd processes spawned by the mongo shell.
+    # Command line options to resmoke.py override the YAML configuration.
+    if config.MONGOCRYPTD_SET_PARAMETERS is not None:
+        mongocryptd_set_parameters.update(utils.load_yaml(config.MONGOCRYPTD_SET_PARAMETERS))
+        mongocryptd_set_parameters.update(feature_flag_dict)
+
+    if config.MONGO_SET_PARAMETERS is not None:
+        mongo_set_parameters.update(utils.load_yaml(config.MONGO_SET_PARAMETERS))
+
+    fixturelib = FixtureLib()
+    mongod_launcher = standalone.MongodLauncher(fixturelib)
 
     # If the 'logComponentVerbosity' setParameter for mongod was not already specified, we set its
     # value to a default.
-    mongod_set_parameters.setdefault("logComponentVerbosity",
-                                     default_mongod_log_component_verbosity())
+    mongod_set_parameters.setdefault(
+        "logComponentVerbosity", mongod_launcher.get_default_log_component_verbosity_for_mongod()
+    )
+
+    mongos_launcher = shardedcluster.MongosLauncher(fixturelib)
+    # If the 'logComponentVerbosity' setParameter for mongos was not already specified, we set its
+    # value to a default.
+    mongos_set_parameters.setdefault(
+        "logComponentVerbosity", mongos_launcher.default_mongos_log_component_verbosity()
+    )
 
     test_data["setParameters"] = mongod_set_parameters
+    test_data["setParametersMongos"] = mongos_set_parameters
+    test_data["setParametersMongocryptd"] = mongocryptd_set_parameters
+    test_data["setShellParameters"] = mongo_set_parameters
 
-    if config.MONGOS_SET_PARAMETERS is not None:
-        if "setParametersMongos" in test_data:
-            raise ValueError("setParametersMongos passed via TestData can only be set from either"
-                             " the command line or the suite YAML, not both")
-        mongos_set_parameters = utils.load_yaml(config.MONGOS_SET_PARAMETERS)
-        test_data["setParametersMongos"] = mongos_set_parameters
+    if "configShard" not in test_data and config.CONFIG_SHARD is not None:
+        test_data["configShard"] = True
+
+    if "embeddedRouter" not in test_data and config.EMBEDDED_ROUTER is not None:
+        test_data["embeddedRouter"] = True
 
     # There's a periodic background thread that checks for and aborts expired transactions.
     # "transactionLifetimeLimitSeconds" specifies for how long a transaction can run before expiring
     # and being aborted by the background thread. It defaults to 60 seconds, which is too short to
-    # be reliable for our tests. Setting it to 3 hours, so that it is longer than the 2 hours we
-    # allow JS tests to run before timing them out.
+    # be reliable for our tests. Setting it to 24 hours, so that it is longer than the Evergreen
+    # execution timeout.
     if "transactionLifetimeLimitSeconds" not in test_data:
-        test_data["transactionLifetimeLimitSeconds"] = 3 * 60 * 60
+        test_data["transactionLifetimeLimitSeconds"] = 24 * 60 * 60
 
     if "eval_prepend" in kwargs:
         eval_sb.append(str(kwargs.pop("eval_prepend")))
+
+    if config.SHELL_GRPC:
+        eval_sb.append('await import("jstests/libs/override_methods/enable_grpc_on_connect.js")')
 
     # If nodb is specified, pass the connection string through TestData so it can be used inside the
     # test, then delete it so it isn't given as an argument to the mongo shell.
@@ -260,28 +423,78 @@ def mongo_shell_program(  # pylint: disable=too-many-branches,too-many-locals,to
         test_data["connectionString"] = connection_string
         connection_string = None
 
+    if config.FUZZ_MONGOD_CONFIGS is not None and config.FUZZ_MONGOD_CONFIGS is not False:
+        test_data["fuzzMongodConfigs"] = True
+
     for var_name in global_vars:
-        _format_shell_vars(eval_sb, var_name, global_vars[var_name])
+        _format_shell_vars(eval_sb, [var_name], global_vars[var_name])
 
     if "eval" in kwargs:
         eval_sb.append(str(kwargs.pop("eval")))
 
+    # Load a callback to check that the cluster-wide metadata is consistent.
+    eval_sb.append('await import("jstests/libs/override_methods/check_metadata_consistency.js")')
+
     # Load this file to allow a callback to validate collections before shutting down mongod.
-    eval_sb.append("load('jstests/libs/override_methods/validate_collections_on_shutdown.js');")
+    eval_sb.append(
+        'await import("jstests/libs/override_methods/validate_collections_on_shutdown.js")'
+    )
 
     # Load a callback to check UUID consistency before shutting down a ShardingTest.
     eval_sb.append(
-        "load('jstests/libs/override_methods/check_uuids_consistent_across_cluster.js');")
+        'await import("jstests/libs/override_methods/check_uuids_consistent_across_cluster.js")'
+    )
+
+    # Load a callback to check index consistency before shutting down a ShardingTest.
+    eval_sb.append(
+        'await import("jstests/libs/override_methods/check_indexes_consistent_across_cluster.js")'
+    )
+
+    # Load a callback to check that all orphans are deleted before shutting down a ShardingTest.
+    eval_sb.append('await import("jstests/libs/override_methods/check_orphans_are_deleted.js")')
+
+    # Load a callback to check that the info stored in config.collections and config.chunks is
+    # semantically correct before shutting down a ShardingTest.
+    eval_sb.append(
+        'await import("jstests/libs/override_methods/check_routing_table_consistency.js")'
+    )
+
+    # Load a callback to check that all shards have correct filtering information before shutting
+    # down a ShardingTest.
+    eval_sb.append(
+        'await import("jstests/libs/override_methods/check_shard_filtering_metadata.js")'
+    )
+
+    if config.FUZZ_MONGOD_CONFIGS is not None and config.FUZZ_MONGOD_CONFIGS is not False:
+        # Prevent commands from running with the config fuzzer.
+        eval_sb.append(
+            'await import("jstests/libs/override_methods/config_fuzzer_incompatible_commands.js")'
+        )
+
+    # Load this file to retry operations that fail due to in-progress background operations.
+    eval_sb.append(
+        'await import("jstests/libs/override_methods/index_builds/implicitly_retry_on_background_op_in_progress.js")'
+    )
+
+    eval_sb.append(
+        '(function() { Timestamp.prototype.toString = function() { throw new Error("Cannot toString timestamps. Consider using timestampCmp() for comparison or tojson(<variable>) for output."); } })()'
+    )
 
     eval_str = "; ".join(eval_sb)
     args.append("--eval")
     args.append(eval_str)
 
-    if config.SHELL_READ_MODE is not None:
-        kwargs["readMode"] = config.SHELL_READ_MODE
+    if config.SHELL_TLS_ENABLED:
+        args.extend(["--tls", "--tlsAllowInvalidHostnames"])
+        if config.TLS_CA_FILE:
+            kwargs["tlsCAFile"] = config.TLS_CA_FILE
+        if config.SHELL_TLS_CERTIFICATE_KEY_FILE:
+            kwargs["tlsCertificateKeyFile"] = config.SHELL_TLS_CERTIFICATE_KEY_FILE
 
-    if config.SHELL_WRITE_MODE is not None:
-        kwargs["writeMode"] = config.SHELL_WRITE_MODE
+    # mongotmock testing with gRPC requires that the shell establish a connection with mongotmock
+    # over gRPC.
+    if config.SHELL_GRPC or mongod_set_parameters.get("useGrpcForSearch"):
+        args.append("--gRPC")
 
     if connection_string is not None:
         # The --host and --port options are ignored by the mongo shell when an explicit connection
@@ -293,6 +506,15 @@ def mongo_shell_program(  # pylint: disable=too-many-branches,too-many-locals,to
         if "host" in kwargs:
             kwargs.pop("host")
 
+    for key in mongo_set_parameters:
+        val = str(mongo_set_parameters[key])
+        args.append(f"--setShellParameter={key}={val}")
+
+    # if featureFlagQETextSearchPreview is enabled in setParameter, enable it in the shell also
+    # TODO: SERVER-65769 remove once FF is enabled by default
+    if mongod_set_parameters.get("featureFlagQETextSearchPreview"):
+        args.append("--setShellParameter=featureFlagQETextSearchPreview=true")
+
     # Apply the rest of the command line arguments.
     _apply_kwargs(args, kwargs)
 
@@ -300,8 +522,8 @@ def mongo_shell_program(  # pylint: disable=too-many-branches,too-many-locals,to
         args.append(connection_string)
 
     # Have the mongo shell run the specified file.
-    if filename is not None:
-        args.append(filename)
+    if filenames:
+        args.extend(filenames)
 
     _set_keyfile_permissions(test_data)
 
@@ -309,27 +531,35 @@ def mongo_shell_program(  # pylint: disable=too-many-branches,too-many-locals,to
     return make_process(logger, args, **process_kwargs)
 
 
-def _format_shell_vars(sb, path, value):
-    """Format 'value' in a way that can be passed to --eval.
+def _format_shell_vars(sb, paths, value):
+    """
+    Format 'value' in a way that can be passed to --eval.
 
-    If 'value' is a dictionary, then it is unrolled into the creation of
-    a new JSON object with properties assigned for each key of the
-    dictionary.
+    :param sb: string builder array for the output string.
+    :param paths: path of keys represented as a list.
+    :param value: value in the object corresponding to the keys in `paths`
+    :return: Nothing.
     """
 
+    # Convert the list ["a", "b", "c"] into the string 'a["b"]["c"]'
+    def bracketize(lst):
+        return lst[0] + "".join(f'["{i}"]' for i in lst[1:])
+
     # Only need to do special handling for JSON objects.
-    if not isinstance(value, dict):
-        sb.append("%s = %s" % (path, json.dumps(value)))
+    if not isinstance(value, (dict, HistoryDict)):
+        sb.append("%s = %s" % (bracketize(paths), json.dumps(value)))
         return
 
     # Avoid including curly braces and colons in output so that the command invocation can be
     # copied and run through bash.
-    sb.append("%s = new Object()" % (path))
+    sb.append("%s = new Object()" % bracketize(paths))
     for subkey in value:
-        _format_shell_vars(sb, ".".join((path, subkey)), value[subkey])
+        _format_shell_vars(sb, paths + [subkey], value[subkey])
 
 
-def dbtest_program(logger, executable=None, suites=None, process_kwargs=None, **kwargs):
+def dbtest_program(
+    logger, executable=None, suites=None, process_kwargs=None, **kwargs
+) -> process.Process:
     """Return a Process instance that starts a dbtest with arguments constructed from 'kwargs'."""
 
     executable = utils.default_if_none(executable, config.DEFAULT_DBTEST_EXECUTABLE)
@@ -338,21 +568,20 @@ def dbtest_program(logger, executable=None, suites=None, process_kwargs=None, **
     if suites is not None:
         args.extend(suites)
 
-    kwargs["enableMajorityReadConcern"] = config.MAJORITY_READ_CONCERN
     if config.STORAGE_ENGINE is not None:
         kwargs["storageEngine"] = config.STORAGE_ENGINE
 
     return generic_program(logger, args, process_kwargs=process_kwargs, **kwargs)
 
 
-def genny_program(logger, executable=None, process_kwargs=None, **kwargs):
+def genny_program(logger, executable=None, process_kwargs=None, **kwargs) -> process.Process:
     """Return a Process instance that starts a genny executable with arguments constructed from 'kwargs'."""
     executable = utils.default_if_none(executable, config.DEFAULT_GENNY_EXECUTABLE)
     args = [executable]
-    return generic_program(logger, args, process_kwargs, **kwargs)
+    return generic_program(logger, args, process_kwargs=process_kwargs, **kwargs)
 
 
-def generic_program(logger, args, process_kwargs=None, **kwargs):
+def generic_program(logger, args, process_kwargs=None, **kwargs) -> process.Process:
     """Return a Process instance that starts an arbitrary executable.
 
     The executable arguments are constructed from 'kwargs'.
@@ -408,6 +637,11 @@ def _set_keyfile_permissions(opts):
     We can't permanently set the keyfile permissions because git is not
     aware of them.
     """
+    for keysuffix in ["1", "2", "ForRollover"]:
+        keyfile = "jstests/libs/key%s" % keysuffix
+        if os.path.exists(keyfile):
+            os.chmod(keyfile, stat.S_IRUSR | stat.S_IWUSR)
+
     if "keyFile" in opts:
         os.chmod(opts["keyFile"], stat.S_IRUSR | stat.S_IWUSR)
     if "encryptionKeyFile" in opts:

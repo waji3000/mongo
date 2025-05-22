@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,14 +29,20 @@
 
 #pragma once
 
+#include <list>
 #include <memory>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/status_with.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/baton.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/executor/remote_command_request.h"
 #include "mongo/executor/task_executor.h"
 #include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/list.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/util/future.h"
+#include "mongo/util/interruptible.h"
+#include "mongo/util/net/hostandport.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo {
 namespace executor {
@@ -50,37 +55,56 @@ class ThreadPoolTaskExecutor;
  * override methods if needed.
  */
 class ShardingTaskExecutor final : public TaskExecutor {
-    MONGO_DISALLOW_COPYING(ShardingTaskExecutor);
+    struct Passkey {
+        explicit Passkey() = default;
+    };
 
 public:
-    ShardingTaskExecutor(std::unique_ptr<ThreadPoolTaskExecutor> executor);
+    ShardingTaskExecutor(Passkey, std::shared_ptr<ThreadPoolTaskExecutor> executor);
+
+    static std::shared_ptr<ShardingTaskExecutor> create(
+        std::shared_ptr<ThreadPoolTaskExecutor> executor) {
+        return std::make_shared<ShardingTaskExecutor>(Passkey{}, std::move(executor));
+    }
+
+    ShardingTaskExecutor(const ShardingTaskExecutor&) = delete;
+    ShardingTaskExecutor& operator=(const ShardingTaskExecutor&) = delete;
 
     void startup() override;
     void shutdown() override;
     void join() override;
+    SharedSemiFuture<void> joinAsync() override;
+    bool isShuttingDown() const override;
     void appendDiagnosticBSON(BSONObjBuilder* builder) const override;
     Date_t now() override;
     StatusWith<EventHandle> makeEvent() override;
     void signalEvent(const EventHandle& event) override;
-    StatusWith<CallbackHandle> onEvent(const EventHandle& event, CallbackFn work) override;
+    StatusWith<CallbackHandle> onEvent(const EventHandle& event, CallbackFn&& work) override;
     void waitForEvent(const EventHandle& event) override;
     StatusWith<stdx::cv_status> waitForEvent(OperationContext* opCtx,
                                              const EventHandle& event,
                                              Date_t deadline) override;
-    StatusWith<CallbackHandle> scheduleWork(CallbackFn work) override;
-    StatusWith<CallbackHandle> scheduleWorkAt(Date_t when, CallbackFn work) override;
-    StatusWith<CallbackHandle> scheduleRemoteCommand(
+    StatusWith<CallbackHandle> scheduleWork(CallbackFn&& work) override;
+    StatusWith<CallbackHandle> scheduleWorkAt(Date_t when, CallbackFn&& work) override;
+    StatusWith<CallbackHandle> scheduleRemoteCommand(const RemoteCommandRequest& request,
+                                                     const RemoteCommandCallbackFn& cb,
+                                                     const BatonHandle& baton = nullptr) override;
+    StatusWith<CallbackHandle> scheduleExhaustRemoteCommand(
         const RemoteCommandRequest& request,
         const RemoteCommandCallbackFn& cb,
-        const transport::BatonHandle& baton = nullptr) override;
+        const BatonHandle& baton = nullptr) override;
+    bool hasTasks() override;
     void cancel(const CallbackHandle& cbHandle) override;
     void wait(const CallbackHandle& cbHandle,
               Interruptible* interruptible = Interruptible::notInterruptible()) override;
 
     void appendConnectionStats(ConnectionPoolStats* stats) const override;
+    void appendNetworkInterfaceStats(BSONObjBuilder&) const override;
+
+    void dropConnections(const HostAndPort& hostAndPort) override;
 
 private:
-    std::unique_ptr<ThreadPoolTaskExecutor> _executor;
+    std::shared_ptr<ThreadPoolTaskExecutor> _executor;
 };
 
 }  // namespace executor

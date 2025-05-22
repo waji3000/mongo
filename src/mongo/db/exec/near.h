@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -34,13 +33,9 @@
 #include <queue>
 #include <vector>
 
-#include "mongo/base/status_with.h"
-#include "mongo/base/string_data.h"
-#include "mongo/db/catalog/collection.h"
 #include "mongo/db/exec/plan_stats.h"
-#include "mongo/db/exec/requires_collection_stage.h"
+#include "mongo/db/exec/requires_index_stage.h"
 #include "mongo/db/exec/working_set.h"
-#include "mongo/db/jsobj.h"
 #include "mongo/db/record_id.h"
 #include "mongo/stdx/unordered_map.h"
 
@@ -88,13 +83,13 @@ namespace mongo {
  * TODO: Right now the interface allows the nextCovering() to be adaptive, but doesn't allow
  * aborting and shrinking a covered range being buffered if we guess wrong.
  */
-class NearStage : public RequiresCollectionStage {
+class NearStage : public RequiresIndexStage {
 public:
     struct CoveredInterval;
 
-    ~NearStage();
+    ~NearStage() override;
 
-    bool isEOF() final;
+    bool isEOF() const final;
     StageState doWork(WorkingSetID* out) final;
 
     StageType stageType() const final;
@@ -105,34 +100,30 @@ protected:
     /**
      * Subclasses of NearStage must provide basics + a stats object which gets owned here.
      */
-    NearStage(OperationContext* opCtx,
+    NearStage(ExpressionContext* expCtx,
               const char* typeName,
               StageType type,
               WorkingSet* workingSet,
-              const Collection* collection);
+              VariantCollectionPtrOrAcquisition collection,
+              const IndexDescriptor* indexDescriptor);
 
     //
     // Methods implemented for specific search functionality
     //
 
     /**
-     * Constructs the next covering over the next interval to buffer results from, or NULL
-     * if the full range has been searched.  Use the provided working set as the working
-     * set for the covering stage if required.
-     *
-     * Returns !OK on failure to create next stage.
+     * Constructs the next covering over the next interval to buffer results from, or nullptr if the
+     * full range has been searched.  Use the provided working set as the working set for the
+     * covering stage if required.
      */
-    virtual StatusWith<CoveredInterval*> nextInterval(OperationContext* opCtx,
-                                                      WorkingSet* workingSet,
-                                                      const Collection* collection) = 0;
+    virtual std::unique_ptr<CoveredInterval> nextInterval(OperationContext* opCtx,
+                                                          WorkingSet* workingSet) = 0;
 
     /**
      * Computes the distance value for the given member data, or -1 if the member should not be
      * returned in the sorted results.
-     *
-     * Returns !OK on invalid member data.
      */
-    virtual StatusWith<double> computeDistance(WorkingSetMember* member) = 0;
+    virtual double computeDistance(WorkingSetMember* member) = 0;
 
     /*
      * Initialize near stage before buffering the data.
@@ -145,9 +136,9 @@ protected:
                                   WorkingSet* workingSet,
                                   WorkingSetID* out) = 0;
 
-    void saveState(RequiresCollTag) final {}
+    void doSaveStateRequiresIndex() final {}
 
-    void restoreState(RequiresCollTag) final {}
+    void doRestoreStateRequiresIndex() final {}
 
     // Filled in by subclasses.
     NearStats _specificStats;
@@ -158,7 +149,7 @@ private:
     //
 
     StageState initNext(WorkingSetID* out);
-    StageState bufferNext(WorkingSetID* toReturn, Status* error);
+    StageState bufferNext(WorkingSetID* toReturn);
     StageState advanceNext(WorkingSetID* toReturn);
 
     //

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,12 +29,15 @@
 
 #pragma once
 
+#include <string>
+#include <vector>
+
 #include "mongo/base/status.h"
 #include "mongo/client/connection_string.h"
 #include "mongo/db/server_options.h"
-#include "mongo/s/is_mongos.h"
 #include "mongo/util/options_parser/environment.h"
 #include "mongo/util/options_parser/option_section.h"
+#include "mongo/util/options_parser/value.h"
 
 namespace mongo {
 
@@ -47,13 +49,14 @@ class Environment;
 namespace moe = mongo::optionenvironment;
 
 struct MongosGlobalParams {
+    bool scriptingEnabled = true;  // Use "security.javascriptEnabled" to set this variable. Or use
+                                   // --noscripting which will set it to false.
+
     // The config server connection string
     ConnectionString configdbs;
 };
 
 extern MongosGlobalParams mongosGlobalParams;
-
-Status addMongosOptions(moe::OptionSection* options);
 
 void printMongosHelp(const moe::OptionSection& options);
 
@@ -75,10 +78,10 @@ Status validateMongosOptions(const moe::Environment& params);
 /**
  * Canonicalize mongos options for the given environment.
  *
- * For example, the options "dur", "nodur", "journal", "nojournal", and
- * "storage.journaling.enabled" should all be merged into "storage.journaling.enabled".
+ * For example, the options "noscripting" and "security.javascriptEnabled" and should all be merged
+ * into "security.javascriptEnabled".
  */
 Status canonicalizeMongosOptions(moe::Environment* params);
 
 Status storeMongosOptions(const moe::Environment& params);
-}
+}  // namespace mongo

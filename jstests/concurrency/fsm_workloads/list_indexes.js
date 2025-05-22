@@ -1,29 +1,37 @@
-'use strict';
-
 /**
  * list_indexes.js
  *
  * Checks that the listIndexes command can tolerate concurrent modifications to the
  * index catalog.
+ *
+ * This workload implicitly assumes that its tid ranges are [0, $config.threadCount). This
+ * isn't guaranteed to be true when they are run in parallel with other workloads. Therefore
+ * it can't be run in concurrency simultaneous suites.
+ * @tags: [
+ *   requires_getmore,
+ *   incompatible_with_concurrency_simultaneous,
+ *   # We run the 'listIndexes' command, which cannot be run within a transaction, and perform
+ *   # subsequent getMores. Therefore the getMore will run outside a transaction.
+ *   uses_getmore_outside_of_transaction,
+ * ]
  */
-var $config = (function() {
-
+export const $config = (function() {
     var states = (function() {
         // Picks a random index to drop and recreate.
         function modifyIndices(db, collName) {
             var spec = {};
             spec['foo' + this.tid] = 1;
 
-            assertWhenOwnColl.commandWorked(db[collName].dropIndex(spec));
+            assert.commandWorked(db[collName].dropIndex(spec));
             sleep(100);
-            assertWhenOwnColl.commandWorked(db[collName].ensureIndex(spec));
+            assert.commandWorked(db[collName].createIndex(spec));
         }
 
         // List indexes, using a batchSize of 2 to ensure getmores happen.
         function listIndices(db, collName) {
             var cursor = new DBCommandCursor(
                 db, db.runCommand({listIndexes: collName, cursor: {batchSize: 2}}));
-            assertWhenOwnColl.gte(cursor.itcount(), 0);
+            assert.gte(cursor.itcount(), 0);
         }
 
         return {modifyIndices: modifyIndices, listIndices: listIndices};
@@ -39,7 +47,7 @@ var $config = (function() {
         for (var i = 0; i < this.threadCount; ++i) {
             var spec = {};
             spec['foo' + i] = 1;
-            assertAlways.commandWorked(db[collName].ensureIndex(spec));
+            assert.commandWorked(db[collName].createIndex(spec));
         }
     }
 

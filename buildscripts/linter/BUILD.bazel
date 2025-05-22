@@ -1,0 +1,29 @@
+load("@poetry//:dependencies.bzl", "dependency")
+
+py_library(
+    name = "linter",
+    srcs = [
+        "base.py",
+        "filediff.py",
+        "git.py",
+        "git_base.py",
+        "mongolint.py",
+        "mypy.py",
+        "parallel.py",
+        "pyrightlinter.py",
+        "ruffchecker.py",
+        "ruffformatter.py",
+        "runner.py",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        dependency(
+            "structlog",
+            group = "evergreen",
+        ),
+        dependency(
+            "gitpython",
+            group = "evergreen",
+        ),
+    ],
+)

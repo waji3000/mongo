@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,14 +29,13 @@
 
 #include "mongo/base/data_type_validated.h"
 
-#include <algorithm>
 #include <iterator>
 
-#include "mongo/base/data_range.h"
 #include "mongo/base/data_range_cursor.h"
-#include "mongo/base/data_type_endian.h"
+#include "mongo/base/error_codes.h"
 #include "mongo/base/status.h"
-#include "mongo/db/jsobj.h"
+#include "mongo/base/string_data.h"
+#include "mongo/stdx/type_traits.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
@@ -62,21 +60,21 @@ struct Validator<char> {
 namespace {
 
 using namespace mongo;
-using std::end;
 using std::begin;
+using std::end;
 
 TEST(DataTypeValidated, SuccessfulValidation) {
     char buf[1];
 
     {
         DataRangeCursor drc(begin(buf), end(buf));
-        ASSERT_OK(drc.writeAndAdvance(Validated<char>(0xFU)));
+        ASSERT_OK(drc.writeAndAdvanceNoThrow(Validated<char>(0xFU)));
     }
 
     {
         Validated<char> valid;
         ConstDataRangeCursor cdrc(begin(buf), end(buf));
-        ASSERT_OK(cdrc.readAndAdvance(&valid));
+        ASSERT_OK(cdrc.readAndAdvanceNoThrow(&valid));
         ASSERT_EQUALS(valid.val, char{0xFU});
     }
 }
@@ -86,7 +84,7 @@ TEST(DataTypeValidated, FailedValidation) {
 
     {
         DataRangeCursor drc(begin(buf), end(buf));
-        ASSERT_NOT_OK(drc.writeAndAdvance(Validated<char>(0x01)));
+        ASSERT_NOT_OK(drc.writeAndAdvanceNoThrow(Validated<char>(0x01)));
     }
 
     buf[0] = char{0x01};
@@ -94,7 +92,7 @@ TEST(DataTypeValidated, FailedValidation) {
     {
         Validated<char> valid;
         ConstDataRangeCursor cdrc(begin(buf), end(buf));
-        ASSERT_NOT_OK(cdrc.readAndAdvance(&valid));
+        ASSERT_NOT_OK(cdrc.readAndAdvanceNoThrow(&valid));
     }
 }
 

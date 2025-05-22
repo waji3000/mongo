@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Public Domain 2014-2018 MongoDB, Inc.
+# Public Domain 2014-present MongoDB, Inc.
 # Public Domain 2008-2014 WiredTiger, Inc.
 #
 # This is free and unencumbered software released into the public domain.
@@ -29,7 +29,7 @@
 # test_bug021.py
 #       Fixed-length column store implicit record operations test.
 
-import wiredtiger, wttest
+import wttest
 
 # Fixed-length column store implicit record operations test.
 class test_bug021(wttest.WiredTigerTestCase):
@@ -62,8 +62,8 @@ class test_bug021(wttest.WiredTigerTestCase):
         c.close()
 
         if actual != expected:
-            print 'expected: ', expected
-            print '  actual: ', actual
+            print('expected: ', expected)
+            print('  actual: ', actual)
         self.assertEqual(expected, actual)
 
     def test_implicit_record_cursor_insert_next(self):
@@ -72,21 +72,21 @@ class test_bug021(wttest.WiredTigerTestCase):
 
         # Check cursor next/operation inside trailing implicit keys.
         cursor.set_key(62)
-        self.assertEquals(cursor.search(), 0)
-        self.assertEquals(cursor.next(), 0)
-        self.assertEquals(cursor.next(), 0)
+        self.assertEqual(cursor.search(), 0)
+        self.assertEqual(cursor.next(), 0)
+        self.assertEqual(cursor.next(), 0)
         cursor.set_value(3)
-        self.assertEquals(cursor.insert(), 0)
+        self.assertEqual(cursor.insert(), 0)
         current[62 + 2] = 3
         self.check(current)
 
         # Check cursor prev/operation inside trailing implicit keys.
         cursor.set_key(68)
-        self.assertEquals(cursor.search(), 0)
-        self.assertEquals(cursor.prev(), 0)
-        self.assertEquals(cursor.prev(), 0)
+        self.assertEqual(cursor.search(), 0)
+        self.assertEqual(cursor.prev(), 0)
+        self.assertEqual(cursor.prev(), 0)
         cursor.set_value(7)
-        self.assertEquals(cursor.insert(), 0)
+        self.assertEqual(cursor.insert(), 0)
         current[68 - 2] = 7
 
     def test_implicit_record_cursor_insert_prev(self):
@@ -95,21 +95,21 @@ class test_bug021(wttest.WiredTigerTestCase):
 
         # Check cursor next/operation inside leading implicit keys.
         cursor.set_key(2)
-        self.assertEquals(cursor.search(), 0)
-        self.assertEquals(cursor.next(), 0)
-        self.assertEquals(cursor.next(), 0)
+        self.assertEqual(cursor.search(), 0)
+        self.assertEqual(cursor.next(), 0)
+        self.assertEqual(cursor.next(), 0)
         cursor.set_value(3)
-        self.assertEquals(cursor.insert(), 0)
+        self.assertEqual(cursor.insert(), 0)
         current[2 + 2] = 3
         self.check(current)
 
         # Check cursor prev/operation inside leading implicit keys.
         cursor.set_key(18)
-        self.assertEquals(cursor.search(), 0)
-        self.assertEquals(cursor.prev(), 0)
-        self.assertEquals(cursor.prev(), 0)
+        self.assertEqual(cursor.search(), 0)
+        self.assertEqual(cursor.prev(), 0)
+        self.assertEqual(cursor.prev(), 0)
         cursor.set_value(7)
-        self.assertEquals(cursor.insert(), 0)
+        self.assertEqual(cursor.insert(), 0)
         current[18 - 2] = 7
         self.check(current)
 
@@ -118,21 +118,21 @@ class test_bug021(wttest.WiredTigerTestCase):
         self.check(current)
 
         # Check cursor next/operation inside trailing implicit keys.
-        cursor.set_key(62)
-        self.assertEquals(cursor.search(), 0)
+        cursor.set_key(60)
+        self.assertEqual(cursor.search(), 0)
         for i in range(1, 5):
-            self.assertEquals(cursor.next(), 0)
-            self.assertEquals(cursor.remove(), 0)
-            current[62 + i] = 0
+            self.assertEqual(cursor.next(), 0)
+            self.assertEqual(cursor.remove(), 0)
+            current[60 + i] = 0
         self.check(current)
 
         # Check cursor prev/operation inside trailing implicit keys.
-        cursor.set_key(68)
-        self.assertEquals(cursor.search(), 0)
+        cursor.set_key(70)
+        self.assertEqual(cursor.search(), 0)
         for i in range(1, 5):
-            self.assertEquals(cursor.prev(), 0)
-            self.assertEquals(cursor.remove(), 0)
-            current[68 - i] = 0
+            self.assertEqual(cursor.prev(), 0)
+            self.assertEqual(cursor.remove(), 0)
+            current[70 - i] = 0
         self.check(current)
 
     def test_implicit_record_cursor_remove_prev(self):
@@ -141,20 +141,20 @@ class test_bug021(wttest.WiredTigerTestCase):
 
         # Check cursor next/operation inside leading implicit keys.
         cursor.set_key(2)
-        self.assertEquals(cursor.search(), 0)
+        self.assertEqual(cursor.search(), 0)
         for i in range(1, 5):
-            self.assertEquals(cursor.next(), 0)
-            self.assertEquals(cursor.remove(), 0)
+            self.assertEqual(cursor.next(), 0)
+            self.assertEqual(cursor.remove(), 0)
             current[2 + i] = 0
         self.check(current)
 
         # Check cursor prev/operation inside leading implicit keys.
         cursor.set_key(18)
-        self.assertEquals(cursor.search(), 0)
+        self.assertEqual(cursor.search(), 0)
         for i in range(1, 5):
             current[18 - i] = 0
-            self.assertEquals(cursor.prev(), 0)
-            self.assertEquals(cursor.remove(), 0)
+            self.assertEqual(cursor.prev(), 0)
+            self.assertEqual(cursor.remove(), 0)
             current[18 - i] = 0
         self.check(current)
 
@@ -164,22 +164,22 @@ class test_bug021(wttest.WiredTigerTestCase):
 
         # Check cursor next/operation inside trailing implicit keys.
         cursor.set_key(62)
-        self.assertEquals(cursor.search(), 0)
+        self.assertEqual(cursor.search(), 0)
         for i in range(1, 5):
-            self.assertEquals(cursor.next(), 0)
+            self.assertEqual(cursor.next(), 0)
             cursor.set_value(i)
             self.session.breakpoint()
-            self.assertEquals(cursor.update(), 0)
+            self.assertEqual(cursor.update(), 0)
             current[62 + i] = i
         self.check(current)
 
         # Check cursor prev/operation inside trailing implicit keys.
         cursor.set_key(68)
-        self.assertEquals(cursor.search(), 0)
+        self.assertEqual(cursor.search(), 0)
         for i in range(1, 5):
-            self.assertEquals(cursor.prev(), 0)
+            self.assertEqual(cursor.prev(), 0)
             cursor.set_value(i)
-            self.assertEquals(cursor.update(), 0)
+            self.assertEqual(cursor.update(), 0)
             current[68 - i] = i
         self.check(current)
 
@@ -189,24 +189,21 @@ class test_bug021(wttest.WiredTigerTestCase):
 
         # Check cursor next/operation inside leading implicit keys.
         cursor.set_key(2)
-        self.assertEquals(cursor.search(), 0)
+        self.assertEqual(cursor.search(), 0)
         for i in range(1, 5):
-            self.assertEquals(cursor.next(), 0)
+            self.assertEqual(cursor.next(), 0)
             cursor.set_value(i)
-            self.assertEquals(cursor.update(), 0)
+            self.assertEqual(cursor.update(), 0)
             current[2 + i] = i
         self.check(current)
 
         # Check cursor prev/operation inside leading implicit keys.
         cursor.set_key(18)
-        self.assertEquals(cursor.search(), 0)
+        self.assertEqual(cursor.search(), 0)
         for i in range(1, 5):
             current[18 - i] = 0
-            self.assertEquals(cursor.prev(), 0)
+            self.assertEqual(cursor.prev(), 0)
             cursor.set_value(i)
-            self.assertEquals(cursor.update(), 0)
+            self.assertEqual(cursor.update(), 0)
             current[18 - i] = i
         self.check(current)
-
-if __name__ == '__main__':
-    wttest.run()

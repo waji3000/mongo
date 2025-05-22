@@ -27,12 +27,6 @@
 #
 """Text Writing Utilites."""
 
-from __future__ import absolute_import, print_function, unicode_literals
-
-import io
-import string
-from typing import List, Mapping, Union
-
 from . import common
 
 # Number of spaces to indent code
@@ -40,25 +34,25 @@ _INDENT_SPACE_COUNT = 4
 
 
 def _fill_spaces(count):
-    # type: (int) -> unicode
+    # type: (int) -> str
     """Fill a string full of spaces."""
-    fill = ''
+    fill = ""
     for _ in range(count * _INDENT_SPACE_COUNT):
-        fill += ' '
+        fill += " "
 
     return fill
 
 
 def _indent_text(count, unindented_text):
-    # type: (int, unicode) -> unicode
+    # type: (int, str) -> str
     """Indent each line of a multi-line string."""
     lines = unindented_text.splitlines()
     fill = _fill_spaces(count)
-    return '\n'.join(fill + line for line in lines)
+    return "\n".join(fill + line for line in lines)
 
 
 def is_function(name):
-    # type: (unicode) -> bool
+    # type: (str) -> bool
     """
     Return True if a serializer/deserializer is function.
 
@@ -69,29 +63,28 @@ def is_function(name):
 
 
 def get_method_name(name):
-    # type: (unicode) -> unicode
+    # type: (str) -> str
     """Get a method name from a fully qualified method name."""
-    pos = name.rfind('::')
+    pos = name.rfind("::")
     if pos == -1:
         return name
-    return name[pos + 2:]
+    return name[pos + 2 :]
 
 
 def get_method_name_from_qualified_method_name(name):
-    # type: (unicode) -> unicode
-    # pylint: disable=invalid-name
+    # type: (str) -> str
     """Get a method name from a fully qualified method name."""
     # TODO: in the future, we may want to support full-qualified calls to static methods
     # Strip the global prefix from enum functions
     if name.startswith("::"):
         name = name[2:]
 
-    prefix = 'mongo::'
+    prefix = "mongo::"
     pos = name.find(prefix)
     if pos == -1:
         return name
 
-    return name[len(prefix):]
+    return name[len(prefix) :]
 
 
 class IndentedTextWriter(object):
@@ -108,10 +101,10 @@ class IndentedTextWriter(object):
         """Create an indented text writer."""
         self._stream = stream
         self._indent = 0
-        self._template_context = None  # type: Mapping[unicode, unicode]
+        self._template_context = None  # type: Mapping[str, str]
 
     def write_unindented_line(self, msg):
-        # type: (unicode) -> None
+        # type: (str) -> None
         """Write an unindented line to the stream, no template formattin applied."""
         self._stream.write(msg)
         self._stream.write("\n")
@@ -128,13 +121,13 @@ class IndentedTextWriter(object):
         self._indent -= 1
 
     def write_line(self, msg):
-        # type: (unicode) -> None
+        # type: (str) -> None
         """Write a line to the stream, no template formattin applied."""
         self._stream.write(_indent_text(self._indent, msg))
         self._stream.write("\n")
 
     def set_template_mapping(self, template_params):
-        # type: (Mapping[unicode,unicode]) -> None
+        # type: (Mapping[str,str]) -> None
         """Set the current template mapping parameters for string.Template formatting."""
         assert not self._template_context
         self._template_context = template_params
@@ -146,7 +139,7 @@ class IndentedTextWriter(object):
         self._template_context = None
 
     def write_template(self, template):
-        # type: (unicode) -> None
+        # type: (str) -> None
         """Write a template to the stream."""
         msg = common.template_format(template, self._template_context)
         self._stream.write(_indent_text(self._indent, msg))
@@ -162,7 +155,7 @@ class TemplateContext(object):
     """Set the template context for the writer."""
 
     def __init__(self, writer, template_params):
-        # type: (IndentedTextWriter, Mapping[unicode,unicode]) -> None
+        # type: (IndentedTextWriter, Mapping[str,str]) -> None
         """Create a template context."""
         self._writer = writer
         self._template_context = template_params
@@ -178,7 +171,21 @@ class TemplateContext(object):
         self._writer.clear_template_mapping()
 
 
-class EmptyBlock(object):
+class WriterBlock(object):
+    """Interface for block types below."""
+
+    def __enter__(self):
+        # type: () -> None
+        """Open a block."""
+        pass
+
+    def __exit__(self, *args):
+        # type: (*str) -> None
+        """Close the block."""
+        pass
+
+
+class EmptyBlock(WriterBlock):
     """Do not generate an indented block."""
 
     def __init__(self):
@@ -197,11 +204,11 @@ class EmptyBlock(object):
         pass
 
 
-class IndentedScopedBlock(object):
+class IndentedScopedBlock(WriterBlock):
     """Generate a block, template the parameters, and indent the contents."""
 
     def __init__(self, writer, opening, closing):
-        # type: (IndentedTextWriter, unicode, unicode) -> None
+        # type: (IndentedTextWriter, str, str) -> None
         """Create a block."""
         self._writer = writer
         self._opening = opening
@@ -220,11 +227,11 @@ class IndentedScopedBlock(object):
         self._writer.write_template(self._closing)
 
 
-class NamespaceScopeBlock(object):
+class NamespaceScopeBlock(WriterBlock):
     """Generate an unindented blocks for a list of namespaces, and do not indent the contents."""
 
     def __init__(self, indented_writer, namespaces):
-        # type: (IndentedTextWriter, List[unicode]) -> None
+        # type: (IndentedTextWriter, List[str]) -> None
         """Create a block."""
         self._writer = indented_writer
         self._namespaces = namespaces
@@ -233,7 +240,7 @@ class NamespaceScopeBlock(object):
         # type: () -> None
         """Write the beginning of the block and do not indent."""
         for namespace in self._namespaces:
-            self._writer.write_unindented_line('namespace %s {' % (namespace))
+            self._writer.write_unindented_line("namespace %s {" % (namespace))
 
     def __exit__(self, *args):
         # type: (*str) -> None
@@ -241,4 +248,190 @@ class NamespaceScopeBlock(object):
         self._namespaces.reverse()
 
         for namespace in self._namespaces:
-            self._writer.write_unindented_line('}  // namespace %s' % (namespace))
+            self._writer.write_unindented_line("}  // namespace %s" % (namespace))
+
+
+class UnindentedBlock(WriterBlock):
+    """Generate a block without indentation."""
+
+    def __init__(self, writer, opening, closing):
+        # type: (IndentedTextWriter, str, str) -> None
+        """Create a block."""
+        self._writer = writer
+        self._opening = opening
+        self._closing = closing
+
+    def __enter__(self):
+        # type: () -> None
+        """Write the beginning of the block."""
+        self._writer.write_unindented_line(self._opening)
+
+    def __exit__(self, *args):
+        # type: (*str) -> None
+        """Write the ending of the block."""
+        self._writer.write_unindented_line(self._closing)
+
+
+class MultiBlock(WriterBlock):
+    """Proxy container for a list of WriterBlocks."""
+
+    def __init__(self, blocks):
+        # type: (MultiBlock, List[WriterBlock]) -> None
+        """Create a multi-block."""
+        self._blocks = blocks
+
+    def __enter__(self):
+        # type: () -> None
+        """Enter each block forwards."""
+        for i in self._blocks:
+            i.__enter__()
+
+    def __exit__(self, *args):
+        # type: (*str) -> None
+        """And leave each block in reverse."""
+        for i in reversed(self._blocks):
+            i.__exit__(*args)
+
+
+def _get_common_prefix(words):
+    # type: (List[str]) -> str
+    """Returns a common prefix for a set of strings.
+
+    Returns empty string if there is no prefix or a empty string
+    """
+    empty_words = [lw for lw in words if len(lw) == 0]
+    if empty_words:
+        return ""
+
+    first_letters = {w[0] for w in words}
+
+    if len(first_letters) == 1:
+        short_words = [lw for lw in words if len(lw) == 1]
+        if short_words:
+            return words[0][0]
+
+        suffix_words = [flw[1:] for flw in words]
+
+        return words[0][0] + _get_common_prefix(suffix_words)
+    else:
+        return ""
+
+
+def gen_trie(words, writer, callback):
+    # type: (List[str], IndentedTextWriter, Callable[[str], None]) -> None
+    """
+    Generate a trie for a list of strings.
+
+    Takes a callback function that can used to generate code that processes a specific word in the trie.
+    i.e. for ["abc", "def"], then callback() will be called twice, once for each string.
+    """
+    words = sorted(words)
+
+    _gen_trie("", words, writer, callback)
+
+
+def _gen_trie(prefix, words, writer, callback):
+    # type: (str, List[str], IndentedTextWriter, Callable[[str], None]) -> None
+    """
+    Recursively generate a trie.
+
+    Prefix is a common prefix for all the strings in words, can be empty string.
+    """
+    assert len(words) >= 1
+    # No duplicate strings allowed
+    assert len(words) == len(set(words))
+
+    prefix_len = len(prefix)
+
+    # Base case: one word
+    if len(words) == 1:
+        # Check remaining string is a string match
+        word_to_check = prefix + words[0]
+        suffix = words[0]
+        suffix_len = len(suffix)
+
+        predicate = (
+            f"fieldName.size() == {len(word_to_check)} && "
+            + f'std::char_traits<char>::compare(fieldName.data() + {prefix_len}, "{suffix}", {suffix_len}) == 0'
+        )
+
+        # If there is no trailing text, we just need to check length to validate we matched
+        if suffix_len == 0:
+            predicate = f"fieldName.size() == {len(word_to_check)}"
+
+        # Optimization:
+        # Checking strings of length 1 or even length is efficient. Strings of 3 byte length are
+        # inefficient to check as they require two comparisons (1 uint16 and 1 uint8) but 4 byte
+        # length strings require just 1. Since we know the field name is zero terminated, we can
+        # just use memcmp and compare with the trailing null byte.
+        elif suffix_len % 4 == 3:
+            predicate = (
+                f"fieldName.size() == {len(word_to_check)} && "
+                + f' memcmp(fieldName.data() + {prefix_len}, "{suffix}\\0", {suffix_len + 1}) == 0'
+            )
+
+        with IndentedScopedBlock(writer, f"if ({predicate}) {{", "}"):
+            callback(word_to_check)
+
+        return
+
+    # Handle the case where one word is a prefix of another
+    # For instance, ["short", "shorter"] will eventually call this function with
+    # (prefix = "short", ["", "er"]) as the tuple of prefix and list of words
+    empty_words = [lw for lw in words if len(lw) == 0]
+    if empty_words:
+        word_to_check = prefix
+        with IndentedScopedBlock(writer, f"if (fieldName.size() == {len(word_to_check)}) {{", "}"):
+            callback(word_to_check)
+
+    # Filter out empty words
+    words = [lw for lw in words if len(lw) > 0]
+
+    # Optimization for a common prefix
+    # Example: ["word1", "word2"]
+    # Instead of generating a trie to check for letters individually (i.e. ["w", "o", "r", "d"]),
+    # we check for the prefix all at once ("word")
+    gcp = _get_common_prefix(words)
+    if len(gcp) > 1:
+        gcp_len = len(gcp)
+        suffix_words = [flw[gcp_len:] for flw in words]
+
+        with IndentedScopedBlock(
+            writer,
+            f"if (fieldName.size() >= {gcp_len} && "
+            + f'std::char_traits<char>::compare(fieldName.data() + {prefix_len}, "{gcp}", {gcp_len}) == 0) {{',
+            "}",
+        ):
+            _gen_trie(prefix + gcp, suffix_words, writer, callback)
+
+        return
+
+    # Handle the main case for the trie
+    # We have a list of non-empty words with no common prefix between them,
+    # the first letters among the words may contain duplicates
+    sorted_words = sorted(words)
+    first_letters = sorted(list({w[0] for w in sorted_words}))
+    min_len = len(prefix) + min([len(w) for w in sorted_words])
+
+    with IndentedScopedBlock(writer, f"if (fieldName.size() >= {min_len}) {{", "}"):
+        first_if = True
+
+        for first_letter in first_letters:
+            fl_words = [flw[1:] for flw in words if flw[0] == first_letter]
+
+            ei = "else " if not first_if else ""
+            with IndentedScopedBlock(
+                writer, f"{ei}if (fieldName[{len(prefix)}] == '{first_letter}') {{", "}"
+            ):
+                _gen_trie(prefix + first_letter, fl_words, writer, callback)
+
+            first_if = False
+
+
+def gen_string_table_find_function_block(out, in_str, on_match, on_fail, words):
+    # type: (IndentedTextWriter, str, str, str, list[str]) -> None
+    """Wrap a gen_trie generated block as a function."""
+    index = {word: i for i, word in enumerate(words)}
+    out.write_line(f"StringData fieldName{{{in_str}}};")
+    gen_trie(words, out, lambda w: out.write_line(f"return {on_match.format(index[w])};"))
+    out.write_line(f"return {on_fail};")

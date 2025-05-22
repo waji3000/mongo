@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,8 +29,8 @@
 
 #pragma once
 
+#include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/pipeline/dependencies.h"
-#include "mongo/db/pipeline/document.h"
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/query/explain_options.h"
 
@@ -54,33 +53,53 @@ public:
         kComputedProjection,
         kReplaceRoot,
         kGroupFromFirstDocument,
+        kSetMetadata,
     };
     virtual ~TransformerInterface() = default;
-    virtual Document applyTransformation(const Document& input) = 0;
+    virtual Document applyTransformation(const Document& input) const = 0;
     virtual TransformerType getType() const = 0;
     virtual void optimize() = 0;
+    virtual Pipeline::SourceContainer::iterator doOptimizeAt(
+        Pipeline::SourceContainer::iterator itr, Pipeline::SourceContainer* container) = 0;
     virtual DepsTracker::State addDependencies(DepsTracker* deps) const = 0;
+    virtual void addVariableRefs(std::set<Variables::Id>* refs) const = 0;
     virtual DocumentSource::GetModPathsReturn getModifiedPaths() const = 0;
+
+    /**
+     * Method used by optimize() to check if stage is a no-op.
+     */
+    virtual bool isNoop() const {
+        return false;
+    }
+
+    /**
+     * Method used to toggle the 'noFieldModifications' stage constraint. True only if guaranteed
+     * this transformation will not modify any document fields (although it may modify metadata).
+     */
+    virtual bool noFieldModifications() const {
+        return false;
+    }
 
     /**
      * Returns a document describing this transformation. For example, this function will return
      * {_id: 0, x: 1} for the stage parsed from {$project: {_id: 0, x: 1}}.
      */
-    virtual Document serializeTransformation(
-        boost::optional<ExplainOptions::Verbosity> explain) const = 0;
+    virtual Document serializeTransformation(const SerializationOptions& options = {}) const = 0;
 
     /**
-     * Returns true if this transformer is an inclusion projection and is a subset of
-     * 'proj', which must be a valid projection specification. For example, if this
-     * TransformerInterface represents the inclusion projection
-     *
-     *      {a: 1, b: 1, c: 1}
-     *
-     * then it is a subset of the projection {a: 1, c: 1}, and this function returns
-     * true.
+     * Method used by inclusion and add fields projecton executors to extract computed projections
+     * that depend only on the 'oldName' field. Returns a pair of <BSONObj, bool>. The BSONObj
+     * contains the extracted projections. The boolean flag is true if the original projection has
+     * become empty after the extraction and can be deleted by the caller.
      */
-    virtual bool isSubsetOfProjection(const BSONObj& proj) const {
-        return false;
+    virtual std::pair<BSONObj, bool> extractComputedProjections(
+        StringData oldName, StringData newName, const std::set<StringData>& reservedNames) {
+        return {BSONObj{}, false};
+    }
+
+    virtual std::pair<BSONObj, bool> extractProjectOnFieldAndRename(StringData oldName,
+                                                                    StringData newName) {
+        return {BSONObj{}, false};
     }
 };
 }  // namespace mongo

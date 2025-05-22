@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,33 +27,38 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <boost/move/utility_core.hpp>
+#include <utility>
 
+#include <boost/optional/optional.hpp>
+
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/util/builder.h"
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/matcher/schema/expression_internal_schema_num_array_items.h"
 
 namespace mongo {
 
 InternalSchemaNumArrayItemsMatchExpression::InternalSchemaNumArrayItemsMatchExpression(
-    MatchType type, StringData path, long long numItems, StringData name)
-    : ArrayMatchingMatchExpression(type, path), _name(name), _numItems(numItems) {}
+    MatchType type,
+    boost::optional<StringData> path,
+    long long numItems,
+    StringData name,
+    clonable_ptr<ErrorAnnotation> annotation)
+    : ArrayMatchingMatchExpression(type, path, std::move(std::move(annotation))),
+      _name(name),
+      _numItems(numItems) {}
 
 void InternalSchemaNumArrayItemsMatchExpression::debugString(StringBuilder& debug,
-                                                             int level) const {
-    _debugAddSpace(debug, level);
-    debug << path() << " " << _name << " " << _numItems << "\n";
-
-    MatchExpression::TagData* td = getTag();
-    if (nullptr != td) {
-        debug << " ";
-        td->debugString(&debug);
-    }
-    debug << "\n";
+                                                             int indentationLevel) const {
+    _debugAddSpace(debug, indentationLevel);
+    debug << path() << " " << _name << " " << _numItems;
+    _debugStringAttachTagInfo(&debug);
 }
 
-void InternalSchemaNumArrayItemsMatchExpression::serialize(BSONObjBuilder* out) const {
-    BSONObjBuilder subBob(out->subobjStart(path()));
-    subBob.append(_name, _numItems);
-    subBob.doneFast();
+void InternalSchemaNumArrayItemsMatchExpression::appendSerializedRightHandSide(
+    BSONObjBuilder* bob, const SerializationOptions& opts, bool includePath) const {
+    opts.appendLiteral(bob, _name, _numItems);
 }
 
 bool InternalSchemaNumArrayItemsMatchExpression::equivalent(const MatchExpression* other) const {

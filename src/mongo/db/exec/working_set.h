@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,114 +29,39 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+#include <cstddef>
+#include <memory>
+#include <string>
+#include <utility>
 #include <vector>
 
-#include "mongo/base/disallow_copying.h"
-#include "mongo/db/jsobj.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/util/builder.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/document_metadata_fields.h"
 #include "mongo/db/record_id.h"
 #include "mongo/db/storage/snapshot.h"
 #include "mongo/stdx/unordered_set.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/bufreader.h"
 
 namespace mongo {
 
-class IndexAccessMethod;
 class WorkingSetMember;
 
 typedef size_t WorkingSetID;
 
 /**
- * All data in use by a query.  Data is passed through the stage tree by referencing the ID of
- * an element of the working set.  Stages can add elements to the working set, delete elements
- * from the working set, or mutate elements in the working set.
+ * A type used to identify indexes that have been registered with the WorkingSet. A WorkingSetMember
+ * can be associated with a particular index via this id.
  */
-class WorkingSet {
-    MONGO_DISALLOW_COPYING(WorkingSet);
-
-public:
-    static const WorkingSetID INVALID_ID = WorkingSetID(-1);
-
-    WorkingSet();
-    ~WorkingSet();
-
-    /**
-     * Allocate a new query result and return the ID used to get and free it.
-     */
-    WorkingSetID allocate();
-
-    /**
-     * Get the i-th mutable query result. The pointer will be valid for this id until freed.
-     * Do not delete the returned pointer as the WorkingSet retains ownership. Call free() to
-     * release it.
-     */
-    WorkingSetMember* get(WorkingSetID i) const {
-        dassert(i < _data.size());              // ID has been allocated.
-        dassert(_data[i].nextFreeOrSelf == i);  // ID currently in use.
-        return _data[i].member;
-    }
-
-    /**
-     * Returns true if WorkingSetMember with id 'i' is free.
-     */
-    bool isFree(WorkingSetID i) const {
-        return _data[i].nextFreeOrSelf != i;
-    }
-
-    /**
-     * Deallocate the i-th query result and release its resources.
-     */
-    void free(WorkingSetID i);
-
-    /**
-     * Removes and deallocates all members of this working set.
-     */
-    void clear();
-
-    //
-    // WorkingSetMember state transitions
-    //
-
-    void transitionToRecordIdAndIdx(WorkingSetID id);
-    void transitionToRecordIdAndObj(WorkingSetID id);
-    void transitionToOwnedObj(WorkingSetID id);
-
-    /**
-     * Returns the list of working set ids that have transitioned into the RID_AND_IDX state since
-     * the last yield. The members corresponding to these ids may have since transitioned to a
-     * different state or been freed, so these cases must be handled by the caller. The list may
-     * also contain duplicates.
-     *
-     * Execution stages are *not* responsible for managing this list, as working set ids are added
-     * to the set automatically by WorkingSet::transitionToRecordIdAndIdx().
-     *
-     * As a side effect, calling this method clears the list of flagged yield sensitive ids kept by
-     * the working set.
-     */
-    std::vector<WorkingSetID> getAndClearYieldSensitiveIds();
-
-private:
-    struct MemberHolder {
-        MemberHolder();
-        ~MemberHolder();
-
-        // Free list link if freed. Points to self if in use.
-        WorkingSetID nextFreeOrSelf;
-
-        // Owning pointer
-        WorkingSetMember* member;
-    };
-
-    // All WorkingSetIDs are indexes into this, except for INVALID_ID.
-    // Elements are added to _freeList rather than removed when freed.
-    std::vector<MemberHolder> _data;
-
-    // Index into _data, forming a linked-list using MemberHolder::nextFreeOrSelf as the next
-    // link. INVALID_ID is the list terminator since 0 is a valid index.
-    // If _freeList == INVALID_ID, the free list is empty and all elements in _data are in use.
-    WorkingSetID _freeList;
-
-    // Contains ids of WSMs that may need to be adjusted when we next yield.
-    std::vector<WorkingSetID> _yieldSensitiveIds;
-};
+using WorkingSetRegisteredIndexId = unsigned int;
 
 /**
  * The key data extracted from an index.  Keeps track of both the key (currently a BSONObj) and
@@ -145,8 +69,34 @@ private:
  * the key.
  */
 struct IndexKeyDatum {
-    IndexKeyDatum(const BSONObj& keyPattern, const BSONObj& key, const IndexAccessMethod* index)
-        : indexKeyPattern(keyPattern), keyData(key), index(index) {}
+    IndexKeyDatum(const BSONObj& keyPattern,
+                  const BSONObj& key,
+                  WorkingSetRegisteredIndexId indexId,
+                  SnapshotId snapshotId)
+        : indexKeyPattern(keyPattern), keyData(key), indexId(indexId), snapshotId(snapshotId) {}
+
+    /**
+     * getFieldDotted produces the field with the provided name based on index keyData. The return
+     * object is populated if the element is in a provided index key.  Returns none otherwise.
+     * Returning none indicates a query planning error.
+     */
+    static boost::optional<BSONElement> getFieldDotted(const std::vector<IndexKeyDatum>& keyData,
+                                                       const std::string& field) {
+        for (size_t i = 0; i < keyData.size(); ++i) {
+            BSONObjIterator keyPatternIt(keyData[i].indexKeyPattern);
+            BSONObjIterator keyDataIt(keyData[i].keyData);
+
+            while (keyPatternIt.more()) {
+                BSONElement keyPatternElt = keyPatternIt.next();
+                MONGO_verify(keyDataIt.more());
+                BSONElement keyDataElt = keyDataIt.next();
+
+                if (field == keyPatternElt.fieldName())
+                    return boost::make_optional(keyDataElt);
+            }
+        }
+        return boost::none;
+    }
 
     // This is not owned and points into the IndexDescriptor's data.
     BSONObj indexKeyPattern;
@@ -154,51 +104,12 @@ struct IndexKeyDatum {
     // This is the BSONObj for the key that we put into the index.  Owned by us.
     BSONObj keyData;
 
-    const IndexAccessMethod* index;
-};
+    // Associates this index key with an index that has been registered with the WorkingSet. Can be
+    // used to recover pointers to catalog objects for this index from the WorkingSet.
+    WorkingSetRegisteredIndexId indexId;
 
-/**
- * What types of computed data can we have?
- */
-enum WorkingSetComputedDataType {
-    // What's the score of the document retrieved from a $text query?
-    WSM_COMPUTED_TEXT_SCORE = 0,
-
-    // What's the distance from a geoNear query point to the document?
-    WSM_COMPUTED_GEO_DISTANCE = 1,
-
-    // The index key used to retrieve the document, for returnKey query option.
-    WSM_INDEX_KEY = 2,
-
-    // What point (of several possible points) was used to compute the distance to the document
-    // via geoNear?
-    WSM_GEO_NEAR_POINT = 3,
-
-    // Comparison key for sorting.
-    WSM_SORT_KEY = 4,
-
-    // Must be last.
-    WSM_COMPUTED_NUM_TYPES,
-};
-
-/**
- * Data that is a computed function of a WSM.
- */
-class WorkingSetComputedData {
-    MONGO_DISALLOW_COPYING(WorkingSetComputedData);
-
-public:
-    WorkingSetComputedData(const WorkingSetComputedDataType type) : _type(type) {}
-    virtual ~WorkingSetComputedData() {}
-
-    WorkingSetComputedDataType type() const {
-        return _type;
-    }
-
-    virtual WorkingSetComputedData* clone() const = 0;
-
-private:
-    WorkingSetComputedDataType _type;
+    // Identifies the storage engine snapshot from which this index key was obtained.
+    SnapshotId snapshotId;
 };
 
 /**
@@ -211,17 +122,7 @@ private:
  * A WorkingSetMember may have any of the data above.
  */
 class WorkingSetMember {
-    MONGO_DISALLOW_COPYING(WorkingSetMember);
-
 public:
-    WorkingSetMember();
-    ~WorkingSetMember();
-
-    /**
-     * Reset to an "empty" state.
-     */
-    void clear();
-
     enum MemberState {
         // Initial state.
         INVALID,
@@ -239,11 +140,22 @@ public:
         OWNED_OBJ,
     };
 
+    static WorkingSetMember deserialize(BufReader& buf);
+
+    /**
+     * Reset to an "empty" state.
+     */
+    void clear();
+
     //
     // Member state and state transitions
     //
 
-    MemberState getState() const;
+    MONGO_COMPILER_ALWAYS_INLINE MemberState getState() const {
+        return _state;
+    }
+
+    void transitionToRecordIdAndObj();
 
     void transitionToOwnedObj();
 
@@ -252,16 +164,20 @@ public:
     //
 
     RecordId recordId;
-    Snapshotted<BSONObj> obj;
+    Snapshotted<Document> doc;
     std::vector<IndexKeyDatum> keyData;
 
-    // True if this WSM has survived a yield in RID_AND_IDX state.
-    // TODO consider replacing by tracking SnapshotIds for IndexKeyDatums.
-    bool isSuspicious = false;
+    MONGO_COMPILER_ALWAYS_INLINE bool hasRecordId() const {
+        return _state == RID_AND_IDX || _state == RID_AND_OBJ;
+    }
 
-    bool hasRecordId() const;
-    bool hasObj() const;
-    bool hasOwnedObj() const;
+    MONGO_COMPILER_ALWAYS_INLINE bool hasObj() const {
+        return _state == OWNED_OBJ || _state == RID_AND_OBJ;
+    }
+
+    MONGO_COMPILER_ALWAYS_INLINE bool hasOwnedObj() const {
+        return _state == OWNED_OBJ || _state == RID_AND_OBJ;
+    }
 
     /**
      * Ensures that 'obj' of a WSM in the RID_AND_OBJ state is owned BSON. It is a no-op if the WSM
@@ -271,14 +187,6 @@ public:
      * members which may stay alive across yield points.
      */
     void makeObjOwnedIfNeeded();
-
-    //
-    // Computed data
-    //
-
-    bool hasComputed(const WorkingSetComputedDataType type) const;
-    const WorkingSetComputedData* getComputed(const WorkingSetComputedDataType type) const;
-    void addComputed(WorkingSetComputedData* data);
 
     /**
      * getFieldDotted uses its state (obj or index data) to produce the field with the provided
@@ -296,12 +204,242 @@ public:
      */
     size_t getMemUsage() const;
 
+    /**
+     * Returns a const reference to an object housing the metadata fields associated with this
+     * WorkingSetMember.
+     */
+    MONGO_COMPILER_ALWAYS_INLINE const DocumentMetadataFields& metadata() const {
+        return _metadata;
+    }
+
+    /**
+     * Returns a non-const reference to an object housing the metadata fields associated with this
+     * WorkingSetMember.
+     */
+    DocumentMetadataFields& metadata() {
+        return _metadata;
+    }
+
+    /**
+     * Clears all metadata fields inside this WorkingSetMember, and returns a structure containing
+     * that extracted metadata to the caller. The metadata can then be attached to a new
+     * WorkingSetMember or to another data structure that houses metadata.
+     */
+    DocumentMetadataFields releaseMetadata() {
+        return std::move(_metadata);
+    }
+
+    /**
+     * Transfers metadata fields to this working set member. By pairs of calls to releaseMetadata()
+     * and setMetadata(), callers can cheaply transfer metadata between WorkingSetMembers.
+     */
+    void setMetadata(DocumentMetadataFields&& metadata) {
+        _metadata = std::move(metadata);
+    }
+
+    /**
+     * Resets the underlying BSONObj in the doc field. This avoids unnecessary allocation/
+     * deallocation of Document/DocumentStorage objects.
+     */
+    void resetDocument(SnapshotId snapshot, const BSONObj& obj);
+
+    void serialize(BufBuilder& buf) const;
+
 private:
     friend class WorkingSet;
 
     MemberState _state = WorkingSetMember::INVALID;
 
-    std::unique_ptr<WorkingSetComputedData> _computed[WSM_COMPUTED_NUM_TYPES];
+    DocumentMetadataFields _metadata;
+};
+
+/**
+ * A variant of WorkingSetMember that is designed to be compatible with the SortExecutor. Objects of
+ * this type are small, acting only as a handle to the underlying WorkingSetMember. This means that
+ * they can be efficiently copied or moved during the sorting process while the actual
+ * WorkingSetMember data remains in place.
+ *
+ * A SortableWorkingSetMember supports serialization and deserialization so that objects of this
+ * type can be flushed to disk and later recovered.
+ */
+class SortableWorkingSetMember {
+public:
+    struct SorterDeserializeSettings {};
+
+    static SortableWorkingSetMember deserializeForSorter(BufReader& buf,
+                                                         const SorterDeserializeSettings&) {
+        return WorkingSetMember::deserialize(buf);
+    }
+
+    /**
+     * Constructs an empty SortableWorkingSetMember.
+     */
+    SortableWorkingSetMember() = default;
+
+    /**
+     * Constructs a SortableWorkingSetMember from a regular WorkingSetMember. Supports implicit
+     * conversion from WorkingSetMember.
+     */
+    /* implicit */ SortableWorkingSetMember(WorkingSetMember&& wsm)
+        : _holder(std::make_shared<WorkingSetMember>(std::move(wsm))) {}
+
+    void serializeForSorter(BufBuilder& buf) const {
+        _holder->serialize(buf);
+    }
+
+    int memUsageForSorter() const {
+        return _holder->getMemUsage();
+    }
+
+    /**
+     * Extracts and returns the underlying WorkingSetMember held by this SortableWorkingSetMember.
+     */
+    WorkingSetMember extract() {
+        return std::move(*_holder);
+    }
+
+    /**
+     * Returns a reference to the underlying WorkingSetMember.
+     */
+    WorkingSetMember* operator->() const {
+        return _holder.get();
+    }
+
+    WorkingSetMember& operator*() const {
+        return *_holder;
+    }
+
+    SortableWorkingSetMember getOwned() const;
+    void makeOwned();
+
+private:
+    std::shared_ptr<WorkingSetMember> _holder;
+};
+
+/**
+ * All data in use by a query.  Data is passed through the stage tree by referencing the ID of
+ * an element of the working set.  Stages can add elements to the working set, delete elements
+ * from the working set, or mutate elements in the working set.
+ */
+class WorkingSet {
+    WorkingSet(const WorkingSet&) = delete;
+    WorkingSet& operator=(const WorkingSet&) = delete;
+
+public:
+    static const WorkingSetID INVALID_ID = WorkingSetID(-1);
+
+    WorkingSet();
+
+    ~WorkingSet() = default;
+
+    /**
+     * Allocate a new query result and return the ID used to get and free it.
+     */
+    WorkingSetID allocate();
+
+    /**
+     * Get the i-th mutable query result. The pointer will be valid for this id until freed.
+     * Do not delete the returned pointer as the WorkingSet retains ownership. Call free() to
+     * release it.
+     */
+    MONGO_COMPILER_ALWAYS_INLINE WorkingSetMember* get(WorkingSetID i) {
+        dassert(i < _data.size());              // ID has been allocated.
+        dassert(_data[i].nextFreeOrSelf == i);  // ID currently in use.
+        return &_data[i].member;
+    }
+
+    MONGO_COMPILER_ALWAYS_INLINE const WorkingSetMember* get(WorkingSetID i) const {
+        dassert(i < _data.size());              // ID has been allocated.
+        dassert(_data[i].nextFreeOrSelf == i);  // ID currently in use.
+        return &_data[i].member;
+    }
+
+    /**
+     * Returns true if WorkingSetMember with id 'i' is free.
+     */
+    bool isFree(WorkingSetID i) const {
+        return _data[i].nextFreeOrSelf != i;
+    }
+
+    /**
+     * Deallocate the i-th query result and release its resources.
+     */
+    inline void free(WorkingSetID i) {
+        MemberHolder& holder = _data[i];
+        MONGO_verify(i < _data.size());            // ID has been allocated.
+        MONGO_verify(holder.nextFreeOrSelf == i);  // ID currently in use.
+
+        // Free resources and push this WSM to the head of the freelist.
+        holder.member.clear();
+        holder.nextFreeOrSelf = _freeList;
+        _freeList = i;
+    }
+
+    /**
+     * Removes and deallocates all members of this working set.
+     */
+    void clear();
+
+    //
+    // WorkingSetMember state transitions
+    //
+
+    void transitionToRecordIdAndIdx(WorkingSetID id);
+    void transitionToRecordIdAndObj(WorkingSetID id);
+    void transitionToOwnedObj(WorkingSetID id);
+
+    /**
+     * Registers the index ident with the WorkingSet, and returns a handle that can be used to
+     * recover the index ident.
+     */
+    WorkingSetRegisteredIndexId registerIndexIdent(const std::string& ident);
+
+    /**
+     * Returns the index ident for an index that has previously been registered with the WorkingSet
+     * using 'registerIndexIdent()'.
+     */
+    StringData retrieveIndexIdent(WorkingSetRegisteredIndexId indexId) const {
+        return _registeredIndexes[indexId];
+    }
+
+    /**
+     * Returns the WorkingSetMember with the given id after removing it from this WorkingSet. The
+     * WSM can be reinstated in the WorkingSet by calling 'emplace()'.
+     *
+     * WorkingSetMembers typically only temporarily live free of their WorkingSet, so calls to
+     * 'extract()' and 'emplace()' should come in pairs.
+     */
+    WorkingSetMember extract(WorkingSetID);
+
+    /**
+     * Puts the given WorkingSetMember into this WorkingSet. Assigns the WorkingSetMember an id and
+     * returns it. This id can be used later to obtain a pointer to the WSM using 'get()'.
+     *
+     * WorkingSetMembers typically only temporarily live free of their WorkingSet, so calls to
+     * 'extract()' and 'emplace()' should come in pairs.
+     */
+    WorkingSetID emplace(WorkingSetMember&&);
+
+private:
+    struct MemberHolder {
+        // Free list link if freed. Points to self if in use.
+        WorkingSetID nextFreeOrSelf;
+
+        WorkingSetMember member;
+    };
+
+    // All WorkingSetIDs are indexes into this, except for INVALID_ID.
+    // Elements are added to _freeList rather than removed when freed.
+    std::vector<MemberHolder> _data;
+
+    // Index into _data, forming a linked-list using MemberHolder::nextFreeOrSelf as the next
+    // link. INVALID_ID is the list terminator since 0 is a valid index.
+    // If _freeList == INVALID_ID, the free list is empty and all elements in _data are in use.
+    WorkingSetID _freeList;
+
+    // Holds index idents that have been registered with 'registerIndexIdent()`. The
+    // WorkingSetRegisteredIndexId is the offset into the vector.
+    std::vector<std::string> _registeredIndexes;
 };
 
 }  // namespace mongo

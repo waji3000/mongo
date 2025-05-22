@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -31,6 +30,10 @@
 #pragma once
 
 #include <array>
+#include <cstddef>
+#include <js/Id.h>
+#include <js/RootingAPI.h>
+#include <js/TypeDecls.h>
 #include <jsapi.h>
 
 namespace mongo {
@@ -44,6 +47,7 @@ namespace mozjs {
 enum class InternedString {
 #define MONGO_MOZJS_INTERNED_STRING(name, str) name,
 #include "mongo/scripting/mozjs/internedstring.defs"
+
 #undef MONGO_MOZJS_INTERNED_STRING
     NUM_IDS,
 };

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,14 +29,19 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
 #include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
 #include <iosfwd>
 #include <memory>
 #include <string>
 
+#include "mongo/base/error_codes.h"
 #include "mongo/base/status.h"
-#include "mongo/db/jsobj.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/rpc/message.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/net/hostandport.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
@@ -51,38 +55,49 @@ namespace executor {
 
 /**
  * Type of object describing the response of previously sent RemoteCommandRequest.
+ *
+ * The target member may be used by callers to associate a HostAndPort with the remote or
+ * local error that the RemoteCommandResponse holds. The "status" member will be populated
+ * with possible local errors, while the "data" member may hold any remote errors.
+ *
  */
 struct RemoteCommandResponse {
     RemoteCommandResponse() = default;
 
-    RemoteCommandResponse(ErrorCodes::Error code, std::string reason);
+    RemoteCommandResponse(HostAndPort hp, Status s);
 
-    RemoteCommandResponse(ErrorCodes::Error code, std::string reason, Milliseconds millis);
+    RemoteCommandResponse(HostAndPort hp, Status s, Microseconds elapsed);
 
-    RemoteCommandResponse(Status s);
-
-    RemoteCommandResponse(Status s, Milliseconds millis);
-
-    RemoteCommandResponse(BSONObj dataObj, Milliseconds millis);
-
-    RemoteCommandResponse(Message messageArg, BSONObj dataObj, Milliseconds millis);
-
-    RemoteCommandResponse(const rpc::ReplyInterface& rpcReply, Milliseconds millis);
-
-    bool isOK() const;
+    RemoteCommandResponse(HostAndPort hp,
+                          BSONObj dataObj,
+                          Microseconds elapsed,
+                          bool moreToCome = false);
 
     std::string toString() const;
 
     bool operator==(const RemoteCommandResponse& rhs) const;
     bool operator!=(const RemoteCommandResponse& rhs) const;
 
-    std::shared_ptr<const Message> message;  // May be null.
-    BSONObj data;                            // Always owned. May point into message.
-    boost::optional<Milliseconds> elapsedMillis;
+    bool isOK() const;
+
+    static RemoteCommandResponse make_forTest(Status s);
+    static RemoteCommandResponse make_forTest(Status s, Microseconds elapsed);
+    static RemoteCommandResponse make_forTest(BSONObj dataObj,
+                                              Microseconds elapsed,
+                                              bool moreToCome = false);
+
+    BSONObj data;  // Always owned. May point into message.
+    boost::optional<Microseconds> elapsed;
     Status status = Status::OK();
+    bool moreToCome = false;  // Whether or not the moreToCome bit is set on an exhaust message.
+    HostAndPort target;
+
+    friend std::ostream& operator<<(std::ostream& os, const RemoteCommandResponse& request);
+
+private:
+    RemoteCommandResponse(Status s);
+    RemoteCommandResponse(Status s, Microseconds elapsed);
+    RemoteCommandResponse(BSONObj dataObj, Microseconds elapsed, bool moreToCome);
 };
-
-std::ostream& operator<<(std::ostream& os, const RemoteCommandResponse& request);
-
 }  // namespace executor
 }  // namespace mongo

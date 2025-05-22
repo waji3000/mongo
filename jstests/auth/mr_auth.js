@@ -2,28 +2,28 @@
 // mode. Other modes require writing to an output collection which is not allowed. SERVER-3345
 //
 // This test requires users to persist across a restart.
-// @tags: [requires_persistence]
+// @tags: [requires_persistence, requires_scripting]
 
-baseName = "jstests_mr_auth";
-dbName = "test";
-out = baseName + "_out";
+let baseName = "jstests_mr_auth";
+let dbName = "test";
+let out = baseName + "_out";
 
-map = function() {
+let map = function() {
     emit(this.x, this.y);
 };
-red = function(k, vs) {
+let red = function(k, vs) {
     var s = 0;
     for (var i = 0; i < vs.length; i++)
         s += vs[i];
     return s;
 };
-red2 = function(k, vs) {
+let red2 = function(k, vs) {
     return 42;
 };
 
 // make sure writing is allowed when started without --auth enabled
 
-dbms = MongoRunner.runMongod({bind_ip: "127.0.0.1"});
+let dbms = MongoRunner.runMongod({bind_ip: "127.0.0.1"});
 var d = dbms.getDB(dbName);
 var t = d[baseName];
 
@@ -32,11 +32,11 @@ for (var i = 0; i < 1000; i++)
 assert.eq(1000, t.count(), "inserts failed");
 
 d.dropAllUsers();
-d.getSisterDB("admin").createUser({user: "admin", pwd: "admin", roles: jsTest.adminUserRoles});
-d.getSisterDB("admin").auth('admin', 'admin');
+d.getSiblingDB("admin").createUser({user: "admin", pwd: "admin", roles: jsTest.adminUserRoles});
+d.getSiblingDB("admin").auth('admin', 'admin');
 d.createUser({user: "write", pwd: "write", roles: jsTest.basicUserRoles});
 d.createUser({user: "read", pwd: "read", roles: jsTest.readOnlyUserRoles});
-d.getSisterDB("admin").logout();
+d.getSiblingDB("admin").logout();
 
 t.mapReduce(map, red, {out: {inline: 1}});
 

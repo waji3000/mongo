@@ -1,4 +1,11 @@
 /**
+ * @tags: [
+ *   # Uses $where operator
+ *   requires_scripting,
+ * ]
+ */
+
+/**
  * Verify that killing an instance of mongod while it is in a long running computation or infinite
  * loop still leads to clean shutdown, and that said shutdown is prompt.
  *
@@ -12,7 +19,11 @@ var dbpath = MongoRunner.dataPath + baseName;
 var mongod = MongoRunner.runMongod({dbpath: dbpath});
 var db = mongod.getDB("test");
 var collection = db.getCollection(baseName);
-assert.writeOK(collection.insert({}));
+assert.commandWorked(collection.insert({}));
+
+// set timeout for js function execution to 100 ms to speed up the test.
+assert.commandWorked(
+    db.adminCommand({setParameter: 1, internalQueryJavaScriptFnTimeoutMillis: 100}));
 
 var awaitShell = startParallelShell(
     "db." + baseName + ".count( { $where: function() { while( 1 ) { ; } } } )", mongod.port);

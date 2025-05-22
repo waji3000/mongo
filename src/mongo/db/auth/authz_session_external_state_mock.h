@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,9 +29,11 @@
 
 #pragma once
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/status.h"
+#include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authz_session_external_state.h"
+#include "mongo/db/client.h"
+#include "mongo/db/operation_context.h"
 
 namespace mongo {
 
@@ -44,21 +45,21 @@ class AuthzSessionExternalStateMock : public AuthzSessionExternalState {
     AuthzSessionExternalStateMock& operator=(const AuthzSessionExternalStateMock&) = delete;
 
 public:
-    AuthzSessionExternalStateMock(AuthorizationManager* authzManager)
-        : AuthzSessionExternalState(authzManager),
+    AuthzSessionExternalStateMock(Client* client)
+        : AuthzSessionExternalState(client),
           _ignoreAuthChecksReturnValue(false),
           _allowLocalhostReturnValue(false),
           _serverIsArbiterReturnValue(false) {}
 
-    virtual bool shouldIgnoreAuthChecks() const {
+    bool shouldIgnoreAuthChecks() const override {
         return _ignoreAuthChecksReturnValue;
     }
 
-    virtual bool shouldAllowLocalhost() const {
+    bool shouldAllowLocalhost() const override {
         return _allowLocalhostReturnValue;
     }
 
-    virtual bool serverIsArbiter() const {
+    bool serverIsArbiter() const override {
         return _serverIsArbiterReturnValue;
     }
 
@@ -70,7 +71,7 @@ public:
         _allowLocalhostReturnValue = returnValue;
     }
 
-    virtual void startRequest(OperationContext* opCtx) {}
+    void startRequest(OperationContext* opCtx) override {}
 
 private:
     bool _ignoreAuthChecksReturnValue;

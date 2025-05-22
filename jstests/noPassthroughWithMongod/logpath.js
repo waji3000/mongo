@@ -4,7 +4,8 @@ var name = "logpath";
 var token = "logpath_token";
 
 var dbdir = MongoRunner.dataPath + name + "/";  // this will work under windows as well as linux
-var basedir = MongoRunner.dataPath + name + "files" + "/";
+var basedir = MongoRunner.dataPath + name + "files" +
+    "/";
 var logdir = basedir + "logdir/";
 var testdir = basedir + "testdir/";
 var sfile = _isWindows() ? "NUL" : "/dev/null";
@@ -22,7 +23,7 @@ assert(mkdir(testdir));
 var cleanupFiles = function() {
     var files = listFiles(logdir);
 
-    for (f in files) {
+    for (let f in files) {
         var name = files[f].name;
 
         // mostly here for safety
@@ -37,7 +38,7 @@ var logCount = function(fpattern, prefix) {
     var pat = RegExp(fpattern + (prefix ? "" : "$"));
     var cnt = 0;
 
-    for (f in files) {
+    for (let f in files) {
         if (pat.test(files[f].name)) {
             cnt++;
         }

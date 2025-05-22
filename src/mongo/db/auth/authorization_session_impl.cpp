@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,187 +27,429 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kAccessControl
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/auth/authorization_session_impl.h"
-
+#include "mongo/db/auth/authorization_manager.h"
+#include <absl/container/node_hash_map.h>
+#include <absl/meta/type_traits.h>
+#include <algorithm>
+#include <boost/none.hpp>
+#include <boost/optional.hpp>
+#include <cstddef>
 #include <string>
+#include <utility>
 #include <vector>
 
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/init.h"  // IWYU pragma: keep
+#include "mongo/base/initializer.h"
 #include "mongo/base/status.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/bson/util/builder.h"
+#include "mongo/bson/util/builder_fwd.h"
+#include "mongo/db/api_parameters.h"
+#include "mongo/db/audit.h"
+#include "mongo/db/auth/access_checks_gen.h"
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/action_type.h"
+#include "mongo/db/auth/action_type_gen.h"
+#include "mongo/db/auth/auth_name.h"
+#include "mongo/db/auth/authorization_session_impl.h"
 #include "mongo/db/auth/authz_session_external_state.h"
 #include "mongo/db/auth/privilege.h"
-#include "mongo/db/auth/restriction_environment.h"
-#include "mongo/db/auth/security_key.h"
-#include "mongo/db/auth/user_management_commands_parser.h"
-#include "mongo/db/bson/dotted_path_support.h"
-#include "mongo/db/catalog/document_validation.h"
+#include "mongo/db/auth/resource_pattern_search_list.h"
+#include "mongo/db/auth/validated_tenancy_scope.h"
 #include "mongo/db/client.h"
-#include "mongo/db/jsobj.h"
+#include "mongo/db/list_collections_gen.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/pipeline/aggregation_request.h"
-#include "mongo/db/pipeline/lite_parsed_pipeline.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/session/logical_session_id.h"
+#include "mongo/db/tenant_id.h"
+#include "mongo/idl/idl_parser.h"
+#include "mongo/logv2/log.h"
+#include "mongo/platform/compiler.h"
+#include "mongo/rpc/metadata/audit_user_attrs.h"
+#include "mongo/stdx/unordered_map.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/clock_source.h"
+#include "mongo/util/decorable.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/read_through_cache.h"
+#include "mongo/util/str.h"
+#include "mongo/util/testing_proctor.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kAccessControl
 
 namespace mongo {
 
-namespace dps = ::mongo::dotted_path_support;
 using std::vector;
-
-MONGO_REGISTER_SHIM(AuthorizationSession::create)
-(AuthorizationManager* authzManager)->std::unique_ptr<AuthorizationSession> {
-    return std::make_unique<AuthorizationSessionImpl>(
-        AuthzSessionExternalState::create(authzManager),
-        AuthorizationSessionImpl::InstallMockForTestingOrAuthImpl{});
-}
-
 namespace {
-constexpr StringData ADMIN_DBNAME = "admin"_sd;
 
-// Checks if this connection has the privileges necessary to create or modify the view 'viewNs'
-// to be a view on 'viewOnNs' with pipeline 'viewPipeline'. Call this function after verifying
-// that the user has the 'createCollection' or 'collMod' action, respectively.
-Status checkAuthForCreateOrModifyView(AuthorizationSession* authzSession,
-                                      const NamespaceString& viewNs,
-                                      const NamespaceString& viewOnNs,
-                                      const BSONArray& viewPipeline,
-                                      bool isMongos) {
-    // It's safe to allow a user to create or modify a view if they can't read it anyway.
-    if (!authzSession->isAuthorizedForActionsOnNamespace(viewNs, ActionType::find)) {
-        return Status::OK();
+constexpr StringData SYSTEM_BUCKETS_PREFIX = "system.buckets."_sd;
+
+bool checkContracts() {
+    // Only check contracts in testing modes, invalid contracts should not break customers.
+    if (!TestingProctor::instance().isEnabled()) {
+        return false;
     }
 
-    // This check performs some validation but it is not exhaustive and may allow for an invalid
-    // pipeline specification. In this case the authorization check will succeed but the pipeline
-    // will fail to parse later in Command::run().
-    return authzSession->checkAuthForAggregate(
-        viewOnNs,
-        BSON("aggregate" << viewOnNs.coll() << "pipeline" << viewPipeline << "cursor" << BSONObj()),
-        isMongos);
+    return true;
 }
+
+using ServerlessPermissionMap = stdx::unordered_map<MatchTypeEnum, ActionSet>;
+ServerlessPermissionMap kServerlessPrivilegesPermitted;
+
+/**
+ * Load extra data from action_types.idl into runtime structure.
+ * For any given resource match type, we allow only the ActionTypes named
+ * to be granted to security token based users.
+ */
+MONGO_INITIALIZER(ServerlessPrivilegePermittedMap)(InitializerContext*) try {
+    ServerlessPermissionMap ret;
+
+    for (std::size_t i = 0; i < idlEnumCount<MatchTypeEnum>; ++i) {
+        auto matchType = static_cast<MatchTypeEnum>(i);
+        auto matchTypeName = MatchType_serializer(matchType);
+        auto dataObj = MatchType_get_extra_data(matchType);
+        auto data = MatchTypeExtraData::parse(IDLParserContext{matchTypeName}, dataObj);
+
+        std::vector<std::string> unknownActions;
+        auto actions =
+            ActionSet::parseFromStringVector(data.getServerlessActionTypes(), &unknownActions);
+        if (!unknownActions.empty()) {
+            StringBuilder sb;
+            sb << "Unknown actions listed for match type '" << matchTypeName << "':";
+            for (const auto& unknownAction : unknownActions) {
+                sb << " '" << unknownAction << "'";
+            }
+            uasserted(ErrorCodes::FailedToParse, sb.str());
+        }
+
+        ret[matchType] = std::move(actions);
+    }
+
+    kServerlessPrivilegesPermitted = std::move(ret);
+} catch (const DBException& ex) {
+    uassertStatusOK(ex.toStatus().withContext("Failed parsing extraData for MatchType enum"));
+}
+
+MONGO_INITIALIZER(CheckAuthForInternalClient)(InitializerContext*) {
+    Client::setCheckAuthForInternalClient([](Client* client) {
+        return AuthorizationSession::get(client)->isAuthorizedForClusterAction(ActionType::internal,
+                                                                               boost::none);
+    });
+}
+
+void validateSecurityTokenUserPrivileges(const User::ResourcePrivilegeMap& privs) {
+    for (const auto& priv : privs) {
+        auto matchType = priv.first.matchType();
+        const auto& actions = priv.second.getActions();
+        auto it = kServerlessPrivilegesPermitted.find(matchType);
+        // This actually can't happen since the initializer above populated the map with all match
+        // types.
+        uassert(6161701,
+                str::stream() << "Unknown matchType: " << MatchType_serializer(matchType),
+                it != kServerlessPrivilegesPermitted.end());
+        if (MONGO_unlikely(!it->second.isSupersetOf(actions))) {
+            auto unauthorized = actions;
+            unauthorized.removeAllActionsFromSet(it->second);
+            uasserted(6161702,
+                      str::stream()
+                          << "Security Token user has one or more actions not approved for "
+                             "resource matchType '"
+                          << MatchType_serializer(matchType) << "': " << unauthorized.toString());
+        }
+    }
+}
+
+MONGO_FAIL_POINT_DEFINE(allowMultipleUsersWithApiStrict);
 
 }  // namespace
 
 AuthorizationSessionImpl::AuthorizationSessionImpl(
-    std::unique_ptr<AuthzSessionExternalState> externalState, InstallMockForTestingOrAuthImpl)
-    : _externalState(std::move(externalState)), _impersonationFlag(false) {}
+    std::unique_ptr<AuthzSessionExternalState> externalState, Client* client)
+    : _externalState(std::move(externalState)),
+      _contract(TestingProctor::instance().isEnabled()),
+      _client(client) {}
 
-AuthorizationSessionImpl::~AuthorizationSessionImpl() {}
+AuthorizationSessionImpl::~AuthorizationSessionImpl() {
+    invariant(_authenticatedUser == boost::none,
+              "The authenticated user should have been logged out by the Client destruction hook");
+}
 
-AuthorizationManager& AuthorizationSessionImpl::getAuthorizationManager() {
-    return _externalState->getAuthorizationManager();
+AuthorizationManager* AuthorizationSessionImpl::_getAuthorizationManager() {
+    return AuthorizationManager::get(_client->getService());
 }
 
 void AuthorizationSessionImpl::startRequest(OperationContext* opCtx) {
     _externalState->startRequest(opCtx);
+    if (_authenticationMode == AuthenticationMode::kSecurityToken) {
+        // Previously authenticated using SecurityToken,
+        // clear that user and reset to unauthenticated state.
+        if (auto user = std::exchange(_authenticatedUser, boost::none); user) {
+            LOGV2_DEBUG(6161507,
+                        3,
+                        "security token based user still authenticated at start of request, "
+                        "clearing from authentication state",
+                        "user"_attr = user.value()->getName().toBSON(true /* encode tenant */));
+            _updateInternalAuthorizationState();
+        }
+        _authenticationMode = AuthenticationMode::kNone;
+    } else {
+        // For non-security token users, check if expiration has passed and move session into
+        // expired state if so.
+        if (_authenticatedUser && _expirationTime &&
+            _expirationTime.value() <= opCtx->getServiceContext()->getFastClockSource()->now()) {
+            _expiredUserName = std::exchange(_authenticatedUser, boost::none).value()->getName();
+            _expirationTime = boost::none;
+            rpc::AuditUserAttrs::resetToAuthenticatedUser(opCtx);
+            _updateInternalAuthorizationState();
+        }
+    }
     _refreshUserInfoAsNeeded(opCtx);
 }
 
+void AuthorizationSessionImpl::startContractTracking() {
+    if (!checkContracts()) {
+        return;
+    }
+
+    _contract.clear();
+}
+
 Status AuthorizationSessionImpl::addAndAuthorizeUser(OperationContext* opCtx,
-                                                     const UserName& userName) {
-    AuthorizationManager* authzManager = AuthorizationManager::get(opCtx->getServiceContext());
-    auto swUser = authzManager->acquireUser(opCtx, userName);
-    if (!swUser.isOK()) {
-        return swUser.getStatus();
+                                                     std::unique_ptr<UserRequest> userRequest,
+                                                     boost::optional<Date_t> expirationTime) try {
+    // Check before we start to reveal as little as possible. Note that we do not need the lock
+    // because only the Client thread can mutate _authenticatedUser.
+    if (_authenticatedUser) {
+        // Already logged in.
+        auto previousUser = _authenticatedUser.value()->getName();
+        if (previousUser == userRequest->getUserName()) {
+            // Allow reauthenticating as the same user, but warn.
+            LOGV2_WARNING(5626700,
+                          "Client has attempted to reauthenticate as a single user",
+                          "user"_attr = userRequest->getUserName());
+
+            // Strict API requires no reauth, even as same user, unless FP is enabled.
+            const bool hasStrictAPI = APIParameters::get(opCtx).getAPIStrict().value_or(false);
+            uassert(5626703,
+                    "Each client connection may only be authenticated once",
+                    !hasStrictAPI || allowMultipleUsersWithApiStrict.shouldFail());
+
+            return Status::OK();
+        } else {
+            uassert(5626701,
+                    str::stream() << "Each client connection may only be authenticated once. "
+                                  << "Previously authenticated as: " << previousUser,
+                    previousUser.getDB() == userRequest->getUserName().getDB());
+            uasserted(5626702,
+                      str::stream() << "Client has attempted to authenticate on multiple databases."
+                                    << "Already authenticated as: " << previousUser);
+        }
+        MONGO_UNREACHABLE;
+    } else {
+        // If session is expired, then treat this as reauth for an expired session and only permit
+        // the same user.
+        if (_expiredUserName) {
+            uassert(7070100,
+                    str::stream() << "Only same user is permitted to re-auth to an expired "
+                                     "session. Expired user is "
+                                  << _expiredUserName.value(),
+                    _expiredUserName == userRequest->getUserName());
+        }
     }
 
-    auto user = std::move(swUser.getValue());
+    AuthorizationManager* authzManager = AuthorizationManager::get(opCtx->getService());
+    auto user = uassertStatusOK(authzManager->acquireUser(opCtx, std::move(userRequest)));
 
-    const auto& restrictionSet = user->getRestrictions();
-    if (opCtx->getClient() == nullptr) {
-        return Status(ErrorCodes::AuthenticationFailed,
-                      "Unable to evaluate restrictions, OperationContext has no Client");
-    }
+    const auto& userName = user->getName();
 
-    Status restrictionStatus =
-        restrictionSet.validate(RestrictionEnvironment::get(*opCtx->getClient()));
+    auto restrictionStatus = user->validateRestrictions(opCtx);
     if (!restrictionStatus.isOK()) {
-        log() << "Failed to acquire user '" << userName
-              << "' because of unmet authentication restrictions: " << restrictionStatus.reason();
+        LOGV2(20240,
+              "Failed to acquire user because of unmet authentication restrictions",
+              "user"_attr = userName,
+              "reason"_attr = restrictionStatus.reason());
         return AuthorizationManager::authenticationFailedStatus;
     }
 
-    _authenticatedUsers.add(std::move(user));
+    stdx::lock_guard<Client> lk(*_client);
 
-    // If there are any users and roles in the impersonation data, clear it out.
-    clearImpersonatedUserData();
+    auto validatedTenancyScope = auth::ValidatedTenancyScope::get(opCtx);
+    if (validatedTenancyScope && validatedTenancyScope->hasAuthenticatedUser()) {
+        uassert(
+            6161501,
+            "Attempt to authorize via security token on connection with established authentication",
+            _authenticationMode != AuthenticationMode::kConnection);
+        uassert(6161502,
+                "Attempt to authorize a user other than that present in the security token",
+                validatedTenancyScope->authenticatedUser() == userName);
+        auto tokenExpires = validatedTenancyScope->getExpiration();
+        if (!expirationTime) {
+            expirationTime = tokenExpires;
+        } else if (tokenExpires < expirationTime.get()) {
+            expirationTime = tokenExpires;
+        }
+        validateSecurityTokenUserPrivileges(user->getPrivileges());
+        _authenticationMode = AuthenticationMode::kSecurityToken;
+    } else {
+        uassert(7070102,
+                "Invalid expiration time specified",
+                !expirationTime ||
+                    expirationTime.value() >
+                        opCtx->getServiceContext()->getFastClockSource()->now());
+        _authenticationMode = AuthenticationMode::kConnection;
+    }
+    _authenticatedUser = std::move(user);
+    _expirationTime = std::move(expirationTime);
+    _expiredUserName = boost::none;
+    _loginTime = Date_t::now();
 
-    _buildAuthenticatedRolesVector();
+    // Reset AuditUserAttrs so that it contains the newly authorized user's information.
+    rpc::AuditUserAttrs::resetToAuthenticatedUser(opCtx);
+
+    _updateInternalAuthorizationState();
     return Status::OK();
+
+} catch (const DBException& ex) {
+    return ex.toStatus();
 }
 
 User* AuthorizationSessionImpl::lookupUser(const UserName& name) {
-    return _authenticatedUsers.lookup(name).get();
+    _contract.addAccessCheck(AccessCheckEnum::kLookupUser);
+
+    if (!_authenticatedUser || (_authenticatedUser.value()->getName() != name)) {
+        return nullptr;
+    }
+    return _authenticatedUser->get();
 }
 
-User* AuthorizationSessionImpl::getSingleUser() {
-    UserName userName;
+boost::optional<UserHandle> AuthorizationSessionImpl::getAuthenticatedUser() {
+    _contract.addAccessCheck(AccessCheckEnum::kGetAuthenticatedUser);
+    return _authenticatedUser;
+}
 
-    auto userNameItr = getAuthenticatedUserNames();
-    if (userNameItr.more()) {
-        userName = userNameItr.next();
-        if (userNameItr.more()) {
-            uasserted(ErrorCodes::Unauthorized, "too many users are authenticated");
-        }
-    } else {
-        uasserted(ErrorCodes::Unauthorized, "there are no users authenticated");
+void AuthorizationSessionImpl::logoutSecurityTokenUser() {
+    stdx::lock_guard<Client> lk(*_client);
+
+    uassert(6161503,
+            "Attempted to deauth a security token user while using standard login",
+            _authenticationMode != AuthenticationMode::kConnection);
+
+    auto user = std::exchange(_authenticatedUser, boost::none);
+    if (user) {
+        LOGV2_DEBUG(6161506,
+                    5,
+                    "security token based user explicitly logged out",
+                    "user"_attr = user.value()->getName().toBSON(true /* encode tenant */));
     }
 
-    return lookupUser(userName);
+    // Explicitly skip auditing the logout event,
+    // security tokens don't represent a permanent login.
+    rpc::AuditUserAttrs::resetToAuthenticatedUser(_client);
+    _updateInternalAuthorizationState();
+    _loginTime = boost::none;
 }
 
-void AuthorizationSessionImpl::logoutDatabase(StringData dbname) {
-    _authenticatedUsers.removeByDBName(dbname);
-    clearImpersonatedUserData();
-    _buildAuthenticatedRolesVector();
+void AuthorizationSessionImpl::logoutAllDatabases(StringData reason) {
+    stdx::lock_guard<Client> lk(*_client);
+
+    uassert(6161504,
+            "May not log out while using a security token based authentication",
+            _authenticationMode != AuthenticationMode::kSecurityToken);
+
+    auto authenticatedUser = std::exchange(_authenticatedUser, boost::none);
+    auto expiredUserName = std::exchange(_expiredUserName, boost::none);
+
+    if (authenticatedUser) {
+        auto names = BSON_ARRAY(authenticatedUser.value()->getName().toBSON());
+        audit::logLogout(_client, reason, names, BSONArray(), _loginTime);
+    } else if (expiredUserName) {
+        auto names = BSON_ARRAY(expiredUserName.value().toBSON());
+        audit::logLogout(_client, reason, names, BSONArray(), _loginTime);
+    } else {
+        return;
+    }
+
+    _loginTime = boost::none;
+    _expirationTime = boost::none;
+    rpc::AuditUserAttrs::resetToAuthenticatedUser(_client);
+    _updateInternalAuthorizationState();
 }
 
-UserNameIterator AuthorizationSessionImpl::getAuthenticatedUserNames() {
-    return _authenticatedUsers.getNames();
+
+void AuthorizationSessionImpl::logoutDatabase(const DatabaseName& dbname, StringData reason) {
+    bool isLoggedInOnDB =
+        (_authenticatedUser && _authenticatedUser.value()->getName().getDatabaseName() == dbname);
+    bool isExpiredOnDB = (_expiredUserName && _expiredUserName.value().getDatabaseName() == dbname);
+
+    if (isLoggedInOnDB || isExpiredOnDB) {
+        // The session either has an authenticated or expired user belonging to the database being
+        // logged out from. Calling logoutAllDatabases() will clear that user out.
+        logoutAllDatabases(reason);
+    }
+}
+
+boost::optional<UserName> AuthorizationSessionImpl::getAuthenticatedUserName() {
+    _contract.addAccessCheck(AccessCheckEnum::kGetAuthenticatedUserName);
+
+    if (_authenticatedUser) {
+        return _authenticatedUser.value()->getName();
+    } else {
+        return boost::none;
+    }
 }
 
 RoleNameIterator AuthorizationSessionImpl::getAuthenticatedRoleNames() {
+    _contract.addAccessCheck(AccessCheckEnum::kGetAuthenticatedRoleNames);
+
     return makeRoleNameIterator(_authenticatedRoleNames.begin(), _authenticatedRoleNames.end());
 }
 
-std::string AuthorizationSessionImpl::getAuthenticatedUserNamesToken() {
-    std::string ret;
-    for (UserNameIterator nameIter = getAuthenticatedUserNames(); nameIter.more();
-         nameIter.next()) {
-        ret += '\0';  // Using a NUL byte which isn't valid in usernames to separate them.
-        ret += nameIter->getFullName();
+void AuthorizationSessionImpl::grantInternalAuthorization() {
+    stdx::lock_guard<Client> lk(*_client);
+    if (MONGO_unlikely(_authenticatedUser != boost::none)) {
+        auto previousUser = _authenticatedUser.value()->getName();
+        uassert(ErrorCodes::Unauthorized,
+                str::stream() << "Unable to grant internal authorization, previously authorized as "
+                              << previousUser.getUnambiguousName(),
+                previousUser == internalSecurity.getUser()->get()->getName());
+        return;
     }
 
-    return ret;
+    uassert(ErrorCodes::ReauthenticationRequired,
+            str::stream() << "Unable to grant internal authorization on an expired session, "
+                          << "must reauthenticate as " << _expiredUserName->getUnambiguousName(),
+            _expiredUserName == boost::none);
+
+    _authenticatedUser = *internalSecurity.getUser();
+    _authenticationMode = AuthenticationMode::kConnection;
+    _expirationTime = boost::none;
+    _updateInternalAuthorizationState();
 }
 
-void AuthorizationSessionImpl::grantInternalAuthorization() {
-    _authenticatedUsers.add(internalSecurity.user);
-    _buildAuthenticatedRolesVector();
-}
-
-PrivilegeVector AuthorizationSessionImpl::getDefaultPrivileges() {
+PrivilegeVector AuthorizationSessionImpl::_getDefaultPrivileges() {
     PrivilegeVector defaultPrivileges;
 
     // If localhost exception is active (and no users exist),
     // return a vector of the minimum privileges required to bootstrap
     // a system and add the first user.
     if (_externalState->shouldAllowLocalhost()) {
-        ResourcePattern adminDBResource = ResourcePattern::forDatabaseName(ADMIN_DBNAME);
-        ActionSet setupAdminUserActionSet;
-        setupAdminUserActionSet.addAction(ActionType::createUser);
-        setupAdminUserActionSet.addAction(ActionType::grantRole);
-        Privilege setupAdminUserPrivilege = Privilege(adminDBResource, setupAdminUserActionSet);
 
-        ResourcePattern externalDBResource = ResourcePattern::forDatabaseName("$external");
-        Privilege setupExternalUserPrivilege =
-            Privilege(externalDBResource, ActionType::createUser);
+        const ResourcePattern adminDBResource =
+            ResourcePattern::forDatabaseName(DatabaseName::kAdmin);
+        const ActionSet setupAdminUserActionSet{ActionType::createUser, ActionType::grantRole};
+        Privilege setupAdminUserPrivilege(adminDBResource, setupAdminUserActionSet);
+
+        const ResourcePattern externalDBResource =
+            ResourcePattern::forDatabaseName(DatabaseName::kExternal);
+        Privilege setupExternalUserPrivilege(externalDBResource, ActionType::createUser);
 
         ActionSet setupServerConfigActionSet;
 
@@ -224,8 +465,9 @@ PrivilegeVector AuthorizationSessionImpl::getDefaultPrivileges() {
         setupServerConfigActionSet.addAction(ActionType::addShard);
         setupServerConfigActionSet.addAction(ActionType::replSetConfigure);
         setupServerConfigActionSet.addAction(ActionType::replSetGetStatus);
+        setupServerConfigActionSet.addAction(ActionType::issueDirectShardOperations);
         Privilege setupServerConfigPrivilege =
-            Privilege(ResourcePattern::forClusterResource(), setupServerConfigActionSet);
+            Privilege(ResourcePattern::forClusterResource(boost::none), setupServerConfigActionSet);
 
         Privilege::addPrivilegeToPrivilegeVector(&defaultPrivileges, setupAdminUserPrivilege);
         Privilege::addPrivilegeToPrivilegeVector(&defaultPrivileges, setupExternalUserPrivilege);
@@ -236,351 +478,58 @@ PrivilegeVector AuthorizationSessionImpl::getDefaultPrivileges() {
     return defaultPrivileges;
 }
 
-Status AuthorizationSessionImpl::checkAuthForAggregate(const NamespaceString& nss,
-                                                       const BSONObj& cmdObj,
-                                                       bool isMongos) {
-    if (!nss.isValid()) {
-        return Status(ErrorCodes::InvalidNamespace,
-                      mongoutils::str::stream() << "Invalid input namespace, " << nss.ns());
-    }
-
-    // If this connection does not need to be authenticated (for instance, if auth is disabled),
-    // return Status::OK() immediately.
-    if (_externalState->shouldIgnoreAuthChecks()) {
-        return Status::OK();
-    }
-
-    // We require at least one authenticated user when running aggregate with auth enabled.
-    if (!isAuthenticated()) {
-        return Status(ErrorCodes::Unauthorized, "unauthorized");
-    }
-
-    auto statusWithAggRequest = AggregationRequest::parseFromBSON(nss, cmdObj);
-    if (!statusWithAggRequest.isOK()) {
-        return statusWithAggRequest.getStatus();
-    }
-    AggregationRequest aggRequest = std::move(statusWithAggRequest.getValue());
-
-    const auto& pipeline = aggRequest.getPipeline();
-
-    // If the aggregation pipeline is empty, confirm the user is authorized for find on 'nss'.
-    if (pipeline.empty()) {
-        if (!isAuthorizedForPrivilege(
-                Privilege(ResourcePattern::forExactNamespace(nss), ActionType::find))) {
-            return Status(ErrorCodes::Unauthorized, "unauthorized");
-        }
-
-        return Status::OK();
-    }
-
-    // Confirm the user is authorized for the pipeline's initial document source. We confirm a user
-    // is authorized incrementally rather than once for the entire pipeline. This will prevent a
-    // malicious user, who doesn't have access to the initial document source, from consuming the
-    // resources needed to parse a potentially large pipeline.
-    auto liteParsedFirstDocumentSource = LiteParsedDocumentSource::parse(aggRequest, pipeline[0]);
-    if (!liteParsedFirstDocumentSource->isInitialSource() &&
-        !isAuthorizedForPrivilege(
-            Privilege(ResourcePattern::forExactNamespace(nss), ActionType::find))) {
-        return Status(ErrorCodes::Unauthorized, "unauthorized");
-    }
-
-    // We have done the work to lite parse the first stage. Given that, we check required privileges
-    // for it using 'liteParsedFirstDocumentSource' regardless of whether is an initial source or
-    // not.
-    if (!isAuthorizedForPrivileges(liteParsedFirstDocumentSource->requiredPrivileges(isMongos))) {
-        return Status(ErrorCodes::Unauthorized, "unauthorized");
-    }
-
-    // Confirm privileges for the remainder of the pipepline. Start with the second stage as we have
-    // already authorized the first.
-    auto pipelineIter = pipeline.begin() + 1;
-
-    for (; pipelineIter != pipeline.end(); ++pipelineIter) {
-        auto liteParsedDocSource = LiteParsedDocumentSource::parse(aggRequest, *pipelineIter);
-        if (!isAuthorizedForPrivileges(liteParsedDocSource->requiredPrivileges(isMongos))) {
-            return Status(ErrorCodes::Unauthorized, "unauthorized");
-        }
-    }
-
-    return Status::OK();
-}
-
-Status AuthorizationSessionImpl::checkAuthForFind(const NamespaceString& ns, bool hasTerm) {
-    if (MONGO_unlikely(ns.isCommand())) {
-        return Status(ErrorCodes::InternalError,
-                      str::stream() << "Checking query auth on command namespace " << ns.ns());
-    }
-    if (!isAuthorizedForActionsOnNamespace(ns, ActionType::find)) {
-        return Status(ErrorCodes::Unauthorized,
-                      str::stream() << "not authorized for query on " << ns.ns());
-    }
-
-    // Only internal clients (such as other nodes in a replica set) are allowed to use
-    // the 'term' field in a find operation. Use of this field could trigger changes
-    // in the receiving server's replication state and should be protected.
-    if (hasTerm &&
-        !isAuthorizedForActionsOnResource(ResourcePattern::forClusterResource(),
-                                          ActionType::internal)) {
-        return Status(ErrorCodes::Unauthorized,
-                      str::stream() << "not authorized for query with term on " << ns.ns());
-    }
-
-    return Status::OK();
-}
-
-Status AuthorizationSessionImpl::checkAuthForGetMore(const NamespaceString& ns,
-                                                     long long cursorID,
-                                                     bool hasTerm) {
-    // Since users can only getMore their own cursors, we verify that a user either is authenticated
-    // or does not need to be.
-    if (!_externalState->shouldIgnoreAuthChecks() && !isAuthenticated()) {
-        return Status(ErrorCodes::Unauthorized,
-                      str::stream() << "not authorized for getMore on " << ns.db());
-    }
-
-    // Only internal clients (such as other nodes in a replica set) are allowed to use
-    // the 'term' field in a getMore operation. Use of this field could trigger changes
-    // in the receiving server's replication state and should be protected.
-    if (hasTerm &&
-        !isAuthorizedForActionsOnResource(ResourcePattern::forClusterResource(),
-                                          ActionType::internal)) {
-        return Status(ErrorCodes::Unauthorized,
-                      str::stream() << "not authorized for getMore with term on " << ns.ns());
-    }
-
-    return Status::OK();
-}
-
-Status AuthorizationSessionImpl::checkAuthForInsert(OperationContext* opCtx,
-                                                    const NamespaceString& ns) {
-    ActionSet required{ActionType::insert};
-    if (documentValidationDisabled(opCtx)) {
-        required.addAction(ActionType::bypassDocumentValidation);
-    }
-    if (!isAuthorizedForActionsOnNamespace(ns, required)) {
-        return Status(ErrorCodes::Unauthorized,
-                      str::stream() << "not authorized for insert on " << ns.ns());
-    }
-
-    return Status::OK();
-}
-
-Status AuthorizationSessionImpl::checkAuthForUpdate(OperationContext* opCtx,
-                                                    const NamespaceString& ns,
-                                                    const BSONObj& query,
-                                                    const BSONObj& update,
-                                                    bool upsert) {
-    ActionSet required{ActionType::update};
-    StringData operationType = "update"_sd;
-
-    if (upsert) {
-        required.addAction(ActionType::insert);
-        operationType = "upsert"_sd;
-    }
-
-    if (documentValidationDisabled(opCtx)) {
-        required.addAction(ActionType::bypassDocumentValidation);
-    }
-
-    if (!isAuthorizedForActionsOnNamespace(ns, required)) {
-        return Status(ErrorCodes::Unauthorized,
-                      str::stream() << "not authorized for " << operationType << " on " << ns.ns());
-    }
-
-    return Status::OK();
-}
-
-Status AuthorizationSessionImpl::checkAuthForDelete(OperationContext* opCtx,
-                                                    const NamespaceString& ns,
-                                                    const BSONObj& query) {
-    if (!isAuthorizedForActionsOnNamespace(ns, ActionType::remove)) {
-        return Status(ErrorCodes::Unauthorized,
-                      str::stream() << "not authorized to remove from " << ns.ns());
-    }
-    return Status::OK();
-}
-
-Status AuthorizationSessionImpl::checkAuthForKillCursors(const NamespaceString& ns,
-                                                         UserNameIterator cursorOwner) {
-    if (isAuthorizedForActionsOnResource(ResourcePattern::forClusterResource(),
-                                         ActionType::killAnyCursor)) {
-        return Status::OK();
-    }
-
-    if (isCoauthorizedWith(cursorOwner)) {
-        return Status::OK();
-    }
-
-    ResourcePattern target;
-    if (ns.isListCollectionsCursorNS()) {
-        target = ResourcePattern::forDatabaseName(ns.db());
-    } else if (ns.isListIndexesCursorNS()) {
-        target = ResourcePattern::forExactNamespace(ns.getTargetNSForListIndexes());
-    } else {
-        target = ResourcePattern::forExactNamespace(ns);
-    }
-
-    if (isAuthorizedForActionsOnResource(target, ActionType::killAnyCursor)) {
-        return Status::OK();
-    }
-
-    return Status(ErrorCodes::Unauthorized,
-                  str::stream() << "not authorized to kill cursor on " << ns.ns());
-}
-
-Status AuthorizationSessionImpl::checkAuthForCreate(const NamespaceString& ns,
-                                                    const BSONObj& cmdObj,
-                                                    bool isMongos) {
-    if (cmdObj["capped"].trueValue() &&
-        !isAuthorizedForActionsOnNamespace(ns, ActionType::convertToCapped)) {
-        return Status(ErrorCodes::Unauthorized, "unauthorized");
-    }
-
-    const bool hasCreateCollectionAction =
-        isAuthorizedForActionsOnNamespace(ns, ActionType::createCollection);
-
-    // If attempting to create a view, check for additional required privileges.
-    if (cmdObj["viewOn"]) {
-        // You need the createCollection action on this namespace; the insert action is not
-        // sufficient.
-        if (!hasCreateCollectionAction) {
-            return Status(ErrorCodes::Unauthorized, "unauthorized");
-        }
-
-        // Parse the viewOn namespace and the pipeline. If no pipeline was specified, use the empty
-        // pipeline.
-        NamespaceString viewOnNs(ns.db(), cmdObj["viewOn"].checkAndGetStringData());
-        auto pipeline =
-            cmdObj.hasField("pipeline") ? BSONArray(cmdObj["pipeline"].Obj()) : BSONArray();
-        return checkAuthForCreateOrModifyView(this, ns, viewOnNs, pipeline, isMongos);
-    }
-
-    // To create a regular collection, ActionType::createCollection or ActionType::insert are
-    // both acceptable.
-    if (hasCreateCollectionAction || isAuthorizedForActionsOnNamespace(ns, ActionType::insert)) {
-        return Status::OK();
-    }
-
-    return Status(ErrorCodes::Unauthorized, "unauthorized");
-}
-
-Status AuthorizationSessionImpl::checkAuthForCollMod(const NamespaceString& ns,
-                                                     const BSONObj& cmdObj,
-                                                     bool isMongos) {
-    if (!isAuthorizedForActionsOnNamespace(ns, ActionType::collMod)) {
-        return Status(ErrorCodes::Unauthorized, "unauthorized");
-    }
-
-    // Check for additional required privileges if attempting to modify a view. When auth is
-    // enabled, users must specify both "viewOn" and "pipeline" together. This prevents a user from
-    // exposing more information in the original underlying namespace by only changing "pipeline",
-    // or looking up more information via the original pipeline by only changing "viewOn".
-    const bool hasViewOn = cmdObj.hasField("viewOn");
-    const bool hasPipeline = cmdObj.hasField("pipeline");
-    if (hasViewOn != hasPipeline) {
-        return Status(
-            ErrorCodes::InvalidOptions,
-            "Must specify both 'viewOn' and 'pipeline' when modifying a view and auth is enabled");
-    }
-    if (hasViewOn) {
-        NamespaceString viewOnNs(ns.db(), cmdObj["viewOn"].checkAndGetStringData());
-        auto viewPipeline = BSONArray(cmdObj["pipeline"].Obj());
-        return checkAuthForCreateOrModifyView(this, ns, viewOnNs, viewPipeline, isMongos);
-    }
-
-    return Status::OK();
-}
-
-Status AuthorizationSessionImpl::checkAuthorizedToGrantPrivilege(const Privilege& privilege) {
-    const ResourcePattern& resource = privilege.getResourcePattern();
-    if (resource.isDatabasePattern() || resource.isExactNamespacePattern()) {
-        if (!isAuthorizedForActionsOnResource(
-                ResourcePattern::forDatabaseName(resource.databaseToMatch()),
-                ActionType::grantRole)) {
-            return Status(ErrorCodes::Unauthorized,
-                          str::stream() << "Not authorized to grant privileges on the "
-                                        << resource.databaseToMatch()
-                                        << "database");
-        }
-    } else if (!isAuthorizedForActionsOnResource(ResourcePattern::forDatabaseName("admin"),
-                                                 ActionType::grantRole)) {
-        return Status(ErrorCodes::Unauthorized,
-                      "To grant privileges affecting multiple databases or the cluster,"
-                      " must be authorized to grant roles from the admin database");
-    }
-    return Status::OK();
-}
-
-
-Status AuthorizationSessionImpl::checkAuthorizedToRevokePrivilege(const Privilege& privilege) {
-    const ResourcePattern& resource = privilege.getResourcePattern();
-    if (resource.isDatabasePattern() || resource.isExactNamespacePattern()) {
-        if (!isAuthorizedForActionsOnResource(
-                ResourcePattern::forDatabaseName(resource.databaseToMatch()),
-                ActionType::revokeRole)) {
-            return Status(ErrorCodes::Unauthorized,
-                          str::stream() << "Not authorized to revoke privileges on the "
-                                        << resource.databaseToMatch()
-                                        << "database");
-        }
-    } else if (!isAuthorizedForActionsOnResource(ResourcePattern::forDatabaseName("admin"),
-                                                 ActionType::revokeRole)) {
-        return Status(ErrorCodes::Unauthorized,
-                      "To revoke privileges affecting multiple databases or the cluster,"
-                      " must be authorized to revoke roles from the admin database");
-    }
-    return Status::OK();
+boost::optional<TenantId> AuthorizationSessionImpl::getUserTenantId() const {
+    return _authenticatedUser ? _authenticatedUser.value()->getName().tenantId() : boost::none;
 }
 
 bool AuthorizationSessionImpl::isAuthorizedToParseNamespaceElement(const BSONElement& element) {
     const bool isUUID = element.type() == BinData && element.binDataType() == BinDataType::newUUID;
-
-    uassert(ErrorCodes::InvalidNamespace,
-            "Failed to parse namespace element",
-            element.type() == String || isUUID);
+    _contract.addAccessCheck(AccessCheckEnum::kIsAuthorizedToParseNamespaceElement);
 
     if (isUUID) {
-        return isAuthorizedForActionsOnResource(ResourcePattern::forClusterResource(),
-                                                ActionType::useUUID);
+        return isAuthorizedForActionsOnResource(
+            ResourcePattern::forClusterResource(getUserTenantId()), ActionType::useUUID);
     }
 
     return true;
 }
 
-bool AuthorizationSessionImpl::isAuthorizedToCreateRole(
-    const struct auth::CreateOrUpdateRoleArgs& args) {
+bool AuthorizationSessionImpl::isAuthorizedToParseNamespaceElement(
+    const NamespaceStringOrUUID& nss) {
+    _contract.addAccessCheck(AccessCheckEnum::kIsAuthorizedToParseNamespaceElement);
+
+    if (nss.isUUID()) {
+        return isAuthorizedForActionsOnResource(
+            ResourcePattern::forClusterResource(getUserTenantId()), ActionType::useUUID);
+    }
+    return true;
+}
+
+bool AuthorizationSessionImpl::isAuthorizedToCreateRole(const RoleName& roleName) {
+    _contract.addAccessCheck(AccessCheckEnum::kIsAuthorizedToCreateRole);
+
     // A user is allowed to create a role under either of two conditions.
 
     // The user may create a role if the authorization system says they are allowed to.
-    if (isAuthorizedForActionsOnResource(ResourcePattern::forDatabaseName(args.roleName.getDB()),
-                                         ActionType::createRole)) {
+    if (isAuthorizedForActionsOnResource(
+            ResourcePattern::forDatabaseName(roleName.getDatabaseName()), ActionType::createRole)) {
         return true;
     }
 
     // The user may create a role if the localhost exception is enabled, and they already own the
     // role. This implies they have obtained the role through an external authorization mechanism.
     if (_externalState->shouldAllowLocalhost()) {
-        for (const auto& user : _authenticatedUsers) {
-            if (user->hasRole(args.roleName)) {
-                return true;
-            }
+        if (_authenticatedUser && _authenticatedUser.value()->hasRole(roleName)) {
+            return true;
         }
-        log() << "Not authorized to create the first role in the system '" << args.roleName
-              << "' using the localhost exception. The user needs to acquire the role through "
-                 "external authentication first.";
+        LOGV2(20241,
+              "Not authorized to create the first role in the system using the "
+              "localhost exception. The user needs to acquire the role through "
+              "external authentication first.",
+              "role"_attr = roleName);
     }
 
     return false;
-}
-
-bool AuthorizationSessionImpl::isAuthorizedToGrantRole(const RoleName& role) {
-    return isAuthorizedForActionsOnResource(ResourcePattern::forDatabaseName(role.getDB()),
-                                            ActionType::grantRole);
-}
-
-bool AuthorizationSessionImpl::isAuthorizedToRevokeRole(const RoleName& role) {
-    return isAuthorizedForActionsOnResource(ResourcePattern::forDatabaseName(role.getDB()),
-                                            ActionType::revokeRole);
 }
 
 bool AuthorizationSessionImpl::isAuthorizedForPrivilege(const Privilege& privilege) {
@@ -622,236 +571,239 @@ bool AuthorizationSessionImpl::isAuthorizedForActionsOnNamespace(const Namespace
     return isAuthorizedForPrivilege(Privilege(ResourcePattern::forExactNamespace(ns), actions));
 }
 
-static const int resourceSearchListCapacity = 5;
-/**
- * Builds from "target" an exhaustive list of all ResourcePatterns that match "target".
- *
- * Stores the resulting list into resourceSearchList, and returns the length.
- *
- * The seach lists are as follows, depending on the type of "target":
- *
- * target is ResourcePattern::forAnyResource():
- *   searchList = { ResourcePattern::forAnyResource(), ResourcePattern::forAnyResource() }
- * target is the ResourcePattern::forClusterResource():
- *   searchList = { ResourcePattern::forAnyResource(), ResourcePattern::forClusterResource() }
- * target is a database, db:
- *   searchList = { ResourcePattern::forAnyResource(),
- *                  ResourcePattern::forAnyNormalResource(),
- *                  db }
- * target is a non-system collection, db.coll:
- *   searchList = { ResourcePattern::forAnyResource(),
- *                  ResourcePattern::forAnyNormalResource(),
- *                  db,
- *                  coll,
- *                  db.coll }
- * target is a system collection, db.system.coll:
- *   searchList = { ResourcePattern::forAnyResource(),
- *                  system.coll,
- *                  db.system.coll }
- */
-static int buildResourceSearchList(const ResourcePattern& target,
-                                   ResourcePattern resourceSearchList[resourceSearchListCapacity]) {
-    int size = 0;
-    resourceSearchList[size++] = ResourcePattern::forAnyResource();
-    if (target.isExactNamespacePattern()) {
-        if (!target.ns().isSystem()) {
-            // Some databases should not be matchable with ResourcePattern::forAnyNormalResource.
-            // 'local' and 'config' are used to store special system collections, which user level
-            // administrators should not be able to manipulate.
-            if (target.ns().db() != "local" && target.ns().db() != "config") {
-                resourceSearchList[size++] = ResourcePattern::forAnyNormalResource();
-            }
-            resourceSearchList[size++] = ResourcePattern::forDatabaseName(target.ns().db());
-        }
-        resourceSearchList[size++] = ResourcePattern::forCollectionName(target.ns().coll());
-    } else if (target.isDatabasePattern()) {
-        resourceSearchList[size++] = ResourcePattern::forAnyNormalResource();
-    }
-    resourceSearchList[size++] = target;
-    dassert(size <= resourceSearchListCapacity);
-    return size;
-}
-
 bool AuthorizationSessionImpl::isAuthorizedToChangeAsUser(const UserName& userName,
                                                           ActionType actionType) {
+    _contract.addAccessCheck(AccessCheckEnum::kIsAuthorizedToChangeAsUser);
+
     User* user = lookupUser(userName);
     if (!user) {
         return false;
     }
-    ResourcePattern resourceSearchList[resourceSearchListCapacity];
-    const int resourceSearchListLength = buildResourceSearchList(
-        ResourcePattern::forDatabaseName(userName.getDB()), resourceSearchList);
 
-    ActionSet actions;
-    for (int i = 0; i < resourceSearchListLength; ++i) {
-        actions.addAllActionsFromSet(user->getActionsForResource(resourceSearchList[i]));
-    }
-    return actions.contains(actionType);
+    auth::ResourcePatternSearchList search(
+        ResourcePattern::forDatabaseName(userName.getDatabaseName()));
+    return std::any_of(search.cbegin(), search.cend(), [&user, &actionType](const auto& pattern) {
+        return user->getActionsForResource(pattern).contains(actionType);
+    });
 }
 
-bool AuthorizationSessionImpl::isAuthorizedToChangeOwnPasswordAsUser(const UserName& userName) {
-    return AuthorizationSessionImpl::isAuthorizedToChangeAsUser(userName,
-                                                                ActionType::changeOwnPassword);
-}
+StatusWith<PrivilegeVector> AuthorizationSessionImpl::checkAuthorizedToListCollections(
+    const ListCollections& cmd) {
+    const auto& dbname = cmd.getDbName();
+    _contract.addAccessCheck(AccessCheckEnum::kCheckAuthorizedToListCollections);
 
-bool AuthorizationSessionImpl::isAuthorizedToChangeOwnCustomDataAsUser(const UserName& userName) {
-    return AuthorizationSessionImpl::isAuthorizedToChangeAsUser(userName,
-                                                                ActionType::changeOwnCustomData);
-}
-
-bool AuthorizationSessionImpl::isAuthorizedToListCollections(StringData dbname,
-                                                             const BSONObj& cmdObj) {
-    if (cmdObj["authorizedCollections"].trueValue() && cmdObj["nameOnly"].trueValue() &&
+    if (cmd.getAuthorizedCollections() && cmd.getNameOnly() &&
         AuthorizationSessionImpl::isAuthorizedForAnyActionOnAnyResourceInDB(dbname)) {
-        return true;
+        return PrivilegeVector();
     }
 
     // Check for the listCollections ActionType on the database.
-    return AuthorizationSessionImpl::isAuthorizedForActionsOnResource(
-        ResourcePattern::forDatabaseName(dbname), ActionType::listCollections);
+    PrivilegeVector privileges = {
+        Privilege(ResourcePattern::forDatabaseName(dbname), ActionType::listCollections)};
+    if (AuthorizationSessionImpl::isAuthorizedForPrivileges(privileges)) {
+        return privileges;
+    }
+
+    return Status(ErrorCodes::Unauthorized,
+                  str::stream() << "Not authorized to list collections on db: "
+                                << dbname.toStringForErrorMsg());
 }
 
 bool AuthorizationSessionImpl::isAuthenticatedAsUserWithRole(const RoleName& roleName) {
-    for (UserSet::iterator it = _authenticatedUsers.begin(); it != _authenticatedUsers.end();
-         ++it) {
-        if ((*it)->hasRole(roleName)) {
-            return true;
-        }
-    }
-    return false;
+    _contract.addAccessCheck(AccessCheckEnum::kIsAuthenticatedAsUserWithRole);
+    return (_authenticatedUser && _authenticatedUser.value()->hasRole(roleName));
+}
+
+bool AuthorizationSessionImpl::shouldIgnoreAuthChecks() {
+    _contract.addAccessCheck(AccessCheckEnum::kShouldIgnoreAuthChecks);
+
+    return _externalState->shouldIgnoreAuthChecks();
 }
 
 bool AuthorizationSessionImpl::isAuthenticated() {
-    return _authenticatedUsers.begin() != _authenticatedUsers.end();
+    _contract.addAccessCheck(AccessCheckEnum::kIsAuthenticated);
+
+    return _authenticatedUser != boost::none;
 }
 
 void AuthorizationSessionImpl::_refreshUserInfoAsNeeded(OperationContext* opCtx) {
-    AuthorizationManager& authMan = getAuthorizationManager();
-    UserSet::iterator it = _authenticatedUsers.begin();
+    if (_authenticatedUser == boost::none) {
+        return;
+    }
 
-    while (it != _authenticatedUsers.end()) {
-        auto& user = *it;
-        if (!user->isValid()) {
-            // The user is invalid, so make sure that we erase it from _authenticateUsers at the
-            // end of this block.
-            auto removeGuard = MakeGuard([&] { _authenticatedUsers.removeAt(it++); });
+    auto currentUser = _authenticatedUser.value();
+    const auto& name = currentUser->getName();
 
-            // Make a good faith effort to acquire an up-to-date user object, since the one
-            // we've cached is marked "out-of-date."
-            UserName name = user->getName();
-            UserHandle updatedUser;
+    const auto clearUser = [&] {
+        stdx::lock_guard<Client> lk(*opCtx->getClient());
+        _authenticatedUser = boost::none;
+        _authenticationMode = AuthenticationMode::kNone;
+        _expirationTime = boost::none;
+        _updateInternalAuthorizationState();
+    };
 
-            auto swUser = authMan.acquireUser(opCtx, name);
-            auto& status = swUser.getStatus();
-            switch (status.code()) {
-                case ErrorCodes::OK: {
-                    updatedUser = std::move(swUser.getValue());
-                    try {
-                        const auto& restrictionSet =
-                            updatedUser->getRestrictions();  // Owned by updatedUser
-                        invariant(opCtx->getClient());
-                        Status restrictionStatus = restrictionSet.validate(
-                            RestrictionEnvironment::get(*opCtx->getClient()));
-                        if (!restrictionStatus.isOK()) {
-                            log() << "Removed user " << name
-                                  << " with unmet authentication restrictions from session cache of"
-                                  << " user information. Restriction failed because: "
-                                  << restrictionStatus.reason();
-                            // If we remove from the UserSet, we cannot increment the iterator.
-                            continue;
-                        }
-                    } catch (...) {
-                        log() << "Evaluating authentication restrictions for " << name
-                              << " resulted in an unknown exception. Removing user from the"
-                              << " session cache.";
-                        continue;
-                    }
+    const auto updateUser = [&](auto&& user) {
+        stdx::lock_guard<Client> lk(*opCtx->getClient());
+        _authenticatedUser = std::move(user);
+        LOGV2_DEBUG(
+            20244, 1, "Updated session cache of user information for user", "user"_attr = name);
+        _updateInternalAuthorizationState();
+    };
 
-                    // Success! Replace the old User object with the updated one.
-                    removeGuard.Dismiss();
-                    _authenticatedUsers.replaceAt(it, std::move(updatedUser));
-                    LOG(1) << "Updated session cache of user information for " << name;
-                    break;
-                }
-                case ErrorCodes::UserNotFound: {
-                    // User does not exist anymore; remove it from _authenticatedUsers.
-                    log() << "Removed deleted user " << name
-                          << " from session cache of user information.";
-                    continue;  // No need to advance "it" in this case.
-                }
-                case ErrorCodes::UnsupportedFormat: {
-                    // An auth subsystem has explicitly indicated a failure.
-                    log() << "Removed user " << name
-                          << " from session cache of user information because of refresh failure:"
-                          << " '" << status << "'.";
-                    continue;  // No need to advance "it" in this case.
-                }
-                default:
-                    // Unrecognized error; assume that it's transient, and continue working with the
-                    // out-of-date privilege data.
-                    warning() << "Could not fetch updated user privilege information for " << name
-                              << "; continuing to use old information.  Reason is "
-                              << redact(status);
-                    removeGuard.Dismiss();
-                    break;
+    auto swUser = _getAuthorizationManager()->reacquireUser(opCtx, currentUser);
+    if (!swUser.isOK()) {
+        auto& status = swUser.getStatus();
+        switch (status.code()) {
+            case ErrorCodes::UserNotFound: {
+                // User does not exist anymore.
+                clearUser();
+                LOGV2(20245,
+                      "Removed deleted user from session cache of user information",
+                      "user"_attr = name,
+                      "error"_attr = status);
+                return;
             }
+            case ErrorCodes::UnsupportedFormat: {
+                // An auth subsystem has explicitly indicated a failure.
+                clearUser();
+                LOGV2(20246,
+                      "Removed user from session cache of user information because of "
+                      "refresh failure",
+                      "user"_attr = name,
+                      "error"_attr = status);
+                return;
+            }
+            case ErrorCodes::ReauthenticationRequired: {
+                // An auth subsystem has indicated that client reauthentication is required. The
+                // session will exist in an expired state to signal this to drivers.
+                _expiredUserName = _authenticatedUser.value()->getName();
+                clearUser();
+                LOGV2(
+                    7119502,
+                    "Removed user from session cache of user information because reauthentication "
+                    "is required",
+                    "user"_attr = name,
+                    "error"_attr = status);
+                return;
+            }
+            case ErrorCodes::LDAPRoleAcquisitionError: {
+                LOGV2_WARNING(
+                    7785501,
+                    "Could not fetch updated user authorization rights via LDAP, continuing "
+                    "to use old information",
+                    "user"_attr = name,
+                    "error"_attr = redact(status));
+                return;
+            }
+            default:
+                // Unrecognized error; assume that it's transient, and continue working with the
+                // out-of-date privilege data.
+                LOGV2_WARNING(20247,
+                              "Could not fetch updated user privilege information, continuing "
+                              "to use old information",
+                              "user"_attr = name,
+                              "error"_attr = redact(status));
+                return;
         }
-        ++it;
     }
-    _buildAuthenticatedRolesVector();
+
+    // !ok check above should never fallthrough.
+    invariant(swUser.getStatus());
+
+    if (currentUser.isValid() && !currentUser->isInvalidated()) {
+        // Current user may carry on, no need to update.
+        return;
+    }
+
+    // Our user handle has changed, update it.
+    auto user = std::move(swUser.getValue());
+    try {
+        uassertStatusOK(user->validateRestrictions(opCtx));
+    } catch (const DBException& ex) {
+        clearUser();
+        LOGV2(20242,
+              "Removed user with unmet authentication restrictions from "
+              "session cache of user information. Restriction failed",
+              "user"_attr = name,
+              "reason"_attr = ex.reason());
+        return;
+    } catch (...) {
+        clearUser();
+        LOGV2(20243,
+              "Evaluating authentication restrictions for user resulted in an "
+              "unknown exception. Removing user from the session cache",
+              "user"_attr = name);
+        return;
+    }
+
+    updateUser(std::move(user));
 }
 
-void AuthorizationSessionImpl::_buildAuthenticatedRolesVector() {
-    _authenticatedRoleNames.clear();
-    for (UserSet::iterator it = _authenticatedUsers.begin(); it != _authenticatedUsers.end();
-         ++it) {
-        RoleNameIterator roles = (*it)->getIndirectRoles();
-        while (roles.more()) {
-            RoleName roleName = roles.next();
-            _authenticatedRoleNames.push_back(RoleName(roleName.getRole(), roleName.getDB()));
-        }
-    }
-}
+bool AuthorizationSessionImpl::isAuthorizedForAnyActionOnAnyResourceInDB(
+    const DatabaseName& dbname) {
+    _contract.addAccessCheck(AccessCheckEnum::kIsAuthorizedForAnyActionOnAnyResourceInDB);
+    const auto& tenantId = dbname.tenantId();
 
-bool AuthorizationSessionImpl::isAuthorizedForAnyActionOnAnyResourceInDB(StringData db) {
     if (_externalState->shouldIgnoreAuthChecks()) {
         return true;
     }
 
-    for (const auto& user : _authenticatedUsers) {
-        // First lookup any Privileges on this database specifying Database resources
-        if (user->hasActionsForResource(ResourcePattern::forDatabaseName(db))) {
+    if (_authenticatedUser == boost::none) {
+        return false;
+    }
+
+    const auto& user = _authenticatedUser.value();
+    // First lookup any Privileges on this database specifying Database resources
+    if (user->hasActionsForResource(ResourcePattern::forDatabaseName(dbname))) {
+        return true;
+    }
+
+    // Any resource will match any collection in the database
+    if (user->hasActionsForResource(ResourcePattern::forAnyResource(tenantId))) {
+        return true;
+    }
+
+    // Any resource will match any system_buckets collection in the database
+    if (user->hasActionsForResource(ResourcePattern::forAnySystemBuckets(tenantId)) ||
+        user->hasActionsForResource(ResourcePattern::forAnySystemBucketsInDatabase(dbname))) {
+        return true;
+    }
+
+    // If the user is authorized for anyNormalResource, then they implicitly have access
+    // to most databases.
+    if (!dbname.isLocalDB() && !dbname.isConfigDB() &&
+        user->hasActionsForResource(ResourcePattern::forAnyNormalResource(tenantId))) {
+        return true;
+    }
+
+    // We've checked all the resource types that can be directly expressed. Now we must
+    // iterate all privileges, until we see something that could reside in the target database.
+    auto map = user->getPrivileges();
+    for (const auto& privilege : map) {
+        const auto& privRsrc = privilege.first;
+
+        // If the user has a Collection privilege, then they're authorized for this resource
+        // on all databases.
+        if (privRsrc.isCollectionPattern()) {
             return true;
         }
 
-        // Any resource will match any collection in the database
-        if (user->hasActionsForResource(ResourcePattern::forAnyResource())) {
+        // User can see system_buckets in any database so we consider them to have permission in
+        // this database
+        if (privRsrc.isAnySystemBucketsCollectionInAnyDB()) {
             return true;
         }
 
-        // If the user is authorized for anyNormalResource, then they implicitly have access
-        // to most databases.
-        if (db != "local" && db != "config" &&
-            user->hasActionsForResource(ResourcePattern::forAnyNormalResource())) {
+        // If the user has an exact namespace privilege on a collection in this database, they
+        // have access to a resource in this database.
+        if (privRsrc.isExactNamespacePattern() && (privRsrc.dbNameToMatch() == dbname)) {
             return true;
         }
 
-        // We've checked all the resource types that can be directly expressed. Now we must
-        // iterate all privileges, until we see something that could reside in the target database.
-        User::ResourcePrivilegeMap map = user->getPrivileges();
-        for (const auto& privilege : map) {
-            // If the user has a Collection privilege, then they're authorized for this resource
-            // on all databases.
-            if (privilege.first.isCollectionPattern()) {
-                return true;
-            }
-
-            // If the user has an exact namespace privilege on a collection in this database, they
-            // have access to a resource in this database.
-            if (privilege.first.isExactNamespacePattern() &&
-                privilege.first.databaseToMatch() == db) {
-                return true;
-            }
+        // If the user has an exact namespace privilege on a system.buckets collection in this
+        // database, they have access to a resource in this database.
+        if (privRsrc.isExactSystemBucketsCollection() && (privRsrc.dbNameToMatch() == dbname)) {
+            return true;
         }
     }
 
@@ -859,153 +811,137 @@ bool AuthorizationSessionImpl::isAuthorizedForAnyActionOnAnyResourceInDB(StringD
 }
 
 bool AuthorizationSessionImpl::isAuthorizedForAnyActionOnResource(const ResourcePattern& resource) {
+    _contract.addAccessCheck(AccessCheckEnum::kIsAuthorizedForAnyActionOnResource);
+
     if (_externalState->shouldIgnoreAuthChecks()) {
         return true;
     }
 
-    std::array<ResourcePattern, resourceSearchListCapacity> resourceSearchList;
-    const int resourceSearchListLength =
-        buildResourceSearchList(resource, resourceSearchList.data());
-
-    for (int i = 0; i < resourceSearchListLength; ++i) {
-        for (const auto& user : _authenticatedUsers) {
-            if (user->hasActionsForResource(resourceSearchList[i])) {
-                return true;
-            }
-        }
+    if (_authenticatedUser == boost::none) {
+        return false;
     }
 
-    return false;
+    const auto& user = _authenticatedUser.value();
+    auth::ResourcePatternSearchList search(resource);
+    return std::any_of(search.cbegin(), search.cend(), [&user](const auto& pattern) {
+        return user->hasActionsForResource(pattern);
+    });
 }
 
+namespace {
+// ActionTypes usable with the isAuthorizedForClusterAction() "quick" method.
+// Checks on non-root tenants, or for unauthenticated connections will be handled
+// by the isAuthorizedForPrivileges() fallback.
+const ActionSet kClusterActionsQuickList({
+    ActionType::advanceClusterTime,
+    ActionType::bypassDefaultMaxTimeMS,
+    ActionType::bypassWriteBlockingMode,
+    ActionType::impersonate,
+    ActionType::internal,
+    ActionType::useTenant,
+});
+}  // namespace
 
-bool AuthorizationSessionImpl::_isAuthorizedForPrivilege(const Privilege& privilege) {
-    const ResourcePattern& target(privilege.getResourcePattern());
+bool AuthorizationSessionImpl::isAuthorizedForClusterActions(
+    const ActionSet& actionSet, const boost::optional<TenantId>& tenantId) {
 
-    ResourcePattern resourceSearchList[resourceSearchListCapacity];
-    const int resourceSearchListLength = buildResourceSearchList(target, resourceSearchList);
-
-    ActionSet unmetRequirements = privilege.getActions();
-
-    PrivilegeVector defaultPrivileges = getDefaultPrivileges();
-    for (PrivilegeVector::iterator it = defaultPrivileges.begin(); it != defaultPrivileges.end();
-         ++it) {
-        for (int i = 0; i < resourceSearchListLength; ++i) {
-            if (!(it->getResourcePattern() == resourceSearchList[i]))
-                continue;
-
-            ActionSet userActions = it->getActions();
-            unmetRequirements.removeAllActionsFromSet(userActions);
-
-            if (unmetRequirements.empty())
-                return true;
-        }
+    if (_externalState->shouldIgnoreAuthChecks()) {
+        return true;
     }
 
-    for (const auto& user : _authenticatedUsers) {
-        for (int i = 0; i < resourceSearchListLength; ++i) {
-            ActionSet userActions = user->getActionsForResource(resourceSearchList[i]);
-            unmetRequirements.removeAllActionsFromSet(userActions);
+    if (tenantId || !kClusterActionsQuickList.isSupersetOf(actionSet) || !isAuthenticated()) {
+        dassert(kClusterActionsQuickList.isSupersetOf(actionSet));
+        // Fallback on slower method for multitenancy, non-allowlisted actions, or unauthenticated.
+        return isAuthorizedForPrivilege(
+            Privilege(ResourcePattern::forClusterResource(tenantId), actionSet));
+    }
 
+    return _nonTenantClusterActions.isSupersetOf(actionSet);
+}
+
+bool AuthorizationSessionImpl::_isAuthorizedForPrivilege(const Privilege& privilege) {
+    _contract.addPrivilege(privilege);
+
+    const auto& rp = privilege.getResourcePattern();
+    auth::ResourcePatternSearchList search(rp);
+    ActionSet unmetRequirements = privilege.getActions();
+    for (const auto& priv : _getDefaultPrivileges()) {
+        for (auto patternIt = search.cbegin(); patternIt != search.cend(); ++patternIt) {
+            if (priv.getResourcePattern() != *patternIt) {
+                continue;
+            }
+
+            unmetRequirements.removeAllActionsFromSet(priv.getActions());
             if (unmetRequirements.empty()) {
                 return true;
             }
         }
     }
 
-    return false;
+    if (_authenticatedUser == boost::none) {
+        return false;
+    }
+
+    const auto& user = _authenticatedUser.value();
+    // Safeguard that cross-tenant privileges are only granted when users have cluster-useTenant.
+    if (MONGO_unlikely(!_nonTenantClusterActions.contains(ActionType::useTenant) &&
+                       (user->getName().tenantId() != rp.tenantId()))) {
+        return unmetRequirements.empty();
+    }
+    return std::any_of(search.cbegin(), search.cend(), [&](const auto& pattern) {
+        unmetRequirements.removeAllActionsFromSet(user->getActionsForResource(pattern));
+        return unmetRequirements.empty();
+    });
 }
 
-void AuthorizationSessionImpl::setImpersonatedUserData(std::vector<UserName> usernames,
-                                                       std::vector<RoleName> roles) {
-    _impersonatedUserNames = usernames;
-    _impersonatedRoleNames = roles;
-    _impersonationFlag = true;
-}
+bool AuthorizationSessionImpl::isCoauthorizedWithClient(Client* opClient, WithLock opClientLock) {
+    _contract.addAccessCheck(AccessCheckEnum::kIsCoauthorizedWithClient);
 
-bool AuthorizationSessionImpl::isCoauthorizedWithClient(Client* opClient) {
-    auto getUserNames = [](AuthorizationSession* authSession) {
-        if (authSession->isImpersonating()) {
-            return authSession->getImpersonatedUserNames();
-        } else {
-            return authSession->getAuthenticatedUserNames();
+    auto getUserName = [](Client* client) -> boost::optional<UserName> {
+        if (auto auditUserAttrs = rpc::AuditUserAttrs::get(client)) {
+            return auditUserAttrs->getUser();
         }
+        return boost::none;
     };
 
-    UserNameIterator it = getUserNames(this);
-    while (it.more()) {
-        UserNameIterator opIt = getUserNames(AuthorizationSession::get(opClient));
-        while (opIt.more()) {
-            if (it.get() == opIt.get()) {
-                return true;
-            }
-            opIt.next();
-        }
-        it.next();
+    if (auto myName = getUserName(_client)) {
+        return myName == getUserName(opClient);
     }
-
     return false;
 }
 
-bool AuthorizationSessionImpl::isCoauthorizedWith(UserNameIterator userNameIter) {
-    if (!getAuthorizationManager().isAuthEnabled()) {
+bool AuthorizationSessionImpl::isCoauthorizedWith(const boost::optional<UserName>& userName) {
+    _contract.addAccessCheck(AccessCheckEnum::kIsCoauthorizedWith);
+    if (!_getAuthorizationManager()->isAuthEnabled()) {
         return true;
     }
-    if (!userNameIter.more() && !isAuthenticated()) {
-        return true;
-    }
 
-    for (; userNameIter.more(); userNameIter.next()) {
-        for (UserNameIterator thisUserNameIter = getAuthenticatedUserNames();
-             thisUserNameIter.more();
-             thisUserNameIter.next()) {
-            if (*userNameIter == *thisUserNameIter) {
-                return true;
-            }
-        }
-    }
-
-    return false;
-}
-
-UserNameIterator AuthorizationSessionImpl::getImpersonatedUserNames() {
-    return makeUserNameIterator(_impersonatedUserNames.begin(), _impersonatedUserNames.end());
-}
-
-RoleNameIterator AuthorizationSessionImpl::getImpersonatedRoleNames() {
-    return makeRoleNameIterator(_impersonatedRoleNames.begin(), _impersonatedRoleNames.end());
+    return getAuthenticatedUserName() == userName;
 }
 
 bool AuthorizationSessionImpl::isUsingLocalhostBypass() {
-    return getAuthorizationManager().isAuthEnabled() && _externalState->shouldAllowLocalhost();
-}
+    _contract.addAccessCheck(AccessCheckEnum::kIsUsingLocalhostBypass);
 
-// Clear the vectors of impersonated usernames and roles.
-void AuthorizationSessionImpl::clearImpersonatedUserData() {
-    _impersonatedUserNames.clear();
-    _impersonatedRoleNames.clear();
-    _impersonationFlag = false;
-}
-
-
-bool AuthorizationSessionImpl::isImpersonating() const {
-    return _impersonationFlag;
+    return _getAuthorizationManager()->isAuthEnabled() && _externalState->shouldAllowLocalhost();
 }
 
 auto AuthorizationSessionImpl::checkCursorSessionPrivilege(
     OperationContext* const opCtx, const boost::optional<LogicalSessionId> cursorSessionId)
     -> Status {
+    _contract.addAccessCheck(AccessCheckEnum::kCheckCursorSessionPrivilege);
+
     auto nobodyIsLoggedIn = [authSession = this] {
         return !authSession->isAuthenticated();
     };
 
     auto authHasImpersonatePrivilege = [authSession = this] {
         return authSession->isAuthorizedForPrivilege(
-            Privilege(ResourcePattern::forClusterResource(), ActionType::impersonate));
+            Privilege(ResourcePattern::forClusterResource(authSession->getUserTenantId()),
+                      ActionType::impersonate));
     };
 
     auto authIsOn = [authSession = this] {
-        return authSession->getAuthorizationManager().isAuthEnabled();
+        return authSession->_getAuthorizationManager()->isAuthEnabled();
     };
 
     auto sessionIdToStringOrNone =
@@ -1031,16 +967,120 @@ auto AuthorizationSessionImpl::checkCursorSessionPrivilege(
                                         // Operation Context (which implies a background job
         !authHasImpersonatePrivilege()  // Or if the user has an impersonation privilege, in which
                                         // case, the user gets to sidestep certain checks.
-        ) {
+    ) {
         return Status{ErrorCodes::Unauthorized,
-                      str::stream() << "Cursor session id ("
-                                    << sessionIdToStringOrNone(cursorSessionId)
-                                    << ") is not the same as the operation context's session id ("
-                                    << sessionIdToStringOrNone(opCtx->getLogicalSessionId())
-                                    << ")"};
+                      str::stream()
+                          << "Cursor session id (" << sessionIdToStringOrNone(cursorSessionId)
+                          << ") is not the same as the operation context's session id ("
+                          << sessionIdToStringOrNone(opCtx->getLogicalSessionId()) << ")"};
     }
 
     return Status::OK();
+}
+
+void AuthorizationSessionImpl::verifyContract(const AuthorizationContract* contract) const {
+    if (contract == nullptr) {
+        return;
+    }
+
+    if (!checkContracts()) {
+        return;
+    }
+
+    // Make a mutable copy so that the common auth checks can be added.
+    auto tempContract = *contract;
+
+    // Certain access checks are done by code common to all commands.
+    //
+    // The first two checks are done by initializeOperationSessionInfo
+    tempContract.addAccessCheck(AccessCheckEnum::kIsUsingLocalhostBypass);
+    tempContract.addAccessCheck(AccessCheckEnum::kIsAuthenticated);
+
+    // These checks are done by auditing
+    tempContract.addAccessCheck(AccessCheckEnum::kGetAuthenticatedUserName);
+    tempContract.addAccessCheck(AccessCheckEnum::kGetAuthenticatedRoleNames);
+
+    // Since internal sessions are started by the server, the generated authorization contract is
+    // missing the following user access checks, so we add them here to allow commands that spawn
+    // internal sessions to pass this authorization check.
+    tempContract.addAccessCheck(AccessCheckEnum::kGetAuthenticatedUser);
+    tempContract.addAccessCheck(AccessCheckEnum::kLookupUser);
+
+    // "internal" comes from readRequestMetadata and sharded clusters
+    // "advanceClusterTime" is an implicit check in clusters in metadata handling
+    tempContract.addPrivilege(Privilege(ResourcePattern::forClusterResource(boost::none),
+                                        {ActionType::advanceClusterTime, ActionType::internal}));
+
+    // Implicitly checked often to keep mayBypassWriteBlockingMode() fast
+    tempContract.addPrivilege(Privilege(ResourcePattern::forClusterResource(boost::none),
+                                        ActionType::bypassWriteBlockingMode));
+
+    // Operations which do not specify a maxTimeMS check if the defaultMaxTimeMS can be bypassed.
+    tempContract.addPrivilege(Privilege(ResourcePattern::forClusterResource(boost::none),
+                                        ActionType::bypassDefaultMaxTimeMS));
+
+    // Implicitly checked often to keep useTenant checks fast
+    tempContract.addPrivilege(
+        Privilege(ResourcePattern::forClusterResource(boost::none), ActionType::useTenant));
+
+
+    // makeLogicalSessionId checks for impersonate privileges
+    tempContract.addPrivilege(
+        Privilege(ResourcePattern::forClusterResource(boost::none), ActionType::impersonate));
+
+    // Needed for internal sessions started by the server.
+    tempContract.addPrivilege(Privilege(ResourcePattern::forClusterResource(boost::none),
+                                        ActionType::issueDirectShardOperations));
+
+    tempContract.addPrivilege(
+        Privilege(ResourcePattern::forExactNamespace(NamespaceString{}),
+                  {ActionType::performRawDataOperations, ActionType::internal}));
+
+    uassert(5452401,
+            "Authorization Session contains more authorization checks than permitted by contract.",
+            tempContract.contains(_contract));
+}
+
+void AuthorizationSessionImpl::_updateInternalAuthorizationState() {
+    // Update the authenticated role names vector to reflect current state.
+    _authenticatedRoleNames.clear();
+    if (_authenticatedUser == boost::none) {
+        _authenticationMode = AuthenticationMode::kNone;
+    } else {
+        RoleNameIterator roles = _authenticatedUser.value()->getIndirectRoles();
+        while (roles.more()) {
+            RoleName roleName = roles.next();
+            _authenticatedRoleNames.push_back(RoleName(roleName.getRole(), roleName.getDB()));
+        }
+    }
+
+    if (auto auditUserAttrs = rpc::AuditUserAttrs::get(_client);
+        !auditUserAttrs || !auditUserAttrs->getIsImpersonating()) {
+        // If we are not impersonating or AuditUserAttrs doesn't exist, reset AuditUserAttrs to the
+        // authenticated user.
+        rpc::AuditUserAttrs::resetToAuthenticatedUser(_client);
+    }
+
+    // Update cached cluster/any action types for non-tenant resources.
+    if (!_getAuthorizationManager()->isAuthEnabled()) {
+        _nonTenantClusterActions.addAllActions();
+    } else if (!isAuthenticated()) {
+        _nonTenantClusterActions.removeAllActions();
+    } else {
+        auto user = _authenticatedUser.get();
+        _nonTenantClusterActions =
+            user->getActionsForResource(ResourcePattern::forAnyResource(boost::none));
+        _nonTenantClusterActions.addAllActionsFromSet(
+            user->getActionsForResource(ResourcePattern::forClusterResource(boost::none)));
+    }
+}
+
+bool AuthorizationSessionImpl::mayBypassWriteBlockingMode() const {
+    return MONGO_unlikely(_nonTenantClusterActions.contains(ActionType::bypassWriteBlockingMode));
+}
+
+bool AuthorizationSessionImpl::isExpired() const {
+    return _expiredUserName.has_value();
 }
 
 }  // namespace mongo

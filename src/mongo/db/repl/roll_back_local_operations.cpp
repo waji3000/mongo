@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,29 +27,27 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplicationRollback
 
-#include "mongo/platform/basic.h"
+#include <string>
+#include <utility>
 
+#include <boost/move/utility_core.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/repl/oplog_entry.h"
 #include "mongo/db/repl/roll_back_local_operations.h"
-
+#include "mongo/db/storage/remove_saver.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplicationRollback
+
 
 namespace mongo {
 namespace repl {
-
-// After the release of MongoDB 3.8, these fail point declarations can
-// be moved into the rs_rollback.cpp file, as we no longer need to maintain
-// functionality for rs_rollback_no_uuid.cpp. See SERVER-29766.
-
-// Failpoint which causes rollback to hang before finishing.
-MONGO_FAIL_POINT_DEFINE(rollbackHangBeforeFinish);
-
-// Failpoint which causes rollback to hang and then fail after minValid is written.
-MONGO_FAIL_POINT_DEFINE(rollbackHangThenFailAfterWritingMinValid);
-
 
 namespace {
 
@@ -58,6 +55,10 @@ constexpr int kMaxConnectionAttempts = 3;
 
 OpTime getOpTime(const OplogInterface::Iterator::Value& oplogValue) {
     return fassert(40298, OpTime::parseFromOplogEntry(oplogValue.first));
+}
+
+long long getTerm(const BSONObj& operation) {
+    return operation["t"].numberLong();
 }
 
 Timestamp getTimestamp(const BSONObj& operation) {
@@ -68,15 +69,13 @@ Timestamp getTimestamp(const OplogInterface::Iterator::Value& oplogValue) {
     return getTimestamp(oplogValue.first);
 }
 
-long long getHash(const BSONObj& operation) {
-    return operation["h"].Long();
+long long getTerm(const OplogInterface::Iterator::Value& oplogValue) {
+    return getTerm(oplogValue.first);
 }
-
-long long getHash(const OplogInterface::Iterator::Value& oplogValue) {
-    return getHash(oplogValue.first);
-}
-
 }  // namespace
+
+static constexpr auto kRollbackRemoveSaverType = "rollback";
+static constexpr auto kRollbackRemoveSaverWhy = "removed";
 
 RollBackLocalOperations::RollBackLocalOperations(const OplogInterface& localOplog,
                                                  const RollbackOperationFn& rollbackOperation)
@@ -89,15 +88,19 @@ RollBackLocalOperations::RollBackLocalOperations(const OplogInterface& localOplo
 }
 
 RollBackLocalOperations::RollbackCommonPoint::RollbackCommonPoint(BSONObj oplogBSON,
-                                                                  RecordId recordId)
+                                                                  RecordId recordId,
+                                                                  BSONObj nextOplogBSON)
     : _recordId(std::move(recordId)) {
     auto oplogEntry = uassertStatusOK(repl::OplogEntry::parse(oplogBSON));
     _opTime = oplogEntry.getOpTime();
     _wallClockTime = oplogEntry.getWallClockTime();
+    // nextOplogEntry holds the oplog entry immediately after the common point.
+    auto nextOplogEntry = uassertStatusOK(repl::OplogEntry::parse(nextOplogBSON));
+    _firstWallClockTimeAfterCommonPoint = nextOplogEntry.getWallClockTime();
 }
 
 StatusWith<RollBackLocalOperations::RollbackCommonPoint> RollBackLocalOperations::onRemoteOperation(
-    const BSONObj& operation) {
+    const BSONObj& operation, RemoveSaver& removeSaver, bool shouldCreateDataFiles) {
     if (_scanned == 0) {
         auto result = _localOplogIterator->next();
         if (!result.isOK()) {
@@ -106,9 +109,19 @@ StatusWith<RollBackLocalOperations::RollbackCommonPoint> RollBackLocalOperations
         _localOplogValue = result.getValue();
     }
 
+    // As we iterate through the oplog in reverse, opAfterCurrentEntry holds the oplog entry
+    // immediately after the entry stored in _localOplogValue.
+    BSONObj opAfterCurrentEntry = _localOplogValue.first;
+
     while (getTimestamp(_localOplogValue) > getTimestamp(operation)) {
         _scanned++;
-        LOG(2) << "Local oplog entry to roll back: " << redact(_localOplogValue.first);
+        LOGV2_DEBUG(21656,
+                    2,
+                    "Local oplog entry to roll back",
+                    "oplogEntry"_attr = redact(_localOplogValue.first));
+        if (shouldCreateDataFiles) {
+            fassert(9777500, removeSaver.goingToDelete(_localOplogValue.first));
+        }
         auto status = _rollbackOperation(_localOplogValue.first);
         if (!status.isOK()) {
             invariant(ErrorCodes::NoSuchKey != status.code());
@@ -117,45 +130,30 @@ StatusWith<RollBackLocalOperations::RollbackCommonPoint> RollBackLocalOperations
         auto result = _localOplogIterator->next();
         if (!result.isOK()) {
             return Status(ErrorCodes::NoMatchingDocument,
-                          str::stream() << "reached beginning of local oplog: {"
-                                        << "scanned: "
-                                        << _scanned
-                                        << ", theirTime: "
-                                        << getTimestamp(operation).toString()
-                                        << ", ourTime: "
-                                        << getTimestamp(_localOplogValue).toString()
-                                        << "}");
+                          str::stream()
+                              << "reached beginning of local oplog: {"
+                              << "scanned: " << _scanned
+                              << ", theirTime: " << getTimestamp(operation).toString()
+                              << ", ourTime: " << getTimestamp(_localOplogValue).toString() << "}");
         }
+        opAfterCurrentEntry = _localOplogValue.first;
         _localOplogValue = result.getValue();
     }
 
     if (getTimestamp(_localOplogValue) == getTimestamp(operation)) {
         _scanned++;
-        if (getHash(_localOplogValue) == getHash(operation)) {
-            return RollbackCommonPoint(_localOplogValue.first, _localOplogValue.second);
+        if (getTerm(_localOplogValue) == getTerm(operation)) {
+            return RollbackCommonPoint(
+                _localOplogValue.first, _localOplogValue.second, opAfterCurrentEntry);
         }
 
-        LOG(2) << "Local oplog entry to roll back: " << redact(_localOplogValue.first);
-        auto status = _rollbackOperation(_localOplogValue.first);
-        if (!status.isOK()) {
-            invariant(ErrorCodes::NoSuchKey != status.code());
-            return status;
-        }
-        auto result = _localOplogIterator->next();
-        if (!result.isOK()) {
-            return Status(ErrorCodes::NoMatchingDocument,
-                          str::stream() << "reached beginning of local oplog: {"
-                                        << "scanned: "
-                                        << _scanned
-                                        << ", theirTime: "
-                                        << getTimestamp(operation).toString()
-                                        << ", ourTime: "
-                                        << getTimestamp(_localOplogValue).toString()
-                                        << "}");
-        }
-        _localOplogValue = result.getValue();
+        // We don't need to advance the localOplogIterator here because it is guaranteed to advance
+        // during the next call to onRemoteOperation. This is because before the next call to
+        // onRemoteOperation, the remote oplog iterator will advance and the new remote operation is
+        // guaranteed to have a timestamp less than the current local operation, which will trigger
+        // a call to get the next local operation.
         return Status(ErrorCodes::NoSuchKey,
-                      "Unable to determine common point - same timestamp but different hash. "
+                      "Unable to determine common point - same timestamp but different terms. "
                       "Need to process additional remote operations.");
     }
 
@@ -169,7 +167,8 @@ StatusWith<RollBackLocalOperations::RollbackCommonPoint> RollBackLocalOperations
 StatusWith<RollBackLocalOperations::RollbackCommonPoint> syncRollBackLocalOperations(
     const OplogInterface& localOplog,
     const OplogInterface& remoteOplog,
-    const RollBackLocalOperations::RollbackOperationFn& rollbackOperation) {
+    const RollBackLocalOperations::RollbackOperationFn& rollbackOperation,
+    bool shouldCreateDataFiles) {
 
     std::unique_ptr<OplogInterface::Iterator> remoteIterator;
 
@@ -193,10 +192,12 @@ StatusWith<RollBackLocalOperations::RollbackCommonPoint> syncRollBackLocalOperat
 
     RollBackLocalOperations finder(localOplog, rollbackOperation);
     Timestamp theirTime;
+    RemoveSaver removeSaver(kRollbackRemoveSaverType, "local.oplog.rs", kRollbackRemoveSaverWhy);
     while (remoteResult.isOK()) {
-        theirTime = remoteResult.getValue().first["ts"].timestamp();
         BSONObj theirObj = remoteResult.getValue().first;
-        auto result = finder.onRemoteOperation(theirObj);
+        theirTime = theirObj["ts"].timestamp();
+
+        auto result = finder.onRemoteOperation(theirObj, removeSaver, shouldCreateDataFiles);
         if (result.isOK()) {
             return result.getValue();
         } else if (result.getStatus().code() != ErrorCodes::NoSuchKey) {
@@ -206,11 +207,8 @@ StatusWith<RollBackLocalOperations::RollbackCommonPoint> syncRollBackLocalOperat
     }
     return Status(ErrorCodes::NoMatchingDocument,
                   str::stream() << "reached beginning of remote oplog: {"
-                                << "them: "
-                                << remoteOplog.toString()
-                                << ", theirTime: "
-                                << theirTime.toString()
-                                << "}");
+                                << "them: " << remoteOplog.toString()
+                                << ", theirTime: " << theirTime.toString() << "}");
 }
 
 }  // namespace repl

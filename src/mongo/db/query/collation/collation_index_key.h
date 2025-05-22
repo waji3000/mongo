@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -36,6 +35,7 @@ namespace mongo {
 
 class BSONElement;
 class BSONObjBuilder;
+
 class CollatorInterface;
 
 /**

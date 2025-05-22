@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -49,12 +48,13 @@ class LockRequestList {
 public:
     void push_front(LockRequest* request) {
         // Sanity check that we do not reuse entries without cleaning them up
-        invariant(request->next == NULL);
-        invariant(request->prev == NULL);
+        invariant(request->next == nullptr);
+        invariant(request->prev == nullptr);
 
-        if (_front == NULL) {
+        if (_front == nullptr) {
             _front = _back = request;
         } else {
+            invariant(_front->prev == nullptr);
             request->next = _front;
 
             _front->prev = request;
@@ -64,12 +64,14 @@ public:
 
     void push_back(LockRequest* request) {
         // Sanity check that we do not reuse entries without cleaning them up
-        invariant(request->next == NULL);
-        invariant(request->prev == NULL);
+        invariant(request->next == nullptr);
+        invariant(request->prev == nullptr);
 
-        if (_front == NULL) {
+        if (_front == nullptr) {
             _front = _back = request;
         } else {
+            invariant(_back);
+            invariant(_back->next == nullptr);
             request->prev = _back;
 
             _back->next = request;
@@ -78,28 +80,33 @@ public:
     }
 
     void remove(LockRequest* request) {
-        if (request->prev != NULL) {
+        if (request->prev != nullptr) {
+            invariant(request->prev->next == request);
             request->prev->next = request->next;
         } else {
             _front = request->next;
         }
 
-        if (request->next != NULL) {
+        if (request->next != nullptr) {
+            invariant(request->next->prev == request);
             request->next->prev = request->prev;
         } else {
             _back = request->prev;
         }
 
-        request->prev = NULL;
-        request->next = NULL;
+        request->prev = nullptr;
+        request->next = nullptr;
+
+        invariant((_front == nullptr) == (_back == nullptr),
+                  str::stream() << "_front=" << (void*)_front << ", _back=" << (void*)_back);
     }
 
     void reset() {
-        _front = _back = NULL;
+        _front = _back = nullptr;
     }
 
     bool empty() const {
-        return _front == NULL;
+        return _front == nullptr;
     }
 
     // Pointers to the beginning and the end of the list

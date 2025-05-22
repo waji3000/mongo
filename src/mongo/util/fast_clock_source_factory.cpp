@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,14 +27,11 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/util/fast_clock_source_factory.h"
-
 #include <memory>
 
-#include "mongo/stdx/memory.h"
 #include "mongo/util/background_thread_clock_source.h"
+#include "mongo/util/clock_source.h"
+#include "mongo/util/fast_clock_source_factory.h"
 #include "mongo/util/system_clock_source.h"
 
 namespace mongo {
@@ -44,8 +40,8 @@ std::unique_ptr<ClockSource> FastClockSourceFactory::create(Milliseconds granula
     // TODO: Create the fastest to read wall clock available on the system.
     // For now, assume there is no built-in fast wall clock so instead
     // create a background-thread-based timer.
-    return stdx::make_unique<BackgroundThreadClockSource>(stdx::make_unique<SystemClockSource>(),
-                                                          granularity);
+    return std::make_unique<BackgroundThreadClockSource>(std::make_unique<SystemClockSource>(),
+                                                         granularity);
 }
 
 }  // namespace mongo

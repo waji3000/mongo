@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,12 +29,18 @@
 
 #pragma once
 
+#include <boost/container/small_vector.hpp>
+// IWYU pragma: no_include "boost/intrusive/detail/iterator.hpp"
+#include <boost/move/utility_core.hpp>
+#include <cstddef>
+#include <memory>
 #include <set>
+#include <string>
+#include <utility>
 #include <vector>
 
-#include "mongo/base/disallow_copying.h"
-#include "mongo/base/owned_pointer_vector.h"
-#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
 #include "mongo/db/field_ref.h"
 
 namespace mongo {
@@ -51,25 +56,32 @@ namespace mongo {
  * FieldRefSets do not own the FieldRef paths they contain.
  */
 class FieldRefSet {
-    MONGO_DISALLOW_COPYING(FieldRefSet);
+    FieldRefSet(const FieldRefSet&) = delete;
+    FieldRefSet& operator=(const FieldRefSet&) = delete;
 
     struct FieldRefPtrLessThan {
         bool operator()(const FieldRef* lhs, const FieldRef* rhs) const;
     };
 
-    typedef std::set<const FieldRef*, FieldRefPtrLessThan> FieldSet;
+    typedef std::set<const FieldRef*, FieldRefPtrLessThan> SetType;
 
 public:
-    typedef FieldSet::iterator iterator;
-    typedef FieldSet::const_iterator const_iterator;
+    using iterator = SetType::iterator;
+    using const_iterator = SetType::const_iterator;
 
     FieldRefSet();
 
+    FieldRefSet(const std::vector<std::unique_ptr<FieldRef>>& paths);
+    FieldRefSet(const std::vector<const FieldRef*>& paths);
     FieldRefSet(const std::vector<FieldRef*>& paths);
 
     /** Returns 'true' if the set is empty */
     bool empty() const {
         return _fieldSet.empty();
+    }
+
+    size_t size() const {
+        return _fieldSet.size();
     }
 
     inline const_iterator begin() const {
@@ -90,9 +102,9 @@ public:
     }
 
     /**
-     * Returns true if the field 'toInsert' can be added in the set without
-     * conflicts. Otherwise returns false and fill in '*conflict' with the field 'toInsert'
-     * clashed with.
+     * Returns true if the field 'toInsert' was added to the set without conflicts.
+     *
+     * Otherwise, returns false and fills '*conflict' with the field 'toInsert' clashed with.
      *
      * There is no ownership transfer of 'toInsert'. The caller is responsible for
      * maintaining it alive for as long as the FieldRefSet is so. By the same token
@@ -101,14 +113,26 @@ public:
     bool insert(const FieldRef* toInsert, const FieldRef** conflict);
 
     /**
-     * Fills the set with the supplied FieldRef*s
+     * Returns true if the field 'toInsert' was added to the set without conflicts.
+     */
+    bool insertNoConflict(const FieldRef* toInsert);
+
+    /**
+     * Fills the set with the supplied FieldRef pointers.
      *
      * Note that *no* conflict resolution occurs here.
      */
     void fillFrom(const std::vector<FieldRef*>& fields);
 
     /**
-     * Replace any existing conflicting FieldRef with the shortest (closest to root) one
+     * Fills the set with the supplied FieldRefs. Does not take ownership of the managed pointers.
+     *
+     * Note that *no* conflict resolution occurs here.
+     */
+    void fillFrom(const std::vector<std::unique_ptr<FieldRef>>& fields);
+
+    /**
+     * Replace any existing conflicting FieldRef with the shortest (closest to root) one.
      */
     void keepShortest(const FieldRef* toInsert);
 
@@ -118,20 +142,68 @@ public:
      *
      * Return true if conflicts were found.
      */
-    bool findConflicts(const FieldRef* toCheck, FieldRefSet* conflicts) const;
+    StatusWith<bool> checkForConflictsAndPrefix(const FieldRef* toCheck) const;
 
     void clear() {
         _fieldSet.clear();
     }
 
+    void erase(const FieldRef* item) {
+        _fieldSet.erase(item);
+    }
+
     /**
      * A debug/log-able string
      */
-    const std::string toString() const;
+    std::string toString() const;
 
 private:
     // A set of field_ref pointers, none of which is owned here.
-    FieldSet _fieldSet;
+    SetType _fieldSet;
+};
+
+/**
+ * A wrapper class for FieldRefSet which owns the storage of the underlying FieldRef objects.
+ */
+class FieldRefSetWithStorage {
+public:
+    /**
+     * Inserts the given FieldRef into the set. In the case of a conflict with an existing element,
+     * only the shortest path is kept in the set.
+     */
+    void keepShortest(const FieldRef& toInsert) {
+        const FieldRef* inserted = &(*_ownedFieldRefs.insert(toInsert).first);
+        _fieldRefSet.keepShortest(inserted);
+    }
+
+    std::vector<std::string> serialize() const {
+        std::vector<std::string> ret;
+        for (const auto fieldRef : _fieldRefSet) {
+            ret.push_back(fieldRef->dottedField().toString());
+        }
+        return ret;
+    }
+
+    bool empty() const {
+        return _fieldRefSet.empty();
+    }
+
+    void clear() {
+        _ownedFieldRefs.clear();
+        _fieldRefSet.clear();
+    }
+
+    std::string toString() const {
+        return _fieldRefSet.toString();
+    }
+
+private:
+    // Holds the storage for FieldRef's inserted into the set. This may become out of sync with
+    // '_fieldRefSet' since we don't attempt to remove conflicts from the backing set, which can
+    // leave '_ownedFieldRefs' holding storage for a superset of the field refs that are actually
+    // contained in '_fieldRefSet'.
+    std::set<FieldRef> _ownedFieldRefs;
+    FieldRefSet _fieldRefSet;
 };
 
 }  // namespace mongo

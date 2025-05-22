@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,66 +27,21 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
-
-#include "mongo/platform/basic.h"
+#include "mongo/db/s/collection_sharding_state_factory_shard.h"
 
 #include "mongo/db/s/collection_sharding_runtime.h"
-#include "mongo/db/service_context.h"
-#include "mongo/executor/network_interface_factory.h"
-#include "mongo/executor/network_interface_thread_pool.h"
-#include "mongo/executor/thread_pool_task_executor.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 namespace mongo {
-namespace {
 
-class CollectionShardingStateFactoryShard final : public CollectionShardingStateFactory {
-public:
-    CollectionShardingStateFactoryShard(ServiceContext* serviceContext)
-        : CollectionShardingStateFactory(serviceContext) {}
+CollectionShardingStateFactoryShard::CollectionShardingStateFactoryShard(
+    ServiceContext* serviceContext)
+    : _serviceContext(serviceContext) {}
 
-    ~CollectionShardingStateFactoryShard() {
-        if (_taskExecutor) {
-            _taskExecutor->shutdown();
-            _taskExecutor->join();
-        }
-    }
-
-    std::unique_ptr<CollectionShardingState> make(const NamespaceString& nss) override {
-        return std::make_unique<CollectionShardingRuntime>(_serviceContext, nss, _getExecutor());
-    }
-
-private:
-    executor::TaskExecutor* _getExecutor() {
-        stdx::lock_guard<stdx::mutex> lg(_mutex);
-        if (!_taskExecutor) {
-            const std::string kExecName("CollectionRangeDeleter-TaskExecutor");
-
-            auto net = executor::makeNetworkInterface(kExecName);
-            auto pool = stdx::make_unique<executor::NetworkInterfaceThreadPool>(net.get());
-            auto taskExecutor = stdx::make_unique<executor::ThreadPoolTaskExecutor>(std::move(pool),
-                                                                                    std::move(net));
-            taskExecutor->startup();
-
-            _taskExecutor = std::move(taskExecutor);
-        }
-
-        return _taskExecutor.get();
-    }
-
-    // Serializes the instantiation of the task executor
-    stdx::mutex _mutex;
-    std::unique_ptr<executor::TaskExecutor> _taskExecutor{nullptr};
-};
-
-}  // namespace
-
-ServiceContext::ConstructorActionRegisterer collectionShardingStateFactoryRegisterer{
-    "CollectionShardingStateFactory",
-    [](ServiceContext* service) {
-        CollectionShardingStateFactory::set(
-            service, std::make_unique<CollectionShardingStateFactoryShard>(service));
-    },
-    [](ServiceContext* service) { CollectionShardingStateFactory::clear(service); }};
+std::unique_ptr<CollectionShardingState> CollectionShardingStateFactoryShard::make(
+    const NamespaceString& nss) {
+    return std::make_unique<CollectionShardingRuntime>(_serviceContext, nss);
+}
 
 }  // namespace mongo

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -33,7 +32,6 @@
 
 #include "mongo/base/status_with.h"
 #include "mongo/executor/network_connection_hook.h"
-#include "mongo/stdx/memory.h"
 
 namespace mongo {
 namespace executor {
@@ -55,15 +53,16 @@ public:
 
     Status validateHost(const HostAndPort& remoteHost,
                         const BSONObj& request,
-                        const RemoteCommandResponse& isMasterReply) override {
-        return _validateFunc(remoteHost, request, isMasterReply);
+                        const RemoteCommandResponse& helloReply) override {
+        return _validateFunc(remoteHost, request, helloReply);
     }
 
-    StatusWith<boost::optional<RemoteCommandRequest>> makeRequest(const HostAndPort& remoteHost) {
+    StatusWith<boost::optional<RemoteCommandRequest>> makeRequest(
+        const HostAndPort& remoteHost) override {
         return _requestFunc(remoteHost);
     }
 
-    Status handleReply(const HostAndPort& remoteHost, RemoteCommandResponse&& response) {
+    Status handleReply(const HostAndPort& remoteHost, RemoteCommandResponse&& response) override {
         return _replyFunc(remoteHost, std::move(response));
     }
 
@@ -81,9 +80,9 @@ template <typename Val, typename Req, typename Rep>
 std::unique_ptr<TestConnectionHook<Val, Req, Rep>> makeTestHook(Val&& validateFunc,
                                                                 Req&& requestFunc,
                                                                 Rep&& replyFunc) {
-    return stdx::make_unique<TestConnectionHook<Val, Req, Rep>>(std::forward<Val>(validateFunc),
-                                                                std::forward<Req>(requestFunc),
-                                                                std::forward<Rep>(replyFunc));
+    return std::make_unique<TestConnectionHook<Val, Req, Rep>>(std::forward<Val>(validateFunc),
+                                                               std::forward<Req>(requestFunc),
+                                                               std::forward<Rep>(replyFunc));
 }
 
 }  // namespace executor

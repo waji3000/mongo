@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,12 +29,13 @@
 
 #include "mongo/client/sasl_client_session.h"
 
-#include "mongo/base/init.h"
-#include "mongo/util/allocator.h"
+#include <cstddef>
+#include <limits>
+#include <type_traits>
+
+#include "mongo/base/init.h"  // IWYU pragma: keep
 #include "mongo/util/assert_util.h"
-#include "mongo/util/concurrency/mutex.h"
-#include "mongo/util/mongoutils/str.h"
-#include "mongo/util/signal_handlers_synchronous.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 SaslClientSession::SaslClientSessionFactoryFn SaslClientSession::create;
@@ -55,7 +55,7 @@ void SaslClientSession::setParameter(Parameter id, StringData value) {
     // Note that we append a terminal NUL to buffer.data, so it may be treated as a C-style
     // string.  This is required for parameterServiceName, parameterServiceHostname,
     // parameterMechanism and parameterUser.
-    value.copyTo(buffer.data.get(), true);
+    str::copyAsCString(buffer.data.get(), value);
 }
 
 bool SaslClientSession::hasParameter(Parameter id) {

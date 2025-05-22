@@ -2,7 +2,6 @@ __quiet = false;
 __magicNoPrint = {
     __magicNoPrint: 1111
 };
-__callLastError = false;
 _verboseShell = false;
 
 chatty = function(s) {
@@ -23,24 +22,78 @@ function reconnect(db) {
 
 function _getErrorWithCode(codeOrObj, message) {
     var e = new Error(message);
-    if (codeOrObj != undefined) {
-        if (codeOrObj.writeError || codeOrObj.code) {
-            if (codeOrObj.writeError) {
-                e.code = codeOrObj.writeError.code;
-            } else if (codeOrObj.code) {
-                e.code = codeOrObj.code;
-            }
-
-            if (codeOrObj.hasOwnProperty("errorLabels")) {
-                e.errorLabels = codeOrObj.errorLabels;
-            }
-        } else {
-            // At this point assume codeOrObj is a number type
-            e.code = codeOrObj;
+    if (typeof codeOrObj === "object" && codeOrObj !== null) {
+        if (TestData?.logFormat === "json") {
+            e.extraAttr = codeOrObj;
+            codeOrObj = codeOrObj.res ?? codeOrObj;
         }
+        if (codeOrObj.hasOwnProperty("code")) {
+            e.code = codeOrObj.code;
+        }
+
+        if (codeOrObj.hasOwnProperty("writeErrors")) {
+            e.writeErrors = codeOrObj.writeErrors;
+        } else if ((codeOrObj instanceof BulkWriteResult || codeOrObj instanceof BulkWriteError) &&
+                   codeOrObj.hasWriteErrors()) {
+            e.writeErrors = codeOrObj.getWriteErrors();
+        }
+
+        if (codeOrObj instanceof WriteResult && codeOrObj.hasWriteError()) {
+            e.writeErrors = [codeOrObj.getWriteError()];
+        }
+
+        if (codeOrObj.hasOwnProperty("errorLabels")) {
+            e.errorLabels = codeOrObj.errorLabels;
+        }
+
+        if (codeOrObj.hasOwnProperty("writeConcernError")) {
+            e.writeConcernError = codeOrObj.writeConcernError;
+        } else if (codeOrObj.hasOwnProperty("writeConcernErrors") &&
+                   codeOrObj.writeConcernErrors.length > 0) {
+            e.writeConcernError =
+                codeOrObj.writeConcernErrors[codeOrObj.writeConcernErrors.length - 1];
+        } else if (codeOrObj.hasOwnProperty("hasWriteConcernError") &&
+                   codeOrObj.hasWriteConcernError()) {
+            e.writeConcernError = codeOrObj.getWriteConcernError();
+        }
+    } else if (typeof codeOrObj === "number") {
+        e.code = codeOrObj;
     }
 
     return e;
+}
+
+/**
+ * Executes the specified function and retries it if it fails due to retryable error.
+ * If it exhausts the number of allowed retries, it simply throws the last exception.
+ * Additional error codes can also be specified to be retried.
+ *
+ * Returns the return value of the input call.
+ */
+
+function retryOnRetryableError(func, numRetries, sleepMs, additionalCodesToRetry) {
+    numRetries = numRetries || 1;
+    sleepMs = sleepMs || 1000;
+    additionalCodesToRetry = additionalCodesToRetry || [];
+
+    while (true) {
+        if (numRetries % 10 === 0) {
+            print("retryOnRetryableError has " + numRetries + " retries remaining.");
+        }
+        try {
+            return func();
+        } catch (e) {
+            if ((isRetryableError(e) || hasErrorCode(e, additionalCodesToRetry)) &&
+                numRetries > 0) {
+                print("An error occurred and the call will be retried: " +
+                      tojson({error: e.toString(), stack: e.stack}));
+                numRetries--;
+                sleep(sleepMs);
+            } else {
+                throw e;
+            }
+        }
+    }
 }
 
 /**
@@ -69,46 +122,132 @@ function retryOnNetworkError(func, numRetries, sleepMs) {
     }
 }
 
-// Checks if a Javascript exception is a network error.
-function isNetworkError(error) {
-    let networkErrs = [
-        "network error",
-        "error doing query",
-        "socket exception",
-        "SocketException",
-        "HostNotFound"
-    ];
-    // See if any of the known network error strings appear in the given message.
-    return networkErrs.some(err => error.message.includes(err));
+const shellGeneratedNetworkErrs = ["network error", "error doing query", "socket exception"];
+
+const networkErrs = [
+    "SocketException",
+    "HostNotFound",
+    "HostUnreachable",
+    "NetworkTimeout",
+    "ConnectionPoolExpired",
+    "ConnectionError",
+];
+const networkErrsPlusShellGeneratedNetworkErrs = [...networkErrs, ...shellGeneratedNetworkErrs];
+/**
+ * Determine if a provided object represents a network error
+ * @param {object|Error|string|number} errorOrResponse A command response, error or scalar
+ *     representing an error
+ */
+function isNetworkError(errorOrResponse) {
+    // First check if this is a command response, if so check by error code
+    if (errorOrResponse.code) {
+        if (ErrorCodes.isNetworkError(errorOrResponse.code)) {
+            return true;
+        }
+    }
+
+    // Then check if it's an Error, if so see if any of the known network error strings appear
+    // in the given message.
+    if (errorOrResponse.message) {
+        if (networkErrsPlusShellGeneratedNetworkErrs.some(
+                err => errorOrResponse.message.includes(err))) {
+            return true;
+        }
+    }
+
+    // Otherwise fall back to checking by scalar value
+    return ErrorCodes.isNetworkError(errorOrResponse);
 }
 
-function isRetryableError(error) {
-    const retryableErrors = [
-        "Interrupted",
-        "InterruptedAtShutdown",
-        "InterruptedDueToStepDown",
-        "ExceededTimeLimit",
-        "MaxTimeMSExpired",
-        "CursorKilled",
-        "LockTimeout",
-        "ShutdownInProgress",
-        "HostUnreachable",
-        "HostNotFound",
-        "NetworkTimeout",
-        "SocketException",
-        "NotMaster",
-        "NotMasterNoSlaveOk",
-        "NotMasterOrSecondary",
-        "InterruptedDueToStepDown",
-        "PrimarySteppedDown",
-        "WriteConcernFailed",
-        "WriteConcernLegacyOK",
-        "UnknownReplWriteConcern",
-        "UnsatisfiableWriteConcern"
-    ];
+const retryableErrs = [
+    "Interrupted",
+    "InterruptedAtShutdown",
+    "InterruptedDueToReplStateChange",
+    "ExceededTimeLimit",
+    "MaxTimeMSExpired",
+    "CursorKilled",
+    "LockTimeout",
+    "ShutdownInProgress",
+    "HostUnreachable",
+    "HostNotFound",
+    "NetworkTimeout",
+    "SocketException",
+    "NotWritablePrimary",
+    "NotPrimaryNoSecondaryOk",
+    "NotPrimaryOrSecondary",
+    "PrimarySteppedDown",
+    "WriteConcernTimeout",
+    "WriteConcernLegacyOK",
+    "UnknownReplWriteConcern",
+    "UnsatisfiableWriteConcern",
+    "The server is in quiesce mode and will shut down",
+    "operation was interrupted",
+];
+const retryableErrsPlusShellGeneratedNetworkErrs = [...retryableErrs, ...shellGeneratedNetworkErrs];
+/**
+ * Determine if a provided object represents a retryable error
+ * @param {object|Error|string|number} errorOrResponse A command response, error or scalar
+ *     representing an error
+ */
+function isRetryableError(errorOrResponse) {
+    // First check if this is a command response, if so determine retryability by error code
+    if (errorOrResponse.code) {
+        if (ErrorCodes.isRetriableError(errorOrResponse.code)) {
+            return true;
+        }
+    }
 
-    // See if any of the known network error strings appear in the given message.
-    return retryableErrors.some(err => error.message.includes(err));
+    // Then check if it's an Error, if so determine retryability by checking the error message
+    if (errorOrResponse.message) {
+        // See if any of the known network error strings appear in the given message.
+        if (retryableErrsPlusShellGeneratedNetworkErrs.some(
+                err => errorOrResponse.message.includes(err))) {
+            return true;
+        }
+    }
+
+    // Otherwise fall back to checking by scalar value
+    return ErrorCodes.isRetriableError(errorOrResponse);
+}
+
+/**
+ * Determine if a provided command response has any of the given error codes.
+ * @param {object} response A command response.
+ * @param {Array} errorCodes A list of error codes to check.
+ */
+function hasErrorCode(response, errorCodes) {
+    // Check if this is a command response, if so determine a match by checking the error code
+    // in the response.
+    if (errorCodes.some(code => response.code == code)) {
+        return true;
+    }
+
+    if (response.writeErrors) {
+        for (let writeError of response.writeErrors) {
+            if (errorCodes.some(code => writeError.code == code)) {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+/**
+ * Run the passed function and catch any network error, otherwise throw the exception back to the
+ * caller.
+ * @param {Function} func that will run and catch any network error otherwise throws.
+ * @returns returns the result of the function that was passed as a parameter or the exception.
+ */
+function executeNoThrowNetworkError(func) {
+    try {
+        return func();
+    } catch (e) {
+        if (isNetworkError(e)) {
+            return e;
+        }
+        throw e;
+    }
 }
 
 // Please consider using bsonWoCompare instead of this as much as possible.
@@ -192,21 +331,18 @@ compareOn = function(field) {
 };
 
 shellPrint = function(x) {
-    it = x;
+    const it = x;
     if (x != undefined)
         shellPrintHelper(x);
+};
 
-    if (db) {
-        var e = db.getPrevError();
-        if (e.err) {
-            if (e.nPrev <= 1)
-                print("error on last call: " + tojson(e.err));
-            else
-                print("an error " + tojson(e.err) + " occurred " + e.nPrev +
-                      " operations back in the command invocation");
-        }
-        db.resetError();
-    }
+_originalPrint = print;
+disablePrint = function() {
+    print = Function.prototype;
+};
+
+enablePrint = function() {
+    print = _originalPrint;
 };
 
 print.captureAllOutput = function(fn, args) {
@@ -227,7 +363,7 @@ print.captureAllOutput = function(fn, args) {
 };
 
 var indentStr = function(indent, s) {
-    if (typeof(s) === "undefined") {
+    if (typeof (s) === "undefined") {
         s = indent;
         indent = 0;
     }
@@ -242,52 +378,65 @@ if (typeof TestData == "undefined") {
     TestData = undefined;
 }
 
-function __sanitizeMatch(flag) {
-    var sanitizeMatch = /-fsanitize=([^\s]+) /.exec(getBuildInfo()["buildEnvironment"]["ccflags"]);
-    if (flag && sanitizeMatch && RegExp(flag).exec(sanitizeMatch[1])) {
-        return true;
-    } else {
-        return false;
-    }
-}
-
-function _isAddressSanitizerActive() {
-    return __sanitizeMatch("address");
-}
-
-function _isLeakSanitizerActive() {
-    return __sanitizeMatch("leak");
-}
-
-function _isThreadSanitizerActive() {
-    return __sanitizeMatch("thread");
-}
-
-function _isUndefinedBehaviorSanitizerActive() {
-    return __sanitizeMatch("undefined");
+// Enabling a custom JS_GC_ZEAL value for spidermonkey is a two step process:
+// 1) JS_GC_ZEAL preprocessor directive needs to be defined at compilation (spider-monkey-dbg=on).
+// 2) A valid JS_GC_ZEAL value needs to be provided as an environment variable at runtime.
+// In order to detect whether we are running with JS_GC_ZEAL enabled, ideally we'd like to check for
+// the CPPDEFINE for JS_GC_ZEAL. Unfortunately, this CPPDEFINE only applies to libmozjs, and is not
+// exposed in the BuildInfo response. Instead, we rely on detecting a non-empty environment variable
+// for JS_GC_ZEAL. We could have restricted the RegExp to match a valid input for JS_GC_ZEAL
+// For example: RegExp(/^\w+(;\w+)*(,\d+)?$/), but SpiderMonkey performs the validation for us.
+// As long as a non-whitespace JS_GC_ZEAL value has been detected, we report it as being enabled.
+function _isSpiderMonkeyDebugEnabled() {
+    const jsGcZeal = _getEnv("JS_GC_ZEAL");
+    let regex = RegExp(/^\S+$/);
+    return regex.test(jsGcZeal);
 }
 
 jsTestName = function() {
-    if (TestData)
+    if (TestData) {
+        // If we are using the jsTestName as a database name and performing tenant prefixing
+        // then it's possible that the prefixed database name will exceed the server's dbName
+        // length. In these cases, hashing the test name improves our chances of success. FNV-1a
+        // hashes are maximum 16 characters, so don't hash dbNames that are up to 16 characters.
+        if (TestData.testName.length > 16 && TestData.hashTestNamesForMultitenancy) {
+            return _fnvHashToHexString(TestData.testName);
+        }
         return TestData.testName;
+    }
+
     return "__unknown_name__";
 };
 
-var _jsTestOptions = {enableTestCommands: true};  // Test commands should be enabled by default
+var _jsTestOptions = {};
 
 jsTestOptions = function() {
     if (TestData) {
         return Object.merge(_jsTestOptions, {
-            serviceExecutor: TestData.serviceExecutor,
+            // Test commands should be enabled by default if no enableTestCommands were present in
+            // TestData
+            enableTestCommands:
+                TestData.hasOwnProperty('enableTestCommands') ? TestData.enableTestCommands : true,
+            // Testing diagnostics should be enabled by default if no testingDiagnosticsEnabled was
+            // present in TestData
+            testingDiagnosticsEnabled: TestData.hasOwnProperty('testingDiagnosticsEnabled')
+                ? TestData.testingDiagnosticsEnabled
+                : true,
             setParameters: TestData.setParameters,
             setParametersMongos: TestData.setParametersMongos,
+            setParametersMongocryptd: TestData.setParametersMongocryptd,
             storageEngine: TestData.storageEngine,
             storageEngineCacheSizeGB: TestData.storageEngineCacheSizeGB,
-            transportLayer: TestData.transportLayer,
+            shellGRPC: TestData.shellGRPC || false,
+            shellTlsEnabled: TestData.shellTlsEnabled || false,
+            shellTlsCertificateKeyFile: TestData.shellTlsCertificateKeyFile,
+            tlsCAFile: TestData.tlsCAFile,
+            tlsMode: TestData.tlsMode,
+            mongodTlsCertificateKeyFile: TestData.mongodTlsCertificateKeyFile,
+            mongosTlsCertificateKeyFile: TestData.mongosTlsCertificateKeyFile,
             wiredTigerEngineConfigString: TestData.wiredTigerEngineConfigString,
             wiredTigerCollectionConfigString: TestData.wiredTigerCollectionConfigString,
             wiredTigerIndexConfigString: TestData.wiredTigerIndexConfigString,
-            noJournal: TestData.noJournal,
             auth: TestData.auth,
             // Note: keyFile is also used as a flag to indicate cluster auth is turned on, set it
             // to a truthy value if you'd like to do cluster auth, even if it's not keyFile auth.
@@ -301,18 +450,17 @@ jsTestOptions = function() {
             adminUser: TestData.adminUser || "admin",
             adminPassword: TestData.adminPassword || "password",
             useLegacyConfigServers: TestData.useLegacyConfigServers || false,
-            enableMajorityReadConcern: TestData.enableMajorityReadConcern,
             writeConcernMajorityShouldJournal: TestData.writeConcernMajorityShouldJournal,
             enableEncryption: TestData.enableEncryption,
+            encryptionCipherMode: TestData.encryptionCipherMode,
             encryptionKeyFile: TestData.encryptionKeyFile,
             auditDestination: TestData.auditDestination,
             minPort: TestData.minPort,
             maxPort: TestData.maxPort,
             // Note: does not support the array version
             mongosBinVersion: TestData.mongosBinVersion || "",
-            shardMixedBinVersions: TestData.shardMixedBinVersions || false,
+            mixedBinVersions: TestData.mixedBinVersions || false,
             networkMessageCompressors: TestData.networkMessageCompressors,
-            replSetFeatureCompatibilityVersion: TestData.replSetFeatureCompatibilityVersion,
             skipRetryOnNetworkError: TestData.skipRetryOnNetworkError,
             skipValidationOnInvalidViewDefinitions: TestData.skipValidationOnInvalidViewDefinitions,
             forceValidationWithFeatureCompatibilityVersion:
@@ -328,6 +476,8 @@ jsTestOptions = function() {
             skipValidationNamespaces: TestData.skipValidationNamespaces || [],
             skipCheckingUUIDsConsistentAcrossCluster:
                 TestData.skipCheckingUUIDsConsistentAcrossCluster || false,
+            skipCheckingIndexesConsistentAcrossCluster:
+                TestData.skipCheckingIndexesConsistentAcrossCluster || false,
             skipCheckingCatalogCacheConsistencyWithShardingCatalog:
                 TestData.skipCheckingCatalogCacheConsistencyWithShardingCatalog || false,
             skipAwaitingReplicationOnShardsBeforeCheckingUUIDs:
@@ -349,21 +499,107 @@ jsTestOptions = function() {
             disableImplicitSessions: TestData.disableImplicitSessions || false,
             setSkipShardingPartsOfPrepareTransactionFailpoint:
                 TestData.setSkipShardingPartsOfPrepareTransactionFailpoint || false,
-            retryingOnNetworkError: TestData.retryingOnNetworkError,
+            roleGraphInvalidationIsFatal: TestData.roleGraphInvalidationIsFatal || false,
+            networkErrorAndTxnOverrideConfig: TestData.networkErrorAndTxnOverrideConfig || {},
+            // When useRandomBinVersionsWithinReplicaSet is true, randomly assign the binary
+            // versions of each node in the replica set to 'latest' or 'last-lts'.
+            // This flag is currently a placeholder and only sets the replica set to last-lts
+            // FCV.
+            useRandomBinVersionsWithinReplicaSet:
+                TestData.useRandomBinVersionsWithinReplicaSet || false,
+            // Set a specific random seed to be used when useRandomBinVersionsWithinReplicaSet is
+            // true.
+            seed: TestData.seed || undefined,
+            // Override the logging options for mongod and mongos so they always log to a file
+            // in dbpath; additionally, prevent the dbpath from being cleared after a node
+            // is shut down.
+            alwaysUseLogFiles: TestData.alwaysUseLogFiles || false,
+            skipCheckMetadataConsistency: TestData.skipCheckMetadataConsistency || false,
+            skipCheckOrphans: TestData.skipCheckOrphans || false,
+            skipCheckRoutingTableConsistency: TestData.skipCheckRoutingTableConsistency || false,
+            skipCheckShardFilteringMetadata: TestData.skipCheckShardFilteringMetadata || false,
+            inEvergreen: TestData.inEvergreen || false,
+            defaultReadPreference: TestData.defaultReadPreference,
+
+            backupOnRestartDir: TestData.backupOnRestartDir || false,
+
+            evergreenTaskId: TestData.evergreenTaskId || null,
+            evergreenVariantName: TestData.evergreenVariantName || null,
+            configShard: TestData.configShard || false,
+
+            useAutoBootstrapProcedure: TestData.useAutoBootstrapProcedure || false,
+
+            embeddedRouter: TestData.embeddedRouter || false,
+
+            performTimeseriesCompressionIntermediateDataIntegrityCheckOnInsert: true,
+            fuzzMongodConfigs: TestData.fuzzMongodConfigs || false,
+            mozJSGCZeal: TestData.mozJSGCZeal || "",
         });
     }
     return _jsTestOptions;
 };
 
-setJsTestOption = function(name, value) {
-    _jsTestOptions[name] = value;
-};
+/**
+ * @deprecated: This function should not be used for new tests. The new severity API's should be
+ * used instead: jsTest.log.info("message", args).
+ *
+ * Formats a log and prints it to the console.
+ * Depending on the format, it can either be in plain text, or as a stringified JSON.
+ *
+ * @param {string} msg - The message to be printed.
+ * @param {object} args
+ * @param {object} args.attr - An object used to declare extra logging params.
+ * @param {("I"|"D"|"W"|"E")} args.severity - An unique identified to help with filtering logs.
+ */
+jsTestLog = function(
+    msg,
+    {severity, attr} = {},
+) {
+    if (TestData?.logFormat === "json") {
+        severity = severity === undefined ? "I" : severity;
+        const severityLevel = {E: 1, W: 2, I: 3, D: 4}[severity];
+        const logLevel = TestData?.logLevel;
+        if (!logLevel || typeof logLevel !== "number" || ![1, 2, 3, 4].includes(logLevel) ||
+            !severityLevel) {
+            throw new Error(`Invalid log severity (${severity}) and/or log level (${logLevel}).`);
+        }
+        // If log level is smaller than the current severity level and both values are defined with
+        // expected values, skip printing.
+        if (severityLevel > logLevel) {
+            return;
+        }
 
-jsTestLog = function(msg) {
+        // Syntax sugar for 'jsTestLog({someObject}) = jsTestLog(null, {attr: someObject})'.
+        if (!attr && typeof msg === "object" && msg !== null) {
+            attr = msg;
+            msg = null;
+        }
+
+        // New logging format, enabled through the --logFormat resmoke flag.
+        let new_msg = {
+            t: new Date(),
+            "s": severity,
+            "c": "js_test",
+            "ctx": TestData?.testName || "-",  // context (e.g., TestData.testName)
+            "msg": msg,                        // message body
+        };
+        if (attr && typeof attr === "object" && Object.keys(attr).length > 0) {
+            new_msg["attr"] = attr;
+        }
+        print(toJsonForLog(new_msg));
+        return;
+    }
+
+    // Legacy logging format.
     if (typeof msg === "object") {
         msg = tojson(msg);
     }
-    assert.eq(typeof(msg), "string", "Received: " + msg);
+
+    if (attr) {
+        msg += " " + tojson(attr);
+    }
+
+    assert.eq(typeof (msg), "string", "Received: " + msg);
     const msgs = ["----", ...msg.split("\n"), "----"].map(s => `[jsTest] ${s}`);
     print(`\n\n${msgs.join("\n")}\n\n`);
 };
@@ -372,14 +608,38 @@ jsTest = {};
 
 jsTest.name = jsTestName;
 jsTest.options = jsTestOptions;
-jsTest.setOption = setJsTestOption;
-jsTest.log = jsTestLog;
 jsTest.readOnlyUserRoles = ["read"];
 jsTest.basicUserRoles = ["dbOwner"];
 jsTest.adminUserRoles = ["root"];
 
+/**
+ * @deprecated: This function should not be used for new tests. The new severity API's should be
+ * used instead: jsTest.log.info().
+ */
+jsTest.log = jsTestLog;
+
+jsTest.log.info = function(msg, attr) {
+    jsTestLog(msg, {attr, severity: "I"});
+};
+
+jsTest.log.debug = function(msg, attr) {
+    jsTestLog(msg, {attr, severity: "D"});
+};
+
+jsTest.log.warning = function(msg, attr) {
+    jsTestLog(msg, {attr, severity: "W"});
+};
+
+jsTest.log.error = function(msg, attr) {
+    jsTestLog(msg, {attr, severity: "E"});
+};
+
 jsTest.authenticate = function(conn) {
-    if (!jsTest.options().auth && !jsTest.options().keyFile) {
+    const connOptions = conn.fullOptions || {};
+    const authMode =
+        connOptions.clusterAuthMode || conn.clusterAuthMode || jsTest.options().clusterAuthMode;
+
+    if (!jsTest.options().auth && !jsTest.options().keyFile && authMode !== "x509") {
         conn.authenticated = true;
         return true;
     }
@@ -389,14 +649,29 @@ jsTest.authenticate = function(conn) {
             // Set authenticated to stop an infinite recursion from getDB calling
             // back into authenticate.
             conn.authenticated = true;
-            print("Authenticating as user " + jsTestOptions().authUser + " with mechanism " +
-                  DB.prototype._getDefaultAuthenticationMechanism() + " on connection: " + conn);
-            conn.authenticated = conn.getDB(jsTestOptions().authenticationDatabase).auth({
-                user: jsTestOptions().authUser,
-                pwd: jsTestOptions().authPassword,
-            });
+            let mech = DB.prototype._getDefaultAuthenticationMechanism();
+            if (authMode === 'x509') {
+                mech = 'MONGODB-X509';
+            }
+
+            print("Authenticating as user " + jsTestOptions().authUser + " with mechanism " + mech +
+                  " on connection: " + conn);
+
+            if (authMode !== 'x509') {
+                conn.authenticated = conn.getDB(jsTestOptions().authenticationDatabase).auth({
+                    user: jsTestOptions().authUser,
+                    pwd: jsTestOptions().authPassword,
+                });
+            } else {
+                authutil.assertAuthenticate(conn, '$external', {
+                    mechanism: 'MONGODB-X509',
+                });
+            }
+
             return conn.authenticated;
-        }, "Authenticating connection: " + conn, 5000, 1000);
+            // Dont' run the hang analyzer because we expect that this might fail in the normal
+            // course of events.
+        }, "Authenticating connection: " + conn, 5000, 1000, {runHangAnalyzer: false});
     } catch (e) {
         print("Caught exception while authenticating connection: " + tojson(e));
         conn.authenticated = false;
@@ -408,8 +683,9 @@ jsTest.authenticateNodes = function(nodes) {
     assert.soonNoExcept(function() {
         for (var i = 0; i < nodes.length; i++) {
             // Don't try to authenticate to arbiters
+            let res = {};
             try {
-                res = nodes[i].getDB("admin").runCommand({replSetGetStatus: 1});
+                res = nodes[i].getDB("admin")._runCommandWithoutApiStrict({replSetGetStatus: 1});
             } catch (e) {
                 // ReplicaSet tests which don't use auth are allowed to have nodes crash during
                 // startup. To allow tests which use to behavior to work with auth,
@@ -429,16 +705,16 @@ jsTest.authenticateNodes = function(nodes) {
 };
 
 jsTest.isMongos = function(conn) {
-    return conn.getDB('admin').isMaster().msg == 'isdbgrid';
+    return conn.getDB('admin')._helloOrLegacyHello().msg == 'isdbgrid';
 };
 
 defaultPrompt = function() {
-    var status = db.getMongo().authStatus;
-    var prefix = db.getMongo().promptPrefix;
+    var status = globalThis.db.getMongo().authStatus;
+    var prefix = globalThis.db.getMongo().promptPrefix;
 
     if (typeof prefix == 'undefined') {
         prefix = "";
-        var buildInfo = db.runCommand({buildInfo: 1});
+        var buildInfo = globalThis.db._runCommandWithoutApiStrict({buildInfo: 1});
         try {
             if (buildInfo.modules.indexOf("enterprise") > -1) {
                 prefix += "MongoDB Enterprise ";
@@ -446,15 +722,15 @@ defaultPrompt = function() {
         } catch (e) {
             // Don't do anything here. Just throw the error away.
         }
-        var isMasterRes = db.runCommand({isMaster: 1, forShell: 1});
+        var hello = globalThis.db._helloOrLegacyHello({forShell: 1});
         try {
-            if (isMasterRes.hasOwnProperty("automationServiceDescriptor")) {
+            if (hello.hasOwnProperty("automationServiceDescriptor")) {
                 prefix += "[automated] ";
             }
         } catch (e) {
             // Don't do anything here. Just throw the error away.
         }
-        db.getMongo().promptPrefix = prefix;
+        globalThis.db.getMongo().promptPrefix = prefix;
     }
 
     try {
@@ -463,12 +739,12 @@ defaultPrompt = function() {
             try {
                 var prompt = replSetMemberStatePrompt();
                 // set our status that it was good
-                db.getMongo().authStatus = {replSetGetStatus: true, isMaster: true};
+                globalThis.db.getMongo().authStatus = {replSetGetStatus: true, hello: true};
                 return prefix + prompt;
             } catch (e) {
                 // don't have permission to run that, or requires auth
                 // print(e);
-                status = {authRequired: true, replSetGetStatus: false, isMaster: true};
+                status = {authRequired: true, replSetGetStatus: false, hello: true};
             }
         }
         // auth detected
@@ -479,7 +755,7 @@ defaultPrompt = function() {
                 var prompt = replSetMemberStatePrompt();
                 // set our status that it was good
                 status.replSetGetStatus = true;
-                db.getMongo().authStatus = status;
+                globalThis.db.getMongo().authStatus = status;
                 return prefix + prompt;
             } catch (e) {
                 // don't have permission to run that, or requires auth
@@ -489,31 +765,32 @@ defaultPrompt = function() {
             }
         }
 
-        // try to use isMaster?
-        if (status.isMaster) {
+        // try to use hello?
+        if (status.hello) {
             try {
-                var prompt = isMasterStatePrompt(isMasterRes);
-                status.isMaster = true;
-                db.getMongo().authStatus = status;
+                var prompt = helloStatePrompt(hello);
+                status.hello = true;
+                globalThis.db.getMongo().authStatus = status;
                 return prefix + prompt;
             } catch (e) {
                 status.authRequired = true;
-                status.isMaster = false;
+                status.hello = false;
             }
         }
     } catch (ex) {
         printjson(ex);
         // reset status and let it figure it out next time.
-        status = {isMaster: true};
+        status = {hello: true};
     }
 
-    db.getMongo().authStatus = status;
+    globalThis.db.getMongo().authStatus = status;
     return prefix + "> ";
 };
 
 replSetMemberStatePrompt = function() {
     var state = '';
-    var stateInfo = db.getSiblingDB('admin').runCommand({replSetGetStatus: 1, forShell: 1});
+    var stateInfo = globalThis.db.getSiblingDB('admin')._runCommandWithoutApiStrict(
+        {replSetGetStatus: 1, forShell: 1});
     if (stateInfo.ok) {
         // Report the self member's stateStr if it's present.
         stateInfo.members.forEach(function(member) {
@@ -537,58 +814,34 @@ replSetMemberStatePrompt = function() {
     return state + '> ';
 };
 
-isMasterStatePrompt = function(isMasterResponse) {
+helloStatePrompt = function(helloReply) {
     var state = '';
-    var isMaster = isMasterResponse || db.runCommand({isMaster: 1, forShell: 1});
-    if (isMaster.ok) {
+    var hello = helloReply || globalThis.db._helloOrLegacyHello({forShell: 1});
+    if (hello.ok) {
         var role = "";
 
-        if (isMaster.msg == "isdbgrid") {
+        if (hello.msg == "isdbgrid") {
             role = "mongos";
         }
 
-        if (isMaster.setName) {
-            if (isMaster.ismaster)
+        if (hello.setName) {
+            if (hello.isWritablePrimary || hello.ismaster)
                 role = "PRIMARY";
-            else if (isMaster.secondary)
+            else if (hello.secondary)
                 role = "SECONDARY";
-            else if (isMaster.arbiterOnly)
+            else if (hello.arbiterOnly)
                 role = "ARBITER";
             else {
                 role = "OTHER";
             }
-            state = isMaster.setName + ':';
+            state = hello.setName + ':';
         }
         state = state + role;
     } else {
-        throw _getErrorWithCode(isMaster, "Failed: " + tojson(isMaster));
+        throw _getErrorWithCode(hello, "Failed: " + tojson(hello));
     }
     return state + '> ';
 };
-
-if (typeof _useWriteCommandsDefault === "undefined") {
-    // We ensure the _useWriteCommandsDefault() function is always defined, in case the JavaScript
-    // engine is being used from someplace other than the mongo shell (e.g. map-reduce).
-    _useWriteCommandsDefault = function _useWriteCommandsDefault() {
-        return false;
-    };
-}
-
-if (typeof _writeMode === "undefined") {
-    // We ensure the _writeMode() function is always defined, in case the JavaScript engine is being
-    // used from someplace other than the mongo shell (e.g. map-reduce).
-    _writeMode = function _writeMode() {
-        return "commands";
-    };
-}
-
-if (typeof _readMode === "undefined") {
-    // We ensure the _readMode() function is always defined, in case the JavaScript engine is being
-    // used from someplace other than the mongo shell (e.g. map-reduce).
-    _readMode = function _readMode() {
-        return "legacy";
-    };
-}
 
 if (typeof _shouldRetryWrites === 'undefined') {
     // We ensure the _shouldRetryWrites() function is always defined, in case the JavaScript engine
@@ -609,18 +862,7 @@ if (typeof _shouldUseImplicitSessions === 'undefined') {
 }
 
 shellPrintHelper = function(x) {
-    if (typeof(x) == "undefined") {
-        // Make sure that we have a db var before we use it
-        // TODO: This implicit calling of GLE can cause subtle, hard to track issues - remove?
-        if (__callLastError && typeof(db) != "undefined" && db.getMongo &&
-            db.getMongo().writeMode() == "legacy") {
-            __callLastError = false;
-            // explicit w:1 so that replset getLastErrorDefaults aren't used here which would be bad
-            var err = db.getLastError(1);
-            if (err != null) {
-                print(err);
-            }
-        }
+    if (typeof (x) == "undefined") {
         return;
     }
 
@@ -651,7 +893,6 @@ shellPrintHelper = function(x) {
 
 shellAutocomplete = function(
     /*prefix*/) {  // outer scope function called on init. Actual function at end
-
     var universalMethods =
         "constructor prototype toString valueOf toLocaleString hasOwnProperty propertyIsEnumerable"
             .split(' ');
@@ -756,7 +997,7 @@ shellAutocomplete = function(
             {};  // see http://dreaminginjavascript.wordpress.com/2008/08/22/eliminating-duplicates/
         for (var i = 0; i < possibilities.length; i++) {
             var p = possibilities[i];
-            if (typeof(curObj[p]) == "undefined" && curObj != global)
+            if (typeof (curObj[p]) == "undefined" && curObj != global)
                 continue;  // extraGlobals aren't in the global object
             if (p.length == 0 || p.length < lastPrefix.length)
                 continue;
@@ -814,8 +1055,8 @@ shellHelper.use = function(dbname) {
         print("bad use parameter");
         return;
     }
-    db = db.getSiblingDB(dbname);
-    print("switched to db " + db.getName());
+    globalThis.db = globalThis.db.getSiblingDB(dbname);
+    print("switched to db " + globalThis.db.getName());
 };
 
 shellHelper.set = function(str) {
@@ -823,9 +1064,9 @@ shellHelper.set = function(str) {
         print("bad use parameter");
         return;
     }
-    tokens = str.split(" ");
-    param = tokens[0];
-    value = tokens[1];
+    const tokens = str.split(" ");
+    const param = tokens[0];
+    let value = tokens[1];
 
     if (value == undefined)
         value = true;
@@ -842,7 +1083,7 @@ shellHelper.set = function(str) {
 };
 
 shellHelper.it = function() {
-    if (typeof(___it___) == "undefined" || ___it___ == null) {
+    if (typeof (___it___) == "undefined" || ___it___ == null) {
         print("no cursor");
         return;
     }
@@ -856,14 +1097,16 @@ shellHelper.show = function(what) {
     what = args[0];
     args = args.splice(1);
 
+    var messageIndent = "        ";
+
     if (what == "profile") {
-        if (db.system.profile.count() == 0) {
+        if (globalThis.db.system.profile.count() == 0) {
             print("db.system.profile is empty");
             print("Use db.setProfilingLevel(2) will enable profiling");
             print("Use db.system.profile.find() to show raw profile entries");
         } else {
             print();
-            db.system.profile.find({millis: {$gt: 0}})
+            globalThis.db.system.profile.find({millis: {$gt: 0}})
                 .sort({$natural: -1})
                 .limit(5)
                 .forEach(function(x) {
@@ -875,7 +1118,7 @@ shellHelper.show = function(what) {
                             continue;
 
                         var val = x[z];
-                        var mytype = typeof(val);
+                        var mytype = typeof (val);
 
                         if (mytype == "string" || mytype == "number")
                             l += z + ":" + val + " ";
@@ -894,24 +1137,35 @@ shellHelper.show = function(what) {
     }
 
     if (what == "users") {
-        db.getUsers().forEach(printjson);
+        globalThis.db.getUsers().forEach(printjson);
         return "";
     }
 
     if (what == "roles") {
-        db.getRoles({showBuiltinRoles: true}).forEach(printjson);
+        globalThis.db.getRoles({showBuiltinRoles: true}).forEach(printjson);
         return "";
     }
 
     if (what == "collections" || what == "tables") {
-        db.getCollectionNames().forEach(function(x) {
-            print(x);
+        globalThis.db.getCollectionInfos({}, true, true).forEach(function(infoObj) {
+            print(infoObj.name);
         });
         return "";
     }
 
     if (what == "dbs" || what == "databases") {
-        var dbs = db.getMongo().getDBs(db.getSession());
+        var mongo = globalThis.db.getMongo();
+        var dbs;
+        try {
+            dbs = mongo.getDBs(globalThis.db.getSession(), undefined, false);
+        } catch (ex) {
+            // Unable to get detailed information, retry name-only.
+            mongo.getDBs(globalThis.db.getSession(), undefined, true).forEach(function(x) {
+                print(x);
+            });
+            return "";
+        }
+
         var dbinfo = [];
         var maxNameLength = 0;
         var maxGbDigits = 0;
@@ -929,6 +1183,7 @@ shellHelper.show = function(what) {
             dbinfo.push({
                 name: x.name,
                 size: x.sizeOnDisk,
+                empty: x.empty,
                 size_str: sizeStr,
                 name_size: nameLength,
                 gb_digits: gbDigits
@@ -942,8 +1197,10 @@ shellHelper.show = function(what) {
             var padding = Array(namePadding + sizePadding + 3).join(" ");
             if (db.size > 1) {
                 print(db.name + padding + db.size_str + "GB");
-            } else {
+            } else if (db.empty) {
                 print(db.name + padding + "(empty)");
+            } else {
+                print(db.name);
             }
         });
 
@@ -955,7 +1212,7 @@ shellHelper.show = function(what) {
         if (args.length > 0)
             n = args[0];
 
-        var res = db.adminCommand({getLog: n});
+        var res = globalThis.db.adminCommand({getLog: n});
         if (!res.ok) {
             print("Error while trying to show " + n + " log: " + res.errmsg);
             return "";
@@ -967,7 +1224,7 @@ shellHelper.show = function(what) {
     }
 
     if (what == "logs") {
-        var res = db.adminCommand({getLog: "*"});
+        var res = globalThis.db.adminCommand({getLog: "*"});
         if (!res.ok) {
             print("Error while trying to show logs: " + res.errmsg);
             return "";
@@ -983,20 +1240,38 @@ shellHelper.show = function(what) {
         try {
             // !!db essentially casts db to a boolean
             // Will throw a reference exception if db hasn't been declared.
-            dbDeclared = !!db;
+            dbDeclared = !!globalThis.db;
         } catch (ex) {
             dbDeclared = false;
         }
         if (dbDeclared) {
-            var res = db.adminCommand({getLog: "startupWarnings"});
+            var res = globalThis.db.getSiblingDB("admin")._runCommandWithoutApiStrict(
+                {getLog: "startupWarnings"});
             if (res.ok) {
                 if (res.log.length == 0) {
                     return "";
                 }
-                print("Server has startup warnings: ");
+                print("---");
+                print("The server generated these startup warnings when booting: ");
                 for (var i = 0; i < res.log.length; i++) {
-                    print(res.log[i]);
+                    var logOut;
+                    try {
+                        var parsedLog = JSON.parse(res.log[i]);
+                        var linePrefix = messageIndent + parsedLog.t["$date"] + ": ";
+                        logOut = linePrefix + parsedLog.msg + "\n";
+                        if (parsedLog.attr) {
+                            for (var attr in parsedLog.attr) {
+                                logOut += linePrefix + messageIndent + attr + ": " +
+                                    parsedLog.attr[attr] + "\n";
+                            }
+                        }
+                    } catch (err) {
+                        // err is intentionally unused here
+                        logOut = res.log[i];
+                    }
+                    print(logOut);
                 }
+                print("---");
                 return "";
             } else if (res.errmsg == "no such cmd: getLog") {
                 // Don't print if the command is not available
@@ -1020,13 +1295,13 @@ shellHelper.show = function(what) {
         try {
             // !!db essentially casts db to a boolean
             // Will throw a reference exception if db hasn't been declared.
-            dbDeclared = !!db;
+            dbDeclared = !!globalThis.db;
         } catch (ex) {
             dbDeclared = false;
         }
 
         if (dbDeclared) {
-            var res = db.runCommand({isMaster: 1, forShell: 1});
+            var res = globalThis.db._helloOrLegacyHello({forShell: 1});
             if (!res.ok) {
                 print("Note: Cannot determine if automation is active");
                 return "";
@@ -1048,72 +1323,75 @@ shellHelper.show = function(what) {
         }
     }
 
-    if (what == "freeMonitoring") {
-        var dbDeclared, ex;
+    if (what == "nonGenuineMongoDBCheck") {
+        let matchesKnownImposterSignature = false;
+
+        // A MongoDB emulation service offered by a company
+        // responsible for a certain disk operating system.
         try {
-            // !!db essentially casts db to a boolean
-            // Will throw a reference exception if db hasn't been declared.
-            dbDeclared = !!db;
-        } catch (ex) {
-            dbDeclared = false;
-        }
-
-        if (dbDeclared) {
-            const freemonStatus = db.adminCommand({getFreeMonitoringStatus: 1});
-
-            if (freemonStatus.ok) {
-                if (freemonStatus.state == 'enabled' &&
-                    freemonStatus.hasOwnProperty('userReminder')) {
-                    print("---");
-                    print(freemonStatus.userReminder);
-                    print("---");
-                } else if (freemonStatus.state === 'undecided') {
-                    print(
-                        "---\n" +
-                        "Enable MongoDB's free cloud-based monitoring service, which will then receive and display\n" +
-                        "metrics about your deployment (disk utilization, CPU, operation statistics, etc).\n" +
-                        "\n" +
-                        "The monitoring data will be available on a MongoDB website with a unique URL accessible to you\n" +
-                        "and anyone you share the URL with. MongoDB may use this information to make product\n" +
-                        "improvements and to suggest MongoDB products and deployment options to you.\n" +
-                        "\n" +
-                        "To enable free monitoring, run the following command: db.enableFreeMonitoring()\n" +
-                        "To permanently disable this reminder, run the following command: db.disableFreeMonitoring()\n" +
-                        "---\n");
-                }
+            const buildInfo = globalThis.db._runCommandWithoutApiStrict({buildInfo: 1});
+            if (buildInfo.hasOwnProperty('_t')) {
+                matchesKnownImposterSignature = true;
             }
-
-            return "";
-        } else {
-            print("Cannot show freeMonitoring, \"db\" is not set");
-            return "";
+        } catch (e) {
+            // Don't do anything here. Just throw the error away.
         }
+
+        // A MongoDB emulation service offered by a company named
+        // after some sort of minor river or something.
+        if (!matchesKnownImposterSignature) {
+            try {
+                const cmdLineOpts = globalThis.db.adminCommand({getCmdLineOpts: 1});
+                if (cmdLineOpts.hasOwnProperty('errmsg') &&
+                    cmdLineOpts.errmsg.indexOf('not supported') !== -1) {
+                    matchesKnownImposterSignature = true;
+                }
+            } catch (e) {
+                // Don't do anything here. Just throw the error away.
+            }
+        }
+
+        if (matchesKnownImposterSignature) {
+            print("\n" +
+                  "Warning: Non-Genuine MongoDB Detected\n\n" +
+
+                  "This server or service appears to be an emulation of MongoDB " +
+                  "rather than an official MongoDB product.\n\n" +
+
+                  "Some documented MongoDB features may work differently, " +
+                  "be entirely missing or incomplete, " +
+                  "or have unexpected performance characteristics.\n\n" +
+
+                  "To learn more please visit: " +
+                  "https://dochub.mongodb.org/core/non-genuine-mongodb-server-warning.\n");
+        }
+
+        return "";
     }
 
     throw Error("don't know how to show [" + what + "]");
-
 };
 
 __promptWrapper__ = function(promptFunction) {
     // Call promptFunction directly if the global "db" is not defined, e.g. --nodb.
-    if (typeof db === 'undefined' || !(db instanceof DB)) {
+    if (typeof globalThis.db === 'undefined' || !(globalThis.db instanceof DB)) {
         __prompt__ = promptFunction();
         return;
     }
 
     // Stash the global "db" for the prompt function to make sure the session
     // of the global "db" isn't accessed by the prompt function.
-    let originalDB = db;
+    let originalDB = globalThis.db;
     try {
-        db = originalDB.getMongo().getDB(originalDB.getName());
+        globalThis.db = originalDB.getMongo().getDB(originalDB.getName());
         // Setting db._session to be a _DummyDriverSession instance makes it so that
-        // a logical session id isn't included in the isMaster and replSetGetStatus
+        // a logical session id isn't included in the hello and replSetGetStatus
         // commands and therefore won't interfere with the session associated with the
         // global "db" object.
-        db._session = new _DummyDriverSession(db.getMongo());
+        globalThis.db._session = new _DummyDriverSession(globalThis.db.getMongo());
         __prompt__ = promptFunction();
     } finally {
-        db = originalDB;
+        globalThis.db = originalDB;
     }
 };
 
@@ -1127,8 +1405,12 @@ Math.sigFig = function(x, N) {
 
 var Random = (function() {
     var initialized = false;
-    var errorMsg =
-        "The random number generator hasn't been seeded yet; " + "call Random.setRandomSeed()";
+    var errorMsg = "The random number generator hasn't been seeded yet; " +
+        "call Random.setRandomSeed()";
+
+    function isInitialized() {
+        return initialized;
+    }
 
     // Set the random generator seed.
     function srand(s) {
@@ -1140,6 +1422,18 @@ var Random = (function() {
     function setRandomSeed(s) {
         var seed = srand(s);
         print("setting random seed: " + seed);
+        return seed;
+    }
+
+    // Set the random generator seed with defined seed if it exists or a random seed if it does not.
+    function setRandomFixtureSeed() {
+        var seed = setRandomSeed(TestData.seed).valueOf();
+        print(
+            `Reproduce this randomized jstest fixture topology by adding the --shellSeed
+            ${seed} option to your resmoke invocation.`);
+        print(
+            `ie: buildscripts/resmoke.py run --suites [suite_name] ... --shellSeed
+            ${seed} [my_jstest.js]`);
     }
 
     // Generate a random number 0 <= r < 1.
@@ -1197,12 +1491,13 @@ var Random = (function() {
     return {
         genExp: genExp,
         genNormal: genNormal,
+        isInitialized: isInitialized,
         rand: rand,
         randInt: randInt,
         setRandomSeed: setRandomSeed,
+        setRandomFixtureSeed: setRandomFixtureSeed,
         srand: srand,
     };
-
 })();
 
 /**
@@ -1287,6 +1582,7 @@ Geo.sphereDistance = function(a, b) {
     return Math.acos(cross_prod);
 };
 
+// eslint-disable-next-line
 rs = function() {
     return "try rs.help()";
 };
@@ -1305,7 +1601,8 @@ _awaitRSHostViaRSMonitor = function(hostAddr, desiredState, rsName, timeout) {
         desiredState = {ok: true};
     }
 
-    print("Awaiting " + hostAddr + " to be " + tojson(desiredState) + " in " + " rs " + rsName);
+    print("Awaiting " + hostAddr + " to be " + tojson(desiredState) + " in " +
+          " rs " + rsName);
 
     var tests = 0;
     assert.soon(
@@ -1341,77 +1638,98 @@ _awaitRSHostViaRSMonitor = function(hostAddr, desiredState, rsName, timeout) {
             }
             return false;
         },
-        "timed out waiting for replica set member: " + hostAddr + " to reach state: " +
-            tojson(desiredState),
+        "timed out waiting for replica set member: " + hostAddr +
+            " to reach state: " + tojson(desiredState),
         timeout);
 };
 
 rs.help = function() {
     print(
-        "\trs.status()                                { replSetGetStatus : 1 } checks repl set status");
+        "\trs.status()                                     { replSetGetStatus : 1 } checks repl set status");
     print(
-        "\trs.initiate()                              { replSetInitiate : null } initiates set with default settings");
+        "\trs.initiate()                                   { replSetInitiate : null } initiates set with default settings");
     print(
-        "\trs.initiate(cfg)                           { replSetInitiate : cfg } initiates set with configuration cfg");
+        "\trs.initiate(cfg)                                { replSetInitiate : cfg } initiates set with configuration cfg");
     print(
-        "\trs.conf()                                  get the current configuration object from local.system.replset");
+        "\trs.conf()                                       get the current configuration object from local.system.replset");
     print(
-        "\trs.reconfig(cfg)                           updates the configuration of a running replica set with cfg (disconnects)");
+        "\trs.reconfig(cfg, opts)                          updates the configuration of a running replica set with cfg, using the given opts (disconnects)");
     print(
-        "\trs.add(hostportstr)                        add a new member to the set with default attributes (disconnects)");
+        "\trs.reconfigForPSASet(memberIndex, cfg, opts)    updates the configuration of a Primary-Secondary-Arbiter (PSA) replica set while preserving majority writes");
     print(
-        "\trs.add(membercfgobj)                       add a new member to the set with extra attributes (disconnects)");
+        "\t                                                    memberIndex: index of the node being updated; cfg: the desired new config; opts: options passed in with the reconfig");
     print(
-        "\trs.addArb(hostportstr)                     add a new member which is arbiterOnly:true (disconnects)");
-    print("\trs.stepDown([stepdownSecs, catchUpSecs])   step down as primary (disconnects)");
+        "\t                                                    Not to be used with every configuration");
     print(
-        "\trs.syncFrom(hostportstr)                   make a secondary sync from the given member");
+        "\t                                                    For more information, visit: https://docs.mongodb.com/manual/reference/method/rs.reconfigForPSASet/");
     print(
-        "\trs.freeze(secs)                            make a node ineligible to become primary for the time specified");
+        "\trs.add(hostportstr)                             add a new member to the set with default attributes (disconnects)");
     print(
-        "\trs.remove(hostportstr)                     remove a host from the replica set (disconnects)");
-    print("\trs.slaveOk()                               allow queries on secondary nodes");
+        "\trs.add(membercfgobj)                            add a new member to the set with extra attributes (disconnects)");
+    print(
+        "\trs.addArb(hostportstr)                          add a new member which is arbiterOnly:true (disconnects)");
+    print("\trs.stepDown([stepdownSecs, catchUpSecs])        step down as primary (disconnects)");
+    print(
+        "\trs.syncFrom(hostportstr)                        make a secondary sync from the given member");
+    print(
+        "\trs.freeze(secs)                                 make a node ineligible to become primary for the time specified");
+    print(
+        "\trs.remove(hostportstr)                          remove a host from the replica set (disconnects)");
+    print("\trs.secondaryOk()                                allow queries on secondary nodes");
     print();
-    print("\trs.printReplicationInfo()                  check oplog size and time range");
+    print("\trs.printReplicationInfo()                       check oplog size and time range");
     print(
-        "\trs.printSlaveReplicationInfo()             check replica set members and replication lag");
-    print("\tdb.isMaster()                              check who is primary");
+        "\trs.printSecondaryReplicationInfo()              check replica set members and replication lag");
+    print("\tdb.isMaster()                                   check who is primary");
+    print("\tdb.hello()                                      check who is primary");
     print();
     print("\treconfiguration helpers disconnect from the database so the shell will display");
     print("\tan error, even if the command succeeds.");
 };
 rs.slaveOk = function(value) {
-    return db.getMongo().setSlaveOk(value);
+    print(
+        "WARNING: slaveOk() is deprecated and may be removed in the next major release. Please use secondaryOk() instead.");
+    return globalThis.db.getMongo().setSecondaryOk(value);
 };
+
+rs.secondaryOk = function(value) {
+    return globalThis.db.getMongo().setSecondaryOk(value);
+};
+
 rs.status = function() {
-    return db._adminCommand("replSetGetStatus");
+    return globalThis.db._adminCommand("replSetGetStatus");
 };
 rs.isMaster = function() {
-    return db.isMaster();
+    return globalThis.db.isMaster();
+};
+rs.hello = function() {
+    return globalThis.db.hello();
 };
 rs.initiate = function(c) {
-    return db._adminCommand({replSetInitiate: c});
+    return globalThis.db._adminCommand({replSetInitiate: c});
 };
 rs.printSlaveReplicationInfo = function() {
-    return db.printSlaveReplicationInfo();
+    print(
+        "WARNING: printSlaveReplicationInfo is deprecated and may be removed in the next major release. Please use printSecondaryReplicationInfo instead.");
+    return globalThis.db.printSecondaryReplicationInfo();
+};
+rs.printSecondaryReplicationInfo = function() {
+    return globalThis.db.printSecondaryReplicationInfo();
 };
 rs.printReplicationInfo = function() {
-    return db.printReplicationInfo();
+    return globalThis.db.printReplicationInfo();
 };
 rs._runCmd = function(c) {
     // after the command, catch the disconnect and reconnect if necessary
     var res = null;
     try {
-        res = db.adminCommand(c);
+        res = globalThis.db.adminCommand(c);
     } catch (e) {
         if (isNetworkError(e)) {
-            // closed connection.  reconnect.
-            db.getLastErrorObj();
-            var o = db.getLastErrorObj();
-            if (o.ok) {
+            if (reconnect(db)) {
                 print("reconnected to server after rs command (which is normal)");
             } else {
-                printjson(o);
+                print("failed to reconnect to server after:" + e);
             }
         } else {
             print("shell got exception during repl set operation: " + e);
@@ -1424,71 +1742,152 @@ rs._runCmd = function(c) {
 };
 rs.reconfig = function(cfg, options) {
     cfg.version = rs.conf().version + 1;
-    cmd = {replSetReconfig: cfg};
-    for (var i in options) {
+    const cmd = {replSetReconfig: cfg};
+    for (let i in options) {
         cmd[i] = options[i];
     }
     return this._runCmd(cmd);
 };
+
+_validateMemberIndex = function(memberIndex, newConfig) {
+    const newMemberConfig = newConfig.members[memberIndex];
+    assert(newMemberConfig, `Node at index ${memberIndex} does not exist in the new config`);
+    assert.eq(1,
+              newMemberConfig.votes,
+              `Node at index ${memberIndex} must have {votes: 1} in the new config`);
+
+    // Use memberId to compare nodes across configs.
+    const memberId = newMemberConfig._id;
+    const oldConfig = rs.conf();
+    const oldMemberConfig = oldConfig.members.find(member => member._id === memberId);
+
+    // If the node doesn't exist in the old config, we are adding it as a new node. Skip validating
+    // the node in the old config.
+    if (!oldMemberConfig) {
+        return;
+    }
+
+    assert(!oldMemberConfig.votes,
+           `Node at index ${memberIndex} must have {votes: 0} in the old config`);
+};
+
+rs.reconfigForPSASet = function(memberIndex, cfg, options) {
+    _validateMemberIndex(memberIndex, cfg);
+
+    const memberPriority = cfg.members[memberIndex].priority;
+    print(
+        `Running first reconfig to give member at index ${memberIndex} { votes: 1, priority: 0 }`);
+    cfg.members[memberIndex].votes = 1;
+    cfg.members[memberIndex].priority = 0;
+    let res = rs.reconfig(cfg, options);
+    if (!res.ok) {
+        return res;
+    }
+
+    print(`Running second reconfig to give member at index ${memberIndex} { priority: ${
+        memberPriority} }`);
+    cfg.members[memberIndex].priority = memberPriority;
+
+    // If the first reconfig added a new node, the second config will not succeed until the
+    // automatic reconfig to remove the 'newlyAdded' field is completed. Retry the second reconfig
+    // until it succeeds in that case.
+    assert.soon(() => {
+        res = rs.reconfig(cfg, options);
+        return res.ok;
+    });
+    return res;
+};
 rs.add = function(hostport, arb) {
-    var cfg = hostport;
+    let res;
+    let self = this;
 
-    var local = db.getSisterDB("local");
-    assert(local.system.replset.count() <= 1,
-           "error: local.system.replset has unexpected contents");
-    var c = local.system.replset.findOne();
-    assert(c, "no config object retrievable from local.system.replset");
+    assert.soon(function() {
+        var cfg = hostport;
 
-    c.version++;
+        var local = globalThis.db.getSiblingDB("local");
+        assert(local.system.replset.count() <= 1,
+               "error: local.system.replset has unexpected contents");
+        var c = local.system.replset.findOne();
+        assert(c, "no config object retrievable from local.system.replset");
 
-    var max = 0;
-    for (var i in c.members)
-        if (c.members[i]._id > max)
-            max = c.members[i]._id;
-    if (isString(hostport)) {
-        cfg = {_id: max + 1, host: hostport};
-        if (arb)
-            cfg.arbiterOnly = true;
-    } else if (arb == true) {
-        throw Error("Expected first parameter to be a host-and-port string of arbiter, but got " +
-                    tojson(hostport));
-    }
+        const attemptedVersion = c.version++;
 
-    if (cfg._id == null) {
-        cfg._id = max + 1;
-    }
-    c.members.push(cfg);
-    return this._runCmd({replSetReconfig: c});
+        var max = 0;
+        for (var i in c.members) {
+            // Omit 'newlyAdded' field if it exists in the config.
+            delete c.members[i].newlyAdded;
+            if (c.members[i]._id > max)
+                max = c.members[i]._id;
+        }
+        if (isString(hostport)) {
+            cfg = {_id: max + 1, host: hostport};
+            if (arb)
+                cfg.arbiterOnly = true;
+        } else if (arb == true) {
+            throw Error(
+                "Expected first parameter to be a host-and-port string of arbiter, but got " +
+                tojson(hostport));
+        }
+
+        if (cfg._id == null) {
+            cfg._id = max + 1;
+        }
+        c.members.push(cfg);
+
+        res = self._runCmd({replSetReconfig: c});
+        if (res === "") {
+            // _runCmd caught an exception.
+            return true;
+        }
+        if (res.ok) {
+            return true;
+        }
+        if (res.code === ErrorCodes.ConfigurationInProgress ||
+            res.code === ErrorCodes.CurrentConfigNotCommittedYet) {
+            return false;  // keep retrying
+        }
+        if (res.code === ErrorCodes.NewReplicaSetConfigurationIncompatible) {
+            // We will retry only if this error was due to our config version being too low.
+            const cfgState = local.system.replset.findOne();
+            if (cfgState.version >= attemptedVersion) {
+                return false;  // keep retrying
+            }
+        }
+        // Take no action on other errors.
+        return true;
+    }, () => tojson(res), 10 * 60 * 1000 /* timeout */, 200 /* interval */);
+
+    return res;
 };
 rs.syncFrom = function(host) {
-    return db._adminCommand({replSetSyncFrom: host});
+    return globalThis.db._adminCommand({replSetSyncFrom: host});
 };
 rs.stepDown = function(stepdownSecs, catchUpSecs) {
     var cmdObj = {replSetStepDown: stepdownSecs === undefined ? 60 : stepdownSecs};
     if (catchUpSecs !== undefined) {
         cmdObj['secondaryCatchUpPeriodSecs'] = catchUpSecs;
     }
-    return db._adminCommand(cmdObj);
+    return globalThis.db._adminCommand(cmdObj);
 };
 rs.freeze = function(secs) {
-    return db._adminCommand({replSetFreeze: secs});
+    return globalThis.db._adminCommand({replSetFreeze: secs});
 };
 rs.addArb = function(hn) {
     return this.add(hn, true);
 };
 
 rs.conf = function() {
-    var resp = db._adminCommand({replSetGetConfig: 1});
+    var resp = globalThis.db._adminCommand({replSetGetConfig: 1});
     if (resp.ok && !(resp.errmsg) && resp.config)
         return resp.config;
     else if (resp.errmsg && resp.errmsg.startsWith("no such cmd"))
-        return db.getSisterDB("local").system.replset.findOne();
+        return globalThis.db.getSiblingDB("local").system.replset.findOne();
     throw new Error("Could not retrieve replica set config: " + tojson(resp));
 };
 rs.config = rs.conf;
 
 rs.remove = function(hn) {
-    var local = db.getSisterDB("local");
+    var local = globalThis.db.getSiblingDB("local");
     assert(local.system.replset.count() <= 1,
            "error: local.system.replset has unexpected contents");
     var c = local.system.replset.findOne();
@@ -1498,7 +1897,7 @@ rs.remove = function(hn) {
     for (var i in c.members) {
         if (c.members[i].host == hn) {
             c.members.splice(i, 1);
-            return db._adminCommand({replSetReconfig: c});
+            return globalThis.db._adminCommand({replSetReconfig: c});
         }
     }
 
@@ -1510,7 +1909,7 @@ rs.debug = {};
 rs.debug.nullLastOpWritten = function(primary, secondary) {
     var p = connect(primary + "/local");
     var s = connect(secondary + "/local");
-    s.getMongo().setSlaveOk();
+    s.getMongo().setSecondaryOk();
 
     var secondToLast = s.oplog.rs.find().sort({$natural: -1}).limit(1).next();
     var last = p.runCommand({
@@ -1531,13 +1930,20 @@ rs.debug.nullLastOpWritten = function(primary, secondary) {
 };
 
 rs.debug.getLastOpWritten = function(server) {
-    var s = db.getSisterDB("local");
+    var s = globalThis.db.getSiblingDB("local");
     if (server) {
         s = connect(server + "/local");
     }
-    s.getMongo().setSlaveOk();
+    s.getMongo().setSecondaryOk();
 
     return s.oplog.rs.find().sort({$natural: -1}).limit(1).next();
+};
+
+rs.isValidOpTime = function(opTime) {
+    let timestampIsValid = (opTime.hasOwnProperty("ts") && (opTime.ts !== Timestamp(0, 0)));
+    let termIsValid = (opTime.hasOwnProperty("t") && (opTime.t != -1));
+
+    return timestampIsValid && termIsValid;
 };
 
 /**
@@ -1545,15 +1951,7 @@ rs.debug.getLastOpWritten = function(server) {
  * Returns -1 if ot1 is 'earlier' than ot2, 1 if 'later' and 0 if equal.
  */
 rs.compareOpTimes = function(ot1, ot2) {
-
-    function _isValidOptime(opTime) {
-        let timestampIsValid = (opTime.hasOwnProperty("ts") && (opTime.ts !== Timestamp(0, 0)));
-        let termIsValid = (opTime.hasOwnProperty("t") && (opTime.t != -1));
-
-        return timestampIsValid && termIsValid;
-    }
-
-    if (!_isValidOptime(ot1) || !_isValidOptime(ot2)) {
+    if (!globalThis.rs.isValidOpTime(ot1) || !globalThis.rs.isValidOpTime(ot2)) {
         throw Error("invalid optimes, received: " + tojson(ot1) + " and " + tojson(ot2));
     }
 
@@ -1595,8 +1993,6 @@ help = shellHelper.help = function(x) {
         print("    var mydb = x.getDB('mydb');");
         print("  or");
         print("    var mydb = connect('host[:port]/mydb');");
-        print(
-            "\nNote: the REPL prompt only auto-reports getLastError() for the shell command line connection.\n");
         return;
     } else if (x == "keys") {
         print("Tab completion and command history is available at the command prompt.\n");
@@ -1655,35 +2051,52 @@ help = shellHelper.help = function(x) {
         print("\t                              returns a connection to the new server");
         return;
     } else if (x == "") {
-        print("\t" + "db.help()                    help on db methods");
-        print("\t" + "db.mycoll.help()             help on collection methods");
-        print("\t" + "sh.help()                    sharding helpers");
-        print("\t" + "rs.help()                    replica set helpers");
-        print("\t" + "help admin                   administrative help");
-        print("\t" + "help connect                 connecting to a db help");
-        print("\t" + "help keys                    key shortcuts");
-        print("\t" + "help misc                    misc things to know");
-        print("\t" + "help mr                      mapreduce");
+        print("\t" +
+              "db.help()                    help on db methods");
+        print("\t" +
+              "db.mycoll.help()             help on collection methods");
+        print("\t" +
+              "sh.help()                    sharding helpers");
+        print("\t" +
+              "rs.help()                    replica set helpers");
+        print("\t" +
+              "help admin                   administrative help");
+        print("\t" +
+              "help connect                 connecting to a db help");
+        print("\t" +
+              "help keys                    key shortcuts");
+        print("\t" +
+              "help misc                    misc things to know");
+        print("\t" +
+              "help mr                      mapreduce");
         print();
-        print("\t" + "show dbs                     show database names");
-        print("\t" + "show collections             show collections in current database");
-        print("\t" + "show users                   show users in current database");
+        print("\t" +
+              "show dbs                     show database names");
+        print("\t" +
+              "show collections             show collections in current database");
+        print("\t" +
+              "show users                   show users in current database");
         print(
             "\t" +
             "show profile                 show most recent system.profile entries with time >= 1ms");
-        print("\t" + "show logs                    show the accessible logger names");
+        print("\t" +
+              "show logs                    show the accessible logger names");
         print(
             "\t" +
             "show log [name]              prints out the last segment of log in memory, 'global' is default");
-        print("\t" + "use <db_name>                set current database");
-        print("\t" + "db.foo.find()                list objects in collection foo");
-        print("\t" + "db.foo.find( { a : 1 } )     list objects in foo where a == 1");
+        print("\t" +
+              "use <db_name>                set current database");
+        print("\t" +
+              "db.mycoll.find()             list objects in collection mycoll");
+        print("\t" +
+              "db.mycoll.find( { a : 1 } )  list objects in mycoll where a == 1");
         print(
             "\t" +
             "it                           result of the last line evaluated; use to further iterate");
         print("\t" +
               "DBQuery.shellBatchSize = x   set default number of items to display on shell");
-        print("\t" + "exit                         quit the mongo shell");
+        print("\t" +
+              "exit                         quit the mongo shell");
     } else
         print("unknown help option");
 };

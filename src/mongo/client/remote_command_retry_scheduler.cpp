@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,109 +27,20 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kExecutor
+// IWYU pragma: no_include "cxxabi.h"
+#include <functional>
+#include <memory>
+#include <mutex>
+#include <utility>
 
-#include "mongo/platform/basic.h"
-
-#include <algorithm>
-#include <vector>
-
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/client/remote_command_retry_scheduler.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/destructor_guard.h"
-#include "mongo/util/log.h"
+#include "mongo/util/net/hostandport.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
-
-namespace {
-
-class RetryPolicyImpl : public RemoteCommandRetryScheduler::RetryPolicy {
-public:
-    RetryPolicyImpl(std::size_t maximumAttempts,
-                    Milliseconds maximumResponseElapsedTotal,
-                    const std::initializer_list<ErrorCodes::Error>& retryableErrors);
-    std::size_t getMaximumAttempts() const override;
-    Milliseconds getMaximumResponseElapsedTotal() const override;
-    bool shouldRetryOnError(ErrorCodes::Error error) const override;
-    std::string toString() const override;
-
-private:
-    std::size_t _maximumAttempts;
-    Milliseconds _maximumResponseElapsedTotal;
-    std::vector<ErrorCodes::Error> _retryableErrors;
-};
-
-RetryPolicyImpl::RetryPolicyImpl(std::size_t maximumAttempts,
-                                 Milliseconds maximumResponseElapsedTotal,
-                                 const std::initializer_list<ErrorCodes::Error>& retryableErrors)
-    : _maximumAttempts(maximumAttempts),
-      _maximumResponseElapsedTotal(maximumResponseElapsedTotal),
-      _retryableErrors(retryableErrors) {
-    std::sort(_retryableErrors.begin(), _retryableErrors.end());
-}
-
-std::string RetryPolicyImpl::toString() const {
-    str::stream output;
-    output << "RetryPolicyImpl";
-    output << " maxAttempts: " << _maximumAttempts;
-    output << " maxTimeMillis: " << _maximumResponseElapsedTotal;
-
-    if (_retryableErrors.size() > 0) {
-        output << "Retryable Errors: ";
-        for (auto error : _retryableErrors) {
-            output << error;
-        }
-    }
-    return output;
-}
-
-std::size_t RetryPolicyImpl::getMaximumAttempts() const {
-    return _maximumAttempts;
-}
-
-Milliseconds RetryPolicyImpl::getMaximumResponseElapsedTotal() const {
-    return _maximumResponseElapsedTotal;
-}
-
-bool RetryPolicyImpl::shouldRetryOnError(ErrorCodes::Error error) const {
-    return std::binary_search(_retryableErrors.cbegin(), _retryableErrors.cend(), error);
-}
-
-}  // namespace
-
-const std::initializer_list<ErrorCodes::Error> RemoteCommandRetryScheduler::kNotMasterErrors{
-    ErrorCodes::NotMaster, ErrorCodes::NotMasterNoSlaveOk, ErrorCodes::NotMasterOrSecondary};
-
-const std::initializer_list<ErrorCodes::Error> RemoteCommandRetryScheduler::kAllRetriableErrors{
-    ErrorCodes::NotMaster,
-    ErrorCodes::NotMasterNoSlaveOk,
-    ErrorCodes::NotMasterOrSecondary,
-    // If write concern failed to be satisfied on the remote server, this most probably means that
-    // some of the secondary nodes were unreachable or otherwise unresponsive, so the call is safe
-    // to be retried if idempotency can be guaranteed.
-    ErrorCodes::WriteConcernFailed,
-    ErrorCodes::HostUnreachable,
-    ErrorCodes::HostNotFound,
-    ErrorCodes::NetworkTimeout,
-    ErrorCodes::PrimarySteppedDown,
-    ErrorCodes::InterruptedDueToStepDown,
-    ErrorCodes::BalancerInterrupted};
-
-std::unique_ptr<RemoteCommandRetryScheduler::RetryPolicy>
-RemoteCommandRetryScheduler::makeNoRetryPolicy() {
-    return makeRetryPolicy(1U, executor::RemoteCommandRequest::kNoTimeout, {});
-}
-
-std::unique_ptr<RemoteCommandRetryScheduler::RetryPolicy>
-RemoteCommandRetryScheduler::makeRetryPolicy(
-    std::size_t maxAttempts,
-    Milliseconds maxResponseElapsedTotal,
-    const std::initializer_list<ErrorCodes::Error>& retryableErrors) {
-    std::unique_ptr<RetryPolicy> policy =
-        stdx::make_unique<RetryPolicyImpl>(maxAttempts, maxResponseElapsedTotal, retryableErrors);
-    return policy;
-}
 
 RemoteCommandRetryScheduler::RemoteCommandRetryScheduler(
     executor::TaskExecutor* executor,
@@ -147,7 +57,7 @@ RemoteCommandRetryScheduler::RemoteCommandRetryScheduler(
             !request.target.empty());
     uassert(ErrorCodes::BadValue,
             "database name in remote command request cannot be empty",
-            !request.dbname.empty());
+            !request.dbname.isEmpty());
     uassert(ErrorCodes::BadValue,
             "command object in remote command request cannot be empty",
             !request.cmdObj.isEmpty());
@@ -164,15 +74,20 @@ RemoteCommandRetryScheduler::RemoteCommandRetryScheduler(
 }
 
 RemoteCommandRetryScheduler::~RemoteCommandRetryScheduler() {
-    DESTRUCTOR_GUARD(shutdown(); join(););
+    try {
+        shutdown();
+        join();
+    } catch (...) {
+        reportFailedDestructor(MONGO_SOURCE_LOCATION());
+    }
 }
 
 bool RemoteCommandRetryScheduler::isActive() const {
     stdx::lock_guard<stdx::mutex> lock(_mutex);
-    return _isActive_inlock();
+    return _isActive(lock);
 }
 
-bool RemoteCommandRetryScheduler::_isActive_inlock() const {
+bool RemoteCommandRetryScheduler::_isActive(WithLock lk) const {
     return State::kRunning == _state || State::kShuttingDown == _state;
 }
 
@@ -227,7 +142,7 @@ void RemoteCommandRetryScheduler::shutdown() {
 
 void RemoteCommandRetryScheduler::join() {
     stdx::unique_lock<stdx::mutex> lock(_mutex);
-    _condition.wait(lock, [this]() { return !_isActive_inlock(); });
+    _condition.wait(lock, [&]() { return !_isActive(lock); });
 }
 
 std::string RemoteCommandRetryScheduler::toString() const {
@@ -235,7 +150,7 @@ std::string RemoteCommandRetryScheduler::toString() const {
     str::stream output;
     output << "RemoteCommandRetryScheduler";
     output << " request: " << _request.toString();
-    output << " active: " << _isActive_inlock();
+    output << " active: " << _isActive(lock);
     if (_remoteCommandCallbackHandle.isValid()) {
         output << " callbackHandle.valid: " << _remoteCommandCallbackHandle.isValid();
         output << " callbackHandle.cancelled: " << _remoteCommandCallbackHandle.isCanceled();
@@ -287,7 +202,10 @@ void RemoteCommandRetryScheduler::_remoteCommandCallback(
     }();
 
     if (!scheduleStatus.isOK()) {
-        _onComplete({rcba.executor, rcba.myHandle, rcba.request, scheduleStatus});
+        _onComplete({rcba.executor,
+                     rcba.myHandle,
+                     rcba.request,
+                     executor::RemoteCommandResponse(rcba.request.target, scheduleStatus)});
         return;
     }
 }
@@ -304,9 +222,13 @@ void RemoteCommandRetryScheduler::_onComplete(
     _callback = {};
 
     stdx::lock_guard<stdx::mutex> lock(_mutex);
-    invariant(_isActive_inlock());
+    invariant(_isActive(lock));
     _state = State::kComplete;
     _condition.notify_all();
+}
+
+bool isMongosRetriableError(const ErrorCodes::Error& code) {
+    return ErrorCodes::isRetriableError(code) || code == ErrorCodes::BalancerInterrupted;
 }
 
 }  // namespace mongo

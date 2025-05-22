@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,13 +27,22 @@
  *    it in the license file.
  */
 
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <list>
+
 #include "mongo/base/status.h"
 #include "mongo/bson/bsonelement.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/db/catalog/collection_options.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/repl/optime.h"
+#include "mongo/db/server_parameter.h"
+#include "mongo/db/tenant_id.h"
 #include "mongo/util/uuid.h"
 
 namespace mongo {
+
 class NamespaceString;
 class OperationContext;
 
@@ -43,15 +51,47 @@ class OpTime;
 }  // namespace repl
 
 /**
- * Renames the collection from "source" to "target" and drops the existing collection with UUID
- * dropTargetUUID iff "dropTarget" is true. "stayTemp" indicates whether a collection should
- * maintain its temporariness.
+ * Renames the collection from "source" to "target" and drops the existing collection if
+ * "dropTarget" is true. "stayTemp" indicates whether a collection should maintain its
+ * temporariness. "newTargetCollectionUUID" is the UUID set to the final collection when renaming
+ * across DBs (if not present, a random UUID will be assigned).
  */
 struct RenameCollectionOptions {
     bool dropTarget = false;
-    OptionalCollectionUUID dropTargetUUID;
     bool stayTemp = false;
+    bool markFromMigrate = false;
+    boost::optional<UUID> expectedSourceUUID;
+    boost::optional<UUID> expectedTargetUUID;
+    boost::optional<UUID> newTargetCollectionUuid;
+    boost::optional<std::list<BSONObj>> originalIndexes;
+    boost::optional<BSONObj> originalCollectionOptions;
 };
+
+void doLocalRenameIfOptionsAndIndexesHaveNotChanged(OperationContext* opCtx,
+                                                    const NamespaceString& sourceNs,
+                                                    const NamespaceString& targetNs,
+                                                    const RenameCollectionOptions& options);
+
+/**
+ * Checks that CollectionOptions 'expectedOptions' and 'currentOptions' are equal, except for the
+ * 'uuid' field. Returns a CommandFailed status otherwise.
+ * To be used by doLocalRenameIfOptionsAndIndexesHaveNotChanged and also its sharding-aware
+ * equivalent in RenameCollectionCoordinator.
+ */
+Status checkTargetCollectionOptionsMatch(const NamespaceString& targetNss,
+                                         const BSONObj& expectedOptions,
+                                         const BSONObj& currentOptions);
+
+/**
+ * Checks that the lists of index specs 'expectedIndexes' and 'currentIndexes' are equal.
+ * To be used by doLocalRenameIfOptionsAndIndexesHaveNotChanged and also its sharding-aware
+ * equivalent in RenameCollectionCoordinator. Returns a CommandFailed status if indexes do not
+ * match.
+ */
+Status checkTargetCollectionIndexesMatch(const NamespaceString& targetNss,
+                                         const std::list<BSONObj>& expectedIndexes,
+                                         const std::list<BSONObj>& currentIndexes);
+
 Status renameCollection(OperationContext* opCtx,
                         const NamespaceString& source,
                         const NamespaceString& target,
@@ -65,8 +105,8 @@ Status renameCollection(OperationContext* opCtx,
  * drop-pending collection.
  */
 Status renameCollectionForApplyOps(OperationContext* opCtx,
-                                   const std::string& dbName,
-                                   const BSONElement& ui,
+                                   const boost::optional<UUID>& uuidToRename,
+                                   const boost::optional<TenantId>& tid,
                                    const BSONObj& cmd,
                                    const repl::OpTime& renameOpTime);
 
@@ -79,5 +119,23 @@ Status renameCollectionForApplyOps(OperationContext* opCtx,
 Status renameCollectionForRollback(OperationContext* opCtx,
                                    const NamespaceString& target,
                                    const UUID& uuid);
+
+/**
+ * Performs validation checks to ensure source and target namespaces are eligible for rename.
+ */
+void validateNamespacesForRenameCollection(
+    OperationContext* opCtx,
+    const NamespaceString& source,
+    const NamespaceString& target,
+    const RenameCollectionOptions& options = RenameCollectionOptions());
+
+/**
+ * Runs renameCollection() with preliminary validation checks to ensure source
+ * and target namespaces are eligible for rename.
+ */
+void validateAndRunRenameCollection(OperationContext* opCtx,
+                                    const NamespaceString& source,
+                                    const NamespaceString& target,
+                                    const RenameCollectionOptions& options);
 
 }  // namespace mongo

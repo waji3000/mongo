@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,16 +27,15 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
 
-#include "mongo/platform/basic.h"
-
+#include "mongo/base/string_data.h"
+#include "mongo/logv2/log.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/concurrency/with_lock.h"
-#include "mongo/util/log.h"
 
-#include <iostream>
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
+
 
 namespace mongo {
 
@@ -64,7 +62,7 @@ private:
         return _blerp(lk, i);
     }
     int _blerp(WithLock, int i) {
-        log() << i << " bleep" << (i == 1 ? "\n" : "s\n");
+        LOGV2(23122, "{i} bleep(s)\n", "i"_attr = i);
         return i;
     }
     stdx::mutex _m;

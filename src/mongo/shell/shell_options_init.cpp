@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,31 +27,26 @@
  *    it in the license file.
  */
 
-#include "mongo/shell/shell_options.h"
-
 #include <iostream>
+#include <string>
+#include <vector>
 
-#include "mongo/transport/message_compressor_registry.h"
+#include "mongo/base/initializer.h"
+#include "mongo/base/status.h"
+#include "mongo/shell/shell_options.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/exit_code.h"
+#include "mongo/util/options_parser/environment.h"
 #include "mongo/util/options_parser/startup_option_init.h"
 #include "mongo/util/options_parser/startup_options.h"
 #include "mongo/util/quick_exit.h"
 
 namespace mongo {
-MONGO_GENERAL_STARTUP_OPTIONS_REGISTER(MongoShellOptions)(InitializerContext* context) {
-    return addMessageCompressionOptions(&moe::startupOptions, true);
-}
-
 MONGO_STARTUP_OPTIONS_VALIDATE(MongoShellOptions)(InitializerContext* context) {
     if (!handlePreValidationMongoShellOptions(moe::startupOptionsParsed, context->args())) {
-        quickExit(EXIT_SUCCESS);
+        quickExit(ExitCode::clean);
     }
-    Status ret = moe::startupOptionsParsed.validate();
-    if (!ret.isOK()) {
-        return ret;
-    }
-
-    return Status::OK();
+    uassertStatusOK(moe::startupOptionsParsed.validate());
 }
 
 MONGO_STARTUP_OPTIONS_STORE(MongoShellOptions)(InitializerContext* context) {
@@ -60,8 +54,7 @@ MONGO_STARTUP_OPTIONS_STORE(MongoShellOptions)(InitializerContext* context) {
     if (!ret.isOK()) {
         std::cerr << ret.toString() << std::endl;
         std::cerr << "try '" << context->args()[0] << " --help' for more information" << std::endl;
-        quickExit(EXIT_BADOPTIONS);
+        quickExit(ExitCode::badOptions);
     }
-    return Status::OK();
 }
-}
+}  // namespace mongo

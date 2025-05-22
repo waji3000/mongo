@@ -1,6 +1,3 @@
-// progress_meter.h
-
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -32,14 +29,21 @@
 
 #pragma once
 
-#include "mongo/util/thread_safe_string.h"
-
+#include <mutex>
 #include <string>
+#include <utility>
+
+#include "mongo/base/string_data.h"
+#include "mongo/db/client.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/stdx/mutex.h"
+#include "mongo/util/concurrency/with_lock.h"
 
 namespace mongo {
 
 class ProgressMeter {
-    MONGO_DISALLOW_COPYING(ProgressMeter);
+    ProgressMeter(const ProgressMeter&) = delete;
+    ProgressMeter& operator=(const ProgressMeter&) = delete;
 
 public:
     ProgressMeter(unsigned long long total,
@@ -47,8 +51,7 @@ public:
                   int checkInterval = 100,
                   std::string units = "",
                   std::string name = "Progress")
-        : _showTotal(true), _units(units) {
-        _name = name.c_str();
+        : _showTotal(true), _units(units), _name(std::move(name)) {
         reset(total, secondsBetween, checkInterval);
     }
 
@@ -79,11 +82,13 @@ public:
         return _units;
     }
 
-    void setName(std::string name) {
-        _name = name.c_str();
+    void setName(StringData name) {
+        stdx::lock_guard lk(_nameMutex);
+        _name = std::string{name};
     }
     std::string getName() const {
-        return _name.toString();
+        stdx::lock_guard lk(_nameMutex);
+        return _name;
     }
 
     void setTotalWhileRunning(unsigned long long total) {
@@ -125,44 +130,47 @@ private:
     int _lastTime;
 
     std::string _units;
-    ThreadSafeString _name;
+
+    mutable stdx::mutex _nameMutex;
+    std::string _name;  // guarded by _nameMutex
 };
 
-// e.g.:
-// CurOp * op = CurOp::get(opCtx);
-// ProgressMeterHolder pm(op->setMessage("index: (1/3) external sort",
-// "Index: External Sort Progress", d->stats.nrecords, 10)); loop { pm.hit(); }
+/*
+ * Wraps a CurOp owned ProgressMeter and calls finished() when destructed. This may only exist as
+ * long as the underlying ProgressMeter.
+ *
+ * The underlying ProgressMeter will have the same locking requirements as CurOp (see CurOp class
+ * description). Accessors and modifiers on the underlying ProgressMeter may need to be performed
+ * while holding a client lock and specifying the WithLock argument. If accessing without a client
+ * lock, then the thread must be executing the associated OperationContext.
+ */
 class ProgressMeterHolder {
-    MONGO_DISALLOW_COPYING(ProgressMeterHolder);
+    ProgressMeterHolder(const ProgressMeterHolder&) = delete;
+    ProgressMeterHolder& operator=(const ProgressMeterHolder&) = delete;
 
 public:
-    ProgressMeterHolder(ProgressMeter& pm) : _pm(pm) {}
+    ProgressMeterHolder() : _pm(nullptr) {}
 
     ~ProgressMeterHolder() {
-        _pm.finished();
+        if (_pm) {
+            {
+                stdx::unique_lock<Client> lk(*_opCtx->getClient());
+                _pm->finished();
+            }
+        }
     }
 
-    ProgressMeter* operator->() {
-        return &_pm;
+    void set(WithLock, ProgressMeter& pm, OperationContext* opCtx) {
+        _opCtx = opCtx;
+        _pm = &pm;
     }
 
-    ProgressMeter* get() {
-        return &_pm;
-    }
-
-    bool hit(int n = 1) {
-        return _pm.hit(n);
-    }
-
-    void finished() {
-        _pm.finished();
-    }
-
-    bool operator==(const ProgressMeter& other) {
-        return _pm == other;
+    ProgressMeter* get(WithLock) {
+        return _pm;
     }
 
 private:
-    ProgressMeter& _pm;
+    ProgressMeter* _pm;
+    OperationContext* _opCtx;
 };
-}
+}  // namespace mongo

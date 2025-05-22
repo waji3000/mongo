@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,11 +27,14 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
 
-#include "mongo/db/update/unset_node.h"
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
 
+#include "mongo/bson/bsontypes.h"
 #include "mongo/db/update/storage_validation.h"
+#include "mongo/db/update/unset_node.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 
@@ -42,8 +44,8 @@ Status UnsetNode::init(BSONElement modExpr, const boost::intrusive_ptr<Expressio
     return Status::OK();
 }
 
-ModifierNode::ModifyResult UnsetNode::updateExistingElement(
-    mutablebson::Element* element, std::shared_ptr<FieldRef> elementPath) const {
+ModifierNode::ModifyResult UnsetNode::updateExistingElement(mutablebson::Element* element,
+                                                            const FieldRef& elementPath) const {
     auto parent = element->parent();
 
     invariant(parent.ok());
@@ -62,8 +64,10 @@ void UnsetNode::validateUpdate(mutablebson::ConstElement updatedElement,
                                mutablebson::ConstElement leftSibling,
                                mutablebson::ConstElement rightSibling,
                                std::uint32_t recursionLevel,
-                               ModifyResult modifyResult) const {
-    invariant(modifyResult == ModifyResult::kNormalUpdate);
+                               ModifyResult modifyResult,
+                               bool validateForStorage,
+                               bool* containsDotsAndDollarsField) const {
+    invariant(modifyResult.type == ModifyResult::kNormalUpdate);
 
     // We only need to check the left and right sibling to see if the removed element was part of a
     // now invalid DBRef.
@@ -71,21 +75,42 @@ void UnsetNode::validateUpdate(mutablebson::ConstElement updatedElement,
     const uint32_t recursionLevelForCheck = 0;
 
     if (leftSibling.ok()) {
-        storage_validation::storageValid(leftSibling, doRecursiveCheck, recursionLevelForCheck);
+        storage_validation::scanDocument(leftSibling,
+                                         doRecursiveCheck,
+                                         recursionLevelForCheck,
+                                         false, /* allowTopLevelDollarPrefixedFields */
+                                         validateForStorage,
+                                         false, /* isEmbeddedInIdField */
+                                         containsDotsAndDollarsField);
     }
 
     if (rightSibling.ok()) {
-        storage_validation::storageValid(rightSibling, doRecursiveCheck, recursionLevelForCheck);
+        storage_validation::scanDocument(rightSibling,
+                                         doRecursiveCheck,
+                                         recursionLevelForCheck,
+                                         false, /* allowTopLevelDollarPrefixedFields */
+                                         validateForStorage,
+                                         false, /* isEmbeddedInIdField */
+                                         containsDotsAndDollarsField);
     }
 }
 
-void UnsetNode::logUpdate(LogBuilder* logBuilder,
-                          StringData pathTaken,
+void UnsetNode::logUpdate(LogBuilderInterface* logBuilder,
+                          const RuntimeUpdatePath& pathTaken,
                           mutablebson::Element element,
-                          ModifyResult modifyResult) const {
+                          ModifyResult modifyResult,
+                          boost::optional<int> createdFieldIdx) const {
     invariant(logBuilder);
-    invariant(modifyResult == ModifyResult::kNormalUpdate);
-    uassertStatusOK(logBuilder->addToUnsets(pathTaken));
+    invariant(modifyResult.type == ModifyResult::kNormalUpdate);
+    invariant(!createdFieldIdx);
+
+    if (pathTaken.types().back() == RuntimeUpdatePath::ComponentType::kArrayIndex) {
+        // If $unset is applied to an array index, the value was set to null.
+        invariant(element.getType() == BSONType::jstNULL);
+        uassertStatusOK(logBuilder->logUpdatedField(pathTaken, element));
+    } else {
+        uassertStatusOK(logBuilder->logDeletedField(pathTaken));
+    }
 }
 
 }  // namespace mongo

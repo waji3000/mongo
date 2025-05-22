@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,6 +29,8 @@
 
 #include "mongo/db/update/field_checker.h"
 
+#include <memory>
+
 #include "mongo/base/error_codes.h"
 #include "mongo/base/status.h"
 #include "mongo/db/field_ref.h"
@@ -37,11 +38,10 @@
 
 namespace {
 
-using mongo::ErrorCodes;
 using mongo::FieldRef;
-using mongo::fieldchecker::isUpdatable;
-using mongo::fieldchecker::isPositional;
 using mongo::Status;
+using mongo::fieldchecker::isPositional;
+using mongo::fieldchecker::isUpdatable;
 
 TEST(IsUpdatable, Basics) {
     FieldRef fieldRef("x");

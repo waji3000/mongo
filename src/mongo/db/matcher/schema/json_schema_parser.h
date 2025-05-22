@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,9 +29,18 @@
 
 #pragma once
 
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/db/matcher/expression.h"
+#include "mongo/db/matcher/expression_parser.h"
 #include "mongo/db/matcher/expression_tree.h"
 #include "mongo/db/matcher/expression_type.h"
+#include "mongo/db/matcher/matcher_type_set.h"
+#include "mongo/db/pipeline/expression_context.h"
 
 namespace mongo {
 
@@ -48,11 +56,62 @@ public:
     // Explicitly unsupported type name constants.
     static constexpr StringData kSchemaTypeInteger = "integer"_sd;
 
+    // Standard JSON Schema keyword constants.
+    static constexpr StringData kSchemaAdditionalItemsKeyword = "additionalItems"_sd;
+    static constexpr StringData kSchemaAdditionalPropertiesKeyword = "additionalProperties"_sd;
+    static constexpr StringData kSchemaAllOfKeyword = "allOf"_sd;
+    static constexpr StringData kSchemaAnyOfKeyword = "anyOf"_sd;
+    static constexpr StringData kSchemaDependenciesKeyword = "dependencies"_sd;
+    static constexpr StringData kSchemaDescriptionKeyword = "description"_sd;
+    static constexpr StringData kSchemaEnumKeyword = "enum"_sd;
+    static constexpr StringData kSchemaExclusiveMaximumKeyword = "exclusiveMaximum"_sd;
+    static constexpr StringData kSchemaExclusiveMinimumKeyword = "exclusiveMinimum"_sd;
+    static constexpr StringData kSchemaItemsKeyword = "items"_sd;
+    static constexpr StringData kSchemaMaxItemsKeyword = "maxItems"_sd;
+    static constexpr StringData kSchemaMaxLengthKeyword = "maxLength"_sd;
+    static constexpr StringData kSchemaMaxPropertiesKeyword = "maxProperties"_sd;
+    static constexpr StringData kSchemaMaximumKeyword = "maximum"_sd;
+    static constexpr StringData kSchemaMinItemsKeyword = "minItems"_sd;
+    static constexpr StringData kSchemaMinLengthKeyword = "minLength"_sd;
+    static constexpr StringData kSchemaMinPropertiesKeyword = "minProperties"_sd;
+    static constexpr StringData kSchemaMinimumKeyword = "minimum"_sd;
+    static constexpr StringData kSchemaMultipleOfKeyword = "multipleOf"_sd;
+    static constexpr StringData kSchemaNotKeyword = "not"_sd;
+    static constexpr StringData kSchemaOneOfKeyword = "oneOf"_sd;
+    static constexpr StringData kSchemaPatternKeyword = "pattern"_sd;
+    static constexpr StringData kSchemaPatternPropertiesKeyword = "patternProperties"_sd;
+    static constexpr StringData kSchemaPropertiesKeyword = "properties"_sd;
+    static constexpr StringData kSchemaRequiredKeyword = "required"_sd;
+    static constexpr StringData kSchemaTitleKeyword = "title"_sd;
+    static constexpr StringData kSchemaTypeKeyword = "type"_sd;
+    static constexpr StringData kSchemaUniqueItemsKeyword = "uniqueItems"_sd;
+
+    // MongoDB-specific (non-standard) JSON Schema keyword constants.
+    static constexpr StringData kSchemaBsonTypeKeyword = "bsonType"_sd;
+    static constexpr StringData kSchemaEncryptKeyword = "encrypt"_sd;
+    static constexpr StringData kSchemaEncryptMetadataKeyword = "encryptMetadata"_sd;
+
+    // A name of placeholder used in ExpressionWithPlaceholder expressions.
+    static constexpr StringData kNamePlaceholder = "i"_sd;
+
     /**
      * Converts a JSON schema, represented as BSON, into a semantically equivalent match expression
      * tree. Returns a non-OK status if the schema is invalid or cannot be parsed.
      */
-    static StatusWithMatchExpression parse(BSONObj schema, bool ignoreUnknownKeywords = false);
+    static StatusWithMatchExpression parse(
+        const boost::intrusive_ptr<ExpressionContext>& expCtx,
+        BSONObj schema,
+        MatchExpressionParser::AllowedFeatureSet allowedFeatures =
+            MatchExpressionParser::kAllowAllSpecialFeatures,
+        bool ignoreUnknownKeywords = false);
+
+    /**
+     * Builds a set of type aliases from the given type element using 'aliasMapFind'. Returns a
+     * non-OK status if 'typeElt' is invalid or does not contain an entry in the 'aliasMap' by
+     * calling 'aliasMapFind'.
+     */
+    static StatusWith<MatcherTypeSet> parseTypeSet(BSONElement typeElt,
+                                                   const findBSONTypeAliasFun& aliasMapFind);
 };
 
 }  // namespace mongo

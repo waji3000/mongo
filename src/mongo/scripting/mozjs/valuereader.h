@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,10 +29,16 @@
 
 #pragma once
 
+#include <cstdint>
+#include <js/RootingAPI.h>
+#include <js/TypeDecls.h>
 #include <jsapi.h>
 #include <string>
 
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
 #include "mongo/bson/bsonobj.h"
+#include "mongo/platform/decimal128.h"
 
 namespace mongo {
 namespace mozjs {
@@ -53,6 +58,7 @@ public:
     void fromBSON(const BSONObj& obj, const BSONObj* parent, bool readOnly);
     void fromBSONArray(const BSONObj& obj, const BSONObj* parent, bool readOnly);
     void fromDouble(double d);
+    void fromInt64(int64_t i);
     void fromStringData(StringData sd);
     void fromDecimal128(Decimal128 decimal);
 

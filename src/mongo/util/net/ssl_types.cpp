@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,24 +27,12 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
 
 #include "mongo/util/net/ssl_types.h"
 
 #include "mongo/util/net/ssl_options.h"
 
 namespace mongo {
-
-namespace {
-
-const transport::Session::Decoration<SSLPeerInfo> peerInfoForSession =
-    transport::Session::declareDecoration<SSLPeerInfo>();
-
-}  // namespace
-
-SSLPeerInfo& SSLPeerInfo::forSession(const transport::SessionHandle& session) {
-    return peerInfoForSession(session.get());
-}
 
 const SSLParams& getSSLGlobalParams() {
     return sslGlobalParams;

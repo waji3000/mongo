@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -35,11 +34,17 @@
 #include "mongo/bson/util/builder.h"
 #include "mongo/db/auth/role_name.h"
 #include "mongo/stdx/unordered_set.h"
-#include "mongo/transport/session.h"
+#include "mongo/util/overloaded_visitor.h"
+#include "mongo/util/synchronized_value.h"
 
 namespace mongo {
 
 constexpr StringData kOID_CommonName = "2.5.4.3"_sd;
+constexpr StringData kOID_CountryName = "2.5.4.6"_sd;
+constexpr StringData kOID_LocalityName = "2.5.4.7"_sd;
+constexpr StringData kOID_StateName = "2.5.4.8"_sd;
+constexpr StringData kOID_OName = "2.5.4.10"_sd;
+constexpr StringData kOID_OUName = "2.5.4.11"_sd;
 
 /**
  * Represents a structed X509 certificate subject name.
@@ -61,13 +66,16 @@ public:
         auto equalityLens() const {
             return std::tie(oid, type, value);
         }
+        bool operator==(const Entry& rhs) const {
+            return this->equalityLens() == rhs.equalityLens();
+        }
     };
 
     SSLX509Name() = default;
     explicit SSLX509Name(std::vector<std::vector<Entry>> entries) : _entries(std::move(entries)) {}
 
     /**
-     * Retreive the first instance of the value for a given OID in this name.
+     * Retrieve the first instance of the value for a given OID in this name.
      * Returns ErrorCodes::KeyNotFound if the OID does not exist.
      */
     StatusWith<std::string> getOID(StringData oid) const;
@@ -87,32 +95,95 @@ public:
         return !(lhs._entries == rhs._entries);
     }
 
+    const std::vector<std::vector<Entry>>& entries() const {
+        return _entries;
+    }
+
+    /*
+     * This will go through every entry, verify that it's type is a valid DirectoryString
+     * according to https://tools.ietf.org/html/rfc5280#section-4.1.2.4, and perform
+     * the RFC 4518 string prep algorithm on it to normalize the values so they can be
+     * directly compared. After this, all entries should have the type 12 (utf8String).
+     */
+    Status normalizeStrings();
+
+    /**
+     * A SSLX509Name is said to contain another SSLX509Name if it contains all of the other
+     * SSLX509Name's entries.
+     */
+    bool contains(const SSLX509Name& other) const;
+
 private:
-    friend struct SSLConfiguration;
     std::vector<std::vector<Entry>> _entries;
 };
 
 std::ostream& operator<<(std::ostream&, const SSLX509Name&);
-inline bool operator==(const SSLX509Name::Entry& lhs, const SSLX509Name::Entry& rhs) {
-    return lhs.equalityLens() == rhs.equalityLens();
-}
 inline bool operator<(const SSLX509Name::Entry& lhs, const SSLX509Name::Entry& rhs) {
     return lhs.equalityLens() < rhs.equalityLens();
 }
 
-/**
- * Contains information extracted from the peer certificate which is consumed by subsystems
- * outside of the networking stack.
- */
-struct SSLPeerInfo {
-    SSLPeerInfo(SSLX509Name subjectName, stdx::unordered_set<RoleName> roles)
-        : subjectName(std::move(subjectName)), roles(std::move(roles)) {}
-    SSLPeerInfo() = default;
+class SSLConfiguration {
+public:
+    bool isClusterMember(StringData subjectName,
+                         const boost::optional<std::string>& clusterExtensionValue) const;
+    bool isClusterMember(SSLX509Name subjectName,
+                         const boost::optional<std::string>& clusterExtensionValue) const;
+    void getServerStatusBSON(BSONObjBuilder*) const;
+    Status setServerSubjectName(SSLX509Name name);
 
-    SSLX509Name subjectName;
-    stdx::unordered_set<RoleName> roles;
+    // Sets the SSLX509Name representations of net.tls.clusterAuthX509.attributes &
+    // tlsClusterAuthX509Override.attributes and the string representations of
+    // net.tls.clusterAuthX509.extensionValue & tlsClusterAuthX509Override.extensionValue into the
+    // SSLConfiguration.
+    Status setClusterAuthX509Config();
 
-    static SSLPeerInfo& forSession(const transport::SessionHandle& session);
+    // Returns true if the server currently accepts certificates with a certain value for the
+    // clusterMembership extension - either through the config option or the override.
+    bool isClusterExtensionSet() const {
+        bool containsClusterMembershipConfig = false;
+        bool containsOverrideClusterMembershipConfig = false;
+        auto visitor = OverloadedVisitor{[](const SSLX509Name&) { return false; },
+                                         [](const std::string&) {
+                                             return true;
+                                         }};
+
+        if (_clusterAuthX509Config._configCriteria) {
+            containsClusterMembershipConfig =
+                visit(visitor, _clusterAuthX509Config._configCriteria.value());
+        }
+
+        if (_clusterAuthX509Config._overrideCriteria) {
+            containsOverrideClusterMembershipConfig =
+                visit(visitor, _clusterAuthX509Config._overrideCriteria.value());
+        }
+
+        return containsClusterMembershipConfig || containsOverrideClusterMembershipConfig;
+    }
+
+    const SSLX509Name& serverSubjectName() const {
+        return _serverSubjectName;
+    }
+
+    SSLX509Name clientSubjectName;
+    Date_t serverCertificateExpirationDate;
+
+private:
+    SSLX509Name _serverSubjectName;
+
+    struct ClusterAuthX509Config {
+        ClusterAuthX509Config() = default;
+
+        // Optionally contains either an SSLX509Name representing net.tls.clusterAuthX509.attributes
+        // or a string representing net.tls.clusterAuthX509.extensionValue.
+        boost::optional<std::variant<SSLX509Name, std::string>> _configCriteria;
+
+        // Optionally contains either an SSLX509Name representing
+        // tlsClusterAuthX509Override.attributes or a string representing
+        // tlsClusterAuthX509Override.extensionValue.
+        boost::optional<std::variant<SSLX509Name, std::string>> _overrideCriteria;
+    };
+
+    ClusterAuthX509Config _clusterAuthX509Config;
 };
 
 }  // namespace mongo

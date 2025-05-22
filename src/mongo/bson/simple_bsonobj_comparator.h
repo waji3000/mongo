@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,9 +29,12 @@
 
 #pragma once
 
+#include <cstddef>
 #include <map>
 #include <set>
 
+#include "mongo/bson/bson_comparator_interface_base.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobj_comparator_interface.h"
 #include "mongo/stdx/unordered_map.h"
 #include "mongo/stdx/unordered_set.h"
@@ -96,6 +98,10 @@ public:
     };
 };
 
+inline auto simpleHash(const BSONObj& obj) {
+    return SimpleBSONObjComparator::kInstance.hash(obj);
+}
+
 /**
  * A set of BSONObjs that performs comparisons with simple binary semantics.
  */
@@ -111,13 +117,6 @@ using SimpleBSONObjMultiSet = std::multiset<BSONObj, SimpleBSONObjComparator::Le
  */
 using SimpleBSONObjUnorderedSet =
     stdx::unordered_set<BSONObj, SimpleBSONObjComparator::Hasher, SimpleBSONObjComparator::EqualTo>;
-
-/**
- * An unordered_multiset of BSONObjs that performs equality checks using simple binary semantics.
- */
-using SimpleBSONObjUnorderedMultiset = stdx::unordered_multiset<BSONObj,
-                                                                SimpleBSONObjComparator::Hasher,
-                                                                SimpleBSONObjComparator::EqualTo>;
 
 /**
  * A map keyed on BSONObj that performs comparisons with simple binary semantics.
@@ -138,13 +137,4 @@ template <typename T>
 using SimpleBSONObjUnorderedMap = stdx::
     unordered_map<BSONObj, T, SimpleBSONObjComparator::Hasher, SimpleBSONObjComparator::EqualTo>;
 
-/**
- * An unordered_multimap keyed on BSONObj that performs equality checks using simple binary
- * semantics.
- */
-template <typename T>
-using SimpleBSONObjUnorderedMultiMap = stdx::unordered_multimap<BSONObj,
-                                                                T,
-                                                                SimpleBSONObjComparator::Hasher,
-                                                                SimpleBSONObjComparator::EqualTo>;
 }  // namespace mongo

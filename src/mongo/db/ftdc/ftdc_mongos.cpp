@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -27,99 +26,122 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kFTDC
 
-#include "mongo/platform/basic.h"
+#include <functional>
+#include <memory>
+#include <string>
 
+#include <boost/filesystem/operations.hpp>
+#include <boost/filesystem/path.hpp>
+
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/client/connpool.h"
+#include "mongo/client/dbclient_connection.h"
+#include "mongo/client/global_conn_pool.h"
+#include "mongo/client/replica_set_monitor_manager.h"
+#include "mongo/db/ftdc/collector.h"
 #include "mongo/db/ftdc/ftdc_mongos.h"
-
-#include <boost/filesystem.hpp>
-
-#include "mongo/db/ftdc/controller.h"
 #include "mongo/db/ftdc/ftdc_server.h"
-#include "mongo/db/server_parameters.h"
-#include "mongo/stdx/thread.h"
-#include "mongo/util/log.h"
+#include "mongo/db/ftdc/util.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/server_options.h"
+#include "mongo/executor/connection_pool_stats.h"
+#include "mongo/executor/task_executor.h"
+#include "mongo/executor/task_executor_pool.h"
+#include "mongo/logv2/log.h"
+#include "mongo/s/grid.h"
+#include "mongo/s/sharding_feature_flags_gen.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kFTDC
+
 
 namespace mongo {
 
-namespace {
-
-/**
- * Expose diagnosticDataCollectionDirectoryPath set parameter to specify the MongoS FTDC path.
- */
-class ExportedFTDCDirectoryPathParameter : public ServerParameter {
+class ConnPoolStatsCollector : public FTDCCollectorInterface {
 public:
-    ExportedFTDCDirectoryPathParameter()
-        : ServerParameter(ServerParameterSet::getGlobal(),
-                          "diagnosticDataCollectionDirectoryPath",
-                          true,
-                          true) {}
+    void collect(OperationContext* opCtx, BSONObjBuilder& builder) override {
+        executor::ConnectionPoolStats stats{};
 
+        // Global connection pool connections.
+        globalConnPool.appendConnectionStats(&stats);
 
-    void append(OperationContext* opCtx, BSONObjBuilder& b, const std::string& name) final {
-        stdx::lock_guard<stdx::mutex> guard(_lock);
-        b.append(name, _path.generic_string());
-    }
+        // Sharding connections.
+        {
+            auto const grid = Grid::get(opCtx);
+            if (grid->isInitialized()) {
+                grid->getExecutorPool()->appendConnectionStats(&stats);
 
-    Status set(const BSONElement& newValueElement) {
-        if (newValueElement.type() != String) {
-            return Status(ErrorCodes::BadValue,
-                          "diagnosticDataCollectionDirectoryPath only supports type string");
-        }
-
-        std::string str = newValueElement.str();
-        return setFromString(str);
-    }
-
-    Status setFromString(const std::string& str) final {
-        stdx::lock_guard<stdx::mutex> guard(_lock);
-
-        FTDCController* controller = nullptr;
-
-        if (hasGlobalServiceContext()) {
-            controller = FTDCController::get(getGlobalServiceContext());
-        }
-
-        if (controller) {
-            Status s = controller->setDirectory(str);
-            if (!s.isOK()) {
-                return s;
+                auto const customConnPoolStatsFn = grid->getCustomConnectionPoolStatsFn();
+                if (customConnPoolStatsFn) {
+                    customConnPoolStatsFn(&stats);
+                }
             }
         }
 
-        _path = str;
+        // Output to a BSON object.
+        builder.appendNumber("numClientConnections", DBClientConnection::getNumConnections());
+        builder.appendNumber("numAScopedConnections", AScopedConnection::getNumConnections());
+        stats.appendToBSON(builder, true /* forFTDC */);
 
-        return Status::OK();
+        // All replica sets being tracked.
+        ReplicaSetMonitorManager::get()->report(&builder, true /* forFTDC */);
     }
 
-    boost::filesystem::path getDirectory() {
-        stdx::lock_guard<stdx::mutex> guard(_lock);
-        return _path;
+    std::string name() const override {
+        return "connPoolStats";
+    }
+};
+
+class NetworkInterfaceStatsCollector final : public FTDCCollectorInterface {
+public:
+    void collect(OperationContext* opCtx, BSONObjBuilder& builder) override {
+        auto const grid = Grid::get(opCtx);
+        if (grid->isInitialized()) {
+            grid->getExecutorPool()->appendNetworkInterfaceStats(builder);
+        }
+
+        if (auto executor = ReplicaSetMonitorManager::get()->getExecutor()) {
+            executor->appendNetworkInterfaceStats(builder);
+        }
     }
 
-    void setDirectory(boost::filesystem::path& path) {
-        stdx::lock_guard<stdx::mutex> guard(_lock);
-        _path = path;
+    std::string name() const override {
+        return "networkInterfaceStats";
     }
+};
 
-private:
-    // Lock to guard _path
-    stdx::mutex _lock;
+void registerRouterCollectors(FTDCController* controller) {
+    registerServerCollectorsForRole(controller, ClusterRole::RouterServer);
 
-    // Directory location of ftdc files, guarded by _lock
-    boost::filesystem::path _path;
-} exportedFTDCDirectoryPathParameter;
-
-void registerMongoSCollectors(FTDCController* controller) {
     // PoolStats
-    controller->addPeriodicCollector(stdx::make_unique<FTDCSimpleInternalCommandCollector>(
-        "connPoolStats", "connPoolStats", "", BSON("connPoolStats" << 1)));
+    controller->addPeriodicCollector(std::make_unique<ConnPoolStatsCollector>(),
+                                     ClusterRole::RouterServer);
+
+    controller->addPeriodicCollector(std::make_unique<NetworkInterfaceStatsCollector>(),
+                                     ClusterRole::RouterServer);
+
+    controller->addPeriodicMetadataCollector(
+        std::make_unique<FTDCSimpleInternalCommandCollector>(
+            "getParameter",
+            "getParameter",
+            DatabaseName::kEmpty,
+            BSON("getParameter" << BSON("allParameters" << true << "setAt"
+                                                        << "runtime"))),
+        ClusterRole::RouterServer);
+
+    controller->addPeriodicMetadataCollector(
+        std::make_unique<FTDCSimpleInternalCommandCollector>("getClusterParameter",
+                                                             "getClusterParameter",
+                                                             DatabaseName::kEmpty,
+                                                             BSON("getClusterParameter"
+                                                                  << "*"
+                                                                  << "omitInFTDC" << true)),
+        ClusterRole::RouterServer);
 }
 
-}  // namespace
-
-void startMongoSFTDC() {
+void startMongoSFTDC(ServiceContext* serviceContext) {
     // Get the path to use for FTDC:
     // 1. Check if the user set one.
     // 2. If not, check if the user has a logpath and derive one.
@@ -127,26 +149,28 @@ void startMongoSFTDC() {
 
     // Only attempt to enable FTDC if we have a path to log files to.
     FTDCStartMode startMode = FTDCStartMode::kStart;
-    auto directory = exportedFTDCDirectoryPathParameter.getDirectory();
+    auto directory = getFTDCDirectoryPathParameter();
 
     if (directory.empty()) {
         if (serverGlobalParams.logpath.empty()) {
-            warning() << "FTDC is disabled because neither '--logpath' nor set parameter "
-                         "'diagnosticDataCollectionDirectoryPath' are specified.";
+            LOGV2_WARNING(23911,
+                          "FTDC is disabled because neither '--logpath' nor set parameter "
+                          "'diagnosticDataCollectionDirectoryPath' are specified.");
             startMode = FTDCStartMode::kSkipStart;
         } else {
             directory = boost::filesystem::absolute(
                 FTDCUtil::getMongoSPath(serverGlobalParams.logpath), serverGlobalParams.cwd);
 
-            // Update the server parameter with the computed path.
             // Note: If the computed FTDC directory conflicts with an existing file, then FTDC will
             // warn about the conflict, and not startup. It will not terminate MongoS in this
             // situation.
-            exportedFTDCDirectoryPathParameter.setDirectory(directory);
         }
     }
 
-    startFTDC(directory, startMode, registerMongoSCollectors);
+    const UseMultiServiceSchema multiServiceSchema{
+        feature_flags::gMultiServiceLogAndFTDCFormat.isEnabled()};
+
+    startFTDC(serviceContext, directory, startMode, {registerRouterCollectors}, multiServiceSchema);
 }
 
 void stopMongoSFTDC() {

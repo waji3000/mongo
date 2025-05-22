@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,10 +29,15 @@
 
 #pragma once
 
+#include <vector>
+
+
+#include "mongo/base/error_codes.h"
 #include "mongo/db/client.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/service_context.h"
 #include "mongo/stdx/mutex.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 
@@ -73,15 +77,6 @@ public:
      * interrupted immediately.
      */
     Context adopt(UniqueOperationContext ctx);
-
-    /**
-     * Moves the OperationContext of `ctx` from its current OperationContextGroup into *this.
-     * Do this to protect an OperationContext from being interrupted along with the rest of its
-     * group, or to expose `ctx` to this->interrupt().  Taking from a Context already in *this is
-     * equivalent to moving from `ctx`. Taking a moved-from Context yields another moved-from
-     * Context.
-     */
-    Context take(Context ctx);
 
     /*
      * Interrupts all the OperationContexts maintained in *this.

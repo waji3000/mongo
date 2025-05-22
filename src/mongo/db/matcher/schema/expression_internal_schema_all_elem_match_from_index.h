@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -29,10 +28,23 @@
  */
 #pragma once
 
+#include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+#include <cstddef>
+#include <memory>
+#include <vector>
+
+#include "mongo/base/clonable_ptr.h"
 #include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/util/builder_fwd.h"
 #include "mongo/db/matcher/expression.h"
 #include "mongo/db/matcher/expression_array.h"
+#include "mongo/db/matcher/expression_visitor.h"
 #include "mongo/db/matcher/expression_with_placeholder.h"
+#include "mongo/db/query/query_shape/serialization_options.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 /**
@@ -43,42 +55,60 @@ class InternalSchemaAllElemMatchFromIndexMatchExpression final
     : public ArrayMatchingMatchExpression {
 public:
     static constexpr StringData kName = "$_internalSchemaAllElemMatchFromIndex"_sd;
+    static constexpr int kNumChildren = 1;
 
     InternalSchemaAllElemMatchFromIndexMatchExpression(
-        StringData path, long long index, std::unique_ptr<ExpressionWithPlaceholder> expression);
+        boost::optional<StringData> path,
+        long long index,
+        std::unique_ptr<ExpressionWithPlaceholder> expression,
+        clonable_ptr<ErrorAnnotation> annotation = nullptr);
 
-    std::unique_ptr<MatchExpression> shallowClone() const final;
+    std::unique_ptr<MatchExpression> clone() const final;
 
-    bool matchesArray(const BSONObj& array, MatchDetails* details) const final {
-        auto iter = BSONObjIterator(array);
-        for (int i = 0; iter.more() && i < _index; i++) {
-            iter.next();
-        }
-        while (iter.more()) {
-            if (!_expression->matchesBSONElement(iter.next(), details)) {
-                return false;
-            }
-        }
-        return true;
-    }
+    void debugString(StringBuilder& debug, int indentationLevel) const final;
 
-    void debugString(StringBuilder& debug, int level) const final;
-
-    void serialize(BSONObjBuilder* out) const final;
+    void appendSerializedRightHandSide(BSONObjBuilder* bob,
+                                       const SerializationOptions& opts = {},
+                                       bool includePath = true) const final;
 
     bool equivalent(const MatchExpression* other) const final;
 
-    std::vector<MatchExpression*>* getChildVector() final {
+    /**
+     * Returns an index of the first element of the array this match expression applies to.
+     */
+    long long startIndex() const {
+        return _index;
+    }
+
+    std::vector<std::unique_ptr<MatchExpression>>* getChildVector() final {
         return nullptr;
     }
 
     size_t numChildren() const final {
-        return 1;
+        return kNumChildren;
     }
 
     MatchExpression* getChild(size_t i) const final {
-        invariant(i == 0);
+        tassert(6400200, "Out-of-bounds access to child of MatchExpression.", i < kNumChildren);
         return _expression->getFilter();
+    }
+
+    void resetChild(size_t i, MatchExpression* other) override {
+        tassert(6329407, "Out-of-bounds access to child of MatchExpression.", i < kNumChildren);
+        _expression->resetFilter(other);
+    };
+
+
+    void acceptVisitor(MatchExpressionMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(MatchExpressionConstVisitor* visitor) const final {
+        visitor->visit(this);
+    }
+
+    const ExpressionWithPlaceholder* getExpression() const {
+        return _expression.get();
     }
 
 private:

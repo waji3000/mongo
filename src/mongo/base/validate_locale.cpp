@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,31 +27,32 @@
  *    it in the license file.
  */
 
-#include <stdexcept>
-
 #include <boost/filesystem/path.hpp>
-#include <codecvt>
-#include <locale>
+#include <codecvt>  // IWYU pragma: keep
+#include <locale>   // IWYU pragma: keep
+#include <stdexcept>
+#include <string>
 
-#include "mongo/base/init.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/base/init.h"  // IWYU pragma: keep
+#include "mongo/base/initializer.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
-MONGO_INITIALIZER_GENERAL(ValidateLocale, MONGO_NO_PREREQUISITES, MONGO_DEFAULT_PREREQUISITES)
+MONGO_INITIALIZER_GENERAL(ValidateLocale, (), ("default"))
 (InitializerContext*) {
     try {
         // Validate that boost can correctly load the user's locale
         boost::filesystem::path("/").has_root_directory();
     } catch (const std::runtime_error& e) {
-        return Status(
-            ErrorCodes::BadValue,
-            str::stream()
-                << "Invalid or no user locale set. "
+        std::string extraHint;
 #ifndef _WIN32
-                << " Please ensure LANG and/or LC_* environment variables are set correctly. "
+        extraHint = " Please ensure LANG and/or LC_* environment variables are set correctly. ";
 #endif
-                << e.what());
+        uasserted(ErrorCodes::BadValue,
+                  str::stream() << "Invalid or no user locale set. " << extraHint << e.what());
     }
 
 #ifdef _WIN32
@@ -60,8 +60,6 @@ MONGO_INITIALIZER_GENERAL(ValidateLocale, MONGO_NO_PREREQUISITES, MONGO_DEFAULT_
     std::locale loc(std::locale(""), new std::codecvt_utf8_utf16<wchar_t>);
     boost::filesystem::path::imbue(loc);
 #endif
-
-    return Status::OK();
 }
 
 }  // namespace mongo

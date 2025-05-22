@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Public Domain 2014-2018 MongoDB, Inc.
+# Public Domain 2014-present MongoDB, Inc.
 # Public Domain 2008-2014 WiredTiger, Inc.
 #
 # This is free and unencumbered software released into the public domain.
@@ -26,7 +26,7 @@
 # ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
 # OTHER DEALINGS IN THE SOFTWARE.
 
-import wiredtiger, wttest
+import wttest
 
 # test_bug015.py
 #    JIRA WT-2162: index drop in a certain order triggers NULL pointer deref
@@ -42,6 +42,3 @@ class test_bug015(wttest.WiredTigerTestCase):
         self.session.create(idx1, "columns=(v)")
         self.session.drop(idx2, "force=true")
         self.session.create(idx2, "columns=(v)")
-
-if __name__ == '__main__':
-    wttest.run()

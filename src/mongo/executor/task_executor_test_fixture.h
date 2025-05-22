@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -32,13 +31,16 @@
 
 #include <memory>
 
+#include "mongo/base/status.h"
 #include "mongo/base/string_data.h"
+#include "mongo/executor/network_interface.h"
+#include "mongo/executor/remote_command_request.h"
+#include "mongo/unittest/log_test.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
 namespace executor {
 
-struct RemoteCommandRequest;
 class TaskExecutor;
 class NetworkInterface;
 class NetworkInterfaceMock;
@@ -61,13 +63,20 @@ public:
     static RemoteCommandRequest assertRemoteCommandNameEquals(StringData cmdName,
                                                               const RemoteCommandRequest& request);
 
-    virtual ~TaskExecutorTest();
+    ~TaskExecutorTest() override;
 
     executor::NetworkInterfaceMock* getNet() {
         return _net;
     }
+
+    void runReadyNetworkOperations();
+
     TaskExecutor& getExecutor() {
         return *_executor;
+    }
+
+    std::shared_ptr<TaskExecutor> getExecutorPtr() const {
+        return _executor;
     }
 
     /**
@@ -91,13 +100,20 @@ private:
      */
     void _doTest() override;
 
-    virtual std::unique_ptr<TaskExecutor> makeTaskExecutor(
+    virtual std::shared_ptr<TaskExecutor> makeTaskExecutor(
         std::unique_ptr<NetworkInterfaceMock> net) = 0;
 
     virtual void postExecutorThreadLaunch();
 
     NetworkInterfaceMock* _net;
-    std::unique_ptr<TaskExecutor> _executor;
+    std::shared_ptr<TaskExecutor> _executor;
+    bool _needsShutDown{false};
+
+    unittest::MinimumLoggedSeverityGuard logSeverityGuardNetwork{
+        logv2::LogComponent::kNetwork,
+        logv2::LogSeverity::Debug(NetworkInterface::kDiagnosticLogLevel)};
+    unittest::MinimumLoggedSeverityGuard logSeverityGuardExecutor{logv2::LogComponent::kExecutor,
+                                                                  logv2::LogSeverity::Debug(3)};
 };
 
 }  // namespace executor

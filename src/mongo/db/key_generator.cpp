@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,16 +27,21 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <utility>
+#include <vector>
 
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/timestamp.h"
 #include "mongo/db/key_generator.h"
-
-#include "mongo/client/read_preference.h"
 #include "mongo/db/keys_collection_client.h"
-#include "mongo/db/logical_clock.h"
+#include "mongo/db/keys_collection_document_gen.h"
+#include "mongo/db/logical_time.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/s/client/shard_registry.h"
-#include "mongo/util/fail_point_service.h"
+#include "mongo/db/time_proof_service.h"
+#include "mongo/db/vector_clock.h"
+#include "mongo/platform/compiler.h"
+#include "mongo/util/fail_point.h"
 
 namespace mongo {
 
@@ -57,7 +61,9 @@ Status insertNewKey(OperationContext* opCtx,
                     long long keyId,
                     const std::string& purpose,
                     const LogicalTime& expiresAt) {
-    KeysCollectionDocument newKey(keyId, purpose, TimeProofService::generateRandomKey(), expiresAt);
+    KeysCollectionDocument newKey(keyId);
+    newKey.setKeysCollectionDocumentBase(
+        {purpose, TimeProofService::generateRandomKey(), expiresAt});
     return client->insertNewKey(opCtx, newKey.toBSON());
 }
 
@@ -77,12 +83,13 @@ KeyGenerator::KeyGenerator(std::string purpose,
 
 Status KeyGenerator::generateNewKeysIfNeeded(OperationContext* opCtx) {
 
-    if (MONGO_FAIL_POINT(disableKeyGeneration)) {
+    if (MONGO_unlikely(disableKeyGeneration.shouldFail())) {
         return {ErrorCodes::FailPointEnabled, "key generation disabled"};
     }
 
-    auto currentTime = LogicalClock::get(opCtx)->getClusterTime();
-    auto keyStatus = _client->getNewKeys(opCtx, _purpose, currentTime);
+    const auto currentTime = VectorClock::get(opCtx)->getTime();
+    auto keyStatus = _client->getNewInternalKeys(
+        opCtx, _purpose, currentTime.clusterTime(), false /* tryUseMajority */);
 
     if (!keyStatus.isOK()) {
         return keyStatus.getStatus();
@@ -93,10 +100,10 @@ Status KeyGenerator::generateNewKeysIfNeeded(OperationContext* opCtx) {
 
     LogicalTime currentKeyExpiresAt;
 
-    long long keyId = currentTime.asTimestamp().asLL();
+    long long keyId = currentTime.clusterTime().asTimestamp().asLL();
 
     if (keyIter == newKeys.cend()) {
-        currentKeyExpiresAt = addSeconds(currentTime, _keyValidForInterval);
+        currentKeyExpiresAt = addSeconds(currentTime.clusterTime(), _keyValidForInterval);
         auto status = insertNewKey(opCtx, _client, keyId, _purpose, currentKeyExpiresAt);
 
         if (!status.isOK()) {
@@ -104,8 +111,8 @@ Status KeyGenerator::generateNewKeysIfNeeded(OperationContext* opCtx) {
         }
 
         keyId++;
-    } else if (keyIter->getExpiresAt() < currentTime) {
-        currentKeyExpiresAt = addSeconds(currentTime, _keyValidForInterval);
+    } else if (keyIter->getExpiresAt() < currentTime.clusterTime()) {
+        currentKeyExpiresAt = addSeconds(currentTime.clusterTime(), _keyValidForInterval);
         auto status = insertNewKey(opCtx, _client, keyId, _purpose, currentKeyExpiresAt);
 
         if (!status.isOK()) {
@@ -129,7 +136,7 @@ Status KeyGenerator::generateNewKeysIfNeeded(OperationContext* opCtx) {
         if (!status.isOK()) {
             return status;
         }
-    } else if (keyIter->getExpiresAt() < currentTime) {
+    } else if (keyIter->getExpiresAt() < currentTime.clusterTime()) {
         currentKeyExpiresAt = addSeconds(currentKeyExpiresAt, _keyValidForInterval);
         auto status = insertNewKey(opCtx, _client, keyId, _purpose, currentKeyExpiresAt);
 

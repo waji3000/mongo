@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Public Domain 2014-2018 MongoDB, Inc.
+# Public Domain 2014-present MongoDB, Inc.
 # Public Domain 2008-2014 WiredTiger, Inc.
 #
 # This is free and unencumbered software released into the public domain.
@@ -79,8 +79,7 @@ context = Context()
 ## cache_size=20GB
 conn_config="create,cache_size=1GB,session_max=1000,eviction=(threads_min=4,threads_max=8),log=(enabled=false),transaction_sync=(enabled=false),checkpoint_sync=true,checkpoint=(wait=60),statistics=(fast),statistics_log=(json,wait=1)"
 table_config="allocation_size=4k,memory_page_max=10MB,prefix_compression=false,split_pct=90,leaf_page_max=32k,internal_page_max=16k,type=file,block_compressor=snappy"
-conn_config += extensions_config(['compressors/snappy'])
-conn = wiredtiger_open("WT_TEST", conn_config)
+conn = context.wiredtiger_open(conn_config)
 s = conn.open_session()
 
 tables = []
@@ -93,13 +92,14 @@ tname = "table:log"
 s.create(tname, 'key_format=S,value_format=S,' + table_config)
 logtable = Table(tname)
 
-##icount=200000000 / 8
+##icount=200000000 // 8
 icount=20000
 ins_ops = operations(Operation.OP_INSERT, tables, Key(Key.KEYGEN_APPEND, 20), Value(500))
 thread = Thread(ins_ops * icount)
 pop_workload = Workload(context, thread)
 print('populate:')
-pop_workload.run(conn)
+ret = pop_workload.run(conn)
+assert ret == 0, ret
 
 ins_ops = operations(Operation.OP_INSERT, tables, Key(Key.KEYGEN_APPEND, 20), Value(500), 0, logtable)
 upd_ops = operations(Operation.OP_UPDATE, tables, Key(Key.KEYGEN_UNIFORM, 20), Value(500), 0, logtable)
@@ -120,10 +120,11 @@ workload = Workload(context, threads)
 ##workload.options.run_time = 3600
 workload.options.run_time = 30
 workload.options.report_interval = 1
-workload.options.sample_interval = 5
+workload.options.sample_interval_ms = 5000
 workload.options.sample_rate = 1
 print('heavy stress workload:')
-workload.run(conn)
+ret = workload.run(conn)
+assert ret == 0, ret
 
 latency_filename = conn.get_home() + '/latency.out'
 print('for latency output, see: ' + latency_filename)

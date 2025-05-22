@@ -1,4 +1,4 @@
-#!/usr/bin/env python2
+#!/usr/bin/env python3
 #
 # Copyright (C) 2018-present MongoDB, Inc.
 #
@@ -29,8 +29,6 @@
 #
 """IDL Compiler Driver Main Entry point."""
 
-from __future__ import absolute_import, print_function
-
 import argparse
 import logging
 import sys
@@ -41,26 +39,43 @@ import idl.compiler
 def main():
     # type: () -> None
     """Execute Main Entry point."""
-    parser = argparse.ArgumentParser(description='MongoDB IDL Compiler.')
+    parser = argparse.ArgumentParser(description="MongoDB IDL Compiler.")
 
-    parser.add_argument('file', type=str, help="IDL input file")
+    parser.add_argument("file", type=str, help="IDL input file")
 
-    parser.add_argument('-o', '--output', type=str, help="IDL output source file")
+    parser.add_argument("-o", "--output", type=str, help="IDL output source file")
 
-    parser.add_argument('--header', type=str, help="IDL output header file")
+    parser.add_argument("--header", type=str, help="IDL output header file")
 
-    parser.add_argument('-i', '--include', type=str, action="append",
-                        help="Directory to search for IDL import files")
+    parser.add_argument(
+        "-i",
+        "--include",
+        type=str,
+        action="append",
+        help="Directory to search for IDL import files",
+    )
 
-    parser.add_argument('-v', '--verbose', action='count', help="Enable verbose tracing")
+    parser.add_argument("-v", "--verbose", action="count", help="Enable verbose tracing")
 
-    parser.add_argument('--base_dir', type=str, help="IDL output relative base directory")
+    parser.add_argument("--base_dir", type=str, help="IDL output relative base directory")
 
-    parser.add_argument('--write-dependencies', action='store_true',
-                        help='only print out a list of dependent imports')
+    parser.add_argument(
+        "--write-dependencies",
+        action="store_true",
+        help="only print out a list of dependent imports",
+    )
 
-    parser.add_argument('--target_arch', type=str,
-                        help="IDL target archiecture (amd64, s390x). defaults to current machine")
+    parser.add_argument(
+        "--write-dependencies-inline",
+        action="store_true",
+        help="print out a list of dependent imports during file generation",
+    )
+
+    parser.add_argument(
+        "--target_arch",
+        type=str,
+        help="IDL target archiecture (amd64, s390x). defaults to current machine",
+    )
 
     args = parser.parse_args()
 
@@ -78,9 +93,11 @@ def main():
     compiler_args.output_base_dir = args.base_dir
     compiler_args.output_suffix = "_gen"
     compiler_args.write_dependencies = args.write_dependencies
+    compiler_args.write_dependencies_inline = args.write_dependencies_inline
 
-    if (args.output is not None and args.header is None) or \
-        (args.output is  None and args.header is not None):
+    if (args.output is not None and args.header is None) or (
+        args.output is None and args.header is not None
+    ):
         print("ERROR: Either both --header and --output must be specified or neither.")
         sys.exit(1)
 
@@ -91,5 +108,5 @@ def main():
         sys.exit(1)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

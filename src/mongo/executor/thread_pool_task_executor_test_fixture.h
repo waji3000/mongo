@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -33,6 +32,7 @@
 #include <memory>
 
 #include "mongo/executor/network_interface_mock.h"
+#include "mongo/executor/task_executor.h"
 #include "mongo/executor/task_executor_test_fixture.h"
 #include "mongo/executor/thread_pool_mock.h"
 #include "mongo/executor/thread_pool_task_executor.h"
@@ -43,7 +43,7 @@ namespace executor {
 /**
  * Makes a new ThreadPoolTaskExecutor for use in unit tests.
  */
-std::unique_ptr<ThreadPoolTaskExecutor> makeThreadPoolTestExecutor(
+std::shared_ptr<ThreadPoolTaskExecutor> makeThreadPoolTestExecutor(
     std::unique_ptr<NetworkInterfaceMock> net,
     executor::ThreadPoolMock::Options options = executor::ThreadPoolMock::Options());
 
@@ -66,7 +66,7 @@ public:
 
 private:
     virtual ThreadPoolMock::Options makeThreadPoolMockOptions() const;
-    std::unique_ptr<TaskExecutor> makeTaskExecutor(
+    std::shared_ptr<TaskExecutor> makeTaskExecutor(
         std::unique_ptr<NetworkInterfaceMock> net) override;
 
     // Returned by makeThreadPoolMockOptions().

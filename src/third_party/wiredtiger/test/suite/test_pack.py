@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Public Domain 2014-2018 MongoDB, Inc.
+# Public Domain 2014-present MongoDB, Inc.
 # Public Domain 2008-2014 WiredTiger, Inc.
 #
 # This is free and unencumbered software released into the public domain.
@@ -30,8 +30,8 @@
 #    Tests packing using public methods
 #
 
-import wiredtiger, wttest
-import re, sys
+import wttest
+import re
 
 class test_pack(wttest.WiredTigerTestCase):
     name = 'test_pack'
@@ -50,7 +50,7 @@ class test_pack(wttest.WiredTigerTestCase):
         uri = 'table:' + test_pack.name + '-' + fmtname
         idx_uri = 'index:' + test_pack.name + '-' + fmtname + ':inverse'
         nargs = len(v)
-        colnames = ",".join("v" + str(x) for x in xrange(nargs))
+        colnames = ",".join("v" + str(x) for x in range(nargs))
         self.session.create(uri, "columns=(k," + colnames + ")," +
                             "key_format=i,value_format=" + fmt)
         self.session.create(idx_uri, "columns=(" + colnames + ")")
@@ -65,15 +65,15 @@ class test_pack(wttest.WiredTigerTestCase):
         #self.dump_cursor(forw_idx, 'index')
 
         forw.set_key(1234)
-        self.assertEquals(forw.search(), 0)
+        self.assertEqual(forw.search(), 0)
         got = forw.get_value()
         if nargs == 1:  # API does not return a list, we want one for comparing
             got = [got]
-        self.assertEquals(got, v)
+        self.assertEqual(got, v)
 
         forw_idx.set_key(*v)
-        self.assertEquals(forw_idx.search(), 0)
-        self.assertEquals(forw_idx.get_value(), 1234)
+        self.assertEqual(forw_idx.search(), 0)
+        self.assertEqual(forw_idx.get_value(), 1234)
         forw.close()
         forw_idx.close()
 
@@ -92,20 +92,17 @@ class test_pack(wttest.WiredTigerTestCase):
         self.check('10SS', 'aaaaa\x00\x00\x00\x00\x00', 'something')
         self.check('S10S', 'something', 'aaaaa\x00\x00\x00\x00\x00')
 
-        self.check('u', r"\x42" * 20)
-        self.check('uu', r"\x42" * 10, r"\x42" * 10)
-        self.check('3u', r"\x4")
-        self.check('3uu', r"\x4", r"\x42" * 10)
-        self.check('u3u', r"\x42" * 10, r"\x4")
-        self.check('u', '\x00')
-        self.check('u', '')
-        self.check('uu', '', '\x00')
-        self.check('uu', '\x00', '')
-        self.check('uu', '', '')
+        self.check('u', b"\x42" * 20)
+        self.check('uu', b"\x42" * 10, b"\x42" * 10)
+        self.check('3u', b"\x04\x03\x02")
+        self.check('3uu', b"\x04\x03\x02", b"\x42" * 10)
+        self.check('u3u', b"\x42" * 10, b"\x04\x03\x02")
+        self.check('u', b'\x00')
+        self.check('u', b'')
+        self.check('uu', b'', b'\x00')
+        self.check('uu', b'\x00', b'')
+        self.check('uu', b'', b'')
 
         self.check('s', "4")
         self.check("1s", "4")
         self.check("2s", "42")
-
-if __name__ == '__main__':
-    wttest.run()

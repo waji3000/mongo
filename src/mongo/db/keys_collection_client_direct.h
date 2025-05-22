@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,12 +29,26 @@
 
 #pragma once
 
+#include <boost/optional/optional.hpp>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/client/read_preference.h"
 #include "mongo/db/keys_collection_client.h"
-#include "mongo/s/client/rs_local_client.h"
+#include "mongo/db/keys_collection_document_gen.h"
+#include "mongo/db/logical_time.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/aggregation_request_helper.h"
+#include "mongo/db/repl/read_concern_level.h"
+#include "mongo/db/rs_local_client.h"
+#include "mongo/db/write_concern_options.h"
+#include "mongo/s/client/shard.h"
 
 namespace mongo {
 
@@ -45,27 +58,49 @@ class BSONObj;
 
 class KeysCollectionClientDirect : public KeysCollectionClient {
 public:
-    KeysCollectionClientDirect();
-    /**
-     * Returns keys for the given purpose and with an expiresAt value greater than newerThanThis.
-     */
-    StatusWith<std::vector<KeysCollectionDocument>> getNewKeys(
-        OperationContext* opCtx, StringData purpose, const LogicalTime& newerThanThis) override;
+    KeysCollectionClientDirect(bool mustUseLocalReads);
 
     /**
-    * Directly inserts a key document to the storage
-    */
+     * Returns internal keys for the given purpose and have an expiresAt value greater than
+     * newerThanThis. Uses readConcern level majority if possible.
+     */
+    StatusWith<std::vector<KeysCollectionDocument>> getNewInternalKeys(
+        OperationContext* opCtx,
+        StringData purpose,
+        const LogicalTime& newerThanThis,
+        bool tryUseMajority) override;
+
+    /**
+     * Returns all external (i.e. validation-only) keys for the given purpose.
+     */
+    StatusWith<std::vector<ExternalKeysCollectionDocument>> getAllExternalKeys(
+        OperationContext* opCtx, StringData purpose) override;
+
+    /**
+     * Directly inserts a key document to the storage
+     */
     Status insertNewKey(OperationContext* opCtx, const BSONObj& doc) override;
 
     /**
-     * Returns false if getNewKeys uses readConcern level:local, so the documents returned can be
-     * rolled back.
+     * Returns true if getNewKeys always uses readConcern level:local, so the documents returned can
+     * be rolled back.
      */
-    bool supportsMajorityReads() const final {
-        return false;
+    bool mustUseLocalReads() const final {
+        return _mustUseLocalReads;
     }
 
 private:
+    /**
+     * Returns keys in the given collection for the given purpose and have an expiresAt value
+     * greater than newerThanThis, using readConcern level majority if possible.
+     */
+    template <typename KeyDocumentType>
+    StatusWith<std::vector<KeyDocumentType>> _getNewKeys(OperationContext* opCtx,
+                                                         const NamespaceString& nss,
+                                                         StringData purpose,
+                                                         const LogicalTime& newerThanThis,
+                                                         bool tryUseMajority);
+
     StatusWith<Shard::QueryResponse> _query(OperationContext* opCtx,
                                             const ReadPreferenceSetting& readPref,
                                             const repl::ReadConcernLevel& readConcernLevel,
@@ -75,10 +110,10 @@ private:
                                             boost::optional<long long> limit);
 
     Status _insert(OperationContext* opCtx,
-                   const NamespaceString& nss,
                    const BSONObj& doc,
                    const WriteConcernOptions& writeConcern);
 
     RSLocalClient _rsLocalClient;
+    bool _mustUseLocalReads{false};
 };
 }  // namespace mongo

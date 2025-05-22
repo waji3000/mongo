@@ -1,6 +1,3 @@
-// sorted_data_interface_test_spaceused.cpp
-
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,80 +27,47 @@
  *    it in the license file.
  */
 
-#include "mongo/db/storage/sorted_data_interface_test_harness.h"
-
+#include <boost/move/utility_core.hpp>
 #include <memory>
 
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/record_id.h"
 #include "mongo/db/storage/sorted_data_interface.h"
+#include "mongo/db/storage/sorted_data_interface_test_assert.h"
+#include "mongo/db/storage/sorted_data_interface_test_harness.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
 namespace {
 
 // Verify that an empty index takes up no space.
-TEST(SortedDataInterface, GetSpaceUsedBytesEmpty) {
-    const auto harnessHelper(newSortedDataInterfaceHarnessHelper());
-    const std::unique_ptr<SortedDataInterface> sorted(harnessHelper->newSortedDataInterface(false));
+TEST_F(SortedDataInterfaceTest, GetSpaceUsedBytesEmpty) {
+    const auto sorted(
+        harnessHelper()->newSortedDataInterface(opCtx(), /*unique=*/false, /*partial=*/false));
 
-    {
-        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
-        ASSERT(sorted->isEmpty(opCtx.get()));
-    }
-
-    // SERVER-15416 mmapv1 test harness does not use SimpleRecordStoreV1 as its record store
-    //              and HeapRecordStoreBtree::dataSize does not have an actual implementation
-    // {
-    //     const ServiceContext::UniqueOperationContext opCtx( harnessHelper->newOperationContext()
-    //     );
-    //     ASSERT( sorted->getSpaceUsedBytes( opCtx.get() ) == 0 );
-    // }
+    ASSERT(sorted->isEmpty(opCtx()));
 }
 
 // Verify that a nonempty index takes up some space.
-TEST(SortedDataInterface, GetSpaceUsedBytesNonEmpty) {
-    const auto harnessHelper(newSortedDataInterfaceHarnessHelper());
-    const std::unique_ptr<SortedDataInterface> sorted(harnessHelper->newSortedDataInterface(false));
+TEST_F(SortedDataInterfaceTest, GetSpaceUsedBytesNonEmpty) {
+    const auto sorted(
+        harnessHelper()->newSortedDataInterface(opCtx(), /*unique=*/false, /*partial=*/false));
 
-    {
-        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
-        ASSERT(sorted->isEmpty(opCtx.get()));
-    }
+    ASSERT(sorted->isEmpty(opCtx()));
 
     int nToInsert = 10;
     for (int i = 0; i < nToInsert; i++) {
-        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
-        {
-            WriteUnitOfWork uow(opCtx.get());
-            BSONObj key = BSON("" << i);
-            RecordId loc(42, i * 2);
-            ASSERT_OK(sorted->insert(opCtx.get(), key, loc, true));
-            uow.commit();
-        }
+        auto& ru = *shard_role_details::getRecoveryUnit(opCtx());
+        StorageWriteTransaction txn(ru);
+        BSONObj key = BSON("" << i);
+        RecordId loc(42, i * 2);
+        ASSERT_SDI_INSERT_OK(sorted->insert(opCtx(), makeKeyString(sorted.get(), key, loc), true));
+        txn.commit();
     }
 
-    {
-        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
-        ASSERT_EQUALS(nToInsert, sorted->numEntries(opCtx.get()));
-    }
-
-    // SERVER-15416 mmapv1 test harness does not use SimpleRecordStoreV1 as its record store
-    //              and HeapRecordStoreBtree::dataSize does not have an actual implementation
-    // long long spaceUsedBytes;
-    // {
-    //     const ServiceContext::UniqueOperationContext opCtx( harnessHelper->newOperationContext()
-    //     );
-    //     spaceUsedBytes = sorted->getSpaceUsedBytes( opCtx.get() );
-    //     ASSERT( spaceUsedBytes > 0 );
-    // }
-
-    // {
-    //     // getSpaceUsedBytes() returns the same value when called multiple times
-    //     // and there were not interleaved write operations.
-    //     const ServiceContext::UniqueOperationContext opCtx( harnessHelper->newOperationContext()
-    //     );
-    //     ASSERT_EQUALS( spaceUsedBytes, sorted->getSpaceUsedBytes( opCtx.get() ) );
-    //     ASSERT_EQUALS( spaceUsedBytes, sorted->getSpaceUsedBytes( opCtx.get() ) );
-    // }
+    ASSERT_EQUALS(nToInsert, sorted->numEntries(opCtx()));
 }
 
 }  // namespace
